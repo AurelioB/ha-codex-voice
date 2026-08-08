@@ -5,6 +5,19 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-08
+
+### Fixed
+
+- Admit only one subscription-backed realtime speech session at a time and
+  reject overlapping STT, TTS, or duplex requests immediately with HTTP 409,
+  instead of allowing a losing WebRTC session to time out after 90 seconds.
+- Retry transient WebRTC input-drain and missing-terminal-transcript stalls in
+  fresh, fully cleaned sessions under one bounded transcription budget.
+- Release speech-session admission after success, failure, timeout, or
+  cancellation, and log privacy-safe audio level metrics when transcription
+  reaches its deadline.
+
 ## [0.1.3] - 2026-08-08
 
 ### Fixed

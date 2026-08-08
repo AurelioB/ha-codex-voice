@@ -182,6 +182,9 @@ opt-in and must never print OAuth tokens or recorded audio.
   output is best-effort conversational rendering: the live voice model may
   paraphrase or expand text instead of reading it verbatim. Do not use this
   TTS entity for safety-critical or legally exact announcements.
+- The Codex subscription realtime surface is admitted one speech session at a
+  time. Overlapping STT, TTS, or duplex requests fail immediately as busy so a
+  caller can retry, rather than occupying the bridge until a timeout.
 - HACS cannot install the bridge process. Run it separately or use the future
   add-on/container packaging.
 - ThirdReality hardware can use milestone 1 through its existing Home
