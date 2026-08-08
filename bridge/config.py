@@ -78,7 +78,7 @@ class BridgeConfig:
     transcript_timeout: float = 90.0
     synthesis_timeout: float = 90.0
     realtime_version: str = "v3"
-    silence_ms: int = 1_000
+    silence_ms: int = 0
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -123,5 +123,5 @@ class BridgeConfig:
                 os.environ.get("HA_CODEX_BRIDGE_SYNTHESIS_TIMEOUT", "90")
             ),
             realtime_version=os.environ.get("HA_CODEX_REALTIME_VERSION", "v3"),
-            silence_ms=int(os.environ.get("HA_CODEX_TRANSCRIBE_SILENCE_MS", "1000")),
+            silence_ms=int(os.environ.get("HA_CODEX_TRANSCRIBE_SILENCE_MS", "0")),
         )

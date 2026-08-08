@@ -590,72 +590,112 @@ async def _run_transcription_attempt(
     prompt: str,
 ) -> str:
     """Run one disposable realtime transcription attempt."""
+    attempt_started = time.monotonic()
+    thread_start_seconds = 0.0
+    realtime_handshake_seconds = 0.0
+    transcript_wait_seconds = 0.0
+    session_stop_peer_close_seconds = 0.0
+    thread_delete_seconds = 0.0
     try:
-        thread_id = await state.start_thread(
-            payload,
-            base_instructions=(
-                "Act only as a speech recognition adapter. Never call tools, inspect "
-                "files, or answer the user's speech."
-            ),
-        )
-    except TimeoutError as err:
-        # A timed-out start may still have created a remote thread, but no id was
-        # returned for safe cleanup. Do not compound that ambiguity with a retry.
-        raise _TranscriptionStartTimeout from err
-    session: RealtimeSession | None = None
-    timeout_stage = "handshake"
-    try:
-        session = RealtimeSession(
-            state.rpc,
-            thread_id,
-            peer=state.peer_factory(),
-            version=state.config.realtime_version,
-            timeout=min(
-                state.config.transcript_timeout,
-                TRANSCRIPTION_SESSION_TIMEOUT_SECONDS,
-            ),
-        )
-        await session.start(
-            prompt=prompt,
-            include_startup_context=False,
-            client_managed_handoffs=True,
-        )
-        timeout_stage = "input_drain"
-        trailing_silence = silence_pcm16(state.config.silence_ms)
-        feed_started = asyncio.get_running_loop().time()
-        session.feed_audio(pcm + trailing_silence)
-        feed_duration = duration + state.config.silence_ms / 1_000
-        drain_task = asyncio.create_task(
-            session.wait_input_drained(
-                timeout=max(10.0, duration + 10.0),
-                monitor_app_server_exit=False,
-            )
-        )
-        timeout_stage = "transcript"
+        thread_start_started = time.monotonic()
         try:
-            # The remote recognizer can stop pulling the trailing silence once it
-            # has emitted a transcript, leaving the local track's drain marker
-            # unset. Transcript events are therefore the completion authority.
-            return await _wait_for_user_transcript(
-                session,
-                min(
-                    state.config.transcript_timeout,
-                    feed_duration + TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
+            thread_id = await state.start_thread(
+                payload,
+                base_instructions=(
+                    "Act only as a speech recognition adapter. Never call tools, "
+                    "inspect files, or answer the user's speech."
                 ),
-                fragment_finalization_at=feed_started + feed_duration,
             )
+        except TimeoutError as err:
+            # A timed-out start may still have created a remote thread, but no id was
+            # returned for safe cleanup. Do not compound that ambiguity with a retry.
+            raise _TranscriptionStartTimeout from err
         finally:
-            if not drain_task.done():
-                drain_task.cancel()
-            await asyncio.gather(drain_task, return_exceptions=True)
-    except TimeoutError as err:
-        raise _TranscriptionAttemptTimeout(timeout_stage) from err
-    finally:
+            thread_start_seconds = time.monotonic() - thread_start_started
+
+        session: RealtimeSession | None = None
+        timeout_stage = "handshake"
         try:
-            if session is not None:
-                await session.stop()
+            session = RealtimeSession(
+                state.rpc,
+                thread_id,
+                peer=state.peer_factory(),
+                version=state.config.realtime_version,
+                timeout=min(
+                    state.config.transcript_timeout,
+                    TRANSCRIPTION_SESSION_TIMEOUT_SECONDS,
+                ),
+            )
+            handshake_started = time.monotonic()
+            try:
+                await session.start(
+                    prompt=prompt,
+                    include_startup_context=False,
+                    client_managed_handoffs=True,
+                )
+            finally:
+                realtime_handshake_seconds = time.monotonic() - handshake_started
+            timeout_stage = "input_drain"
+            trailing_silence = silence_pcm16(state.config.silence_ms)
+            feed_started = asyncio.get_running_loop().time()
+            session.feed_audio(pcm + trailing_silence)
+            feed_duration = duration + state.config.silence_ms / 1_000
+            drain_task = asyncio.create_task(
+                session.wait_input_drained(
+                    timeout=max(10.0, duration + 10.0),
+                    monitor_app_server_exit=False,
+                )
+            )
+            timeout_stage = "transcript"
+            transcript_wait_started = time.monotonic()
+            try:
+                # The remote recognizer can stop pulling the trailing silence once it
+                # has emitted a transcript, leaving the local track's drain marker
+                # unset. Transcript events are therefore the completion authority.
+                return await _wait_for_user_transcript(
+                    session,
+                    min(
+                        state.config.transcript_timeout,
+                        feed_duration + TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
+                    ),
+                    fragment_finalization_at=feed_started + duration,
+                )
+            finally:
+                transcript_wait_seconds = time.monotonic() - transcript_wait_started
+                if not drain_task.done():
+                    drain_task.cancel()
+                await asyncio.gather(drain_task, return_exceptions=True)
+        except TimeoutError as err:
+            raise _TranscriptionAttemptTimeout(timeout_stage) from err
         finally:
-            await _dispose_thread(state.rpc, thread_id)
+            try:
+                if session is not None:
+                    session_stop_started = time.monotonic()
+                    try:
+                        await session.stop()
+                    finally:
+                        session_stop_peer_close_seconds = (
+                            time.monotonic() - session_stop_started
+                        )
+            finally:
+                thread_delete_started = time.monotonic()
+                try:
+                    await _dispose_thread(state.rpc, thread_id)
+                finally:
+                    thread_delete_seconds = time.monotonic() - thread_delete_started
+    finally:
+        LOGGER.info(
+            "Realtime transcription attempt timing: thread_start_seconds=%.3f "
+            "realtime_handshake_seconds=%.3f transcript_wait_seconds=%.3f "
+            "session_stop_peer_close_seconds=%.3f thread_delete_seconds=%.3f "
+            "total_seconds=%.3f",
+            thread_start_seconds,
+            realtime_handshake_seconds,
+            transcript_wait_seconds,
+            session_stop_peer_close_seconds,
+            thread_delete_seconds,
+            time.monotonic() - attempt_started,
+        )
 
 
 def _normalized_pcm16_levels(pcm: bytes) -> tuple[float, float]:
