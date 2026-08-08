@@ -1,0 +1,148 @@
+{
+  "title": "Codex Voice",
+  "config": {
+    "abort": {
+      "already_configured": "This Codex Voice bridge is already configured.",
+      "reauth_successful": "Reauthentication was successful.",
+      "reconfigure_successful": "The bridge configuration was updated."
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Codex Voice bridge.",
+      "invalid_auth": "The bridge rejected the access token.",
+      "unknown": "Unexpected error."
+    },
+    "step": {
+      "user": {
+        "title": "Connect to Codex Voice",
+        "description": "Connect Home Assistant to the local, subscription-backed Codex Voice bridge.",
+        "data": {
+          "access_token": "Bridge access token",
+          "bridge_url": "Bridge URL"
+        },
+        "data_description": {
+          "access_token": "The token configured on the local bridge. This is not your ChatGPT OAuth token.",
+          "bridge_url": "The HTTP URL Home Assistant uses to reach the bridge."
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Codex Voice",
+        "data": {
+          "access_token": "Bridge access token",
+          "bridge_url": "Bridge URL"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Authenticate with the bridge again",
+        "description": "Enter the current access token for the local Codex Voice bridge.",
+        "data": {
+          "access_token": "Bridge access token"
+        }
+      }
+    }
+  },
+  "config_subentries": {
+    "conversation": {
+      "entry_type": "Conversation agent",
+      "initiate_flow": {
+        "user": "Add conversation agent",
+        "reconfigure": "Reconfigure conversation agent"
+      },
+      "abort": {
+        "reconfigure_successful": "The conversation agent was updated."
+      },
+      "step": {
+        "init": {
+          "title": "Conversation agent",
+          "data": {
+            "llm_hass_api": "Control Home Assistant",
+            "model": "Model",
+            "name": "Name",
+            "prompt": "Instructions"
+          },
+          "data_description": {
+            "llm_hass_api": "Select the Home Assistant LLM APIs whose exposed entities and tools this agent may use.",
+            "prompt": "Instructions supplied before the conversation. Templates are supported."
+          }
+        }
+      }
+    },
+    "stt": {
+      "entry_type": "Speech-to-text",
+      "initiate_flow": {
+        "user": "Add speech-to-text provider",
+        "reconfigure": "Reconfigure speech-to-text provider"
+      },
+      "abort": {
+        "reconfigure_successful": "The speech-to-text provider was updated."
+      },
+      "step": {
+        "init": {
+          "title": "Speech-to-text provider",
+          "description": "Speech recognition uses Codex realtime conversation as a best-effort compatibility adapter, not a standalone transcription API.",
+          "data": {
+            "name": "Name",
+            "prompt": "Transcription hint"
+          },
+          "data_description": {
+            "prompt": "Optional vocabulary or context that can improve transcription."
+          }
+        }
+      }
+    },
+    "tts": {
+      "entry_type": "Text-to-speech",
+      "initiate_flow": {
+        "user": "Add text-to-speech provider",
+        "reconfigure": "Reconfigure text-to-speech provider"
+      },
+      "abort": {
+        "reconfigure_successful": "The text-to-speech provider was updated."
+      },
+      "step": {
+        "init": {
+          "title": "Text-to-speech provider",
+          "description": "Speech generation uses Codex realtime conversation as a best-effort compatibility adapter. It can paraphrase or expand text and is not suitable where exact wording is required.",
+          "data": {
+            "instructions": "Voice instructions",
+            "name": "Name",
+            "voice": "Voice"
+          },
+          "data_description": {
+            "instructions": "Optional instructions for tone, pacing, accent, or emotion."
+          }
+        }
+      }
+    }
+  },
+  "entity": {
+    "conversation": {
+      "conversation": {
+        "name": "Conversation"
+      }
+    },
+    "stt": {
+      "stt": {
+        "name": "Speech-to-text"
+      }
+    },
+    "tts": {
+      "tts": {
+        "name": "Text-to-speech"
+      }
+    }
+  },
+  "exceptions": {
+    "authentication_required": {
+      "message": "Codex Voice needs to be authenticated again."
+    },
+    "synthesis_failed": {
+      "message": "Codex Voice could not synthesize speech."
+    },
+    "unsupported_audio_format": {
+      "message": "The bridge returned the unsupported audio format {audio_format}."
+    },
+    "unsupported_home_assistant_version": {
+      "message": "Codex Voice requires Home Assistant {minimum_version} or newer."
+    }
+  }
+}
