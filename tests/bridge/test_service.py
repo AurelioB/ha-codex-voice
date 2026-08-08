@@ -1708,6 +1708,101 @@ async def test_synthesize_returns_best_effort_wav(
 
 
 @pytest.mark.asyncio
+async def test_synthesize_logs_privacy_safe_numeric_timing(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    private_values = (
+        "private-spoken-text-marker",
+        "private-language-marker",
+        "private-voice-marker",
+        "private-instructions-marker",
+        "test-token",
+        "thread-1",
+        "fake-offer",
+        "fake-answer",
+    )
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        response = await client.post(
+            "/v1/synthesize",
+            headers=AUTH,
+            json={
+                "text": private_values[0],
+                "language": private_values[1],
+                "voice": private_values[2],
+                "format": "wav",
+                "instructions": private_values[3],
+            },
+        )
+
+    assert response.status == 200
+    prefix = "Realtime synthesis attempt timing: "
+    timing_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "bridge.service" and record.getMessage().startswith(prefix)
+    ]
+    assert len(timing_messages) == 1
+    expected_fields = [
+        "thread_start_seconds",
+        "realtime_handshake_seconds",
+        "append_text_rpc_seconds",
+        "append_to_first_audio_seconds",
+        "audio_collection_seconds",
+        "last_audio_to_collection_end_seconds",
+        "completion_to_collection_end_seconds",
+        "session_stop_peer_close_seconds",
+        "thread_delete_seconds",
+        "total_to_response_ready_seconds",
+    ]
+    fields = timing_messages[0].removeprefix(prefix).split()
+    assert [field.partition("=")[0] for field in fields] == expected_fields
+    for field in fields:
+        _, separator, numeric_value = field.partition("=")
+        assert separator == "="
+        assert re.fullmatch(r"\d+\.\d{3}", numeric_value)
+        assert float(numeric_value) >= 0
+
+    service_log = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "bridge.service"
+    )
+    for private_value in private_values:
+        assert private_value not in service_log
+
+
+@pytest.mark.asyncio
+async def test_synthesize_logs_one_timing_summary_on_failure(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fail_collection(*_: Any, **__: Any) -> bytes:
+        raise TimeoutError
+
+    monkeypatch.setattr(bridge_service, "_collect_speech_audio", fail_collection)
+    client = await aiohttp_client(bridge_app)
+    prefix = "Realtime synthesis attempt timing: "
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        response = await client.post(
+            "/v1/synthesize", headers=AUTH, json=_synthesis_payload()
+        )
+
+    assert response.status == 504
+    assert (
+        sum(
+            record.name == "bridge.service" and record.getMessage().startswith(prefix)
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_synthesize_rejects_unbounded_text(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
