@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import wave
 from array import array
 from collections.abc import Mapping
@@ -365,6 +366,26 @@ def bridge_app(fake_rpc: FakeRpc) -> web.Application:
         rpc=fake_rpc,
         peer_factory=fake_rpc.peer_factory,
     )
+
+
+def test_transcription_silence_defaults_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_TRANSCRIBE_SILENCE_MS", raising=False)
+
+    assert BridgeConfig(bearer_token="test-token").silence_ms == 0
+    assert BridgeConfig.from_env().silence_ms == 0
+
+
+def test_transcription_silence_supports_explicit_nonzero_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.setenv("HA_CODEX_TRANSCRIBE_SILENCE_MS", "750")
+
+    assert BridgeConfig(bearer_token="test-token", silence_ms=500).silence_ms == 500
+    assert BridgeConfig.from_env().silence_ms == 750
 
 
 def test_codex_child_environment_excludes_credentials(
@@ -1403,6 +1424,58 @@ async def test_transcribe_trims_silence_and_recomputes_feed_duration(
 
 
 @pytest.mark.asyncio
+async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_deadline: float | None = None
+    wait_called_at: float | None = None
+
+    async def capture_finalization(
+        _session: Any,
+        _timeout: float,
+        *,
+        fragment_finalization_at: float | None = None,
+    ) -> str:
+        nonlocal captured_deadline, wait_called_at
+        captured_deadline = fragment_finalization_at
+        wait_called_at = asyncio.get_running_loop().time()
+        return "Synthetic transcript"
+
+    monkeypatch.setattr(
+        bridge_service, "_wait_for_user_transcript", capture_finalization
+    )
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", silence_ms=1_000),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    pcm = b"\x00\x40" * 2_400
+    duration = len(pcm) / (bridge_service.REALTIME_SAMPLE_RATE * 2)
+
+    response = await client.post(
+        "/v1/transcribe",
+        headers=AUTH,
+        json={
+            "audio": base64.b64encode(pcm).decode(),
+            "format": "pcm",
+            "sample_rate": 24_000,
+            "channels": 1,
+        },
+    )
+
+    assert response.status == 200
+    assert captured_deadline is not None
+    assert wait_called_at is not None
+    assert captured_deadline - wait_called_at == pytest.approx(duration, abs=0.02)
+    assert len(fake_rpc.peers[-1].fed) == len(pcm) + len(
+        bridge_service.silence_pcm16(1_000)
+    )
+
+
+@pytest.mark.asyncio
 async def test_transcribe_timeout_logs_only_normalized_audio_diagnostics(
     aiohttp_client: Any,
     bridge_app: web.Application,
@@ -1440,24 +1513,27 @@ async def test_transcribe_retries_after_terminal_event_timeout(
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     attempts = 0
+    private_transcript = "Private recovered transcript"
 
     async def flaky_transcript(*_: Any, **__: Any) -> str:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise TimeoutError
-        return "Recovered transcript"
+        return private_transcript
 
     monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", flaky_transcript)
     client = await aiohttp_client(bridge_app)
-    response = await client.post(
-        "/v1/transcribe", headers=AUTH, json=_transcription_payload()
-    )
+    payload = _transcription_payload()
+    payload["prompt"] = "private-vocabulary-marker"
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
 
     assert response.status == 200
-    assert await response.json() == {"text": "Recovered transcript"}
+    assert await response.json() == {"text": private_transcript}
     assert attempts == 2
     assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
     assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
@@ -1466,6 +1542,41 @@ async def test_transcribe_retries_after_terminal_event_timeout(
         for method, _ in fake_rpc.calls
         if method in {"thread/start", "thread/delete"}
     ] == ["thread/start", "thread/delete", "thread/start", "thread/delete"]
+    timing_pattern = re.compile(
+        r"Realtime transcription attempt timing: "
+        r"thread_start_seconds=(\d+\.\d{3}) "
+        r"realtime_handshake_seconds=(\d+\.\d{3}) "
+        r"transcript_wait_seconds=(\d+\.\d{3}) "
+        r"session_stop_peer_close_seconds=(\d+\.\d{3}) "
+        r"thread_delete_seconds=(\d+\.\d{3}) total_seconds=(\d+\.\d{3})"
+    )
+    timing_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "bridge.service"
+        and record.getMessage().startswith("Realtime transcription attempt timing:")
+    ]
+    assert len(timing_messages) == 2
+    for message in timing_messages:
+        match = timing_pattern.fullmatch(message)
+        assert match is not None
+        assert all(float(value) >= 0 for value in match.groups())
+    service_log = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "bridge.service"
+    )
+    for private_value in (
+        private_transcript,
+        payload["audio"],
+        payload["prompt"],
+        "fake-offer",
+        "fake-answer",
+        "thread-1",
+        "thread-2",
+        "test-token",
+    ):
+        assert private_value not in service_log
 
 
 @pytest.mark.asyncio
