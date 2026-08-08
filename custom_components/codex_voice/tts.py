@@ -5,13 +5,15 @@ from __future__ import annotations
 import io
 import logging
 import wave
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any, override
 
 from homeassistant.components.tts import (
     ATTR_PREFERRED_FORMAT,
     ATTR_VOICE,
     TextToSpeechEntity,
+    TTSAudioRequest,
+    TTSAudioResponse,
     TtsAudioType,
     Voice,
 )
@@ -55,7 +57,7 @@ async def async_setup_entry(
 class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
     """Codex Voice text-to-speech entity."""
 
-    _attr_supported_options = [ATTR_VOICE, ATTR_PREFERRED_FORMAT]
+    _attr_supported_options = [ATTR_VOICE]
     _attr_supported_languages = list(SUPPORTED_LANGUAGES)
     _attr_default_language = "en-US"
     _attr_has_entity_name = False
@@ -109,13 +111,59 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
                 translation_key="authentication_required",
             ) from err
         except BridgeError as err:
-            _LOGGER.exception("Error synthesizing speech with Codex Voice")
+            _LOGGER.error(
+                "Error synthesizing speech with Codex Voice (%s)",
+                type(err).__name__,
+            )
             raise HomeAssistantError(
                 translation_domain="codex_voice",
                 translation_key="synthesis_failed",
             ) from err
 
         return "wav", _as_wav(audio)
+
+    @override
+    async def async_stream_tts_audio(
+        self,
+        request: TTSAudioRequest,
+    ) -> TTSAudioResponse:
+        """Stream synthesized WAV audio through the Codex Voice bridge."""
+        message = "".join([chunk async for chunk in request.message_gen])
+        merged_options = {
+            **self.default_options,
+            **self.subentry.data,
+            **request.options,
+        }
+        bridge_stream = self.entry.runtime_data.async_synthesize_stream(
+            message,
+            language=request.language,
+            voice=merged_options.get(ATTR_VOICE, DEFAULT_VOICE),
+            instructions=merged_options.get(CONF_INSTRUCTIONS),
+        )
+
+        async def data_gen() -> AsyncGenerator[bytes]:
+            try:
+                async for chunk in bridge_stream:
+                    yield chunk
+            except BridgeAuthenticationError as err:
+                self.entry.async_start_reauth(self.hass)
+                raise HomeAssistantError(
+                    translation_domain="codex_voice",
+                    translation_key="authentication_required",
+                ) from err
+            except BridgeError as err:
+                _LOGGER.error(
+                    "Error streaming speech with Codex Voice (%s)",
+                    type(err).__name__,
+                )
+                raise HomeAssistantError(
+                    translation_domain="codex_voice",
+                    translation_key="synthesis_failed",
+                ) from err
+            finally:
+                await bridge_stream.aclose()
+
+        return TTSAudioResponse(extension="wav", data_gen=data_gen())
 
 
 def _as_wav(audio: BridgeAudio) -> bytes:

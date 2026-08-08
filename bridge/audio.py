@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import struct
 import sys
 import wave
 from array import array
@@ -157,3 +158,34 @@ def wav_bytes(
         target.setframerate(sample_rate)
         target.writeframes(pcm)
     return output.getvalue()
+
+
+def streaming_wav_header(
+    sample_rate: int = REALTIME_SAMPLE_RATE, channels: int = 1
+) -> bytes:
+    """Return a PCM16 WAV header whose data length is terminated by stream EOF."""
+
+    if sample_rate <= 0:
+        raise ProtocolError("sample_rate must be positive")
+    if not 0 < channels <= 0xFFFF:
+        raise ProtocolError("channels must fit in an unsigned 16-bit integer")
+    block_align = channels * PCM_SAMPLE_WIDTH
+    byte_rate = sample_rate * block_align
+    if byte_rate > 0xFFFFFFFF:
+        raise ProtocolError("WAV byte rate exceeds the unsigned 32-bit limit")
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        PCM_SAMPLE_WIDTH * 8,
+        b"data",
+        0xFFFFFFFF,
+    )

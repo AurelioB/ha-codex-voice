@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +27,7 @@ from .audio import (
     pcm16_mono_24khz,
     read_pcm16_payload,
     silence_pcm16,
+    streaming_wav_header,
     wav_bytes,
 )
 from .config import BridgeConfig
@@ -383,6 +384,7 @@ def create_app(
     app.router.add_get("/v1/conversation", _conversation)
     app.router.add_post("/v1/transcribe", _transcribe)
     app.router.add_post("/v1/synthesize", _synthesize)
+    app.router.add_post("/v1/synthesize/stream", _synthesize_stream)
     app.router.add_get("/v1/realtime", _realtime)
     app.cleanup_ctx.append(_app_server_lifecycle)
     return app
@@ -852,9 +854,18 @@ async def _synthesize(request: web.Request) -> web.Response:
         return await _synthesize_admitted(request, state)
 
 
+async def _synthesize_stream(request: web.Request) -> web.StreamResponse:
+    state: BridgeState = request.app[STATE_KEY]
+    with state.speech_session_lease():
+        return await _synthesize_admitted(request, state, streaming=True)
+
+
 async def _synthesize_admitted(
-    request: web.Request, state: BridgeState
-) -> web.Response:
+    request: web.Request,
+    state: BridgeState,
+    *,
+    streaming: bool = False,
+) -> web.StreamResponse:
     attempt_started = time.monotonic()
     thread_start_seconds = 0.0
     realtime_handshake_seconds = 0.0
@@ -879,6 +890,18 @@ async def _synthesize_admitted(
     voice = (
         voice_value.lower() if isinstance(voice_value, str) and voice_value else None
     )
+    response_headers = {
+        "X-Audio-Sample-Rate": str(REALTIME_SAMPLE_RATE),
+        "X-Audio-Channels": "1",
+        "X-Codex-Synthesis-Mode": "conversational-best-effort",
+    }
+    stream_response = (
+        web.StreamResponse(headers=response_headers) if streaming else None
+    )
+    if stream_response is not None:
+        stream_response.content_type = "audio/wav"
+    stream_started = False
+    pcm: bytes | None = None
 
     try:
         thread_start_started = time.monotonic()
@@ -936,13 +959,28 @@ async def _synthesize_admitted(
                 )
             finally:
                 append_text_rpc_seconds = time.monotonic() - append_text_started_at
+
+            async def write_pcm_chunk(chunk: bytes) -> None:
+                nonlocal stream_started
+                assert stream_response is not None
+                if not stream_started:
+                    await stream_response.prepare(request)
+                    await stream_response.write(streaming_wav_header())
+                    stream_started = True
+                await stream_response.write(chunk)
+
             collection_started = time.monotonic()
             try:
                 pcm = await _collect_speech_audio(
                     session,
                     state.config.synthesis_timeout,
                     timing=collection_timing,
+                    async_handle_chunk=write_pcm_chunk if streaming else None,
                 )
+                if stream_response is not None:
+                    if not stream_started:
+                        raise ProtocolError("realtime synthesis produced no audio")
+                    await stream_response.write_eof()
             finally:
                 audio_collection_seconds = time.monotonic() - collection_started
         finally:
@@ -960,14 +998,13 @@ async def _synthesize_admitted(
                     await _dispose_thread(state.rpc, thread_id)
                 finally:
                     thread_delete_seconds = time.monotonic() - thread_delete_started
+        if stream_response is not None:
+            return stream_response
+        assert pcm is not None
         return web.Response(
             body=wav_bytes(pcm),
             content_type="audio/wav",
-            headers={
-                "X-Audio-Sample-Rate": str(REALTIME_SAMPLE_RATE),
-                "X-Audio-Channels": "1",
-                "X-Codex-Synthesis-Mode": "conversational-best-effort",
-            },
+            headers=response_headers,
         )
     finally:
         collection_ended_at = collection_timing.ended_at
@@ -1831,6 +1868,7 @@ async def _collect_speech_audio(
     timeout: float,
     *,
     timing: _SynthesisCollectionTiming | None = None,
+    async_handle_chunk: Callable[[bytes], Awaitable[None]] | None = None,
 ) -> bytes:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -1838,6 +1876,7 @@ async def _collect_speech_audio(
     transcript_done = False
     completion_at: float | None = None
     chunks: list[bytes] = []
+    received_audio = False
     audio_task = asyncio.create_task(session.recv_audio())
     event_task = asyncio.create_task(session.next_event())
     data_task = asyncio.create_task(session.recv_data_event())
@@ -1874,7 +1913,11 @@ async def _collect_speech_audio(
             if audio_task in done:
                 chunk = audio_task.result()
                 if chunk:
-                    chunks.append(chunk)
+                    received_audio = True
+                    if async_handle_chunk is None:
+                        chunks.append(chunk)
+                    else:
+                        await async_handle_chunk(chunk)
                     last_audio_at = loop.time()
                     if timing is not None:
                         audio_observed_at = time.monotonic()
@@ -1896,7 +1939,7 @@ async def _collect_speech_audio(
                     raise ProtocolError(
                         str(params.get("message", "realtime synthesis failed"))
                     )
-                elif method == "thread/realtime/closed" and not chunks:
+                elif method == "thread/realtime/closed" and not received_audio:
                     raise ProtocolError(
                         "realtime session closed before producing speech"
                     )
@@ -1923,7 +1966,7 @@ async def _collect_speech_audio(
         event_task.cancel()
         data_task.cancel()
         await asyncio.gather(audio_task, event_task, data_task, return_exceptions=True)
-    if not chunks:
+    if not received_audio:
         raise ProtocolError("realtime synthesis produced no audio")
     return b"".join(chunks)
 

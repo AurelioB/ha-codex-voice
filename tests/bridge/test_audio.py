@@ -6,7 +6,12 @@ from io import BytesIO
 
 import pytest
 
-from bridge.audio import decode_base64_audio, pcm16_mono_24khz, wav_bytes
+from bridge.audio import (
+    decode_base64_audio,
+    pcm16_mono_24khz,
+    streaming_wav_header,
+    wav_bytes,
+)
 from bridge.errors import ProtocolError
 
 
@@ -33,6 +38,16 @@ def test_wav_bytes_wrap_pcm16() -> None:
         assert audio.getnchannels() == 1
         assert audio.getsampwidth() == 2
         assert audio.readframes(2) == payload
+
+
+def test_streaming_wav_header_is_pcm16_and_uses_eof_length() -> None:
+    pcm = b"\x01\x02" * 24_000
+    with wave.open(BytesIO(streaming_wav_header() + pcm), "rb") as audio:
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+        assert audio.getframerate() == 24_000
+        assert audio.getnframes() == 0xFFFFFFFF // 2
+        assert audio.readframes(audio.getnframes()) == pcm
 
 
 def test_base64_decoder_is_strict() -> None:
