@@ -53,6 +53,8 @@ All routes, including `GET /health`, require
   metadata; returns JSON `{ "text": "..." }` under a bounded end-to-end
   deadline.
 - `POST /v1/synthesize`: text, voice, and language; returns mono 24 kHz WAV.
+- `POST /v1/synthesize/stream`: the same request contract, returned as a
+  progressively delivered mono 24 kHz PCM16 WAV stream.
 - `GET /v1/realtime` WebSocket: full-duplex PCM16 `audio`, `text`, `speech`,
   transcripts, tool calls, and stop messages.
 
@@ -67,6 +69,12 @@ text-to-speech API. `/v1/synthesize` sends a tightly constrained text turn but
 still provides best-effort conversational speech and returns the header
 `X-Codex-Synthesis-Mode: conversational-best-effort`; callers must not assume
 that spoken wording exactly matches the input.
+
+Finite transcription does not append synthetic silence by default. Set
+`HA_CODEX_TRANSCRIBE_SILENCE_MS` only when an explicit nonzero compatibility
+tail is required. Successful STT and TTS attempts log numeric stage durations
+only; speech, transcripts, prompts, credentials, SDP, and remote identifiers
+are never included in those timing records.
 
 Interactive approvals, permission requests, and unsupported server-initiated
 requests fail closed. Only explicitly declared dynamic Home Assistant tools are

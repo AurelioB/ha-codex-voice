@@ -5,6 +5,24 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-08-08
+
+### Added
+
+- Stream mono 24 kHz PCM WAV audio from the bridge and Home Assistant TTS
+  entity as realtime speech frames arrive, while retaining the finite
+  synthesis endpoint for compatibility.
+- Emit numeric-only, privacy-safe stage timings for disposable STT and TTS
+  attempts so handshake, recognition, first-audio, tail, and cleanup latency
+  can be measured without logging content or identifiers.
+
+### Changed
+
+- Remove redundant queued STT silence by default and finalize transcript
+  fragments relative to meaningful audio rather than optional padding.
+- Advertise WAV as the native TTS output while allowing Home Assistant to
+  convert explicitly requested alternate formats.
+
 ## [0.1.6] - 2026-08-08
 
 ### Fixed
