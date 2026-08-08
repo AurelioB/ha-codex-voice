@@ -137,6 +137,16 @@ class _ConversationEntry:
     turn_state: _ConversationTurnState = field(default_factory=_ConversationTurnState)
 
 
+@dataclass(slots=True)
+class _SynthesisCollectionTiming:
+    """Private monotonic markers used for aggregate synthesis timing only."""
+
+    first_audio_at: float | None = None
+    last_audio_at: float | None = None
+    completion_at: float | None = None
+    ended_at: float | None = None
+
+
 class BridgeState:
     def __init__(
         self,
@@ -845,6 +855,15 @@ async def _synthesize(request: web.Request) -> web.Response:
 async def _synthesize_admitted(
     request: web.Request, state: BridgeState
 ) -> web.Response:
+    attempt_started = time.monotonic()
+    thread_start_seconds = 0.0
+    realtime_handshake_seconds = 0.0
+    append_text_rpc_seconds = 0.0
+    append_text_started_at: float | None = None
+    audio_collection_seconds = 0.0
+    session_stop_peer_close_seconds = 0.0
+    thread_delete_seconds = 0.0
+    collection_timing = _SynthesisCollectionTiming()
     payload = await _read_json(request)
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -861,64 +880,134 @@ async def _synthesize_admitted(
         voice_value.lower() if isinstance(voice_value, str) and voice_value else None
     )
 
-    thread_id = await state.start_thread(
-        payload,
-        base_instructions=(
-            "Act only as a deterministic voice renderer. Remain silent until the "
-            "client appends speakable text, then vocalize only that text. Never "
-            "greet, acknowledge, answer, paraphrase, add or remove words, call "
-            "tools, or inspect files."
-        ),
-    )
-    session = RealtimeSession(
-        state.rpc,
-        thread_id,
-        peer=state.peer_factory(),
-        version=state.config.realtime_version,
-        timeout=state.config.synthesis_timeout,
-    )
-    language = payload.get("language")
-    language_hint = (
-        f" Speak in {language}." if isinstance(language, str) and language else ""
-    )
-    instructions_value = payload.get("instructions")
-    voice_hint = (
-        f" Follow this client-provided voice guidance: {instructions_value[:2_000]}"
-        if isinstance(instructions_value, str) and instructions_value
-        else ""
-    )
     try:
-        await session.start(
-            prompt=(
-                "Stay silent until a speakable item arrives. Render that item "
-                "verbatim and naturally, without any preface or follow-up."
-            )
-            + language_hint
-            + voice_hint,
-            voice=voice,
-            include_startup_context=False,
-            client_managed_handoffs=True,
-        )
-        await session.append_text(
-            "Vocalize only the following quoted data, with no acknowledgement or "
-            f"extra words: {json.dumps(text, ensure_ascii=False)}",
-            role="user",
-        )
-        pcm = await _collect_speech_audio(session, state.config.synthesis_timeout)
-    finally:
+        thread_start_started = time.monotonic()
         try:
-            await session.stop()
+            thread_id = await state.start_thread(
+                payload,
+                base_instructions=(
+                    "Act only as a deterministic voice renderer. Remain silent until "
+                    "the client appends speakable text, then vocalize only that text. "
+                    "Never greet, acknowledge, answer, paraphrase, add or remove words, "
+                    "call tools, or inspect files."
+                ),
+            )
         finally:
-            await _dispose_thread(state.rpc, thread_id)
-    return web.Response(
-        body=wav_bytes(pcm),
-        content_type="audio/wav",
-        headers={
-            "X-Audio-Sample-Rate": str(REALTIME_SAMPLE_RATE),
-            "X-Audio-Channels": "1",
-            "X-Codex-Synthesis-Mode": "conversational-best-effort",
-        },
-    )
+            thread_start_seconds = time.monotonic() - thread_start_started
+        session = RealtimeSession(
+            state.rpc,
+            thread_id,
+            peer=state.peer_factory(),
+            version=state.config.realtime_version,
+            timeout=state.config.synthesis_timeout,
+        )
+        language = payload.get("language")
+        language_hint = (
+            f" Speak in {language}." if isinstance(language, str) and language else ""
+        )
+        instructions_value = payload.get("instructions")
+        voice_hint = (
+            f" Follow this client-provided voice guidance: {instructions_value[:2_000]}"
+            if isinstance(instructions_value, str) and instructions_value
+            else ""
+        )
+        try:
+            handshake_started = time.monotonic()
+            try:
+                await session.start(
+                    prompt=(
+                        "Stay silent until a speakable item arrives. Render that item "
+                        "verbatim and naturally, without any preface or follow-up."
+                    )
+                    + language_hint
+                    + voice_hint,
+                    voice=voice,
+                    include_startup_context=False,
+                    client_managed_handoffs=True,
+                )
+            finally:
+                realtime_handshake_seconds = time.monotonic() - handshake_started
+            append_text_started_at = time.monotonic()
+            try:
+                await session.append_text(
+                    "Vocalize only the following quoted data, with no acknowledgement "
+                    f"or extra words: {json.dumps(text, ensure_ascii=False)}",
+                    role="user",
+                )
+            finally:
+                append_text_rpc_seconds = time.monotonic() - append_text_started_at
+            collection_started = time.monotonic()
+            try:
+                pcm = await _collect_speech_audio(
+                    session,
+                    state.config.synthesis_timeout,
+                    timing=collection_timing,
+                )
+            finally:
+                audio_collection_seconds = time.monotonic() - collection_started
+        finally:
+            try:
+                session_stop_started = time.monotonic()
+                try:
+                    await session.stop()
+                finally:
+                    session_stop_peer_close_seconds = (
+                        time.monotonic() - session_stop_started
+                    )
+            finally:
+                thread_delete_started = time.monotonic()
+                try:
+                    await _dispose_thread(state.rpc, thread_id)
+                finally:
+                    thread_delete_seconds = time.monotonic() - thread_delete_started
+        return web.Response(
+            body=wav_bytes(pcm),
+            content_type="audio/wav",
+            headers={
+                "X-Audio-Sample-Rate": str(REALTIME_SAMPLE_RATE),
+                "X-Audio-Channels": "1",
+                "X-Codex-Synthesis-Mode": "conversational-best-effort",
+            },
+        )
+    finally:
+        collection_ended_at = collection_timing.ended_at
+        append_to_first_audio_seconds = (
+            max(0.0, collection_timing.first_audio_at - append_text_started_at)
+            if collection_timing.first_audio_at is not None
+            and append_text_started_at is not None
+            else 0.0
+        )
+        last_audio_to_collection_end_seconds = (
+            max(0.0, collection_ended_at - collection_timing.last_audio_at)
+            if collection_ended_at is not None
+            and collection_timing.last_audio_at is not None
+            else 0.0
+        )
+        completion_to_collection_end_seconds = (
+            max(0.0, collection_ended_at - collection_timing.completion_at)
+            if collection_ended_at is not None
+            and collection_timing.completion_at is not None
+            else 0.0
+        )
+        LOGGER.info(
+            "Realtime synthesis attempt timing: thread_start_seconds=%.3f "
+            "realtime_handshake_seconds=%.3f append_text_rpc_seconds=%.3f "
+            "append_to_first_audio_seconds=%.3f audio_collection_seconds=%.3f "
+            "last_audio_to_collection_end_seconds=%.3f "
+            "completion_to_collection_end_seconds=%.3f "
+            "session_stop_peer_close_seconds=%.3f thread_delete_seconds=%.3f "
+            "total_to_response_ready_seconds=%.3f",
+            thread_start_seconds,
+            realtime_handshake_seconds,
+            append_text_rpc_seconds,
+            append_to_first_audio_seconds,
+            audio_collection_seconds,
+            last_audio_to_collection_end_seconds,
+            completion_to_collection_end_seconds,
+            session_stop_peer_close_seconds,
+            thread_delete_seconds,
+            time.monotonic() - attempt_started,
+        )
 
 
 async def _conversation(request: web.Request) -> web.WebSocketResponse:
@@ -1737,7 +1826,12 @@ def _realtime_item_user_transcript(value: object) -> str:
     return ""
 
 
-async def _collect_speech_audio(session: RealtimeSession, timeout: float) -> bytes:
+async def _collect_speech_audio(
+    session: RealtimeSession,
+    timeout: float,
+    *,
+    timing: _SynthesisCollectionTiming | None = None,
+) -> bytes:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     last_audio_at: float | None = None
@@ -1782,6 +1876,11 @@ async def _collect_speech_audio(session: RealtimeSession, timeout: float) -> byt
                 if chunk:
                     chunks.append(chunk)
                     last_audio_at = loop.time()
+                    if timing is not None:
+                        audio_observed_at = time.monotonic()
+                        if timing.first_audio_at is None:
+                            timing.first_audio_at = audio_observed_at
+                        timing.last_audio_at = audio_observed_at
                 audio_task = asyncio.create_task(session.recv_audio())
             if event_task in done:
                 event = event_task.result()
@@ -1814,8 +1913,12 @@ async def _collect_speech_audio(session: RealtimeSession, timeout: float) -> byt
                 if event_type in {"turn.done", "output_audio_buffer.stopped"}:
                     transcript_done = True
                     completion_at = loop.time()
+                    if timing is not None:
+                        timing.completion_at = time.monotonic()
                 data_task = asyncio.create_task(session.recv_data_event())
     finally:
+        if timing is not None:
+            timing.ended_at = time.monotonic()
         audio_task.cancel()
         event_task.cancel()
         data_task.cancel()
