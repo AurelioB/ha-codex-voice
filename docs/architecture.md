@@ -24,6 +24,31 @@ Assistant LLM tools are advertised as dynamic tools. When Codex requests a tool,
 the component executes it through Home Assistant's LLM API; the bridge has no
 direct home-control authority.
 
+## Isolated App Server profile and thread lifecycle
+
+The bridge does not launch App Server against the user's everyday Codex home.
+For each App Server process it creates mode-0700 temporary `HOME` and
+`CODEX_HOME` directories and links only the existing managed ChatGPT
+`auth.json` into that profile. File-backed CLI authentication is forced so a
+Codex refresh updates the source credential through the link. The bridge
+auto-detects `${CODEX_HOME}/auth.json` or `${HOME}/.codex/auth.json`; deployments
+with another location can set `HA_CODEX_AUTH_FILE`. Startup fails if no secure,
+file-backed credential is available.
+
+This profile boundary keeps the user's normal Codex configuration, history,
+apps, plugins, and MCP servers—including automatically discovered sidecars—out
+of voice sessions. App Server's effective configuration layers are also
+audited at startup; a configured MCP server aborts startup. No OAuth secret is
+copied into Home Assistant or the repository.
+
+Threads start with `ephemeral: false`, but their persistence is confined to the
+temporary profile. This is intentional: App Server cannot apply
+`thread/delete` to an ephemeral thread. The bridge deletes one-shot STT, TTS,
+and realtime threads as soon as their session ends, and deletes cached
+Conversation threads when they are retired, evicted, or the bridge closes.
+Deletion unloads the thread immediately instead of retaining it for App
+Server's idle-unload period.
+
 ## Subscription audio adapter
 
 Codex 0.146.0 does not expose independent subscription-backed STT or TTS RPCs.
@@ -46,7 +71,8 @@ returned to Home Assistant as WAV.
 
 App Server's raw realtime WebSocket route is not used. In the pinned release it
 requires API-key authentication, while the WebRTC call-creation path works with
-Codex-managed ChatGPT OAuth.
+Codex-managed ChatGPT OAuth and consumes ChatGPT subscription availability,
+not OpenAI Platform API quota.
 
 ## Realtime client mode
 

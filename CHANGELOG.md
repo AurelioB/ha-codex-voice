@@ -5,6 +5,20 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-08
+
+### Fixed
+
+- Run App Server in a mode-0700 temporary Codex home linked only to the managed
+  file-backed ChatGPT login, keeping normal Codex history, configuration, apps,
+  plugins, and MCP sidecars outside voice sessions.
+- Persist threads only inside that private home and delete them when their
+  bridge-managed lifetime ends, preventing finished Conversation, STT, TTS,
+  and realtime threads from accumulating during App Server's idle-unload
+  window.
+- Audit effective configuration layers for injected MCP servers and accept
+  bounded App Server JSON-RPC messages larger than asyncio's small default.
+
 ## [0.1.2] - 2026-08-08
 
 ### Fixed

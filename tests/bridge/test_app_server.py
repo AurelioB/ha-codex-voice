@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from bridge.app_server import CodexAppServer
+from bridge.errors import ProtocolError
 
 FAKE_SERVER = Path(__file__).with_name("fake_app_server.py")
 
@@ -55,4 +56,29 @@ async def test_approvals_fail_closed_and_dynamic_tools_round_trip() -> None:
         assert tool_result["params"]["success"] is True
     finally:
         subscription.close()
+        await rpc.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_fails_closed_when_mcp_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_MCP_SERVER", "1")
+    rpc = CodexAppServer((sys.executable, str(FAKE_SERVER)), request_timeout=2)
+
+    with pytest.raises(ProtocolError, match="contains an MCP server"):
+        await rpc.start()
+
+    assert rpc.is_running is False
+    await rpc.close()
+
+
+@pytest.mark.asyncio
+async def test_reads_legitimate_json_lines_above_asyncio_default() -> None:
+    rpc = CodexAppServer((sys.executable, str(FAKE_SERVER)), request_timeout=2)
+    await rpc.start()
+    try:
+        response = await rpc.call("test/largeResponse", {})
+        assert len(response["payload"]) == 100_000
+    finally:
         await rpc.close()

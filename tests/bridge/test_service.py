@@ -15,6 +15,7 @@ from aiohttp import WSMsgType, web
 from bridge import service as bridge_service
 from bridge.config import BridgeConfig
 from bridge.errors import AppServerExited, ProtocolError
+from bridge.runtime import IsolatedCodexRuntime
 from bridge.service import BridgeState, _codex_child_environment, create_app
 
 AUTH = {"Authorization": "Bearer test-token"}
@@ -125,6 +126,7 @@ class FakeRpc:
         self.turn_start_error: Exception | None = None
         self.turn_start_gate: asyncio.Event | None = None
         self.turn_interrupt_error: Exception | None = None
+        self.thread_delete_error: Exception | None = None
         self.turn_gate: asyncio.Event | None = None
         self.tasks: set[asyncio.Task[None]] = set()
 
@@ -172,6 +174,8 @@ class FakeRpc:
         del timeout
         values = dict(params or {})
         self.calls.append((method, values))
+        if method == "thread/delete" and self.thread_delete_error is not None:
+            raise self.thread_delete_error
         if method == "permissionProfile/list":
             return {
                 "data": [
@@ -335,10 +339,59 @@ def test_codex_child_environment_excludes_credentials(
 
     environment = _codex_child_environment()
 
-    assert environment["HOME"] == "/safe/home"
+    assert "HOME" not in environment
     assert "HA_CODEX_BRIDGE_TOKEN" not in environment
     assert "HASS_TOKEN" not in environment
     assert "GH_TOKEN" not in environment
+
+
+def test_isolated_codex_runtime_links_only_secure_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """App Server gets private homes while Codex retains managed token refresh."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}")
+    auth_file.chmod(0o600)
+    monkeypatch.setenv("HOME", "/safe/home")
+    monkeypatch.setenv("CODEX_HOME", "/safe/codex")
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "bridge-secret")
+
+    runtime = IsolatedCodexRuntime(str(auth_file))
+    root = runtime.root
+    try:
+        private_codex_home = Path(runtime.environment["CODEX_HOME"])
+        linked_auth = private_codex_home / "auth.json"
+        assert linked_auth.is_symlink()
+        assert linked_auth.samefile(auth_file)
+        assert Path(runtime.environment["HOME"]).parent == root
+        assert private_codex_home.parent == root
+        assert root.stat().st_mode & 0o777 == 0o700
+        assert "HA_CODEX_BRIDGE_TOKEN" not in runtime.environment
+        assert "/safe/home" not in runtime.environment.values()
+        assert "/safe/codex" not in runtime.environment.values()
+    finally:
+        runtime.cleanup()
+    assert not root.exists()
+
+
+def test_isolated_codex_runtime_rejects_exposed_auth(tmp_path: Path) -> None:
+    """An auth file readable by another local user fails closed."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}")
+    auth_file.chmod(0o644)
+
+    with pytest.raises(ValueError, match="group or others"):
+        IsolatedCodexRuntime(str(auth_file))
+
+
+def test_isolated_codex_runtime_requires_refreshable_auth(tmp_path: Path) -> None:
+    """A read-only auth file cannot safely retain rotating refresh tokens."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}")
+    auth_file.chmod(0o400)
+
+    with pytest.raises(ValueError, match="writable"):
+        IsolatedCodexRuntime(str(auth_file))
 
 
 @pytest.mark.asyncio
@@ -351,9 +404,26 @@ async def test_thread_fails_closed_when_permission_profile_is_not_active(
     state = BridgeState(BridgeConfig(bearer_token="test-token"), rpc=fake_rpc)
     try:
         with pytest.raises(ProtocolError, match="required permission profile"):
-            await state.start_thread({}, ephemeral=True)
+            await state.start_thread({})
     finally:
         await state.close()
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_thread_delete_falls_back_to_unsubscribe(fake_rpc: FakeRpc) -> None:
+    """Older app-server failures still release the event subscription."""
+    fake_rpc.thread_delete_error = RuntimeError("delete unavailable")
+
+    await bridge_service._dispose_thread(fake_rpc, "thread-1")
+
+    assert fake_rpc.calls[-2:] == [
+        ("thread/delete", {"threadId": "thread-1"}),
+        ("thread/unsubscribe", {"threadId": "thread-1"}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -441,6 +511,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
     assert done["type"] == "done"
     await websocket.close()
     await asyncio.sleep(0)
+    assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
 
     second = await client.ws_connect("/v1/conversation", headers=AUTH)
     await second.send_json(
@@ -499,6 +570,37 @@ async def test_conversation_contract_tools_and_thread_reuse(
 
 
 @pytest.mark.asyncio
+async def test_one_shot_conversation_deletes_private_thread(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    """A conversation without a stable ID cannot remain loaded after close."""
+    fake_rpc.emit_tool_once = False
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await websocket.send_json(
+        {
+            "type": "start",
+            "messages": [{"role": "user", "content": "one shot"}],
+            "tools": [],
+        }
+    )
+    assert (await websocket.receive_json())["type"] == "started"
+    assert (await websocket.receive_json())["type"] == "delta"
+    assert (await websocket.receive_json())["type"] == "done"
+    await websocket.send_json({"type": "stop"})
+    await websocket.close()
+    for _ in range(20):
+        if any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            break
+        await asyncio.sleep(0)
+
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
 async def test_overlapping_turns_are_rejected_without_queueing(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
@@ -548,6 +650,57 @@ async def test_overlapping_turns_are_rejected_without_queueing(
 
 
 @pytest.mark.asyncio
+async def test_tool_change_does_not_delete_busy_conversation(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    """A changed tool schema cannot tear down another socket's active turn."""
+    fake_rpc.emit_tool_once = False
+    fake_rpc.turn_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    first = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await first.send_json(
+        {
+            "type": "start",
+            "conversation_id": "busy-tool-change",
+            "messages": [],
+            "tools": [],
+        }
+    )
+    assert (await first.receive_json())["type"] == "started"
+    await first.send_json({"type": "message", "text": "keep working"})
+    for _ in range(20):
+        if fake_rpc.turn_count == 1:
+            break
+        await asyncio.sleep(0)
+
+    replacement = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await replacement.send_json(
+        {
+            "type": "start",
+            "conversation_id": "busy-tool-change",
+            "messages": [],
+            "tools": [
+                {
+                    "name": "HassTurnOn",
+                    "description": "Turn on a device",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+    )
+    error = await replacement.receive_json(timeout=0.2)
+    assert error["type"] == "error"
+    assert "tools cannot change" in error["error"]
+    assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
+
+    fake_rpc.turn_gate.set()
+    assert (await first.receive_json())["type"] == "delta"
+    assert (await first.receive_json())["type"] == "done"
+    await first.close()
+    await replacement.close()
+
+
+@pytest.mark.asyncio
 async def test_retired_thread_is_rechecked_after_turn_lock_acquisition(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
@@ -573,6 +726,11 @@ async def test_retired_thread_is_rechecked_after_turn_lock_acquisition(
             if old_turn_state.pending_owner is not None:
                 break
             await asyncio.sleep(0)
+        await state.retire_conversation("retire-race", "thread-1", old_turn_state)
+        assert (
+            "thread/delete",
+            {"threadId": "thread-1"},
+        ) in fake_rpc.calls
         replacement = await client.ws_connect("/v1/conversation", headers=AUTH)
         await replacement.send_json(
             {
@@ -626,11 +784,11 @@ async def test_disconnect_during_turn_start_retires_cached_thread(
     assert (await websocket.receive_json())["thread_id"] == "thread-1"
     await websocket.close()
     for _ in range(20):
-        if any(method == "thread/unsubscribe" for method, _ in fake_rpc.calls):
+        if any(method == "thread/delete" for method, _ in fake_rpc.calls):
             break
         await asyncio.sleep(0)
     assert (
-        "thread/unsubscribe",
+        "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
 
@@ -672,7 +830,7 @@ async def test_failed_interrupt_on_disconnect_retires_cached_thread(
         await asyncio.sleep(0)
     await websocket.close()
     for _ in range(20):
-        if any(method == "thread/unsubscribe" for method, _ in fake_rpc.calls):
+        if any(method == "thread/delete" for method, _ in fake_rpc.calls):
             break
         await asyncio.sleep(0)
 
@@ -681,7 +839,7 @@ async def test_failed_interrupt_on_disconnect_retires_cached_thread(
         {"threadId": "thread-1", "turnId": "turn-1"},
     ) in fake_rpc.calls
     assert (
-        "thread/unsubscribe",
+        "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
 
@@ -766,7 +924,7 @@ async def test_app_server_exit_fails_active_conversation_immediately(
     assert error["type"] == "error"
     assert "exited with status 1" in error["error"]
     assert (
-        "thread/unsubscribe",
+        "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
     close_message = await websocket.receive(timeout=0.2)
@@ -797,7 +955,7 @@ async def test_turn_start_timeout_fails_and_closes_conversation(
     close_message = await websocket.receive(timeout=0.2)
     assert close_message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
     assert (
-        "thread/unsubscribe",
+        "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
 
@@ -848,7 +1006,7 @@ async def test_missing_turn_completion_interrupts_and_retires_thread(
         {"threadId": "thread-1", "turnId": "turn-1"},
     ) in fake_rpc.calls
     assert (
-        "thread/unsubscribe",
+        "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
 
@@ -910,6 +1068,10 @@ async def test_transcribe_accepts_component_metadata_shape(
     assert realtime_start["version"] == "v3"
     assert realtime_start["transport"]["type"] == "webrtc"
     assert "Aurelio" in realtime_start["prompt"]
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
 
 
 @pytest.mark.asyncio
@@ -946,6 +1108,10 @@ async def test_synthesize_returns_best_effort_wav(
     )
     assert synthesis_turn["role"] == "user"
     assert "Welcome home" in synthesis_turn["text"]
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
 
 
 @pytest.mark.asyncio
@@ -988,6 +1154,14 @@ async def test_realtime_proxies_text_audio_and_stop(
     await websocket.send_json({"type": "stop"})
     await websocket.close()
     assert any(method == "thread/realtime/appendText" for method, _ in fake_rpc.calls)
+    for _ in range(20):
+        if any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            break
+        await asyncio.sleep(0)
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
 
 
 @pytest.mark.asyncio

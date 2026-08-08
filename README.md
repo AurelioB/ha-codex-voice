@@ -27,10 +27,14 @@ Assist satellite
 ```
 
 HACS installs only `custom_components/codex_voice`. The bridge must run on a
-machine with the Codex CLI and a valid `codex login`; it owns all ChatGPT
-credentials and sends Home Assistant only text/audio results. The Home
-Assistant integration keeps entity exposure and tool execution inside Home
-Assistant, so its user and Assist policies remain authoritative.
+machine with the Codex CLI and a valid, file-backed `codex login`. It locates
+the existing `auth.json`, links that credential into a mode-0700 temporary
+Codex home, and forces file-backed CLI authentication so Codex refreshes the
+original credential through the link. Normal Codex history, configuration,
+apps, plugins, and MCP servers are not imported into voice sessions. The
+bridge sends Home Assistant only text/audio results; Home Assistant never
+receives the ChatGPT credential. Entity exposure and tool execution remain
+inside Home Assistant, so its user and Assist policies stay authoritative.
 
 ## Status
 
@@ -57,7 +61,17 @@ codex --version
 
 The bridge asks Codex App Server to use that managed session. Do not copy
 `auth.json` into Home Assistant and do not paste its contents into this
-integration.
+integration. It auto-detects `${CODEX_HOME}/auth.json` and then
+`${HOME}/.codex/auth.json`. If the login file is elsewhere, point to the
+existing file explicitly when starting the bridge:
+
+```bash
+export HA_CODEX_AUTH_FILE="/path/to/auth.json"
+```
+
+The bridge fails clearly when it cannot find a secure, file-backed login. It
+does not support silently substituting an OpenAI API key or importing a
+keyring-only login.
 
 ### 2. Run the bridge
 
@@ -99,6 +113,20 @@ Codex threads use a required named permission profile that exposes only minimal
 runtime paths. The default bridge command also disables shell, web, plugins,
 apps, MCP servers, hooks, command-environment inheritance, and interactive
 approvals. The bridge fails closed if that profile is missing or inactive.
+It also audits App Server's effective configuration layers at startup and
+rejects any configured MCP server.
+Each App Server also runs with private temporary `HOME` and `CODEX_HOME`
+directories containing only a link to the managed login. Threads are persisted
+only inside that isolated home, then deleted with `thread/delete` when their
+bridge-managed lifetime ends. This keeps ordinary Codex history and locally
+installed apps, including automatically discovered MCP sidecars, outside voice
+sessions and prevents finished threads from lingering in App Server's idle
+cache.
+
+No OAuth secret is copied into Home Assistant or this repository. The isolated
+home contains a link to the source credential so refreshes remain owned by the
+Codex CLI on the bridge host.
+
 Running the bridge as a dedicated OS user or container remains recommended as
 defense in depth.
 
@@ -146,7 +174,8 @@ opt-in and must never print OAuth tokens or recorded audio.
 ## Known limitations
 
 - Subscription-backed audio depends on an experimental Codex realtime
-  conversation feature, not the stable OpenAI Audio API.
+  conversation feature and consumes ChatGPT subscription availability, not
+  OpenAI Platform API quota. It is not the stable OpenAI Audio API.
 - Standalone STT and TTS are implemented as bounded realtime-conversation
   compatibility sessions, not OpenAI's separately billed `/v1/audio/*`
   endpoints. Transcription may differ from the Speech-to-Text API, and speech

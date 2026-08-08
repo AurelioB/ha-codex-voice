@@ -2,13 +2,16 @@
 
 This process exposes a small bearer-authenticated HTTP/WebSocket API to the
 Home Assistant custom component and owns a local `codex app-server` child. The
-child inherits the machine's existing Codex/ChatGPT login; no OAuth token is
-copied into Home Assistant.
+child uses the machine's existing file-backed Codex/ChatGPT login through a
+private temporary Codex home; no OAuth token is copied into Home Assistant.
 
 ## Run
 
-Python 3.11 or newer, Codex CLI 0.146 or newer, and a working `codex login` are
-required.
+Python 3.11 or newer, Codex CLI 0.146 or newer, and a working file-backed
+`codex login` are required. The bridge auto-detects `auth.json` below
+`CODEX_HOME` or `$HOME/.codex`; set `HA_CODEX_AUTH_FILE` to an absolute path
+when it lives elsewhere. Keyring-only and group/world-readable credentials
+fail closed.
 
 ```bash
 python -m venv .venv
@@ -19,14 +22,17 @@ export HA_CODEX_BRIDGE_TOKEN="$(openssl rand -hex 32)"
 
 The default listener is `127.0.0.1:8787`. Override it with
 `HA_CODEX_BRIDGE_HOST` and `HA_CODEX_BRIDGE_PORT`. `CODEX_APP_SERVER_COMMAND`
-can replace the default hardened app-server command. The bridge creates a
-private empty runtime directory and starts all Codex threads with the named
+can replace the default hardened app-server command. The bridge creates
+mode-0700 temporary `HOME`, `CODEX_HOME`, and runtime directories, linking only
+the managed `auth.json`. It starts all Codex threads with the named
 `ha-voice-minimal` least-privilege permission profile and `approvalPolicy:
-never`. The
-default command grants only Codex's minimal runtime paths and disables shell,
+never`. Threads persist only in that private home so the bridge can delete them
+immediately when their managed lifetime ends. The default command grants only
+Codex's minimal runtime paths and disables shell,
 web, plugins, apps, MCP servers, hooks, and inherited command environment
 variables. Startup and every new thread fail closed unless that profile is
-available and active.
+available and active. Startup also audits App Server's effective configuration
+layers and rejects any configured MCP server.
 
 If `CODEX_APP_SERVER_COMMAND` is overridden, it must enable the experimental
 `realtime_conversation` feature. The bridge still injects and verifies the

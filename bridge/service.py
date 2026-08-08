@@ -7,7 +7,6 @@ import contextlib
 import hmac
 import json
 import logging
-import os
 import tempfile
 import time
 from collections import OrderedDict
@@ -36,6 +35,7 @@ from .errors import (
     RpcError,
 )
 from .realtime import RealtimeSession
+from .runtime import IsolatedCodexRuntime, codex_child_environment
 from .webrtc import WebRtcPeer
 
 LOGGER = logging.getLogger(__name__)
@@ -49,34 +49,11 @@ MAX_SYNTHESIS_TEXT_CHARS = 8_000
 MAX_TRANSCRIPTION_DURATION_SECONDS = 60.0
 TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
-_CODEX_ENV_ALLOWLIST = frozenset(
-    {
-        "CODEX_HOME",
-        "CURL_CA_BUNDLE",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "PATH",
-        "REQUESTS_CA_BUNDLE",
-        "SSL_CERT_DIR",
-        "SSL_CERT_FILE",
-        "TMPDIR",
-        "TZ",
-        "XDG_CACHE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-    }
-)
 
 
 def _codex_child_environment() -> dict[str, str]:
-    """Keep bridge, Home Assistant, and developer credentials out of Codex."""
-    return {
-        name: value
-        for name, value in os.environ.items()
-        if name in _CODEX_ENV_ALLOWLIST
-    }
+    """Compatibility wrapper for tests and downstream bridge diagnostics."""
+    return codex_child_environment()
 
 
 def _secure_thread_config(permission_profile: str) -> dict[str, Any]:
@@ -142,18 +119,29 @@ class BridgeState:
     ) -> None:
         self.config = config
         self._temporary_cwd: tempfile.TemporaryDirectory[str] | None = None
+        self._isolated_runtime: IsolatedCodexRuntime | None = None
         if config.codex_cwd is None:
             self._temporary_cwd = tempfile.TemporaryDirectory(prefix="ha-codex-voice-")
             self.runtime_cwd = self._temporary_cwd.name
         else:
             self.runtime_cwd = config.codex_cwd
-        self.rpc = rpc or CodexAppServer(
-            config.codex_command,
-            cwd=self.runtime_cwd,
-            env=_codex_child_environment(),
-            inherit_env=False,
-            request_timeout=config.request_timeout,
-        )
+        if rpc is None:
+            try:
+                self._isolated_runtime = IsolatedCodexRuntime(config.codex_auth_file)
+                self.rpc = CodexAppServer(
+                    config.codex_command,
+                    cwd=self.runtime_cwd,
+                    env=self._isolated_runtime.environment,
+                    inherit_env=False,
+                    request_timeout=config.request_timeout,
+                )
+            except BaseException:
+                if self._temporary_cwd is not None:
+                    self._temporary_cwd.cleanup()
+                    self._temporary_cwd = None
+                raise
+        else:
+            self.rpc = rpc
         self.peer_factory = peer_factory
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
@@ -162,7 +150,6 @@ class BridgeState:
         self,
         payload: Mapping[str, Any],
         *,
-        ephemeral: bool,
         tools: object | None = None,
         base_instructions: str | None = None,
     ) -> str:
@@ -170,7 +157,9 @@ class BridgeState:
         params: dict[str, Any] = {
             "approvalPolicy": "never",
             "permissions": self.config.permission_profile,
-            "ephemeral": ephemeral,
+            # Persist only inside the private, temporary CODEX_HOME so App Server
+            # can honor thread/delete immediately after the session is released.
+            "ephemeral": False,
             "serviceName": "ha_codex_voice",
             "cwd": self.runtime_cwd,
             "config": _secure_thread_config(self.config.permission_profile),
@@ -193,27 +182,6 @@ class BridgeState:
         if dynamic_tools:
             params["dynamicTools"] = dynamic_tools
         response = await self.rpc.call("thread/start", params)
-        active_profile = response.get("activePermissionProfile")
-        if (
-            not isinstance(active_profile, Mapping)
-            or active_profile.get("id") != self.config.permission_profile
-        ):
-            raise ProtocolError(
-                "thread/start did not activate the required permission profile"
-            )
-        sandbox = response.get("sandbox")
-        if (
-            not isinstance(sandbox, Mapping)
-            or sandbox.get("type") != "readOnly"
-            or sandbox.get("networkAccess") is not False
-        ):
-            raise ProtocolError(
-                "thread/start did not activate the required read-only, network-denied sandbox"
-            )
-        if response.get("runtimeWorkspaceRoots") != []:
-            raise ProtocolError(
-                "thread/start granted unexpected runtime workspace roots"
-            )
         try:
             thread_id = response["thread"]["id"]
         except (KeyError, TypeError) as exc:
@@ -222,6 +190,11 @@ class BridgeState:
             ) from exc
         if not isinstance(thread_id, str) or not thread_id:
             raise ProtocolError("thread/start returned an invalid thread id")
+        try:
+            _validate_started_thread(response, self.config.permission_profile)
+        except Exception:
+            await _dispose_thread(self.rpc, thread_id)
+            raise
         return thread_id
 
     def require_subscription_auth(self) -> None:
@@ -241,7 +214,7 @@ class BridgeState:
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id:
             return (
-                await self.start_thread(thread_payload, ephemeral=True),
+                await self.start_thread(thread_payload),
                 False,
                 True,
                 _ConversationTurnState(),
@@ -260,12 +233,18 @@ class BridgeState:
                 self._conversations.move_to_end(conversation_id)
                 return existing.thread_id, True, False, existing.turn_state
             if existing is not None:
+                if _turn_state_busy(existing.turn_state):
+                    raise ProtocolError(
+                        "conversation tools cannot change while a turn is in progress"
+                    )
                 self._conversations.pop(conversation_id, None)
                 existing.turn_state.retired = True
-                await _unsubscribe_thread(self.rpc, existing.thread_id)
-            thread_id = await self.start_thread(
-                thread_payload, ephemeral=True, tools=tools
-            )
+                await _dispose_thread(self.rpc, existing.thread_id)
+            if len(self._conversations) >= MAX_CONVERSATIONS:
+                raise ProtocolError(
+                    "conversation cache is busy; retry after an active turn finishes"
+                )
+            thread_id = await self.start_thread(thread_payload, tools=tools)
             entry = _ConversationEntry(
                 thread_id=thread_id, tools_fingerprint=fingerprint
             )
@@ -291,17 +270,24 @@ class BridgeState:
                 ):
                     entry = self._conversations.pop(conversation_id)
         if entry is not None:
-            await _unsubscribe_thread(self.rpc, entry.thread_id)
+            await _dispose_thread(self.rpc, entry.thread_id)
 
     async def close(self) -> None:
-        for entry in self._conversations.values():
-            entry.turn_state.retired = True
-            await _unsubscribe_thread(self.rpc, entry.thread_id)
-        self._conversations.clear()
-        await self.rpc.close()
-        if self._temporary_cwd is not None:
-            self._temporary_cwd.cleanup()
-            self._temporary_cwd = None
+        try:
+            for entry in self._conversations.values():
+                entry.turn_state.retired = True
+                await _dispose_thread(self.rpc, entry.thread_id)
+            self._conversations.clear()
+        finally:
+            try:
+                await self.rpc.close()
+            finally:
+                if self._temporary_cwd is not None:
+                    self._temporary_cwd.cleanup()
+                    self._temporary_cwd = None
+                if self._isolated_runtime is not None:
+                    self._isolated_runtime.cleanup()
+                    self._isolated_runtime = None
 
     async def _prune_conversations(self) -> None:
         now = time.monotonic()
@@ -309,11 +295,14 @@ class BridgeState:
             key
             for key, entry in self._conversations.items()
             if now - entry.last_used > CONVERSATION_TTL
+            and not _turn_state_busy(entry.turn_state)
         ]
         active_count = len(self._conversations) - len(expired)
         if active_count >= MAX_CONVERSATIONS:
             for key in self._conversations:
-                if key in expired:
+                if key in expired or _turn_state_busy(
+                    self._conversations[key].turn_state
+                ):
                     continue
                 expired.append(key)
                 active_count -= 1
@@ -323,7 +312,7 @@ class BridgeState:
             entry = self._conversations.pop(key, None)
             if entry is not None:
                 entry.turn_state.retired = True
-                await _unsubscribe_thread(self.rpc, entry.thread_id)
+                await _dispose_thread(self.rpc, entry.thread_id)
 
 
 def create_app(
@@ -387,9 +376,15 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
 
 async def _app_server_lifecycle(app: web.Application) -> Any:
     state: BridgeState = app[STATE_KEY]
-    await state.rpc.start()
-    yield
-    await state.close()
+    try:
+        await state.rpc.start()
+    except BaseException:
+        await state.close()
+        raise
+    try:
+        yield
+    finally:
+        await state.close()
 
 
 async def _health(request: web.Request) -> web.Response:
@@ -441,7 +436,6 @@ async def _transcribe(request: web.Request) -> web.Response:
 
     thread_id = await state.start_thread(
         payload,
-        ephemeral=True,
         base_instructions=(
             "Act only as a speech recognition adapter. Never call tools, inspect "
             "files, or answer the user's speech."
@@ -487,8 +481,10 @@ async def _transcribe(request: web.Request) -> web.Response:
                 session, state.config.transcript_timeout
             )
     finally:
-        await session.stop()
-        await _unsubscribe_thread(state.rpc, thread_id)
+        try:
+            await session.stop()
+        finally:
+            await _dispose_thread(state.rpc, thread_id)
     response: dict[str, Any] = {"text": transcript}
     if isinstance(language, str) and language:
         response["language"] = language
@@ -515,7 +511,6 @@ async def _synthesize(request: web.Request) -> web.Response:
 
     thread_id = await state.start_thread(
         payload,
-        ephemeral=True,
         base_instructions=(
             "Act only as a deterministic voice renderer. Remain silent until the "
             "client appends speakable text, then vocalize only that text. Never "
@@ -559,8 +554,10 @@ async def _synthesize(request: web.Request) -> web.Response:
         )
         pcm = await _collect_speech_audio(session, state.config.synthesis_timeout)
     finally:
-        await session.stop()
-        await _unsubscribe_thread(state.rpc, thread_id)
+        try:
+            await session.stop()
+        finally:
+            await _dispose_thread(state.rpc, thread_id)
     return web.Response(
         body=wav_bytes(pcm),
         content_type="audio/wav",
@@ -936,7 +933,7 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
         if turn_state.pending_owner is socket_owner:
             turn_state.pending_owner = None
         if not persistent:
-            await _unsubscribe_thread(state.rpc, thread_id)
+            await _dispose_thread(state.rpc, thread_id)
 
 
 async def _realtime(request: web.Request) -> web.WebSocketResponse:
@@ -953,7 +950,6 @@ async def _realtime(request: web.Request) -> web.WebSocketResponse:
         thread_payload.pop("model", None)
         thread_id = await state.start_thread(
             thread_payload,
-            ephemeral=True,
             base_instructions=(
                 "Act only as a realtime Home Assistant voice agent. Never inspect "
                 "local files or use undeclared tools."
@@ -1005,9 +1001,14 @@ async def _realtime(request: web.Request) -> web.WebSocketResponse:
         await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
     finally:
         if session is not None:
-            await session.stop()
+            try:
+                await session.stop()
+            finally:
+                if thread_id is not None:
+                    await _dispose_thread(state.rpc, thread_id)
+                    thread_id = None
         if thread_id is not None:
-            await _unsubscribe_thread(state.rpc, thread_id)
+            await _dispose_thread(state.rpc, thread_id)
         if not websocket.closed:
             await websocket.close()
     return websocket
@@ -1445,6 +1446,52 @@ async def _safe_ws_json(
 async def _unsubscribe_thread(rpc: Any, thread_id: str) -> None:
     with contextlib.suppress(Exception):
         await rpc.call("thread/unsubscribe", {"threadId": thread_id}, timeout=10)
+
+
+def _turn_state_busy(turn_state: _ConversationTurnState) -> bool:
+    """Return whether deleting the associated thread could race a turn."""
+    return (
+        turn_state.pending_owner is not None
+        or turn_state.owner is not None
+        or turn_state.turn_lock.locked()
+    )
+
+
+def _validate_started_thread(
+    response: Mapping[str, Any], permission_profile: str
+) -> None:
+    """Require the least-privilege settings requested for a new thread."""
+    active_profile = response.get("activePermissionProfile")
+    if (
+        not isinstance(active_profile, Mapping)
+        or active_profile.get("id") != permission_profile
+    ):
+        raise ProtocolError(
+            "thread/start did not activate the required permission profile"
+        )
+    sandbox = response.get("sandbox")
+    if (
+        not isinstance(sandbox, Mapping)
+        or sandbox.get("type") != "readOnly"
+        or sandbox.get("networkAccess") is not False
+    ):
+        raise ProtocolError(
+            "thread/start did not activate the required read-only, network-denied sandbox"
+        )
+    if response.get("runtimeWorkspaceRoots") != []:
+        raise ProtocolError("thread/start granted unexpected runtime workspace roots")
+
+
+async def _dispose_thread(rpc: Any, thread_id: str) -> None:
+    """Delete a finished private thread, falling back to event unsubscribe."""
+    try:
+        await rpc.call("thread/delete", {"threadId": thread_id}, timeout=20)
+    except Exception:
+        LOGGER.warning(
+            "Could not delete finished Codex thread; falling back to unsubscribe",
+            exc_info=True,
+        )
+        await _unsubscribe_thread(rpc, thread_id)
 
 
 def _positive_int(value: object, name: str) -> int:
