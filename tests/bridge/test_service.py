@@ -1708,6 +1708,54 @@ async def test_synthesize_returns_best_effort_wav(
 
 
 @pytest.mark.asyncio
+async def test_synthesize_stream_yields_first_pcm_before_cleanup(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    response = await client.post(
+        "/v1/synthesize/stream",
+        headers=AUTH,
+        json=_synthesis_payload(),
+    )
+
+    assert response.status == 200
+    assert response.content_type == "audio/wav"
+    first_audio = await response.content.readexactly(44 + 960)
+    assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
+
+    complete_audio = first_audio + await response.read()
+    with wave.open(BytesIO(complete_audio), "rb") as audio:
+        assert audio.getframerate() == 24_000
+        assert audio.getnchannels() == 1
+        assert audio.getnframes() == 0xFFFFFFFF // 2
+        assert audio.readframes(audio.getnframes()) == b"\x01\x00" * 480
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_can_return_error_before_first_pcm(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_collection(*_: Any, **__: Any) -> bytes:
+        raise TimeoutError
+
+    monkeypatch.setattr(bridge_service, "_collect_speech_audio", fail_collection)
+    client = await aiohttp_client(bridge_app)
+
+    response = await client.post(
+        "/v1/synthesize/stream", headers=AUTH, json=_synthesis_payload()
+    )
+
+    assert response.status == 504
+    assert response.content_type == "application/json"
+
+
+@pytest.mark.asyncio
 async def test_synthesize_logs_privacy_safe_numeric_timing(
     aiohttp_client: Any,
     bridge_app: web.Application,

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import Awaitable, Callable, Mapping
+import struct
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -28,6 +29,24 @@ from .const import (
 
 _JSON_CONTENT_TYPES: Final = ("application/json", "text/json")
 _WAV_CONTENT_TYPES: Final = ("audio/wav", "audio/wave", "audio/x-wav")
+_STREAMING_WAV_HEADER: Final = struct.pack(
+    "<4sI4s4sIHHIIHH4sI",
+    b"RIFF",
+    0xFFFFFFFF,
+    b"WAVE",
+    b"fmt ",
+    16,
+    1,
+    1,
+    24_000,
+    48_000,
+    2,
+    16,
+    b"data",
+    0xFFFFFFFF,
+)
+_WAV_STREAM_PREAMBLE_BYTES: Final = len(_STREAMING_WAV_HEADER) + 2
+_AUDIO_STREAM_CHUNK_BYTES: Final = 64 * 1024
 
 JsonObject = dict[str, Any]
 DeltaHandler = Callable[[str], Awaitable[None]]
@@ -283,6 +302,87 @@ class BridgeClient:
         except (TimeoutError, ClientError) as err:
             raise BridgeConnectionError("Speech synthesis failed") from err
 
+    async def async_synthesize_stream(
+        self,
+        text: str,
+        *,
+        language: str,
+        voice: str,
+        instructions: str | None,
+    ) -> AsyncGenerator[bytes]:
+        """Yield a bounded WAV response as the bridge produces it."""
+        payload: JsonObject = {
+            "text": text,
+            "language": language,
+            "voice": voice,
+            "format": "wav",
+        }
+        if instructions:
+            payload["instructions"] = instructions
+
+        try:
+            async with self._session.post(
+                self._url("/v1/synthesize/stream"),
+                headers=self._headers,
+                json=payload,
+                timeout=ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as response:
+                try:
+                    await self._raise_for_status(response)
+                    content_type = response.content_type.lower()
+                    if content_type not in _WAV_CONTENT_TYPES:
+                        raise BridgeProtocolError(
+                            "Synthesis stream returned unsupported content type "
+                            f"{content_type!r}"
+                        )
+                    if (
+                        response.content_length is not None
+                        and response.content_length > MAX_SYNTHESIZED_AUDIO_BYTES
+                    ):
+                        raise BridgeProtocolError(
+                            "Synthesized audio exceeds the 50 MiB limit"
+                        )
+
+                    total_bytes = 0
+                    header = bytearray()
+                    header_validated = False
+                    async for chunk in response.content.iter_chunked(
+                        _AUDIO_STREAM_CHUNK_BYTES
+                    ):
+                        if not chunk:
+                            continue
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_SYNTHESIZED_AUDIO_BYTES:
+                            raise BridgeProtocolError(
+                                "Synthesized audio exceeds the 50 MiB limit"
+                            )
+
+                        if header_validated:
+                            yield chunk
+                            continue
+
+                        header.extend(chunk)
+                        if len(header) < _WAV_STREAM_PREAMBLE_BYTES:
+                            continue
+                        self._validate_streaming_wav_header(bytes(header))
+                        header_validated = True
+                        yield bytes(header)
+
+                    if not header_validated:
+                        self._validate_streaming_wav_header(bytes(header))
+                    if (total_bytes - len(_STREAMING_WAV_HEADER)) % 2:
+                        raise BridgeProtocolError(
+                            "Synthesis stream contained incomplete PCM16 audio"
+                        )
+                finally:
+                    # aiohttp's context manager also releases the response, but
+                    # closing explicitly makes generator cancellation immediate.
+                    response.close()
+        except BridgeError:
+            raise
+        except (TimeoutError, ClientError) as err:
+            raise BridgeConnectionError("Speech synthesis failed") from err
+
     async def _async_post_json(self, path: str, payload: JsonObject) -> JsonObject:
         """POST JSON and return a JSON object."""
         try:
@@ -431,3 +531,11 @@ class BridgeClient:
         """Reject mislabeled or truncated WAV responses."""
         if len(audio) < 12 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
             raise BridgeProtocolError("Synthesis response was not a valid WAV file")
+
+    @staticmethod
+    def _validate_streaming_wav_header(audio: bytes) -> None:
+        """Require the bridge's canonical EOF-terminated PCM16 WAV framing."""
+        if len(audio) < _WAV_STREAM_PREAMBLE_BYTES:
+            raise BridgeProtocolError("Synthesis stream was not a valid WAV file")
+        if audio[: len(_STREAMING_WAV_HEADER)] != _STREAMING_WAV_HEADER:
+            raise BridgeProtocolError("Synthesis stream was not a valid WAV file")
