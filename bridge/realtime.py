@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections import deque
 from collections.abc import Mapping
+from time import monotonic
 from typing import Any, Protocol
 
 from .errors import AppServerExited, ProtocolError
 from .webrtc import WebRtcPeer
+
+_EVENT_BACKLOG_LIMIT = 64
 
 
 class PeerLike(Protocol):
@@ -50,7 +54,7 @@ class RealtimeSession:
         self.timeout = timeout
         self.subscription = rpc.subscribe()
         self.realtime_session_id: str | None = None
-        self._backlog: deque[dict[str, Any]] = deque()
+        self._backlog: deque[dict[str, Any]] = deque(maxlen=_EVENT_BACKLOG_LIMIT)
         self._started = False
         self._closed = False
 
@@ -64,6 +68,7 @@ class RealtimeSession:
         client_managed_handoffs: bool = True,
         initial_items: list[dict[str, str]] | None = None,
     ) -> None:
+        deadline = monotonic() + self.timeout
         offer = await self.peer.create_offer()
         params: dict[str, Any] = {
             "threadId": self.thread_id,
@@ -83,12 +88,18 @@ class RealtimeSession:
             if self.version != "v3":
                 raise ProtocolError("initial realtime items require version v3")
             params["initialItems"] = initial_items
-        await self.rpc.call("thread/realtime/start", params, timeout=self.timeout)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("realtime handshake timed out")
+        await self.rpc.call("thread/realtime/start", params, timeout=remaining)
 
         answer: str | None = None
         started = False
         while answer is None or not started:
-            event = await self.subscription.get(timeout=self.timeout)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError("realtime handshake timed out")
+            event = await self.subscription.get(timeout=remaining)
             self._raise_if_app_server_exited(event)
             if not self._belongs_to_thread(event):
                 continue
@@ -113,7 +124,10 @@ class RealtimeSession:
             else:
                 self._backlog.append(event)
         await self.peer.set_answer(answer)
-        await self.peer.wait_connected(timeout=min(self.timeout, 15))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("realtime handshake timed out")
+        await self.peer.wait_connected(timeout=min(remaining, 15))
         self._started = True
 
     def feed_audio(self, pcm: bytes) -> None:
@@ -122,7 +136,20 @@ class RealtimeSession:
         self.peer.feed_audio(pcm)
 
     async def wait_input_drained(self, timeout: float | None = None) -> None:
-        await self.peer.wait_input_drained(timeout)
+        drain_task = asyncio.create_task(self.peer.wait_input_drained(timeout))
+        exit_task = asyncio.create_task(self._watch_for_app_server_exit())
+        try:
+            done, _ = await asyncio.wait(
+                {drain_task, exit_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if exit_task in done:
+                await exit_task
+            await drain_task
+        finally:
+            for task in (drain_task, exit_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(drain_task, exit_task, return_exceptions=True)
 
     async def append_text(self, text: str, role: str = "user") -> None:
         if role not in {"user", "developer", "assistant"}:
@@ -178,6 +205,13 @@ class RealtimeSession:
         if not isinstance(params, Mapping):
             return False
         return params.get("threadId") == self.thread_id
+
+    async def _watch_for_app_server_exit(self) -> None:
+        while True:
+            event = await self.subscription.get()
+            self._raise_if_app_server_exited(event)
+            if self._belongs_to_thread(event):
+                self._backlog.append(event)
 
     @staticmethod
     def _raise_if_app_server_exited(event: Mapping[str, Any]) -> None:

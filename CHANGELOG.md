@@ -5,6 +5,16 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-08
+
+### Fixed
+
+- Bound conversation completion waits, with ambiguous turns interrupted and retired.
+- Reject overlapping turns instead of allowing an unbounded background queue.
+- Apply one deadline and bounded event backlog to realtime handshakes.
+- Fail transcription promptly when app-server exits and bound accepted audio to
+  60 seconds under an end-to-end request deadline.
+
 ## [0.1.0] - 2026-08-08
 
 ### Added

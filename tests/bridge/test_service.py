@@ -14,7 +14,7 @@ from aiohttp import WSMsgType, web
 
 from bridge import service as bridge_service
 from bridge.config import BridgeConfig
-from bridge.errors import ProtocolError
+from bridge.errors import AppServerExited, ProtocolError
 from bridge.service import BridgeState, _codex_child_environment, create_app
 
 AUTH = {"Authorization": "Bearer test-token"}
@@ -118,10 +118,13 @@ class FakeRpc:
         self.turn_count = 0
         self.peers: list[FakePeer] = []
         self.emit_tool_once = True
+        self.emit_turn_completion = True
         self.tool_result_received = asyncio.Event()
         self.active_profile_id = "ha-voice-minimal"
         self.permission_profile_allowed = True
         self.turn_start_error: Exception | None = None
+        self.turn_start_gate: asyncio.Event | None = None
+        self.turn_interrupt_error: Exception | None = None
         self.turn_gate: asyncio.Event | None = None
         self.tasks: set[asyncio.Task[None]] = set()
 
@@ -191,6 +194,8 @@ class FakeRpc:
                 "thread": {"id": f"thread-{self.thread_count}"},
             }
         if method == "turn/start":
+            if self.turn_start_gate is not None:
+                await self.turn_start_gate.wait()
             if self.turn_start_error is not None:
                 raise self.turn_start_error
             self.turn_count += 1
@@ -202,6 +207,8 @@ class FakeRpc:
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             return {"turn": {"id": turn_id, "status": "inProgress"}}
+        if method == "turn/interrupt" and self.turn_interrupt_error is not None:
+            raise self.turn_interrupt_error
         if method == "thread/realtime/start":
             thread_id = values["threadId"]
             peer = self.peers[-1]
@@ -280,6 +287,8 @@ class FakeRpc:
                 }
             )
             await self.tool_result_received.wait()
+        if not self.emit_turn_completion:
+            return
         await self.broadcast(
             {
                 "method": "item/started",
@@ -490,11 +499,12 @@ async def test_conversation_contract_tools_and_thread_reuse(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_sockets_do_not_receive_each_others_turns(
+async def test_overlapping_turns_are_rejected_without_queueing(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
-    """One reused conversation thread still isolates each WebSocket's events."""
+    """One thread admits one turn and rejects authenticated message floods."""
     fake_rpc.emit_tool_once = False
+    fake_rpc.turn_gate = asyncio.Event()
     client = await aiohttp_client(bridge_app)
     start = {
         "type": "start",
@@ -510,17 +520,170 @@ async def test_concurrent_sockets_do_not_receive_each_others_turns(
     assert (await second.receive_json())["type"] == "started"
 
     await first.send_json({"type": "message", "text": "alpha"})
+    for _ in range(20):
+        if fake_rpc.turn_count == 1:
+            break
+        await asyncio.sleep(0)
+    assert fake_rpc.turn_count == 1
+
+    for index in range(20):
+        await first.send_json({"type": "message", "text": f"extra-{index}"})
     await second.send_json({"type": "message", "text": "beta"})
 
-    first_events = [await first.receive_json(), await first.receive_json()]
-    second_events = [await second.receive_json(), await second.receive_json()]
-    assert first_events[0] == {"type": "delta", "delta": "Done:alpha"}
-    assert first_events[1]["type"] == "done"
-    assert second_events[0] == {"type": "delta", "delta": "Done:beta"}
-    assert second_events[1]["type"] == "done"
+    for _ in range(20):
+        error = await first.receive_json(timeout=0.2)
+        assert error["type"] == "error"
+        assert error["code"] == "busy"
+    second_error = await second.receive_json(timeout=0.2)
+    assert second_error["type"] == "error"
+    assert second_error["code"] == "busy"
+    assert fake_rpc.turn_count == 1
+
+    fake_rpc.turn_gate.set()
+    assert await first.receive_json() == {"type": "delta", "delta": "Done:alpha"}
+    assert (await first.receive_json())["type"] == "done"
 
     await first.close()
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_retired_thread_is_rechecked_after_turn_lock_acquisition(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    """A scheduled task cannot start after its cached thread is replaced."""
+    fake_rpc.emit_tool_once = False
+    client = await aiohttp_client(bridge_app)
+    first = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await first.send_json(
+        {
+            "type": "start",
+            "conversation_id": "retire-race",
+            "messages": [],
+            "tools": [],
+        }
+    )
+    assert (await first.receive_json())["thread_id"] == "thread-1"
+    state = bridge_app[bridge_service.STATE_KEY]
+    old_turn_state = state._conversations["retire-race"].turn_state
+    await old_turn_state.turn_lock.acquire()
+    try:
+        await first.send_json({"type": "message", "text": "stale"})
+        for _ in range(20):
+            if old_turn_state.pending_owner is not None:
+                break
+            await asyncio.sleep(0)
+        replacement = await client.ws_connect("/v1/conversation", headers=AUTH)
+        await replacement.send_json(
+            {
+                "type": "start",
+                "conversation_id": "retire-race",
+                "messages": [],
+                "tools": [
+                    {
+                        "name": "HassTurnOn",
+                        "description": "Turn on a device",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        )
+        assert (await replacement.receive_json())["thread_id"] == "thread-2"
+    finally:
+        old_turn_state.turn_lock.release()
+
+    error = await first.receive_json(timeout=0.2)
+    assert error["type"] == "error"
+    assert "retired" in error["error"]
+    assert not any(method == "turn/start" for method, _ in fake_rpc.calls)
+
+    await replacement.send_json({"type": "message", "text": "fresh"})
+    assert (await replacement.receive_json())["type"] == "delta"
+    assert (await replacement.receive_json())["type"] == "done"
+    replacement_turn = next(
+        params for method, params in fake_rpc.calls if method == "turn/start"
+    )
+    assert replacement_turn["threadId"] == "thread-2"
+    await first.close()
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_turn_start_retires_cached_thread(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    fake_rpc.turn_start_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await websocket.send_json(
+        {
+            "type": "start",
+            "conversation_id": "disconnect-start",
+            "messages": [{"role": "user", "content": "waiting"}],
+            "tools": [],
+        }
+    )
+    assert (await websocket.receive_json())["thread_id"] == "thread-1"
+    await websocket.close()
+    for _ in range(20):
+        if any(method == "thread/unsubscribe" for method, _ in fake_rpc.calls):
+            break
+        await asyncio.sleep(0)
+    assert (
+        "thread/unsubscribe",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+
+    fake_rpc.turn_start_gate.set()
+    replacement = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await replacement.send_json(
+        {
+            "type": "start",
+            "conversation_id": "disconnect-start",
+            "messages": [],
+            "tools": [],
+        }
+    )
+    assert (await replacement.receive_json())["thread_id"] == "thread-2"
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_interrupt_on_disconnect_retires_cached_thread(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    fake_rpc.emit_tool_once = False
+    fake_rpc.turn_gate = asyncio.Event()
+    fake_rpc.turn_interrupt_error = RuntimeError("interrupt failed")
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await websocket.send_json(
+        {
+            "type": "start",
+            "conversation_id": "failed-interrupt",
+            "messages": [{"role": "user", "content": "waiting"}],
+            "tools": [],
+        }
+    )
+    assert (await websocket.receive_json())["thread_id"] == "thread-1"
+    for _ in range(20):
+        if fake_rpc.turn_count == 1:
+            break
+        await asyncio.sleep(0)
+    await websocket.close()
+    for _ in range(20):
+        if any(method == "thread/unsubscribe" for method, _ in fake_rpc.calls):
+            break
+        await asyncio.sleep(0)
+
+    assert (
+        "turn/interrupt",
+        {"threadId": "thread-1", "turnId": "turn-1"},
+    ) in fake_rpc.calls
+    assert (
+        "thread/unsubscribe",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
 
 
 @pytest.mark.asyncio
@@ -602,8 +765,12 @@ async def test_app_server_exit_fails_active_conversation_immediately(
     error = await websocket.receive_json(timeout=0.2)
     assert error["type"] == "error"
     assert "exited with status 1" in error["error"]
-    fake_rpc.turn_gate.set()
-    await websocket.close()
+    assert (
+        "thread/unsubscribe",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+    close_message = await websocket.receive(timeout=0.2)
+    assert close_message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
 
 
 @pytest.mark.asyncio
@@ -629,6 +796,87 @@ async def test_turn_start_timeout_fails_and_closes_conversation(
     }
     close_message = await websocket.receive(timeout=0.2)
     assert close_message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert (
+        "thread/unsubscribe",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+
+    fake_rpc.turn_start_error = None
+    replacement = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await replacement.send_json(
+        {
+            "type": "start",
+            "conversation_id": "turn-timeout",
+            "messages": [],
+            "tools": [],
+        }
+    )
+    assert (await replacement.receive_json())["thread_id"] == "thread-2"
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_turn_completion_interrupts_and_retires_thread(
+    aiohttp_client: Any, fake_rpc: FakeRpc
+) -> None:
+    fake_rpc.emit_tool_once = False
+    fake_rpc.emit_turn_completion = False
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", request_timeout=0.03),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    websocket = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await websocket.send_json(
+        {
+            "type": "start",
+            "conversation_id": "missing-completion",
+            "messages": [{"role": "user", "content": "waiting"}],
+            "tools": [],
+        }
+    )
+
+    assert (await websocket.receive_json())["thread_id"] == "thread-1"
+    assert (await websocket.receive_json())["type"] == "delta"
+    assert await websocket.receive_json(timeout=0.2) == {
+        "type": "error",
+        "error": "conversation timed out",
+    }
+    assert (
+        "turn/interrupt",
+        {"threadId": "thread-1", "turnId": "turn-1"},
+    ) in fake_rpc.calls
+    assert (
+        "thread/unsubscribe",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_transcribe_rejects_audio_beyond_endpoint_deadline(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "MAX_TRANSCRIPTION_DURATION_SECONDS", 0.001)
+    client = await aiohttp_client(bridge_app)
+    pcm = b"\x01\x00" * 48
+    response = await client.post(
+        "/v1/transcribe",
+        headers=AUTH,
+        json={
+            "audio": base64.b64encode(pcm).decode(),
+            "format": "pcm",
+            "sample_rate": 24_000,
+            "channels": 1,
+        },
+    )
+
+    assert response.status == 400
+    assert "must not exceed" in (await response.json())["error"]
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
 
 
 @pytest.mark.asyncio
@@ -836,3 +1084,16 @@ async def test_transcription_uses_v3_data_channel_final() -> None:
     )
 
     assert transcript == "The front door is locked."
+
+
+@pytest.mark.asyncio
+async def test_transcription_fails_immediately_when_app_server_exits() -> None:
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {"method": "bridge/appServerExited", "params": {"returncode": 19}}
+    )
+
+    with pytest.raises(AppServerExited, match="status 19"):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(session, 10.0), timeout=0.2
+        )

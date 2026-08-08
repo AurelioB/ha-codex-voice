@@ -46,6 +46,8 @@ CONVERSATION_TTL = 60 * 60
 MAX_HISTORY_CONTEXT_CHARS = 16_000
 MAX_EARLY_TURN_EVENTS = 64
 MAX_SYNTHESIS_TEXT_CHARS = 8_000
+MAX_TRANSCRIPTION_DURATION_SECONDS = 60.0
+TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
 _CODEX_ENV_ALLOWLIST = frozenset(
     {
@@ -118,6 +120,8 @@ class _ConversationTurnState:
 
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     owner: object | None = None
+    pending_owner: object | None = None
+    retired: bool = False
 
 
 @dataclass(slots=True)
@@ -247,12 +251,17 @@ class BridgeState:
         async with self._conversation_lock:
             await self._prune_conversations()
             existing = self._conversations.get(conversation_id)
-            if existing is not None and existing.tools_fingerprint == fingerprint:
+            if (
+                existing is not None
+                and not existing.turn_state.retired
+                and existing.tools_fingerprint == fingerprint
+            ):
                 existing.last_used = time.monotonic()
                 self._conversations.move_to_end(conversation_id)
                 return existing.thread_id, True, False, existing.turn_state
             if existing is not None:
                 self._conversations.pop(conversation_id, None)
+                existing.turn_state.retired = True
                 await _unsubscribe_thread(self.rpc, existing.thread_id)
             thread_id = await self.start_thread(
                 thread_payload, ephemeral=True, tools=tools
@@ -263,8 +272,30 @@ class BridgeState:
             self._conversations[conversation_id] = entry
             return thread_id, True, True, entry.turn_state
 
+    async def retire_conversation(
+        self,
+        conversation_id: object,
+        thread_id: str,
+        turn_state: _ConversationTurnState,
+    ) -> None:
+        """Evict a thread whose active-turn state is no longer trustworthy."""
+        turn_state.retired = True
+        entry: _ConversationEntry | None = None
+        if isinstance(conversation_id, str) and conversation_id:
+            async with self._conversation_lock:
+                candidate = self._conversations.get(conversation_id)
+                if (
+                    candidate is not None
+                    and candidate.thread_id == thread_id
+                    and candidate.turn_state is turn_state
+                ):
+                    entry = self._conversations.pop(conversation_id)
+        if entry is not None:
+            await _unsubscribe_thread(self.rpc, entry.thread_id)
+
     async def close(self) -> None:
         for entry in self._conversations.values():
+            entry.turn_state.retired = True
             await _unsubscribe_thread(self.rpc, entry.thread_id)
         self._conversations.clear()
         await self.rpc.close()
@@ -291,6 +322,7 @@ class BridgeState:
         for key in expired:
             entry = self._conversations.pop(key, None)
             if entry is not None:
+                entry.turn_state.retired = True
                 await _unsubscribe_thread(self.rpc, entry.thread_id)
 
 
@@ -343,6 +375,8 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
     except (RpcError, AppServerExited) as exc:
         LOGGER.warning("Codex app-server request failed: %s", exc)
         return web.json_response({"error": str(exc)}, status=503)
+    except TimeoutError:
+        return web.json_response({"error": "Codex operation timed out"}, status=504)
     except AuthenticationRequired as exc:
         return web.json_response(
             {"error": str(exc), "code": "authentication_required"}, status=503
@@ -398,6 +432,12 @@ async def _transcribe(request: web.Request) -> web.Response:
     pcm = pcm16_mono_24khz(pcm, actual_rate, actual_channels)
     if not pcm:
         raise ProtocolError("audio payload contains no samples")
+    duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
+        raise ProtocolError(
+            "audio must not exceed "
+            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
+        )
 
     thread_id = await state.start_thread(
         payload,
@@ -428,21 +468,24 @@ async def _transcribe(request: web.Request) -> web.Response:
         else ""
     )
     try:
-        await session.start(
-            prompt=(
-                "Transcribe the user's speech accurately. Do not answer it and do not speak."
-                + language_hint
-                + vocabulary_hint
-            ),
-            include_startup_context=False,
-            client_managed_handoffs=True,
+        total_timeout = min(
+            state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
         )
-        session.feed_audio(pcm + silence_pcm16(state.config.silence_ms))
-        duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
-        await session.wait_input_drained(timeout=max(10.0, duration + 10.0))
-        transcript = await _wait_for_user_transcript(
-            session, state.config.transcript_timeout
-        )
+        async with asyncio.timeout(total_timeout):
+            await session.start(
+                prompt=(
+                    "Transcribe the user's speech accurately. Do not answer it and do not speak."
+                    + language_hint
+                    + vocabulary_hint
+                ),
+                include_startup_context=False,
+                client_managed_handoffs=True,
+            )
+            session.feed_audio(pcm + silence_pcm16(state.config.silence_ms))
+            await session.wait_input_drained(timeout=max(10.0, duration + 10.0))
+            transcript = await _wait_for_user_transcript(
+                session, state.config.transcript_timeout
+            )
     finally:
         await session.stop()
         await _unsubscribe_thread(state.rpc, thread_id)
@@ -641,14 +684,18 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
             if waiter is None or waiter.done():
                 return
             waiter.set_result(dict(params))
-            turn = params.get("turn")
-            await send({"type": "done", "turn": turn, "status": _turn_status(turn)})
         elif method in {"error", "thread/realtime/error"}:
-            await send({"type": "error", "error": params.get("message", method)})
+            waiter = turn_waiters.get(turn_id)
+            if waiter is not None and not waiter.done():
+                waiter.set_exception(ProtocolError(str(params.get("message", method))))
 
     async def run_turn(text: str) -> None:
         try:
             async with turn_state.turn_lock:
+                if turn_state.retired:
+                    raise ProtocolError(
+                        "conversation thread was retired; reconnect to continue"
+                    )
                 turn_state.owner = socket_owner
                 try:
                     turn_params: dict[str, Any] = {
@@ -705,8 +752,26 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                                     turn_id,
                                 )
                     try:
-                        await waiter
+                        try:
+                            completion = await asyncio.wait_for(
+                                waiter, timeout=state.config.request_timeout
+                            )
+                        except TimeoutError:
+                            async with turn_event_lock:
+                                if active_turn["id"] == turn_id:
+                                    active_turn["id"] = None
+                                tool_requests.clear()
+                                early_turn_events.clear()
+                            with contextlib.suppress(Exception):
+                                await state.rpc.call(
+                                    "turn/interrupt",
+                                    {"threadId": thread_id, "turnId": turn_id},
+                                    timeout=min(state.config.request_timeout, 10),
+                                )
+                            raise
                     finally:
+                        if not waiter.done():
+                            waiter.cancel()
                         async with turn_event_lock:
                             turn_waiters.pop(turn_id, None)
                             if active_turn["id"] == turn_id:
@@ -718,14 +783,51 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                         early_turn_events.clear()
                     if turn_state.owner is socket_owner:
                         turn_state.owner = None
+            if turn_state.pending_owner is socket_owner:
+                turn_state.pending_owner = None
+            turn = completion.get("turn")
+            await send({"type": "done", "turn": turn, "status": _turn_status(turn)})
         except TimeoutError:
+            await state.retire_conversation(
+                start_payload.get("conversation_id"), thread_id, turn_state
+            )
             await send({"type": "error", "error": "conversation timed out"})
             stop.set()
             await websocket.close()
         except (BridgeError, ValueError) as exc:
+            await state.retire_conversation(
+                start_payload.get("conversation_id"), thread_id, turn_state
+            )
             await send({"type": "error", "error": str(exc)})
             stop.set()
             await websocket.close()
+        finally:
+            if turn_state.pending_owner is socket_owner:
+                turn_state.pending_owner = None
+
+    async def schedule_turn(text: str) -> None:
+        if turn_state.retired:
+            await send(
+                {
+                    "type": "error",
+                    "code": "conversation_retired",
+                    "error": "conversation thread was retired; reconnect to continue",
+                }
+            )
+            return
+        if turn_state.pending_owner is not None:
+            await send(
+                {
+                    "type": "error",
+                    "code": "busy",
+                    "error": "a conversation turn is already in progress",
+                }
+            )
+            return
+        turn_state.pending_owner = socket_owner
+        task = asyncio.create_task(run_turn(text), name="codex-conversation-turn")
+        turn_tasks.add(task)
+        task.add_done_callback(turn_tasks.discard)
 
     async def dispatch() -> None:
         while not stop.is_set():
@@ -735,6 +837,9 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                 params = event.get("params")
                 returncode = (
                     params.get("returncode") if isinstance(params, Mapping) else None
+                )
+                await state.retire_conversation(
+                    start_payload.get("conversation_id"), thread_id, turn_state
                 )
                 raise AppServerExited(
                     f"codex app-server exited with status {returncode}"
@@ -746,8 +851,10 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                 continue
             turn_id = event_turn_id(params)
             if method in {"error", "thread/realtime/error"} and turn_id is None:
-                await send({"type": "error", "error": params.get("message", method)})
-                continue
+                await state.retire_conversation(
+                    start_payload.get("conversation_id"), thread_id, turn_state
+                )
+                raise ProtocolError(str(params.get("message", method)))
             if turn_id is None:
                 continue
             async with turn_event_lock:
@@ -776,11 +883,7 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                         {"type": "error", "error": "text must be a non-empty string"}
                     )
                     continue
-                task = asyncio.create_task(
-                    run_turn(text), name="codex-conversation-turn"
-                )
-                turn_tasks.add(task)
-                task.add_done_callback(turn_tasks.discard)
+                await schedule_turn(text)
             elif message_type == "tool_result":
                 await _respond_to_tool_result(state.rpc, message, tool_requests)
             elif message_type == "stop":
@@ -800,11 +903,7 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
     receiver = asyncio.create_task(receive(), name="codex-conversation-receiver")
     initial_text = _current_user_text(start_payload)
     if isinstance(initial_text, str) and initial_text.strip():
-        task = asyncio.create_task(
-            run_turn(initial_text), name="codex-conversation-initial-turn"
-        )
-        turn_tasks.add(task)
-        task.add_done_callback(turn_tasks.discard)
+        await schedule_turn(initial_text)
     try:
         done, _ = await asyncio.wait(
             {dispatcher, receiver}, return_when=asyncio.FIRST_COMPLETED
@@ -815,6 +914,9 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                 raise exception
     finally:
         stop.set()
+        had_pending_turn = turn_state.pending_owner is socket_owner
+        if had_pending_turn:
+            turn_state.retired = True
         current_turn = active_turn["id"]
         if current_turn:
             with contextlib.suppress(Exception):
@@ -827,6 +929,12 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
             task.cancel()
         await asyncio.gather(dispatcher, receiver, *turn_tasks, return_exceptions=True)
         subscription.close()
+        if had_pending_turn:
+            await state.retire_conversation(
+                start_payload.get("conversation_id"), thread_id, turn_state
+            )
+        if turn_state.pending_owner is socket_owner:
+            turn_state.pending_owner = None
         if not persistent:
             await _unsubscribe_thread(state.rpc, thread_id)
 
@@ -1056,6 +1164,15 @@ async def _wait_for_user_transcript(session: RealtimeSession, timeout: float) ->
                 event = event_task.result()
                 method = event.get("method")
                 params = event.get("params", {})
+                if method == "bridge/appServerExited":
+                    returncode = (
+                        params.get("returncode")
+                        if isinstance(params, Mapping)
+                        else None
+                    )
+                    raise AppServerExited(
+                        f"codex app-server exited with status {returncode}"
+                    )
                 role = str(params.get("role", "")).lower()
                 if method == "thread/realtime/error":
                     raise ProtocolError(
