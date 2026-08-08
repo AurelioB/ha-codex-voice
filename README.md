@@ -39,6 +39,8 @@ inside Home Assistant, so its user and Assist policies stay authoritative.
 ## Status
 
 - Milestone 1: standard Home Assistant Conversation, STT, and TTS entities.
+- Milestone 1 TTS progressively delivers realtime speech frames instead of
+  waiting for the entire rendered response and remote cleanup.
 - Milestone 2: experimental realtime duplex-audio proxy with barge-in-ready
   session primitives.
 - Target Home Assistant version: 2026.8.0 or newer.
@@ -101,6 +103,11 @@ Until the repository is accepted into HACS defaults:
 The config flow creates Conversation, STT, and TTS subentries. Select their
 entities in an Assist pipeline.
 
+For the lowest latency on ordinary device-control commands, enable **Prefer
+handling commands locally** on that pipeline. Home Assistant will handle
+matching built-in intents locally and retain Codex Voice as the fallback for
+open-ended conversation.
+
 ## Home Assistant controls
 
 When the Home Assistant Assist LLM API is enabled for the Conversation
@@ -141,6 +148,11 @@ clients:
 - `text`: append a role-bearing text item.
 - `speech`: append text intended to be spoken.
 - `stop`: close the realtime session.
+
+The standard TTS entity uses the authenticated
+`POST /v1/synthesize/stream` route. It sends an EOF-terminated PCM16 WAV stream
+through Home Assistant's TTS proxy as audio arrives; the finite
+`POST /v1/synthesize` route remains available for older clients and diagnostics.
 
 The bridge converts that narrow WebSocket protocol to a genuine WebRTC peer:
 an active audio track carries media and the `oai-events` data channel carries
