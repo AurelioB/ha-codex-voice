@@ -5,6 +5,20 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-08
+
+### Fixed
+
+- Normalize unusually quiet microphone audio with bounded, clipping-safe gain,
+  allowing low-level ThirdReality captures to reach the realtime recognizer.
+- Assemble realtime v3 user transcript fragments and finish finite STT input
+  after the complete clip and a quiet period when no terminal event arrives.
+- Treat a valid user transcript as authoritative when the remote recognizer
+  stops pulling trailing silence, instead of hanging on a local input-drain
+  marker that may never complete.
+- Preserve transcript events while observing audio drain, recognize current v3
+  handoff and delegation shapes, and reject assistant text as STT input.
+
 ## [0.1.4] - 2026-08-08
 
 ### Fixed

@@ -93,7 +93,7 @@ class AppServer:
                 "clientInfo": {
                     "name": "ha_codex_voice_probe",
                     "title": "Codex Voice WebRTC Probe",
-                    "version": "0.1.4",
+                    "version": "0.1.5",
                 },
                 "capabilities": {"experimentalApi": True},
             },
