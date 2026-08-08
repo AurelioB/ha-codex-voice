@@ -5,6 +5,17 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-08
+
+### Fixed
+
+- Remove only confidently silent prefixes longer than two seconds before
+  pacing finite STT audio over WebRTC, while retaining 320 milliseconds of
+  pre-roll and preserving quiet or ambiguous early speech.
+- Recompute transcription feed deadlines after trimming, preventing long
+  post-command waits caused by replaying the satellite's leading silence in
+  real time.
+
 ## [0.1.5] - 2026-08-08
 
 ### Fixed

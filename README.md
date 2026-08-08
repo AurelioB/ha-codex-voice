@@ -191,6 +191,13 @@ opt-in and must never print OAuth tokens or recorded audio.
   Assistant Assist satellite entity. Direct full-duplex firmware transport
   depends on hardware/firmware support for the bridge's authenticated PCM
   WebSocket protocol.
+- ThirdReality firmware 1.01.07 does not forward microphone audio until its
+  wake confirmation sound has completely finished. The bundled sound has a
+  short silent tail, so speech begun immediately after the audible tone can be
+  lost; wait about 0.3 seconds after the tone. Shortening that gap or raising
+  the device's hardware microphone gain requires a device-side configuration
+  or firmware change and cannot be controlled by this Home Assistant
+  integration.
 
 ## License
 
