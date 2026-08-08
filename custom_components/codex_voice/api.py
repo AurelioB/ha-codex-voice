@@ -6,9 +6,9 @@ import asyncio
 import base64
 import json
 import struct
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, NoReturn
 
 from aiohttp import (
     ClientError,
@@ -16,6 +16,7 @@ from aiohttp import (
     ClientSession,
     ClientTimeout,
     WSMsgType,
+    WSServerHandshakeError,
 )
 
 from .const import (
@@ -75,6 +76,10 @@ class BridgeBusyError(BridgeError):
 
 class BridgeQuotaError(BridgeError):
     """The ChatGPT subscription quota is exhausted."""
+
+
+class BridgeStreamingUnsupported(BridgeError):
+    """The bridge predates the streaming transcription endpoint."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +264,77 @@ class BridgeClient:
         if not isinstance(text, str):
             raise BridgeProtocolError("Transcription response did not contain text")
         return text
+
+    async def async_transcribe_stream(
+        self,
+        stream: AsyncIterable[bytes],
+        metadata: Mapping[str, Any],
+        *,
+        prompt: str | None,
+    ) -> str:
+        """Transcribe a bounded PCM stream over an authenticated WebSocket."""
+        start = self._transcription_start(metadata, prompt=prompt)
+
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                try:
+                    async with self._session.ws_connect(
+                        self._url("/v1/transcribe/stream"),
+                        headers=self._headers,
+                    ) as websocket:
+                        try:
+                            await websocket.send_json(start)
+                            started = await self._receive_transcription_event(websocket)
+                            self._validate_transcription_started(started)
+
+                            total_bytes = 0
+                            pending_sample = b""
+                            async for chunk in stream:
+                                if not isinstance(chunk, bytes):
+                                    raise BridgeProtocolError(
+                                        "Transcription audio chunks must be bytes"
+                                    )
+                                if not chunk:
+                                    continue
+                                total_bytes += len(chunk)
+                                if total_bytes > MAX_AUDIO_BYTES:
+                                    raise BridgeProtocolError(
+                                        "Audio input exceeds the 16 MiB limit"
+                                    )
+                                if pending_sample:
+                                    chunk = pending_sample + chunk
+                                complete_bytes = len(chunk) - (len(chunk) % 2)
+                                for offset in range(
+                                    0, complete_bytes, _AUDIO_STREAM_CHUNK_BYTES
+                                ):
+                                    await websocket.send_bytes(
+                                        chunk[
+                                            offset : min(
+                                                offset + _AUDIO_STREAM_CHUNK_BYTES,
+                                                complete_bytes,
+                                            )
+                                        ]
+                                    )
+                                pending_sample = chunk[complete_bytes:]
+
+                            if pending_sample:
+                                raise BridgeProtocolError(
+                                    "Transcription audio contained incomplete PCM16 data"
+                                )
+
+                            await websocket.send_json({"type": "end"})
+                            result = await self._receive_transcription_event(websocket)
+                            return self._decode_transcription_result(result)
+                        finally:
+                            await websocket.close()
+                except WSServerHandshakeError as err:
+                    self._raise_transcription_handshake_error(err)
+        except BridgeError:
+            raise
+        except TimeoutError as err:
+            raise BridgeConnectionError("Speech transcription timed out") from err
+        except (ClientError, ConnectionError) as err:
+            raise BridgeConnectionError("Speech transcription failed") from err
 
     async def async_synthesize(
         self,
@@ -445,6 +521,108 @@ class BridgeClient:
         if not isinstance(event, dict):
             raise BridgeProtocolError("The bridge WebSocket event must be an object")
         return event
+
+    @staticmethod
+    async def _receive_transcription_event(websocket: Any) -> JsonObject:
+        """Receive one transcription protocol event."""
+        while True:
+            message = await websocket.receive()
+            if message.type is WSMsgType.TEXT:
+                event = BridgeClient._decode_event(message.data)
+                if event.get("type") == "error":
+                    BridgeClient._raise_event_error(event)
+                return event
+            if message.type is WSMsgType.ERROR:
+                raise BridgeConnectionError(
+                    "The transcription WebSocket connection failed"
+                )
+            if message.type in (
+                WSMsgType.CLOSE,
+                WSMsgType.CLOSED,
+                WSMsgType.CLOSING,
+            ):
+                raise BridgeConnectionError(
+                    "The transcription WebSocket closed unexpectedly"
+                )
+            if message.type is WSMsgType.BINARY:
+                raise BridgeProtocolError(
+                    "The transcription WebSocket returned unexpected binary data"
+                )
+
+    @staticmethod
+    def _transcription_start(
+        metadata: Mapping[str, Any], *, prompt: str | None
+    ) -> JsonObject:
+        """Build and validate a streaming transcription start event."""
+        start: JsonObject = {
+            "type": "start",
+            "protocol_version": 1,
+            "format": "pcm",
+            "codec": "pcm",
+        }
+        for key in ("sample_rate", "bit_rate", "channels"):
+            value = metadata.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise BridgeProtocolError(
+                    f"Transcription {key} must be a positive integer"
+                )
+            start[key] = value
+        language = metadata.get("language")
+        if not isinstance(language, str) or not language:
+            raise BridgeProtocolError("Transcription language must be text")
+        start["language"] = language
+        if prompt:
+            start["prompt"] = prompt
+        return start
+
+    @staticmethod
+    def _validate_transcription_started(event: JsonObject) -> None:
+        """Validate the streaming transcription acknowledgement."""
+        if event.get("type") != "started":
+            raise BridgeProtocolError(
+                "Transcription stream did not begin with a started event"
+            )
+        version = event.get("protocol_version")
+        if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+            raise BridgeProtocolError(
+                "Transcription stream used an incompatible protocol version"
+            )
+
+    @staticmethod
+    def _decode_transcription_result(event: JsonObject) -> str:
+        """Validate and return a final streaming transcription result."""
+        if event.get("type") != "result":
+            raise BridgeProtocolError(
+                "Transcription stream did not return a result event"
+            )
+        text = event.get("text")
+        if not isinstance(text, str):
+            raise BridgeProtocolError("Transcription result did not contain text")
+        if "language" in event and not isinstance(event["language"], str):
+            raise BridgeProtocolError("Transcription result language must be text")
+        return text
+
+    @staticmethod
+    def _raise_transcription_handshake_error(
+        error: WSServerHandshakeError,
+    ) -> NoReturn:
+        """Translate a failed streaming WebSocket upgrade."""
+        status = error.status
+        if status in (404, 405, 426):
+            raise BridgeStreamingUnsupported(
+                "The bridge does not support streaming transcription"
+            ) from error
+        if status in (401, 403):
+            raise BridgeAuthenticationError(
+                "The bridge access token was rejected"
+            ) from error
+        if status == 409:
+            raise BridgeBusyError("The bridge is busy") from error
+        if status == 429:
+            raise BridgeQuotaError("The subscription quota is exhausted") from error
+        if status >= 500:
+            raise BridgeConnectionError(f"The bridge returned HTTP {status}") from error
+        raise BridgeProtocolError(f"The bridge returned HTTP {status}") from error
 
     @staticmethod
     def _decode_tool_call(event: JsonObject) -> BridgeToolCall:

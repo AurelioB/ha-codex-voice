@@ -57,6 +57,10 @@ TRANSCRIPTION_MAX_ATTEMPTS = 3
 TRANSCRIPTION_SESSION_TIMEOUT_SECONDS = 20.0
 TRANSCRIPTION_RESULT_TIMEOUT_SECONDS = 15.0
 TRANSCRIPTION_FRAGMENT_QUIET_SECONDS = 2.0
+TRANSCRIPTION_STREAM_START_TIMEOUT_SECONDS = 30.0
+TRANSCRIPTION_STREAM_CAPTURE_TIMEOUT_SECONDS = 70.0
+TRANSCRIPTION_STREAM_MAX_FRAME_BYTES = 256 * 1024
+TRANSCRIPTION_STREAM_MAX_RAW_BYTES = 16 * 1024 * 1024
 TRANSCRIPTION_TARGET_RMS = 0.05
 TRANSCRIPTION_TARGET_PEAK = 0.8
 TRANSCRIPTION_MAX_GAIN = 64.0
@@ -78,6 +82,14 @@ class _TranscriptionAttemptTimeout(TimeoutError):
 
 class _TranscriptionStartTimeout(TimeoutError):
     """A thread start timed out without returning an id that can be cleaned up."""
+
+
+class _TranscriptionStreamCancelled(Exception):
+    """The streaming client explicitly cancelled or disconnected."""
+
+
+class _TranscriptionStreamProtocolError(ProtocolError):
+    """A client-safe streaming protocol error."""
 
 
 def _codex_child_environment() -> dict[str, str]:
@@ -146,6 +158,26 @@ class _SynthesisCollectionTiming:
     last_audio_at: float | None = None
     completion_at: float | None = None
     ended_at: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _PreparedTranscriptionAudio:
+    """Normalized finite audio plus privacy-safe numeric diagnostics."""
+
+    pcm: bytes
+    duration: float
+    input_duration: float
+    peak: float
+    rms: float
+    adaptive_gain: float
+
+
+@dataclass(slots=True)
+class _TranscriptionOverlapTiming:
+    """Monotonic markers for the first stream attempt's capture overlap."""
+
+    attempt_started_at: float | None = None
+    handshake_finished_at: float | None = None
 
 
 class BridgeState:
@@ -383,6 +415,7 @@ def create_app(
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/conversation", _conversation)
     app.router.add_post("/v1/transcribe", _transcribe)
+    app.router.add_get("/v1/transcribe/stream", _transcribe_stream)
     app.router.add_post("/v1/synthesize", _synthesize)
     app.router.add_post("/v1/synthesize/stream", _synthesize_stream)
     app.router.add_get("/v1/realtime", _realtime)
@@ -416,7 +449,7 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
     except BridgeBusyError as exc:
         return web.json_response({"error": str(exc), "code": "busy"}, status=409)
     except (RpcError, AppServerExited) as exc:
-        LOGGER.warning("Codex app-server request failed: %s", exc)
+        LOGGER.warning("Codex app-server request failed")
         return web.json_response({"error": str(exc)}, status=503)
     except TimeoutError:
         return web.json_response({"error": "Codex operation timed out"}, status=504)
@@ -486,50 +519,22 @@ async def _transcribe_admitted(
         channels=channels,
     )
     pcm = pcm16_mono_24khz(pcm, actual_rate, actual_channels)
-    if not pcm:
-        raise ProtocolError("audio payload contains no samples")
-    input_duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
-    if input_duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
-        raise ProtocolError(
-            "audio must not exceed "
-            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
-        )
+    prepared_audio = _prepare_transcription_audio(pcm)
+    pcm = prepared_audio.pcm
 
     language = payload.get("language", metadata.get("language"))
-    language_hint = (
-        f" The expected language is {language}."
-        if isinstance(language, str) and language
-        else ""
-    )
     prompt_value = payload.get("prompt")
-    vocabulary_hint = (
-        " Use this client-provided vocabulary/context hint when resolving "
-        f"ambiguous speech: {prompt_value[:2_000]}"
-        if isinstance(prompt_value, str) and prompt_value
-        else ""
-    )
-    transcription_prompt = (
-        "Transcribe the user's speech accurately. Do not answer it and do not speak."
-        + language_hint
-        + vocabulary_hint
+    transcription_prompt = _transcription_prompt(
+        language if isinstance(language, str) else None,
+        prompt_value if isinstance(prompt_value, str) else None,
     )
     total_timeout = min(
         state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
     )
-    peak, rms = _normalized_pcm16_levels(pcm)
-    pcm, adaptive_gain = _apply_transcription_gain(pcm, peak=peak, rms=rms)
-    pcm = _trim_transcription_silence(pcm)
-    duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
-    if duration < input_duration:
-        LOGGER.info(
-            "Trimmed leading transcription silence: "
-            "input_duration_seconds=%.3f trimmed_duration_seconds=%.3f "
-            "normalized_peak=%.4f normalized_rms=%.4f",
-            input_duration,
-            duration,
-            peak,
-            rms,
-        )
+    peak = prepared_audio.peak
+    rms = prepared_audio.rms
+    adaptive_gain = prepared_audio.adaptive_gain
+    duration = prepared_audio.duration
     transcript: str | None = None
     last_timeout: _TranscriptionAttemptTimeout | None = None
     current_attempt = 0
@@ -594,6 +599,411 @@ async def _transcribe_admitted(
     return web.json_response(response)
 
 
+async def _transcribe_stream(request: web.Request) -> web.WebSocketResponse:
+    """Admit a finite streaming STT capture before upgrading the connection."""
+    state: BridgeState = request.app[STATE_KEY]
+    with state.speech_session_lease():
+        # A WebSocket cannot change its HTTP status after prepare(). Keep managed
+        # subscription failures, like bearer and busy failures, at the HTTP layer.
+        state.require_subscription_auth()
+        return await _transcribe_stream_admitted(request, state)
+
+
+async def _transcribe_stream_admitted(
+    request: web.Request, state: BridgeState
+) -> web.WebSocketResponse:
+    websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
+    await websocket.prepare(request)
+    stream_started_at = time.monotonic()
+    capture_started_at: float | None = None
+    capture_ended_at: float | None = None
+    overlap_timing = _TranscriptionOverlapTiming()
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio] | None = None
+    transcription_task: asyncio.Task[str] | None = None
+    capture_task: asyncio.Task[bytes] | None = None
+    cancellation_task: asyncio.Task[None] | None = None
+    try:
+        try:
+            first = await _receive_ws_json(
+                websocket, timeout=TRANSCRIPTION_STREAM_START_TIMEOUT_SECONDS
+            )
+        except ProtocolError as err:
+            raise _TranscriptionStreamProtocolError(str(err)) from None
+        except TimeoutError as err:
+            raise _TranscriptionStreamProtocolError(
+                "transcription start timed out"
+            ) from err
+        payload, sample_rate, language, prompt = _validate_transcription_stream_start(
+            first
+        )
+        audio_ready = asyncio.get_running_loop().create_future()
+        transcription_task = asyncio.create_task(
+            _run_streaming_transcription(
+                state,
+                payload,
+                audio_ready,
+                _transcription_prompt(language, prompt),
+                overlap_timing,
+            ),
+            name="codex-streaming-transcription",
+        )
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        capture_started_at = time.monotonic()
+        capture_task = asyncio.create_task(
+            _capture_transcription_stream(websocket, sample_rate),
+            name="codex-transcription-capture",
+        )
+
+        done, _ = await asyncio.wait(
+            {capture_task, transcription_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if capture_task not in done:
+            # Success is impossible before audio_ready is resolved. Retrieving the
+            # result here surfaces exhausted/ambiguous early setup failures promptly.
+            await transcription_task
+            raise ProtocolError(  # noqa: TRY301 - impossible worker result
+                "transcription completed before capture ended"
+            )
+
+        raw_pcm = await capture_task
+        capture_ended_at = time.monotonic()
+        try:
+            pcm = pcm16_mono_24khz(raw_pcm, sample_rate, 1)
+            prepared_audio = _prepare_transcription_audio(pcm)
+        except ProtocolError as err:
+            raise _TranscriptionStreamProtocolError(str(err)) from None
+        audio_ready.set_result(prepared_audio)
+        cancellation_task = asyncio.create_task(
+            _watch_transcription_stream_cancellation(websocket),
+            name="codex-transcription-cancellation",
+        )
+        done, _ = await asyncio.wait(
+            {transcription_task, cancellation_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancellation_task in done:
+            await cancellation_task
+        transcript = await transcription_task
+        result: dict[str, Any] = {"type": "result", "text": transcript}
+        if language:
+            result["language"] = language
+        await websocket.send_json(result)
+    except _TranscriptionStreamCancelled:
+        pass
+    except _TranscriptionStreamProtocolError as exc:
+        await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
+    except TimeoutError:
+        await _safe_ws_json(
+            websocket, {"type": "error", "error": "transcription timed out"}
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - wire errors must never expose internals
+        # App-server, WebRTC, and unexpected errors can contain private request
+        # material. The streaming wire contract deliberately returns no details.
+        await _safe_ws_json(
+            websocket, {"type": "error", "error": "transcription failed"}
+        )
+    finally:
+        if capture_ended_at is None and capture_started_at is not None:
+            capture_ended_at = time.monotonic()
+        for task in (capture_task, transcription_task, cancellation_task):
+            if task is not None and not task.done():
+                task.cancel()
+        if audio_ready is not None and not audio_ready.done():
+            audio_ready.cancel()
+        await asyncio.gather(
+            *(
+                task
+                for task in (capture_task, transcription_task, cancellation_task)
+                if task is not None
+            ),
+            return_exceptions=True,
+        )
+        if not websocket.closed:
+            await websocket.close()
+        ended_at = time.monotonic()
+        capture_seconds = (
+            max(0.0, capture_ended_at - capture_started_at)
+            if capture_started_at is not None and capture_ended_at is not None
+            else 0.0
+        )
+        overlap_seconds = 0.0
+        if (
+            capture_started_at is not None
+            and capture_ended_at is not None
+            and overlap_timing.attempt_started_at is not None
+            and overlap_timing.handshake_finished_at is not None
+        ):
+            overlap_seconds = max(
+                0.0,
+                min(capture_ended_at, overlap_timing.handshake_finished_at)
+                - max(capture_started_at, overlap_timing.attempt_started_at),
+            )
+        post_capture_seconds = (
+            max(0.0, ended_at - capture_ended_at)
+            if capture_ended_at is not None
+            else 0.0
+        )
+        LOGGER.info(
+            "Realtime transcription stream timing: capture_seconds=%.3f "
+            "handshake_capture_overlap_seconds=%.3f "
+            "post_capture_seconds=%.3f total_seconds=%.3f",
+            capture_seconds,
+            overlap_seconds,
+            post_capture_seconds,
+            ended_at - stream_started_at,
+        )
+    return websocket
+
+
+def _validate_transcription_stream_start(
+    message: Mapping[str, Any],
+) -> tuple[dict[str, Any], int, str | None, str | None]:
+    """Validate and minimize the v1 stream start message."""
+    if message.get("type") != "start":
+        raise _TranscriptionStreamProtocolError(
+            "first transcription message must have type 'start'"
+        )
+    _require_stream_integer(message, "protocol_version", 1)
+    if message.get("format") != "pcm":
+        raise _TranscriptionStreamProtocolError("format must be 'pcm'")
+    if message.get("codec") != "pcm":
+        raise _TranscriptionStreamProtocolError("codec must be 'pcm'")
+    sample_rate = message.get("sample_rate")
+    if type(sample_rate) is not int or sample_rate not in {16_000, 48_000}:
+        raise _TranscriptionStreamProtocolError("sample_rate must be 16000 or 48000")
+    _require_stream_integer(message, "bit_rate", 16)
+    _require_stream_integer(message, "channels", 1)
+
+    language_value = message.get("language")
+    if "language" in message and not isinstance(language_value, str):
+        raise _TranscriptionStreamProtocolError("language must be a string")
+    prompt_value = message.get("prompt")
+    if "prompt" in message and not isinstance(prompt_value, str):
+        raise _TranscriptionStreamProtocolError("prompt must be a string")
+    language = language_value if isinstance(language_value, str) else None
+    prompt = prompt_value if isinstance(prompt_value, str) else None
+    payload: dict[str, Any] = {}
+    if language:
+        payload["language"] = language
+    if prompt:
+        payload["prompt"] = prompt
+    return payload, sample_rate, language, prompt
+
+
+def _require_stream_integer(
+    message: Mapping[str, Any], key: str, expected: int
+) -> None:
+    value = message.get(key)
+    if type(value) is not int or value != expected:
+        raise _TranscriptionStreamProtocolError(f"{key} must be {expected}")
+
+
+async def _capture_transcription_stream(
+    websocket: web.WebSocketResponse, sample_rate: int
+) -> bytes:
+    """Collect bounded PCM16LE frames until the client's explicit EOF."""
+    raw_pcm = bytearray()
+    duration_limit = int(MAX_TRANSCRIPTION_DURATION_SECONDS * sample_rate * 2)
+    try:
+        async with asyncio.timeout(TRANSCRIPTION_STREAM_CAPTURE_TIMEOUT_SECONDS):
+            while True:
+                message = await websocket.receive()
+                if message.type == WSMsgType.BINARY:
+                    chunk = bytes(message.data)
+                    if len(chunk) > TRANSCRIPTION_STREAM_MAX_FRAME_BYTES:
+                        raise _TranscriptionStreamProtocolError(
+                            "audio frame exceeds 256 KiB"
+                        )
+                    if len(chunk) % 2:
+                        raise _TranscriptionStreamProtocolError(
+                            "PCM16 audio frames must be sample-aligned"
+                        )
+                    next_size = len(raw_pcm) + len(chunk)
+                    if next_size > TRANSCRIPTION_STREAM_MAX_RAW_BYTES:
+                        raise _TranscriptionStreamProtocolError(
+                            "audio capture exceeds the size limit"
+                        )
+                    if next_size > duration_limit:
+                        raise _TranscriptionStreamProtocolError(
+                            "audio must not exceed "
+                            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds "
+                            "for transcription"
+                        )
+                    raw_pcm.extend(chunk)
+                    continue
+                if message.type == WSMsgType.TEXT:
+                    try:
+                        value = json.loads(message.data)
+                    except json.JSONDecodeError as err:
+                        raise _TranscriptionStreamProtocolError(
+                            "transcription control message must be valid JSON"
+                        ) from err
+                    if not isinstance(value, Mapping):
+                        raise _TranscriptionStreamProtocolError(
+                            "transcription control message must be a JSON object"
+                        )
+                    message_type = value.get("type")
+                    if message_type == "end":
+                        return bytes(raw_pcm)
+                    if message_type == "cancel":
+                        raise _TranscriptionStreamCancelled
+                    raise _TranscriptionStreamProtocolError(
+                        "expected binary audio, 'end', or 'cancel'"
+                    )
+                if message.type in {
+                    WSMsgType.CLOSE,
+                    WSMsgType.CLOSING,
+                    WSMsgType.CLOSED,
+                    WSMsgType.ERROR,
+                }:
+                    raise _TranscriptionStreamCancelled
+                if message.type in {WSMsgType.PING, WSMsgType.PONG}:
+                    continue
+                raise _TranscriptionStreamProtocolError(
+                    "unsupported transcription WebSocket message"
+                )
+    except TimeoutError as err:
+        raise _TranscriptionStreamProtocolError("audio capture timed out") from err
+
+
+async def _watch_transcription_stream_cancellation(
+    websocket: web.WebSocketResponse,
+) -> None:
+    """Observe cancellation and disconnects while Codex finishes after EOF."""
+    while True:
+        message = await websocket.receive()
+        if message.type == WSMsgType.TEXT:
+            try:
+                value = json.loads(message.data)
+            except json.JSONDecodeError as err:
+                raise _TranscriptionStreamProtocolError(
+                    "transcription control message must be valid JSON"
+                ) from err
+            if isinstance(value, Mapping) and value.get("type") == "cancel":
+                raise _TranscriptionStreamCancelled
+            raise _TranscriptionStreamProtocolError(
+                "only 'cancel' is accepted after transcription end"
+            )
+        if message.type in {
+            WSMsgType.CLOSE,
+            WSMsgType.CLOSING,
+            WSMsgType.CLOSED,
+            WSMsgType.ERROR,
+        }:
+            raise _TranscriptionStreamCancelled
+        if message.type in {WSMsgType.PING, WSMsgType.PONG}:
+            continue
+        raise _TranscriptionStreamProtocolError(
+            "only 'cancel' is accepted after transcription end"
+        )
+
+
+async def _run_streaming_transcription(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+    prompt: str,
+    overlap_timing: _TranscriptionOverlapTiming,
+) -> str:
+    """Run isolated attempts while capture resolves the shared audio future."""
+    total_timeout = min(
+        state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
+    )
+    last_timeout: _TranscriptionAttemptTimeout | None = None
+    current_attempt = 0
+    loop = asyncio.get_running_loop()
+    try:
+        # POST's total deadline begins only after its complete body is available.
+        # Rescheduling here preserves that budget while still allowing setup to
+        # overlap microphone capture.
+        async with asyncio.timeout(None) as total_deadline:
+
+            def start_total_deadline(
+                completed_audio: asyncio.Future[_PreparedTranscriptionAudio],
+            ) -> None:
+                if not completed_audio.cancelled():
+                    total_deadline.reschedule(loop.time() + total_timeout)
+
+            audio_ready.add_done_callback(start_total_deadline)
+            try:
+                for current_attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
+                    try:
+                        return await _run_transcription_attempt_when_audio_ready(
+                            state,
+                            payload,
+                            audio_ready,
+                            prompt,
+                            overlap_timing=(
+                                overlap_timing if current_attempt == 1 else None
+                            ),
+                        )
+                    except _TranscriptionAttemptTimeout as err:
+                        last_timeout = err
+                        duration, peak, rms, adaptive_gain = (
+                            _stream_transcription_diagnostics(audio_ready)
+                        )
+                        LOGGER.warning(
+                            "Realtime transcription attempt timed out: attempt=%d/%d "
+                            "stage=%s normalized_duration_seconds=%.3f "
+                            "normalized_peak=%.4f normalized_rms=%.4f "
+                            "adaptive_gain=%.2f",
+                            current_attempt,
+                            TRANSCRIPTION_MAX_ATTEMPTS,
+                            err.stage,
+                            duration,
+                            peak,
+                            rms,
+                            adaptive_gain,
+                        )
+            finally:
+                audio_ready.remove_done_callback(start_total_deadline)
+    except _TranscriptionStartTimeout as err:
+        duration, peak, rms, adaptive_gain = _stream_transcription_diagnostics(
+            audio_ready
+        )
+        LOGGER.warning(
+            "Realtime transcription could not start: attempt=%d/%d "
+            "normalized_duration_seconds=%.3f normalized_peak=%.4f "
+            "normalized_rms=%.4f adaptive_gain=%.2f",
+            current_attempt,
+            TRANSCRIPTION_MAX_ATTEMPTS,
+            duration,
+            peak,
+            rms,
+            adaptive_gain,
+        )
+        raise TimeoutError from err
+    except TimeoutError:
+        duration, peak, rms, adaptive_gain = _stream_transcription_diagnostics(
+            audio_ready
+        )
+        LOGGER.warning(
+            "Realtime transcription reached its total deadline: attempt=%d/%d "
+            "normalized_duration_seconds=%.3f normalized_peak=%.4f "
+            "normalized_rms=%.4f adaptive_gain=%.2f",
+            current_attempt,
+            TRANSCRIPTION_MAX_ATTEMPTS,
+            duration,
+            peak,
+            rms,
+            adaptive_gain,
+        )
+        raise
+    raise TimeoutError from last_timeout
+
+
+def _stream_transcription_diagnostics(
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+) -> tuple[float, float, float, float]:
+    if not audio_ready.done() or audio_ready.cancelled():
+        return 0.0, 0.0, 0.0, 1.0
+    audio = audio_ready.result()
+    return audio.duration, audio.peak, audio.rms, audio.adaptive_gain
+
+
 async def _run_transcription_attempt(
     state: BridgeState,
     payload: Mapping[str, Any],
@@ -602,7 +1012,37 @@ async def _run_transcription_attempt(
     prompt: str,
 ) -> str:
     """Run one disposable realtime transcription attempt."""
+    audio_ready = asyncio.get_running_loop().create_future()
+    audio_ready.set_result(
+        _PreparedTranscriptionAudio(
+            pcm=pcm,
+            duration=duration,
+            input_duration=duration,
+            peak=0.0,
+            rms=0.0,
+            adaptive_gain=1.0,
+        )
+    )
+    return await _run_transcription_attempt_when_audio_ready(
+        state,
+        payload,
+        audio_ready,
+        prompt,
+    )
+
+
+async def _run_transcription_attempt_when_audio_ready(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+    prompt: str,
+    *,
+    overlap_timing: _TranscriptionOverlapTiming | None = None,
+) -> str:
+    """Start a disposable session, then feed a normalized finite utterance."""
     attempt_started = time.monotonic()
+    if overlap_timing is not None and overlap_timing.attempt_started_at is None:
+        overlap_timing.attempt_started_at = attempt_started
     thread_start_seconds = 0.0
     realtime_handshake_seconds = 0.0
     transcript_wait_seconds = 0.0
@@ -647,6 +1087,15 @@ async def _run_transcription_attempt(
                 )
             finally:
                 realtime_handshake_seconds = time.monotonic() - handshake_started
+                if (
+                    overlap_timing is not None
+                    and overlap_timing.handshake_finished_at is None
+                ):
+                    overlap_timing.handshake_finished_at = time.monotonic()
+            timeout_stage = "audio_ready"
+            prepared_audio = await audio_ready
+            pcm = prepared_audio.pcm
+            duration = prepared_audio.duration
             timeout_stage = "input_drain"
             trailing_silence = silence_pcm16(state.config.silence_ms)
             feed_started = asyncio.get_running_loop().time()
@@ -708,6 +1157,56 @@ async def _run_transcription_attempt(
             thread_delete_seconds,
             time.monotonic() - attempt_started,
         )
+
+
+def _prepare_transcription_audio(pcm: bytes) -> _PreparedTranscriptionAudio:
+    """Apply the finite-utterance normalization shared by both STT transports."""
+    if not pcm:
+        raise ProtocolError("audio payload contains no samples")
+    input_duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if input_duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
+        raise ProtocolError(
+            "audio must not exceed "
+            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
+        )
+
+    peak, rms = _normalized_pcm16_levels(pcm)
+    normalized_pcm, adaptive_gain = _apply_transcription_gain(pcm, peak=peak, rms=rms)
+    normalized_pcm = _trim_transcription_silence(normalized_pcm)
+    duration = len(normalized_pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if duration < input_duration:
+        LOGGER.info(
+            "Trimmed leading transcription silence: "
+            "input_duration_seconds=%.3f trimmed_duration_seconds=%.3f "
+            "normalized_peak=%.4f normalized_rms=%.4f",
+            input_duration,
+            duration,
+            peak,
+            rms,
+        )
+    return _PreparedTranscriptionAudio(
+        pcm=normalized_pcm,
+        duration=duration,
+        input_duration=input_duration,
+        peak=peak,
+        rms=rms,
+        adaptive_gain=adaptive_gain,
+    )
+
+
+def _transcription_prompt(language: str | None, prompt: str | None) -> str:
+    language_hint = f" The expected language is {language}." if language else ""
+    vocabulary_hint = (
+        " Use this client-provided vocabulary/context hint when resolving "
+        f"ambiguous speech: {prompt[:2_000]}"
+        if prompt
+        else ""
+    )
+    return (
+        "Transcribe the user's speech accurately. Do not answer it and do not speak."
+        + language_hint
+        + vocabulary_hint
+    )
 
 
 def _normalized_pcm16_levels(pcm: bytes) -> tuple[float, float]:
@@ -2124,11 +2623,8 @@ async def _dispose_thread(rpc: Any, thread_id: str) -> None:
     """Delete a finished private thread, falling back to event unsubscribe."""
     try:
         await rpc.call("thread/delete", {"threadId": thread_id}, timeout=20)
-    except Exception:
-        LOGGER.warning(
-            "Could not delete finished Codex thread; falling back to unsubscribe",
-            exc_info=True,
-        )
+    except Exception:  # noqa: BLE001 - best-effort cleanup must not leak details
+        LOGGER.warning("Could not delete finished Codex thread; using fallback")
         await _unsubscribe_thread(rpc, thread_id)
 
 

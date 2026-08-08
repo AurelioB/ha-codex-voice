@@ -12,7 +12,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import CodexVoiceConfigEntry
-from .api import BridgeAuthenticationError, BridgeError
+from .api import (
+    BridgeAuthenticationError,
+    BridgeError,
+    BridgeStreamingUnsupported,
+)
 from .const import MAX_AUDIO_BYTES, SUBENTRY_TYPE_STT, SUPPORTED_LANGUAGES
 from .entity import CodexVoiceEntity
 
@@ -86,17 +90,7 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
         metadata: stt.SpeechMetadata,
         stream: AsyncIterable[bytes],
     ) -> stt.SpeechResult:
-        """Collect bounded PCM and transcribe it through the bridge."""
-        audio = bytearray()
-        async for chunk in stream:
-            if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
-                _LOGGER.warning("Rejecting STT input larger than 16 MiB")
-                return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
-            audio.extend(chunk)
-
-        if not audio:
-            return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
-
+        """Stream bounded PCM to the bridge and return a standard STT result."""
         bridge_metadata = {
             "language": metadata.language,
             "codec": metadata.codec.value,
@@ -104,17 +98,31 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
             "bit_rate": metadata.bit_rate.value,
             "channels": metadata.channel.value,
         }
+        prompt = self.subentry.data.get(CONF_PROMPT)
         try:
-            transcript = await self.entry.runtime_data.async_transcribe(
-                bytes(audio),
-                bridge_metadata,
-                prompt=self.subentry.data.get(CONF_PROMPT),
-            )
+            try:
+                transcript = await self.entry.runtime_data.async_transcribe_stream(
+                    stream,
+                    bridge_metadata,
+                    prompt=prompt,
+                )
+            except BridgeStreamingUnsupported:
+                audio = await _async_collect_audio(stream)
+                if audio is None:
+                    _LOGGER.warning("Rejecting STT input larger than 16 MiB")
+                    return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
+                if not audio:
+                    return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
+                transcript = await self.entry.runtime_data.async_transcribe(
+                    audio,
+                    bridge_metadata,
+                    prompt=prompt,
+                )
         except BridgeAuthenticationError:
             self.entry.async_start_reauth(self.hass)
             _LOGGER.error("The Codex Voice bridge requires reauthentication")
         except BridgeError:
-            _LOGGER.exception("Error transcribing speech with Codex Voice")
+            _LOGGER.error("Error transcribing speech with Codex Voice")
         else:
             if transcript.strip():
                 return stt.SpeechResult(
@@ -123,3 +131,13 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
                 )
 
         return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
+
+
+async def _async_collect_audio(stream: AsyncIterable[bytes]) -> bytes | None:
+    """Collect a legacy transcription request within the input-size bound."""
+    audio = bytearray()
+    async for chunk in stream:
+        if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
+            return None
+        audio.extend(chunk)
+    return bytes(audio)

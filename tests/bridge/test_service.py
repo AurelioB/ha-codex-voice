@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aiohttp import WSMsgType, web
+from aiohttp import WSMsgType, WSServerHandshakeError, web
 
 from bridge import service as bridge_service
 from bridge.config import BridgeConfig
@@ -31,6 +31,20 @@ def _transcription_payload() -> dict[str, Any]:
         "sample_rate": 24_000,
         "channels": 1,
     }
+
+
+def _transcription_stream_start(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "start",
+        "protocol_version": 1,
+        "format": "pcm",
+        "codec": "pcm",
+        "sample_rate": 16_000,
+        "bit_rate": 16,
+        "channels": 1,
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _synthesis_payload() -> dict[str, Any]:
@@ -118,7 +132,9 @@ class FakePeer:
 
     async def close(self) -> None:
         self.closed = True
-        await asyncio.gather(*self.tasks)
+        for task in tuple(self.tasks):
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
 
 
 class FakeCollectorSession:
@@ -162,6 +178,8 @@ class FakeRpc:
         self.input_drain_started = asyncio.Event()
         self.transcript_gate: asyncio.Event | None = None
         self.transcript_started = asyncio.Event()
+        self.realtime_start_gate: asyncio.Event | None = None
+        self.realtime_start_started = asyncio.Event()
         self.synthesis_append_gate: asyncio.Event | None = None
         self.synthesis_append_started = asyncio.Event()
         self.tasks: set[asyncio.Task[None]] = set()
@@ -250,6 +268,9 @@ class FakeRpc:
         if method == "turn/interrupt" and self.turn_interrupt_error is not None:
             raise self.turn_interrupt_error
         if method == "thread/realtime/start":
+            self.realtime_start_started.set()
+            if self.realtime_start_gate is not None:
+                await self.realtime_start_gate.wait()
             thread_id = values["threadId"]
             peer = self.peers[-1]
             peer.thread_id = thread_id
@@ -1242,6 +1263,503 @@ async def test_missing_turn_completion_interrupts_and_retires_thread(
         "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_overlaps_handshake_and_assembles_result(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The disposable Codex session starts while the microphone is still open."""
+    fake_rpc.realtime_start_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    private_prompt = "private-stream-vocabulary"
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await websocket.send_json(
+            _transcription_stream_start(
+                language="en-US",
+                prompt=private_prompt,
+            )
+        )
+        assert await websocket.receive_json() == {
+            "type": "started",
+            "protocol_version": 1,
+        }
+        await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+        assert any(method == "thread/realtime/start" for method, _ in fake_rpc.calls)
+        assert fake_rpc.peers[-1].fed == b""
+
+        await websocket.send_bytes(b"\x00\x20" * 320)
+        fake_rpc.realtime_start_gate.set()
+        for _ in range(100):
+            if fake_rpc.peers[-1].answer is not None:
+                break
+            await asyncio.sleep(0)
+        assert fake_rpc.peers[-1].answer == "v=0\r\nfake-answer\r\n"
+        assert fake_rpc.peers[-1].fed == b""
+
+        await websocket.send_json({"type": "end"})
+        assert await websocket.receive_json(timeout=1) == {
+            "type": "result",
+            "text": "Turn on the kitchen",
+            "language": "en-US",
+        }
+        close = await websocket.receive(timeout=1)
+        assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+
+        for _ in range(100):
+            if any(
+                record.getMessage().startswith("Realtime transcription stream timing:")
+                for record in caplog.records
+            ):
+                break
+            await asyncio.sleep(0)
+
+    assert fake_rpc.peers[-1].fed
+    assert (
+        "thread/delete",
+        {"threadId": "thread-1"},
+    ) in fake_rpc.calls
+    stream_timing = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Realtime transcription stream timing:")
+    )
+    match = re.fullmatch(
+        r"Realtime transcription stream timing: capture_seconds=(\d+\.\d{3}) "
+        r"handshake_capture_overlap_seconds=(\d+\.\d{3}) "
+        r"post_capture_seconds=(\d+\.\d{3}) total_seconds=(\d+\.\d{3})",
+        stream_timing,
+    )
+    assert match is not None
+    assert all(float(value) >= 0 for value in match.groups())
+    assert private_prompt not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "expected_error"),
+    [
+        ({"protocol_version": 2}, "protocol_version must be 1"),
+        ({"format": "wav"}, "format must be 'pcm'"),
+        ({"codec": "opus"}, "codec must be 'pcm'"),
+        ({"sample_rate": 24_000}, "sample_rate must be 16000 or 48000"),
+        ({"bit_rate": 24}, "bit_rate must be 16"),
+        ({"channels": 2}, "channels must be 1"),
+        ({"prompt": None}, "prompt must be a string"),
+    ],
+)
+async def test_transcription_stream_rejects_malformed_start(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    overrides: dict[str, Any],
+    expected_error: str,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    await websocket.send_json(_transcription_stream_start(**overrides))
+
+    assert await websocket.receive_json() == {
+        "type": "error",
+        "error": expected_error,
+    }
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_rejects_binary_first_message(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    await websocket.send_bytes(b"\x00\x00")
+
+    assert await websocket.receive_json() == {
+        "type": "error",
+        "error": "binary WebSocket messages are not supported",
+    }
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_rejects_empty_audio(
+    aiohttp_client: Any, bridge_app: web.Application
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+
+    await websocket.send_json({"type": "end"})
+
+    assert await websocket.receive_json() == {
+        "type": "error",
+        "error": "audio payload contains no samples",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "expected_error"),
+    [
+        (
+            "TRANSCRIPTION_STREAM_MAX_FRAME_BYTES",
+            2,
+            "audio frame exceeds 256 KiB",
+        ),
+        (
+            "TRANSCRIPTION_STREAM_MAX_RAW_BYTES",
+            2,
+            "audio capture exceeds the size limit",
+        ),
+    ],
+)
+async def test_transcription_stream_enforces_binary_size_limits(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    expected_error: str,
+) -> None:
+    monkeypatch.setattr(bridge_service, limit_name, limit_value)
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+
+    await websocket.send_bytes(b"\x01\x00\x02\x00")
+
+    assert await websocket.receive_json() == {
+        "type": "error",
+        "error": expected_error,
+    }
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_enforces_duration_while_capturing(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "MAX_TRANSCRIPTION_DURATION_SECONDS", 0.0)
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+
+    await websocket.send_bytes(b"\x01\x00")
+
+    assert await websocket.receive_json() == {
+        "type": "error",
+        "error": "audio must not exceed 0 seconds for transcription",
+    }
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_capture_timeout_is_safe(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service, "TRANSCRIPTION_STREAM_CAPTURE_TIMEOUT_SECONDS", 0.01
+    )
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "error",
+        "error": "audio capture timed out",
+    }
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_total_timeout_starts_after_capture(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller may capture longer than the legacy post-body processing budget."""
+
+    async def immediate_result(*_: Any, **__: Any) -> str:
+        return "Captured after setup"
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", immediate_result)
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", transcript_timeout=0.02),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+
+    await asyncio.sleep(0.04)
+    await websocket.send_bytes(b"\x00\x20" * 80)
+    await websocket.send_json({"type": "end"})
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "result",
+        "text": "Captured after setup",
+    }
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_enforces_post_capture_total_timeout(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = asyncio.Event()
+
+    async def never_returns(*_: Any, **__: Any) -> str:
+        await blocked.wait()
+        return "unreachable"
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", never_returns)
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", transcript_timeout=0.02),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    await websocket.send_bytes(b"\x00\x20" * 80)
+    await websocket.send_json({"type": "end"})
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "error",
+        "error": "transcription timed out",
+    }
+    assert fake_rpc.peers[-1].closed
+    assert any(method == "thread/delete" for method, _ in fake_rpc.calls)
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_auth_and_busy_fail_before_upgrade(
+    aiohttp_client: Any, bridge_app: web.Application
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    with pytest.raises(WSServerHandshakeError) as unauthorized:
+        await client.ws_connect("/v1/transcribe/stream")
+    assert unauthorized.value.status == 401
+
+    state = bridge_app[bridge_service.STATE_KEY]
+    with state.speech_session_lease(), pytest.raises(WSServerHandshakeError) as busy:
+        await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    assert busy.value.status == 409
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_subscription_auth_fails_before_upgrade(
+    aiohttp_client: Any,
+) -> None:
+    rpc = FakeRpc()
+    rpc.health = lambda: {
+        "running": rpc.running,
+        "initialized": rpc.running,
+        "auth_mode": "apikey",
+    }
+    app = create_app(BridgeConfig(bearer_token="test-token"), rpc=rpc)
+    client = await aiohttp_client(app)
+
+    with pytest.raises(WSServerHandshakeError) as auth_failure:
+        await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    assert auth_failure.value.status == 503
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_races_capture_against_early_attempt_failure(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_error = "private-thread-start-details"
+    state = bridge_app[bridge_service.STATE_KEY]
+
+    async def fail_start(*_: Any, **__: Any) -> str:
+        raise ProtocolError(private_error)
+
+    monkeypatch.setattr(state, "start_thread", fail_start)
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+
+    assert (await websocket.receive_json())["type"] == "started"
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "error",
+        "error": "transcription failed",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_message", [True, False], ids=["cancel", "close"])
+async def test_transcription_stream_cancel_and_disconnect_clean_up(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    cancel_message: bool,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+
+    if cancel_message:
+        await websocket.send_json({"type": "cancel"})
+        close = await websocket.receive(timeout=1)
+        assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    else:
+        await websocket.close()
+
+    for _ in range(100):
+        if (
+            any(method == "thread/delete" for method, _ in fake_rpc.calls)
+            and not bridge_app[bridge_service.STATE_KEY]._speech_session_active
+        ):
+            break
+        await asyncio.sleep(0)
+    assert fake_rpc.peers[-1].closed
+    assert any(method == "thread/delete" for method, _ in fake_rpc.calls)
+    assert not bridge_app[bridge_service.STATE_KEY]._speech_session_active
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_cancel_after_end_cleans_up(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    fake_rpc.transcript_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    await websocket.send_bytes(b"\x00\x20" * 80)
+    await websocket.send_json({"type": "end"})
+    await asyncio.wait_for(fake_rpc.transcript_started.wait(), timeout=1)
+
+    await websocket.send_json({"type": "cancel"})
+    close = await websocket.receive(timeout=1)
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+
+    for _ in range(100):
+        if (
+            any(method == "thread/delete" for method, _ in fake_rpc.calls)
+            and not bridge_app[bridge_service.STATE_KEY]._speech_session_active
+        ):
+            break
+        await asyncio.sleep(0)
+    assert fake_rpc.peers[-1].closed
+    assert any(method == "thread/delete" for method, _ in fake_rpc.calls)
+    assert not bridge_app[bridge_service.STATE_KEY]._speech_session_active
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_retries_with_fresh_threads(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def flaky_transcript(*_: Any, **__: Any) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError
+        return "Recovered stream transcript"
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", flaky_transcript)
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(_transcription_stream_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    await websocket.send_bytes(b"\x00\x30" * 160)
+    await websocket.send_json({"type": "end"})
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "result",
+        "text": "Recovered stream transcript",
+    }
+    assert attempts == 2
+    assert [
+        method
+        for method, _ in fake_rpc.calls
+        if method in {"thread/start", "thread/delete"}
+    ] == ["thread/start", "thread/delete", "thread/start", "thread/delete"]
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_logs_no_private_material(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_transcript = "Private streamed transcript"
+    private_prompt = "private-stream-prompt"
+
+    async def private_result(*_: Any, **__: Any) -> str:
+        return private_transcript
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", private_result)
+    client = await aiohttp_client(bridge_app)
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+        await websocket.send_json(
+            _transcription_stream_start(prompt=private_prompt, language="es-MX")
+        )
+        assert (await websocket.receive_json())["type"] == "started"
+        private_audio = b"\x34\x12" * 80
+        await websocket.send_bytes(private_audio)
+        await websocket.send_json({"type": "end"})
+        assert (await websocket.receive_json())["text"] == private_transcript
+        close = await websocket.receive(timeout=1)
+        assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+        for _ in range(100):
+            if any(
+                record.getMessage().startswith("Realtime transcription stream timing:")
+                for record in caplog.records
+            ):
+                break
+            await asyncio.sleep(0)
+
+    service_log = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "bridge.service"
+    )
+    for private_value in (
+        private_transcript,
+        private_prompt,
+        base64.b64encode(private_audio).decode(),
+        "fake-offer",
+        "fake-answer",
+        "thread-1",
+        "test-token",
+    ):
+        assert private_value not in service_log
+    assert service_log.count("Realtime transcription attempt timing:") == 1
+    assert service_log.count("Realtime transcription stream timing:") == 1
 
 
 @pytest.mark.asyncio

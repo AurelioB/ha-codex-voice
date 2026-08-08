@@ -20,6 +20,7 @@ from custom_components.codex_voice.api import (
     BridgeConnectionError,
     BridgeProtocolError,
     BridgeQuotaError,
+    BridgeStreamingUnsupported,
     BridgeToolCall,
 )
 
@@ -175,6 +176,425 @@ async def test_transcribe_sends_base64_pcm(
     assert base64.b64decode(received["audio"]) == b"\x01\x02"
     assert received["format"] == "pcm"
     assert received["sample_rate"] == 16000
+
+
+async def test_transcribe_stream_opens_before_consuming_and_preserves_chunks(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """The streaming handshake precedes bounded, ordered PCM transmission."""
+    start_received = asyncio.Event()
+    iterator_advanced = asyncio.Event()
+    received: dict[str, Any] = {"audio": []}
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        assert request.headers["Authorization"] == "Bearer token"
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        received["start"] = await websocket.receive_json()
+        start_received.set()
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        async for message in websocket:
+            if message.type is web.WSMsgType.BINARY:
+                received["audio"].append(message.data)
+                continue
+            assert message.type is web.WSMsgType.TEXT
+            received["end"] = message.json()
+            await websocket.send_json(
+                {"type": "result", "text": "Streamed speech", "language": "en-US"}
+            )
+            break
+        return websocket
+
+    async def audio_stream() -> AsyncGenerator[bytes]:
+        assert start_received.is_set()
+        iterator_advanced.set()
+        yield b"a" * (64 * 1024 + 1)
+        yield b"bc"
+        yield b"d"
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    result = await client.async_transcribe_stream(
+        audio_stream(),
+        {
+            "sample_rate": 16000,
+            "bit_rate": 16,
+            "channels": 1,
+            "language": "en-US",
+        },
+        prompt="Home automation",
+    )
+
+    assert result == "Streamed speech"
+    assert iterator_advanced.is_set()
+    assert received["start"] == {
+        "type": "start",
+        "protocol_version": 1,
+        "format": "pcm",
+        "codec": "pcm",
+        "sample_rate": 16000,
+        "bit_rate": 16,
+        "channels": 1,
+        "language": "en-US",
+        "prompt": "Home automation",
+    }
+    assert received["audio"] == [b"a" * (64 * 1024), b"ab", b"cd"]
+    assert received["end"] == {"type": "end"}
+
+
+async def test_transcribe_stream_enforces_input_size_limit(
+    aiohttp_client: Any,
+    socket_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming transcription rejects audio beyond the raw input cap."""
+    monkeypatch.setattr(api_module, "MAX_AUDIO_BYTES", 4)
+    socket_closed = asyncio.Event()
+    received_audio: list[bytes] = []
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.receive_json()
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        try:
+            async for message in websocket:
+                if message.type is web.WSMsgType.BINARY:
+                    received_audio.extend([message.data])
+        finally:
+            socket_closed.set()
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(BridgeProtocolError, match="16 MiB"):
+        await client.async_transcribe_stream(
+            _async_chunks(b"1234", b"5"),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+    await asyncio.wait_for(socket_closed.wait(), timeout=1)
+    assert received_audio == [b"1234"]
+
+
+async def test_transcribe_stream_rejects_incomplete_pcm16_sample(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Odd source boundaries are joined, but an odd final byte is rejected."""
+    socket_closed = asyncio.Event()
+    received_audio: list[bytes] = []
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.receive_json()
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        try:
+            async for message in websocket:
+                if message.type is web.WSMsgType.BINARY:
+                    received_audio.extend([message.data])
+        finally:
+            socket_closed.set()
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(BridgeProtocolError, match="incomplete PCM16"):
+        await client.async_transcribe_stream(
+            _async_chunks(b"123"),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+    await asyncio.wait_for(socket_closed.wait(), timeout=1)
+    assert received_audio == [b"12"]
+
+
+@pytest.mark.parametrize("status", [404, 405, 426])
+async def test_transcribe_stream_reports_pre_upgrade_unsupported_without_consuming(
+    aiohttp_client: Any,
+    socket_enabled: None,
+    status: int,
+) -> None:
+    """Only legacy HTTP upgrade failures report streaming as unsupported."""
+    consumed = False
+
+    async def unsupported(request: web.Request) -> web.Response:
+        return web.Response(status=status)
+
+    async def audio_stream() -> AsyncGenerator[bytes]:
+        nonlocal consumed
+        consumed = True
+        yield b"audio"
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", unsupported)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(BridgeStreamingUnsupported):
+        await client.async_transcribe_stream(
+            audio_stream(),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+    assert not consumed
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (401, BridgeAuthenticationError),
+        (403, BridgeAuthenticationError),
+        (409, BridgeBusyError),
+        (429, BridgeQuotaError),
+        (500, BridgeConnectionError),
+        (400, BridgeProtocolError),
+    ],
+)
+async def test_transcribe_stream_maps_non_fallback_http_errors(
+    aiohttp_client: Any,
+    socket_enabled: None,
+    status: int,
+    error_type: type[Exception],
+) -> None:
+    """Authentication, capacity, server, and protocol failures never fall back."""
+    consumed = False
+
+    async def reject(request: web.Request) -> web.Response:
+        return web.Response(status=status)
+
+    async def audio_stream() -> AsyncGenerator[bytes]:
+        nonlocal consumed
+        consumed = True
+        yield b"audio"
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", reject)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(error_type):
+        await client.async_transcribe_stream(
+            audio_stream(),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+    assert not consumed
+
+
+@pytest.mark.parametrize(
+    ("event", "error_type"),
+    [
+        ({"type": "error", "code": "invalid_auth"}, BridgeAuthenticationError),
+        ({"type": "error", "code": "busy"}, BridgeBusyError),
+        ({"type": "error", "code": "quota_exhausted"}, BridgeQuotaError),
+        ({"type": "error", "code": "unknown"}, BridgeProtocolError),
+    ],
+)
+async def test_transcribe_stream_maps_error_events(
+    aiohttp_client: Any,
+    socket_enabled: None,
+    event: dict[str, Any],
+    error_type: type[Exception],
+) -> None:
+    """Safe post-upgrade error events retain the stable client error types."""
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.receive_json()
+        await websocket.send_json(event)
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(error_type):
+        await client.async_transcribe_stream(
+            _async_chunks(b"audio"),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "started", "protocol_version": 2},
+        {"type": "result", "text": "too soon"},
+    ],
+)
+async def test_transcribe_stream_rejects_invalid_started_events(
+    aiohttp_client: Any,
+    socket_enabled: None,
+    event: dict[str, Any],
+) -> None:
+    """Streaming transcription requires its versioned started acknowledgement."""
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.receive_json()
+        await websocket.send_json(event)
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(BridgeProtocolError):
+        await client.async_transcribe_stream(
+            _async_chunks(b"audio"),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "result_event",
+    [
+        {"type": "done", "text": "wrong type"},
+        {"type": "result"},
+        {"type": "result", "text": 1},
+        {"type": "result", "text": "speech", "language": 1},
+        {"type": "result", "text": "speech", "language": None},
+    ],
+)
+async def test_transcribe_stream_validates_result_events(
+    aiohttp_client: Any,
+    socket_enabled: None,
+    result_event: dict[str, Any],
+) -> None:
+    """The final streaming event must contain a valid transcription result."""
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.receive_json()
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        await websocket.receive_json()
+        await websocket.send_json(result_event)
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    with pytest.raises(BridgeProtocolError):
+        await client.async_transcribe_stream(
+            _async_chunks(),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+
+
+async def test_transcribe_stream_cancellation_closes_socket(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Cancelling microphone capture promptly closes the upgraded socket."""
+    iterator_waiting = asyncio.Event()
+    socket_closed = asyncio.Event()
+
+    async def transcribe(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.receive_json()
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        try:
+            async for _message in websocket:
+                pass
+        finally:
+            socket_closed.set()
+        return websocket
+
+    async def audio_stream() -> AsyncGenerator[bytes]:
+        iterator_waiting.set()
+        await asyncio.Event().wait()
+        yield b"unreachable"
+
+    app = web.Application()
+    app.router.add_get("/v1/transcribe/stream", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+    task = asyncio.create_task(
+        client.async_transcribe_stream(
+            audio_stream(),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+        )
+    )
+
+    await asyncio.wait_for(iterator_waiting.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(socket_closed.wait(), timeout=1)
+
+
+async def _async_chunks(*chunks: bytes) -> AsyncGenerator[bytes]:
+    """Yield byte chunks for streaming client tests."""
+    for chunk in chunks:
+        yield chunk
 
 
 async def test_synthesize_decodes_json_pcm(
