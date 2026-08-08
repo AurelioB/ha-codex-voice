@@ -5,6 +5,13 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-08
+
+### Fixed
+
+- Restore the documented Python 3.11+ bridge compatibility and enforce it in
+  CI with standalone bridge tests on the minimum supported Python version.
+
 ## [0.1.1] - 2026-08-08
 
 ### Fixed
