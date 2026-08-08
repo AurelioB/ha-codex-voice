@@ -1,5 +1,7 @@
 {
   "name": "Codex Voice",
+  "filename": "codex_voice.zip",
   "homeassistant": "2026.8.0",
-  "render_readme": true
+  "render_readme": true,
+  "zip_release": true
 }

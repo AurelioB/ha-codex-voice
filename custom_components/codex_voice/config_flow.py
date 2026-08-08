@@ -1,0 +1,372 @@
+"""Config flow for Codex Voice."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from typing import Any, override
+
+import voluptuous as vol
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    ConfigSubentryData,
+    ConfigSubentryFlow,
+    SubentryFlowResult,
+)
+from homeassistant.const import CONF_LLM_HASS_API, CONF_NAME, CONF_PROMPT
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import llm
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    TemplateSelector,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
+from homeassistant.helpers.typing import VolDictType
+from yarl import URL
+
+from .api import (
+    BridgeAuthenticationError,
+    BridgeClient,
+    BridgeConnectionError,
+    normalize_bridge_url,
+)
+from .const import (
+    CONF_ACCESS_TOKEN,
+    CONF_BRIDGE_URL,
+    CONF_INSTRUCTIONS,
+    CONF_MODEL,
+    CONF_VOICE,
+    DEFAULT_BRIDGE_URL,
+    DEFAULT_CONVERSATION_MODEL,
+    DEFAULT_CONVERSATION_NAME,
+    DEFAULT_LLM_HASS_API,
+    DEFAULT_STT_NAME,
+    DEFAULT_TTS_NAME,
+    DEFAULT_VOICE,
+    DOMAIN,
+    SUBENTRY_TYPE_CONVERSATION,
+    SUBENTRY_TYPE_STT,
+    SUBENTRY_TYPE_TTS,
+    SUPPORTED_VOICES,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+_CONNECTION_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_BRIDGE_URL, default=DEFAULT_BRIDGE_URL): TextSelector(
+            TextSelectorConfig(type=TextSelectorType.URL)
+        ),
+        vol.Required(CONF_ACCESS_TOKEN): TextSelector(
+            TextSelectorConfig(type=TextSelectorType.PASSWORD)
+        ),
+    }
+)
+
+
+def _default_subentries() -> list[ConfigSubentryData]:
+    """Return the three default Assist provider subentries."""
+    return [
+        {
+            "subentry_type": SUBENTRY_TYPE_CONVERSATION,
+            "title": DEFAULT_CONVERSATION_NAME,
+            "unique_id": None,
+            "data": {
+                CONF_MODEL: DEFAULT_CONVERSATION_MODEL,
+                CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
+                CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
+            },
+        },
+        {
+            "subentry_type": SUBENTRY_TYPE_STT,
+            "title": DEFAULT_STT_NAME,
+            "unique_id": None,
+            "data": {},
+        },
+        {
+            "subentry_type": SUBENTRY_TYPE_TTS,
+            "title": DEFAULT_TTS_NAME,
+            "unique_id": None,
+            "data": {
+                CONF_VOICE: DEFAULT_VOICE,
+            },
+        },
+    ]
+
+
+async def _async_validate_connection(
+    hass: HomeAssistant,
+    data: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and normalize bridge connection data."""
+    bridge_url = normalize_bridge_url(str(data[CONF_BRIDGE_URL]))
+    parsed_url = URL(bridge_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.host:
+        raise BridgeConnectionError("Bridge URL must be an HTTP(S) URL")
+
+    client = BridgeClient(
+        async_get_clientsession(hass),
+        bridge_url,
+        str(data[CONF_ACCESS_TOKEN]),
+    )
+    await client.async_health()
+    return {
+        CONF_BRIDGE_URL: bridge_url,
+        CONF_ACCESS_TOKEN: str(data[CONF_ACCESS_TOKEN]),
+    }
+
+
+class CodexVoiceConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle the Codex Voice config flow."""
+
+    VERSION = 1
+    MINOR_VERSION = 1
+
+    @override
+    async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Set up a Codex Voice bridge."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                data = await _async_validate_connection(self.hass, user_input)
+            except BridgeAuthenticationError:
+                errors["base"] = "invalid_auth"
+            except BridgeConnectionError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error validating the Codex Voice bridge")
+                errors["base"] = "unknown"
+            else:
+                await self.async_set_unique_id(data[CONF_BRIDGE_URL])
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(
+                    title="Codex Voice",
+                    data=data,
+                    subentries=_default_subentries(),
+                )
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=self.add_suggested_values_to_schema(
+                _CONNECTION_SCHEMA,
+                user_input,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Reconfigure the bridge connection."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                data = await _async_validate_connection(self.hass, user_input)
+            except BridgeAuthenticationError:
+                errors["base"] = "invalid_auth"
+            except BridgeConnectionError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error validating the Codex Voice bridge")
+                errors["base"] = "unknown"
+            else:
+                existing_entry = (
+                    self.hass.config_entries.async_entry_for_domain_unique_id(
+                        DOMAIN,
+                        data[CONF_BRIDGE_URL],
+                    )
+                )
+                if (
+                    existing_entry is not None
+                    and existing_entry.entry_id != entry.entry_id
+                ):
+                    return self.async_abort(reason="already_configured")
+                return self.async_update_reload_and_abort(
+                    entry,
+                    unique_id=data[CONF_BRIDGE_URL],
+                    data_updates=data,
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                _CONNECTION_SCHEMA,
+                user_input or dict(entry.data),
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reauth(
+        self,
+        entry_data: Mapping[str, Any],
+    ) -> ConfigFlowResult:
+        """Start reauthentication."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Accept a replacement bridge access token."""
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            candidate = {
+                CONF_BRIDGE_URL: entry.data[CONF_BRIDGE_URL],
+                CONF_ACCESS_TOKEN: user_input[CONF_ACCESS_TOKEN],
+            }
+            try:
+                data = await _async_validate_connection(self.hass, candidate)
+            except BridgeAuthenticationError:
+                errors["base"] = "invalid_auth"
+            except BridgeConnectionError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error reauthenticating Codex Voice")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates=data,
+                    reason="reauth_successful",
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_ACCESS_TOKEN): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    @classmethod
+    @callback
+    @override
+    def async_get_supported_subentry_types(
+        cls,
+        config_entry: ConfigEntry,
+    ) -> dict[str, type[ConfigSubentryFlow]]:
+        """Return supported provider profile subentries."""
+        return {
+            SUBENTRY_TYPE_CONVERSATION: CodexVoiceSubentryFlow,
+            SUBENTRY_TYPE_STT: CodexVoiceSubentryFlow,
+            SUBENTRY_TYPE_TTS: CodexVoiceSubentryFlow,
+        }
+
+
+class CodexVoiceSubentryFlow(ConfigSubentryFlow):
+    """Create and reconfigure Conversation, STT, and TTS profiles."""
+
+    _values: dict[str, Any]
+
+    @property
+    def _is_new(self) -> bool:
+        """Return whether a new subentry is being created."""
+        return self.source == "user"
+
+    async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Start creating a profile."""
+        self._values = self._defaults_for_type()
+        return await self.async_step_init(user_input)
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Start reconfiguring a profile."""
+        self._values = dict(self._get_reconfigure_subentry().data)
+        return await self.async_step_init(user_input)
+
+    async def async_step_init(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Configure the selected profile type."""
+        if user_input is not None:
+            submitted = dict(user_input)
+            if self._is_new:
+                title = submitted.pop(CONF_NAME)
+                return self.async_create_entry(title=title, data=submitted)
+            return self.async_update_and_abort(
+                self._get_entry(),
+                self._get_reconfigure_subentry(),
+                data=submitted,
+            )
+
+        schema = self._schema_for_type()
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(schema, self._values),
+        )
+
+    def _schema_for_type(self) -> vol.Schema:
+        """Build the form schema for a profile type."""
+        fields: VolDictType = {}
+        if self._is_new:
+            fields[vol.Required(CONF_NAME)] = str
+
+        if self._subentry_type == SUBENTRY_TYPE_CONVERSATION:
+            hass_apis = [
+                SelectOptionDict(label=api.name, value=api.id)
+                for api in llm.async_get_apis(self.hass)
+            ]
+            fields.update(
+                {
+                    vol.Required(CONF_MODEL): str,
+                    vol.Optional(CONF_PROMPT): TemplateSelector(),
+                    vol.Optional(CONF_LLM_HASS_API): SelectSelector(
+                        SelectSelectorConfig(options=hass_apis, multiple=True)
+                    ),
+                }
+            )
+        elif self._subentry_type == SUBENTRY_TYPE_STT:
+            fields.update(
+                {
+                    vol.Optional(CONF_PROMPT): str,
+                }
+            )
+        else:
+            fields.update(
+                {
+                    vol.Required(CONF_VOICE): SelectSelector(
+                        SelectSelectorConfig(options=list(SUPPORTED_VOICES))
+                    ),
+                    vol.Optional(CONF_INSTRUCTIONS): str,
+                }
+            )
+        return vol.Schema(fields)
+
+    def _defaults_for_type(self) -> dict[str, Any]:
+        """Return defaults for the selected profile type."""
+        if self._subentry_type == SUBENTRY_TYPE_CONVERSATION:
+            return {
+                CONF_NAME: DEFAULT_CONVERSATION_NAME,
+                CONF_MODEL: DEFAULT_CONVERSATION_MODEL,
+                CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
+                CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
+            }
+        if self._subentry_type == SUBENTRY_TYPE_STT:
+            return {CONF_NAME: DEFAULT_STT_NAME}
+        return {
+            CONF_NAME: DEFAULT_TTS_NAME,
+            CONF_VOICE: DEFAULT_VOICE,
+        }

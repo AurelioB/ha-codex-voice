@@ -1,0 +1,89 @@
+rules:
+  # Bronze
+  action-setup:
+    status: exempt
+    comment: The integration does not register custom actions.
+  appropriate-polling:
+    status: exempt
+    comment: The integration communicates on demand and does not poll.
+  brands: done
+  common-modules: done
+  config-flow-test-coverage: done
+  config-flow: done
+  dependency-transparency: done
+  docs-actions:
+    status: exempt
+    comment: The integration does not register custom actions.
+  docs-conditions:
+    status: exempt
+    comment: The integration has no conditions.
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  docs-triggers:
+    status: exempt
+    comment: The integration has no triggers.
+  entity-event-setup: done
+  entity-unique-id: done
+  has-entity-name: done
+  runtime-data: done
+  test-before-configure: done
+  test-before-setup: done
+  unique-config-entry: done
+  # Silver
+  action-exceptions:
+    status: exempt
+    comment: The integration does not register custom actions.
+  config-entry-unloading: done
+  docs-configuration-parameters: done
+  docs-installation-parameters: done
+  entity-unavailable: todo
+  integration-owner: done
+  log-when-unavailable: done
+  parallel-updates: done
+  reauthentication-flow: done
+  test-coverage: done
+  # Gold
+  devices: done
+  diagnostics: done
+  discovery-update-info:
+    status: exempt
+    comment: This service integration does not use discovery.
+  discovery:
+    status: exempt
+    comment: The bridge URL and token must be entered explicitly.
+  docs-data-update:
+    status: exempt
+    comment: Conversation and speech requests run on demand.
+  docs-examples: done
+  docs-known-limitations: done
+  docs-supported-devices:
+    status: exempt
+    comment: The integration represents a service rather than physical devices.
+  docs-supported-functions: done
+  docs-troubleshooting: done
+  docs-use-cases: done
+  dynamic-devices:
+    status: exempt
+    comment: Service devices are created from config subentries.
+  entity-category:
+    status: exempt
+    comment: Provider entities do not have entity categories.
+  entity-device-class:
+    status: exempt
+    comment: Conversation and speech entities have no device classes.
+  entity-disabled-by-default:
+    status: exempt
+    comment: All configured providers are enabled by default.
+  entity-translations: done
+  exception-translations: done
+  icon-translations: done
+  reconfiguration-flow: done
+  repair-issues: todo
+  stale-devices:
+    status: exempt
+    comment: Devices follow the config-subentry lifecycle.
+  # Platinum
+  async-dependency: done
+  inject-websession: done
+  strict-typing: done
