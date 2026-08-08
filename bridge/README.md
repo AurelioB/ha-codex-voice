@@ -43,8 +43,9 @@ All routes, including `GET /health`, require
 - `GET /v1/conversation` WebSocket: `start`, streamed `delta`, `tool_call`,
   `tool_result`, and `done` messages. Stable Home Assistant `conversation_id`
   values reuse a bounded in-memory Codex thread for multi-turn context.
-- `POST /v1/transcribe`: base64 PCM16/WAV plus audio metadata; returns JSON
-  `{ "text": "..." }`.
+- `POST /v1/transcribe`: up to 60 seconds of base64 PCM16/WAV plus audio
+  metadata; returns JSON `{ "text": "..." }` under a bounded end-to-end
+  deadline.
 - `POST /v1/synthesize`: text, voice, and language; returns mono 24 kHz WAV.
 - `GET /v1/realtime` WebSocket: full-duplex PCM16 `audio`, `text`, `speech`,
   transcripts, tool calls, and stop messages.
