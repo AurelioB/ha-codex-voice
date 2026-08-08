@@ -414,6 +414,118 @@ def test_adaptive_transcription_gain_leaves_silence_unchanged() -> None:
     assert gain == 1.0
 
 
+def test_transcription_silence_trim_keeps_preroll_before_synthetic_speech() -> None:
+    silence = array("h", [0]) * (10 * bridge_service.REALTIME_SAMPLE_RATE)
+    speech = array("h", [12_000, -12_000]) * (bridge_service.REALTIME_SAMPLE_RATE // 2)
+    source = (silence + speech).tobytes()
+
+    trimmed = bridge_service._trim_transcription_silence(source)
+    trimmed_samples = array("h")
+    trimmed_samples.frombytes(trimmed)
+    first_speech_sample = next(
+        index for index, sample in enumerate(trimmed_samples) if sample
+    )
+
+    assert 0.25 <= first_speech_sample / bridge_service.REALTIME_SAMPLE_RATE <= 0.4
+    assert trimmed.endswith(speech.tobytes())
+    assert len(trimmed) < len(source) / 4
+
+
+def test_transcription_silence_trim_leaves_immediate_speech_unchanged() -> None:
+    source = (
+        array("h", [10_000, -10_000]) * bridge_service.REALTIME_SAMPLE_RATE
+    ).tobytes()
+
+    assert bridge_service._trim_transcription_silence(source) == source
+
+
+def test_transcription_silence_trim_leaves_quiet_early_speech_unchanged() -> None:
+    quiet_speech = array("h", [150, -150]) * bridge_service.REALTIME_SAMPLE_RATE
+    loud_speech = array("h", [10_000, -10_000]) * (
+        bridge_service.REALTIME_SAMPLE_RATE // 4
+    )
+    source = (quiet_speech + loud_speech).tobytes()
+
+    assert bridge_service._trim_transcription_silence(source) == source
+
+
+def test_transcription_silence_trim_preserves_earlier_high_energy_audio() -> None:
+    initial_silence = array("h", [0]) * (3 * bridge_service.REALTIME_SAMPLE_RATE)
+    high_energy_frame = array("h", [16_000, -16_000]) * (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 2_000
+    )
+    middle_silence = array("h", [0]) * (4 * bridge_service.REALTIME_SAMPLE_RATE)
+    speech = array("h", [12_000, -12_000]) * (bridge_service.REALTIME_SAMPLE_RATE // 4)
+    source = (initial_silence + high_energy_frame + middle_silence + speech).tobytes()
+
+    trimmed = bridge_service._trim_transcription_silence(source)
+    trimmed_samples = array("h")
+    trimmed_samples.frombytes(trimmed)
+    first_active_sample = next(
+        index for index, sample in enumerate(trimmed_samples) if sample
+    )
+
+    assert first_active_sample / bridge_service.REALTIME_SAMPLE_RATE == pytest.approx(
+        bridge_service.TRANSCRIPTION_TRIM_PREROLL_MS / 1_000
+    )
+    assert high_energy_frame.tobytes() in trimmed
+
+
+@pytest.mark.parametrize("padding_level", [0, 300], ids=["digital", "room-noise"])
+def test_transcription_silence_trim_preserves_padded_quiet_speech(
+    padding_level: int,
+) -> None:
+    padding = array("h", [padding_level, -padding_level]) * (
+        5 * bridge_service.REALTIME_SAMPLE_RATE // 2
+    )
+    quiet_level = 150 if padding_level == 0 else 500
+    quiet_speech = array("h", [quiet_level, -quiet_level]) * (
+        bridge_service.REALTIME_SAMPLE_RATE // 2
+    )
+    loud_speech = array("h", [12_000, -12_000]) * (
+        bridge_service.REALTIME_SAMPLE_RATE // 4
+    )
+    speech = (quiet_speech + loud_speech).tobytes()
+    source = (padding + quiet_speech + loud_speech).tobytes()
+
+    trimmed = bridge_service._trim_transcription_silence(source)
+
+    assert trimmed.endswith(speech)
+    assert len(trimmed) < len(source)
+    assert len(trimmed) / 2 / bridge_service.REALTIME_SAMPLE_RATE == pytest.approx(1.82)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"\x00\x00" * bridge_service.REALTIME_SAMPLE_RATE,
+        array("h", [1_000, -1_000] * bridge_service.REALTIME_SAMPLE_RATE).tobytes(),
+        (
+            array("h", [1_000, -1_000]) * (bridge_service.REALTIME_SAMPLE_RATE // 2)
+            + array("h", [1_300, -1_300]) * (bridge_service.REALTIME_SAMPLE_RATE // 2)
+        ).tobytes(),
+    ],
+    ids=["silence", "uniform-noise", "low-contrast"],
+)
+def test_transcription_silence_trim_requires_clear_contrast(source: bytes) -> None:
+    assert bridge_service._trim_transcription_silence(source) == source
+
+
+def test_transcription_silence_trim_preserves_pcm16_byte_alignment() -> None:
+    silence = array("h", [0]) * (3 * bridge_service.REALTIME_SAMPLE_RATE)
+    speech = array("h", [12_345, -12_345]) * (bridge_service.REALTIME_SAMPLE_RATE // 4)
+
+    trimmed = bridge_service._trim_transcription_silence((silence + speech).tobytes())
+    trimmed_samples = array("h")
+    trimmed_samples.frombytes(trimmed)
+
+    assert len(trimmed) % 2 == 0
+    assert len(trimmed) < len((silence + speech).tobytes())
+    assert next(sample for sample in trimmed_samples if sample) == 12_345
+
+
 def test_isolated_codex_runtime_links_only_secure_auth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1238,6 +1350,56 @@ async def test_transcribe_rejects_audio_beyond_endpoint_deadline(
 
     retry = await client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload())
     assert retry.status == 200
+
+
+@pytest.mark.asyncio
+async def test_transcribe_trims_silence_and_recomputes_feed_duration(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    captured_pcm = b""
+    captured_duration = 0.0
+
+    async def capture_attempt(
+        _state: BridgeState,
+        _payload: Mapping[str, Any],
+        pcm: bytes,
+        duration: float,
+        _prompt: str,
+    ) -> str:
+        nonlocal captured_duration, captured_pcm
+        captured_pcm = pcm
+        captured_duration = duration
+        return "Synthetic transcript"
+
+    monkeypatch.setattr(bridge_service, "_run_transcription_attempt", capture_attempt)
+    client = await aiohttp_client(bridge_app)
+    silence = array("h", [0]) * (10 * bridge_service.REALTIME_SAMPLE_RATE)
+    speech = array("h", [12_000, -12_000]) * (bridge_service.REALTIME_SAMPLE_RATE // 4)
+    pcm = (silence + speech).tobytes()
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        response = await client.post(
+            "/v1/transcribe",
+            headers=AUTH,
+            json={
+                "audio": base64.b64encode(pcm).decode(),
+                "format": "pcm",
+                "sample_rate": 24_000,
+                "channels": 1,
+            },
+        )
+
+    assert response.status == 200
+    assert await response.json() == {"text": "Synthetic transcript"}
+    assert captured_duration == pytest.approx(
+        len(captured_pcm) / (bridge_service.REALTIME_SAMPLE_RATE * 2)
+    )
+    assert captured_duration == pytest.approx(0.82)
+    assert "input_duration_seconds=10.500 trimmed_duration_seconds=0.820" in (
+        caplog.text
+    )
 
 
 @pytest.mark.asyncio

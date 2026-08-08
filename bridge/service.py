@@ -59,6 +59,13 @@ TRANSCRIPTION_FRAGMENT_QUIET_SECONDS = 2.0
 TRANSCRIPTION_TARGET_RMS = 0.05
 TRANSCRIPTION_TARGET_PEAK = 0.8
 TRANSCRIPTION_MAX_GAIN = 64.0
+TRANSCRIPTION_TRIM_FRAME_MS = 20
+TRANSCRIPTION_TRIM_NOISE_PROBE_MS = 600
+TRANSCRIPTION_TRIM_PREROLL_MS = 320
+TRANSCRIPTION_TRIM_MIN_REMOVABLE_MS = 2_000
+TRANSCRIPTION_TRIM_MIN_RMS = 0.015
+TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES = 3
+TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES = 5
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
 
 
@@ -469,8 +476,8 @@ async def _transcribe_admitted(
     pcm = pcm16_mono_24khz(pcm, actual_rate, actual_channels)
     if not pcm:
         raise ProtocolError("audio payload contains no samples")
-    duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
-    if duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
+    input_duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if input_duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
         raise ProtocolError(
             "audio must not exceed "
             f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
@@ -499,6 +506,18 @@ async def _transcribe_admitted(
     )
     peak, rms = _normalized_pcm16_levels(pcm)
     pcm, adaptive_gain = _apply_transcription_gain(pcm, peak=peak, rms=rms)
+    pcm = _trim_transcription_silence(pcm)
+    duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if duration < input_duration:
+        LOGGER.info(
+            "Trimmed leading transcription silence: "
+            "input_duration_seconds=%.3f trimmed_duration_seconds=%.3f "
+            "normalized_peak=%.4f normalized_rms=%.4f",
+            input_duration,
+            duration,
+            peak,
+            rms,
+        )
     transcript: str | None = None
     last_timeout: _TranscriptionAttemptTimeout | None = None
     current_attempt = 0
@@ -682,6 +701,99 @@ def _apply_transcription_gain(
     if sys.byteorder != "little":
         samples.byteswap()
     return samples.tobytes(), gain
+
+
+def _trim_transcription_silence(pcm: bytes) -> bytes:
+    """Remove only a confidently silent prefix from finite PCM16 audio."""
+    if not pcm or len(pcm) % 2:
+        return pcm
+
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    frame_samples = REALTIME_SAMPLE_RATE * TRANSCRIPTION_TRIM_FRAME_MS // 1_000
+    frame_levels: list[float] = []
+    scale = 32_768.0
+    for frame_start in range(0, len(samples), frame_samples):
+        frame_end = min(frame_start + frame_samples, len(samples))
+        square_sum = 0
+        for sample in samples[frame_start:frame_end]:
+            square_sum += sample * sample
+        frame_levels.append(math.sqrt(square_sum / (frame_end - frame_start)) / scale)
+
+    if len(frame_levels) < TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES:
+        return pcm
+
+    probe_frames = max(
+        1,
+        TRANSCRIPTION_TRIM_NOISE_PROBE_MS // TRANSCRIPTION_TRIM_FRAME_MS,
+    )
+    opening_levels = sorted(frame_levels[:probe_frames])
+    noise_floor = opening_levels[len(opening_levels) // 2]
+    noise_ceiling = opening_levels[
+        min(len(opening_levels) - 1, len(opening_levels) * 4 // 5)
+    ]
+    active_threshold = max(
+        TRANSCRIPTION_TRIM_MIN_RMS,
+        noise_floor * 4.0,
+        noise_ceiling * 2.0,
+        noise_floor + 0.01,
+    )
+
+    # Several active frames are required so an isolated click cannot establish
+    # that the clip contains speech. Once speech is established, the lower
+    # preservation threshold below keeps any earlier high-energy sound.
+    strongest_levels = sorted(frame_levels, reverse=True)
+    if strongest_levels[TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES - 1] < active_threshold:
+        return pcm
+
+    onset_frame = _first_sustained_transcription_frame(frame_levels, active_threshold)
+    if onset_frame is None:
+        return pcm
+
+    preservation_threshold = max(
+        0.003,
+        noise_floor * 1.35,
+        noise_ceiling * 1.1,
+        noise_floor + 0.002,
+    )
+    preserved_onset = _first_sustained_transcription_frame(
+        frame_levels[:onset_frame], preservation_threshold
+    )
+    if preserved_onset is not None:
+        onset_frame = preserved_onset
+
+    # Sustained low-level contrast protects quiet speech. A single frame must
+    # still be enough for clearly high-energy audio, even if it is isolated.
+    for index, level in enumerate(frame_levels[:onset_frame]):
+        if level >= active_threshold:
+            onset_frame = index
+            break
+
+    preroll_frames = TRANSCRIPTION_TRIM_PREROLL_MS // TRANSCRIPTION_TRIM_FRAME_MS
+    trim_frame = max(0, onset_frame - preroll_frames)
+    minimum_trim_frames = (
+        TRANSCRIPTION_TRIM_MIN_REMOVABLE_MS // TRANSCRIPTION_TRIM_FRAME_MS
+    )
+    if trim_frame < minimum_trim_frames:
+        return pcm
+    return pcm[trim_frame * frame_samples * 2 :]
+
+
+def _first_sustained_transcription_frame(
+    frame_levels: list[float], threshold: float
+) -> int | None:
+    """Return the first frame in a short sustained run above ``threshold``."""
+    active_frames = [level >= threshold for level in frame_levels]
+    for window_start in range(len(active_frames)):
+        window = active_frames[
+            window_start : window_start + TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES
+        ]
+        if sum(window) >= TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES:
+            return window_start + window.index(True)
+    return None
 
 
 async def _synthesize(request: web.Request) -> web.Response:
