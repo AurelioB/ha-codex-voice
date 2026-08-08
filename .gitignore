@@ -1,0 +1,16 @@
+.coverage
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+htmlcov/
+
+# Bridge runtime state and credentials must never be committed.
+.bridge-token
+.codex-voice/
