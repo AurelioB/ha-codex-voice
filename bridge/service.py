@@ -1509,7 +1509,7 @@ def _conversation_history(payload: Mapping[str, Any], current_text: str) -> str 
         return None
     try:
         serialized = json.dumps(prior, ensure_ascii=False, separators=(",", ":"))
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     if len(serialized) > MAX_HISTORY_CONTEXT_CHARS:
         serialized = serialized[-MAX_HISTORY_CONTEXT_CHARS:]
