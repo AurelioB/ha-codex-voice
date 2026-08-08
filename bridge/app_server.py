@@ -17,6 +17,7 @@ from .errors import AppServerExited, ProtocolError, RpcError
 
 LOGGER = logging.getLogger(__name__)
 JsonObject = dict[str, Any]
+MAX_APP_SERVER_LINE_BYTES = 4 * 1024 * 1024
 
 _MODERN_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
@@ -130,6 +131,7 @@ class CodexAppServer:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=MAX_APP_SERVER_LINE_BYTES,
             )
             self._reader_task = asyncio.create_task(
                 self._read_stdout(), name="codex-app-server-reader"
@@ -144,13 +146,14 @@ class CodexAppServer:
                         "clientInfo": {
                             "name": "ha_codex_voice",
                             "title": "Home Assistant Codex Voice Bridge",
-                            "version": "0.1.2",
+                            "version": "0.1.3",
                         },
                         "capabilities": {"experimentalApi": True},
                     },
                 )
                 await self.notify("initialized", {})
                 self._initialized = True
+                await self.assert_no_configured_mcp_servers()
                 await self.refresh_account()
             except BaseException:
                 await self._stop_process()
@@ -183,6 +186,22 @@ class CodexAppServer:
             self._auth_mode = None
             self._plan_type = None
         return self.health()
+
+    async def assert_no_configured_mcp_servers(self) -> None:
+        """Fail closed if a local or managed config layer injects MCP."""
+        response = await self.call(
+            "config/read",
+            {"cwd": self.cwd, "includeLayers": True},
+        )
+        layers = response.get("layers") if isinstance(response, dict) else None
+        if not isinstance(layers, list):
+            raise ProtocolError("config/read returned an invalid layer response")
+        for layer in layers:
+            config = layer.get("config") if isinstance(layer, dict) else None
+            if _contains_configured_mcp(config):
+                raise ProtocolError(
+                    "Codex configuration contains an MCP server; voice bridge startup denied"
+                )
 
     async def call(
         self,
@@ -276,6 +295,9 @@ class CodexAppServer:
             raise
         except Exception:
             LOGGER.exception("App-server stdout reader failed")
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
         finally:
             self._initialized = False
             returncode = await process.wait()
@@ -446,3 +468,14 @@ class CodexAppServer:
 class _RpcFailure:
     def __init__(self, error: Any) -> None:
         self.error = error
+
+
+def _contains_configured_mcp(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key, nested in value.items():
+        if key in {"mcp_servers", "mcpServers"} and bool(nested):
+            return True
+        if _contains_configured_mcp(nested):
+            return True
+    return False

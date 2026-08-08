@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 
@@ -53,6 +54,28 @@ def main() -> None:
                     },
                 }
             )
+        elif method == "config/read":
+            configured = (
+                {"unexpected": {"command": "false"}}
+                if os.environ.get("FAKE_MCP_SERVER")
+                else {}
+            )
+            send(
+                {
+                    "id": request_id,
+                    "result": {
+                        "config": {},
+                        "layers": [
+                            {
+                                "name": "commandLine",
+                                "version": "1",
+                                "config": {"mcp_servers": configured},
+                            }
+                        ],
+                        "origins": {},
+                    },
+                }
+            )
         elif method == "test/requestApproval":
             send({"id": request_id, "result": {}})
             send(
@@ -78,6 +101,8 @@ def main() -> None:
                     },
                 }
             )
+        elif method == "test/largeResponse":
+            send({"id": request_id, "result": {"payload": "x" * 100_000}})
         elif request_id == "approval-1" and "result" in message:
             send({"method": "fake/approvalResult", "params": message["result"]})
         elif request_id == "rpc-tool-1" and "result" in message:

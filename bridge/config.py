@@ -36,6 +36,8 @@ DEFAULT_CODEX_COMMAND = (
     "-c",
     'history.persistence="none"',
     "-c",
+    'cli_auth_credentials_store="file"',
+    "-c",
     'web_search="disabled"',
     "-c",
     "tools.web_search=false",
@@ -70,6 +72,7 @@ class BridgeConfig:
         default_factory=lambda: DEFAULT_CODEX_COMMAND
     )
     codex_cwd: str | None = None
+    codex_auth_file: str | None = None
     permission_profile: str = DEFAULT_PERMISSION_PROFILE
     request_timeout: float = 90.0
     transcript_timeout: float = 90.0
@@ -108,6 +111,7 @@ class BridgeConfig:
             port=int(os.environ.get("HA_CODEX_BRIDGE_PORT", "8787")),
             codex_command=command,
             codex_cwd=os.environ.get("HA_CODEX_BRIDGE_CWD") or None,
+            codex_auth_file=os.environ.get("HA_CODEX_AUTH_FILE") or None,
             permission_profile=os.environ.get(
                 "HA_CODEX_PERMISSION_PROFILE", DEFAULT_PERMISSION_PROFILE
             ),
