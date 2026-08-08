@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
 import contextlib
 import hmac
 import json
 import logging
+import math
+import sys
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,6 +33,7 @@ from .config import BridgeConfig
 from .errors import (
     AppServerExited,
     AuthenticationRequired,
+    BridgeBusyError,
     BridgeError,
     ProtocolError,
     RpcError,
@@ -48,7 +52,20 @@ MAX_EARLY_TURN_EVENTS = 64
 MAX_SYNTHESIS_TEXT_CHARS = 8_000
 MAX_TRANSCRIPTION_DURATION_SECONDS = 60.0
 TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
+TRANSCRIPTION_MAX_ATTEMPTS = 3
+TRANSCRIPTION_SESSION_TIMEOUT_SECONDS = 20.0
+TRANSCRIPTION_RESULT_TIMEOUT_SECONDS = 15.0
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
+
+
+class _TranscriptionAttemptTimeout(TimeoutError):
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        super().__init__(f"transcription attempt timed out during {stage}")
+
+
+class _TranscriptionStartTimeout(TimeoutError):
+    """A thread start timed out without returning an id that can be cleaned up."""
 
 
 def _codex_child_environment() -> dict[str, str]:
@@ -145,6 +162,18 @@ class BridgeState:
         self.peer_factory = peer_factory
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
+        self._speech_session_active = False
+
+    @contextlib.contextmanager
+    def speech_session_lease(self) -> Iterator[None]:
+        """Fail fast when the single realtime speech channel is already in use."""
+        if self._speech_session_active:
+            raise BridgeBusyError("another speech session is already active")
+        self._speech_session_active = True
+        try:
+            yield
+        finally:
+            self._speech_session_active = False
 
     async def start_thread(
         self,
@@ -361,6 +390,8 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
         raise
     except (ProtocolError, ValueError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
+    except BridgeBusyError as exc:
+        return web.json_response({"error": str(exc), "code": "busy"}, status=409)
     except (RpcError, AppServerExited) as exc:
         LOGGER.warning("Codex app-server request failed: %s", exc)
         return web.json_response({"error": str(exc)}, status=503)
@@ -403,6 +434,13 @@ async def _health(request: web.Request) -> web.Response:
 
 async def _transcribe(request: web.Request) -> web.Response:
     state: BridgeState = request.app[STATE_KEY]
+    with state.speech_session_lease():
+        return await _transcribe_admitted(request, state)
+
+
+async def _transcribe_admitted(
+    request: web.Request, state: BridgeState
+) -> web.Response:
     payload = await _read_json(request)
     metadata_value = payload.get("metadata", {})
     metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
@@ -434,20 +472,6 @@ async def _transcribe(request: web.Request) -> web.Response:
             f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
         )
 
-    thread_id = await state.start_thread(
-        payload,
-        base_instructions=(
-            "Act only as a speech recognition adapter. Never call tools, inspect "
-            "files, or answer the user's speech."
-        ),
-    )
-    session = RealtimeSession(
-        state.rpc,
-        thread_id,
-        peer=state.peer_factory(),
-        version=state.config.realtime_version,
-        timeout=state.config.transcript_timeout,
-    )
     language = payload.get("language", metadata.get("language"))
     language_hint = (
         f" The expected language is {language}."
@@ -461,38 +485,161 @@ async def _transcribe(request: web.Request) -> web.Response:
         if isinstance(prompt_value, str) and prompt_value
         else ""
     )
+    transcription_prompt = (
+        "Transcribe the user's speech accurately. Do not answer it and do not speak."
+        + language_hint
+        + vocabulary_hint
+    )
+    total_timeout = min(
+        state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
+    )
+    peak, rms = _normalized_pcm16_levels(pcm)
+    transcript: str | None = None
+    last_timeout: _TranscriptionAttemptTimeout | None = None
+    current_attempt = 0
     try:
-        total_timeout = min(
-            state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
-        )
         async with asyncio.timeout(total_timeout):
-            await session.start(
-                prompt=(
-                    "Transcribe the user's speech accurately. Do not answer it and do not speak."
-                    + language_hint
-                    + vocabulary_hint
-                ),
-                include_startup_context=False,
-                client_managed_handoffs=True,
-            )
-            session.feed_audio(pcm + silence_pcm16(state.config.silence_ms))
-            await session.wait_input_drained(timeout=max(10.0, duration + 10.0))
-            transcript = await _wait_for_user_transcript(
-                session, state.config.transcript_timeout
-            )
-    finally:
-        try:
-            await session.stop()
-        finally:
-            await _dispose_thread(state.rpc, thread_id)
+            for current_attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
+                try:
+                    transcript = await _run_transcription_attempt(
+                        state,
+                        payload,
+                        pcm,
+                        duration,
+                        transcription_prompt,
+                    )
+                    break
+                except _TranscriptionAttemptTimeout as err:
+                    last_timeout = err
+                    LOGGER.warning(
+                        "Realtime transcription attempt timed out: attempt=%d/%d "
+                        "stage=%s normalized_duration_seconds=%.3f "
+                        "normalized_peak=%.4f normalized_rms=%.4f",
+                        current_attempt,
+                        TRANSCRIPTION_MAX_ATTEMPTS,
+                        err.stage,
+                        duration,
+                        peak,
+                        rms,
+                    )
+    except _TranscriptionStartTimeout as err:
+        LOGGER.warning(
+            "Realtime transcription could not start: attempt=%d/%d stage=thread_start "
+            "normalized_duration_seconds=%.3f normalized_peak=%.4f "
+            "normalized_rms=%.4f",
+            current_attempt,
+            TRANSCRIPTION_MAX_ATTEMPTS,
+            duration,
+            peak,
+            rms,
+        )
+        raise TimeoutError from err
+    except TimeoutError:
+        LOGGER.warning(
+            "Realtime transcription reached its total deadline: attempt=%d/%d "
+            "normalized_duration_seconds=%.3f "
+            "normalized_peak=%.4f normalized_rms=%.4f",
+            current_attempt,
+            TRANSCRIPTION_MAX_ATTEMPTS,
+            duration,
+            peak,
+            rms,
+        )
+        raise
+    if transcript is None:
+        raise TimeoutError from last_timeout
     response: dict[str, Any] = {"text": transcript}
     if isinstance(language, str) and language:
         response["language"] = language
     return web.json_response(response)
 
 
+async def _run_transcription_attempt(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    pcm: bytes,
+    duration: float,
+    prompt: str,
+) -> str:
+    """Run one disposable realtime transcription attempt."""
+    try:
+        thread_id = await state.start_thread(
+            payload,
+            base_instructions=(
+                "Act only as a speech recognition adapter. Never call tools, inspect "
+                "files, or answer the user's speech."
+            ),
+        )
+    except TimeoutError as err:
+        # A timed-out start may still have created a remote thread, but no id was
+        # returned for safe cleanup. Do not compound that ambiguity with a retry.
+        raise _TranscriptionStartTimeout from err
+    session: RealtimeSession | None = None
+    timeout_stage = "handshake"
+    try:
+        session = RealtimeSession(
+            state.rpc,
+            thread_id,
+            peer=state.peer_factory(),
+            version=state.config.realtime_version,
+            timeout=min(
+                state.config.transcript_timeout,
+                TRANSCRIPTION_SESSION_TIMEOUT_SECONDS,
+            ),
+        )
+        await session.start(
+            prompt=prompt,
+            include_startup_context=False,
+            client_managed_handoffs=True,
+        )
+        timeout_stage = "input_drain"
+        session.feed_audio(pcm + silence_pcm16(state.config.silence_ms))
+        await session.wait_input_drained(timeout=max(10.0, duration + 10.0))
+        timeout_stage = "transcript"
+        return await _wait_for_user_transcript(
+            session,
+            min(
+                state.config.transcript_timeout,
+                TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
+            ),
+        )
+    except TimeoutError as err:
+        raise _TranscriptionAttemptTimeout(timeout_stage) from err
+    finally:
+        try:
+            if session is not None:
+                await session.stop()
+        finally:
+            await _dispose_thread(state.rpc, thread_id)
+
+
+def _normalized_pcm16_levels(pcm: bytes) -> tuple[float, float]:
+    """Return privacy-safe peak and RMS levels for little-endian PCM16 audio."""
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return 0.0, 0.0
+    peak = 0
+    square_sum = 0
+    for sample in samples:
+        magnitude = abs(sample)
+        peak = max(peak, magnitude)
+        square_sum += sample * sample
+    scale = 32_768.0
+    return peak / scale, math.sqrt(square_sum / len(samples)) / scale
+
+
 async def _synthesize(request: web.Request) -> web.Response:
     state: BridgeState = request.app[STATE_KEY]
+    with state.speech_session_lease():
+        return await _synthesize_admitted(request, state)
+
+
+async def _synthesize_admitted(
+    request: web.Request, state: BridgeState
+) -> web.Response:
     payload = await _read_json(request)
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -938,6 +1085,13 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
 
 async def _realtime(request: web.Request) -> web.WebSocketResponse:
     state: BridgeState = request.app[STATE_KEY]
+    with state.speech_session_lease():
+        return await _realtime_admitted(request, state)
+
+
+async def _realtime_admitted(
+    request: web.Request, state: BridgeState
+) -> web.WebSocketResponse:
     websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
     await websocket.prepare(request)
     session: RealtimeSession | None = None

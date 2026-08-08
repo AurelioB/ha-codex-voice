@@ -9,6 +9,10 @@ class BridgeError(Exception):
     """Base class for expected bridge failures."""
 
 
+class BridgeBusyError(BridgeError):
+    """Another bridge operation exclusively owns the realtime speech channel."""
+
+
 class ProtocolError(BridgeError):
     """The app-server or bridge peer violated the expected protocol."""
 

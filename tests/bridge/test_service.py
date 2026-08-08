@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import wave
 from collections.abc import Mapping
 from io import BytesIO
@@ -14,11 +15,32 @@ from aiohttp import WSMsgType, web
 
 from bridge import service as bridge_service
 from bridge.config import BridgeConfig
-from bridge.errors import AppServerExited, ProtocolError
+from bridge.errors import AppServerExited, BridgeBusyError, ProtocolError
 from bridge.runtime import IsolatedCodexRuntime
 from bridge.service import BridgeState, _codex_child_environment, create_app
 
 AUTH = {"Authorization": "Bearer test-token"}
+
+
+def _transcription_payload() -> dict[str, Any]:
+    return {
+        "audio": base64.b64encode(b"\x01\x00" * 160).decode(),
+        "format": "pcm",
+        "sample_rate": 24_000,
+        "channels": 1,
+    }
+
+
+def _synthesis_payload() -> dict[str, Any]:
+    return {"text": "Welcome home", "voice": "cove", "format": "wav"}
+
+
+async def _assert_busy(response: Any) -> None:
+    assert response.status == 409
+    assert await response.json() == {
+        "error": "another speech session is already active",
+        "code": "busy",
+    }
 
 
 class FakeSubscription:
@@ -74,7 +96,9 @@ class FakePeer:
             task.add_done_callback(self.tasks.discard)
 
     async def wait_input_drained(self, timeout: float | None = None) -> None:
-        return None
+        self.rpc.input_drain_started.set()
+        if self.rpc.input_drain_gate is not None:
+            await self.rpc.input_drain_gate.wait()
 
     async def recv_audio(self, timeout: float | None = None) -> bytes:
         if timeout is None:
@@ -128,6 +152,10 @@ class FakeRpc:
         self.turn_interrupt_error: Exception | None = None
         self.thread_delete_error: Exception | None = None
         self.turn_gate: asyncio.Event | None = None
+        self.input_drain_gate: asyncio.Event | None = None
+        self.input_drain_started = asyncio.Event()
+        self.synthesis_append_gate: asyncio.Event | None = None
+        self.synthesis_append_started = asyncio.Event()
         self.tasks: set[asyncio.Task[None]] = set()
 
     def peer_factory(self) -> FakePeer:
@@ -234,10 +262,14 @@ class FakeRpc:
                 }
             )
             return {}
-        if method == "thread/realtime/appendSpeech" or (
-            method == "thread/realtime/appendText"
-            and str(values.get("text", "")).startswith("Vocalize only")
-        ):
+        is_synthesis_append = method == "thread/realtime/appendText" and str(
+            values.get("text", "")
+        ).startswith("Vocalize only")
+        if method == "thread/realtime/appendSpeech" or is_synthesis_append:
+            if is_synthesis_append:
+                self.synthesis_append_started.set()
+                if self.synthesis_append_gate is not None:
+                    await self.synthesis_append_gate.wait()
             peer = self.peers[-1]
             peer.audio.put_nowait(b"\x01\x00" * 480)
             peer.data.put_nowait(json.dumps({"type": "turn.done"}))
@@ -411,6 +443,37 @@ async def test_thread_fails_closed_when_permission_profile_is_not_active(
         "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_speech_session_lease_releases_when_owner_is_cancelled(
+    fake_rpc: FakeRpc,
+) -> None:
+    """Cancellation cannot permanently strand the exclusive speech channel."""
+    state = BridgeState(BridgeConfig(bearer_token="test-token"), rpc=fake_rpc)
+    entered = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def hold_lease() -> None:
+        with state.speech_session_lease():
+            entered.set()
+            await blocked.wait()
+
+    owner = asyncio.create_task(hold_lease())
+    await entered.wait()
+    with (
+        pytest.raises(BridgeBusyError, match="already active"),
+        state.speech_session_lease(),
+    ):
+        pass
+
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    with state.speech_session_lease():
+        pass
+    await state.close()
 
 
 @pytest.mark.asyncio
@@ -1012,6 +1075,106 @@ async def test_missing_turn_completion_interrupts_and_retires_thread(
 
 
 @pytest.mark.asyncio
+async def test_active_transcription_rejects_synthesis_and_realtime_without_queueing(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    """STT owns the shared channel until cleanup and then permits a retry."""
+    fake_rpc.input_drain_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    active = asyncio.create_task(
+        client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload())
+    )
+    await asyncio.wait_for(fake_rpc.input_drain_started.wait(), timeout=1)
+
+    synthesis = await asyncio.wait_for(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload()),
+        timeout=1,
+    )
+    realtime = await asyncio.wait_for(
+        client.get("/v1/realtime", headers=AUTH), timeout=1
+    )
+    await _assert_busy(synthesis)
+    await _assert_busy(realtime)
+
+    fake_rpc.input_drain_gate.set()
+    transcription = await asyncio.wait_for(active, timeout=2)
+    assert transcription.status == 200
+    retry = await asyncio.wait_for(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload()),
+        timeout=2,
+    )
+    assert retry.status == 200
+
+
+@pytest.mark.asyncio
+async def test_active_synthesis_rejects_transcription_without_queueing(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    """TTS contention returns immediately and releases after successful cleanup."""
+    fake_rpc.synthesis_append_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    active = asyncio.create_task(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload())
+    )
+    await asyncio.wait_for(fake_rpc.synthesis_append_started.wait(), timeout=1)
+
+    transcription = await asyncio.wait_for(
+        client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload()),
+        timeout=1,
+    )
+    await _assert_busy(transcription)
+
+    fake_rpc.synthesis_append_gate.set()
+    synthesis = await asyncio.wait_for(active, timeout=2)
+    assert synthesis.status == 200
+    retry = await asyncio.wait_for(
+        client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload()),
+        timeout=2,
+    )
+    assert retry.status == 200
+
+
+@pytest.mark.asyncio
+async def test_active_realtime_rejects_all_speech_admissions_then_releases(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    """A websocket holds the shared channel only for its complete lifetime."""
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json({"type": "start", "conversation_id": "exclusive-live"})
+    assert (await websocket.receive_json())["type"] == "started"
+
+    transcription = await asyncio.wait_for(
+        client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload()),
+        timeout=1,
+    )
+    synthesis = await asyncio.wait_for(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload()),
+        timeout=1,
+    )
+    second_realtime = await asyncio.wait_for(
+        client.get("/v1/realtime", headers=AUTH), timeout=1
+    )
+    await _assert_busy(transcription)
+    await _assert_busy(synthesis)
+    await _assert_busy(second_realtime)
+
+    await websocket.send_json({"type": "stop"})
+    await websocket.close()
+    for _ in range(50):
+        if not bridge_app[bridge_service.STATE_KEY]._speech_session_active:
+            break
+        await asyncio.sleep(0)
+    assert not bridge_app[bridge_service.STATE_KEY]._speech_session_active
+
+    retry = await asyncio.wait_for(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload()),
+        timeout=2,
+    )
+    assert retry.status == 200
+
+
+@pytest.mark.asyncio
 async def test_transcribe_rejects_audio_beyond_endpoint_deadline(
     aiohttp_client: Any,
     bridge_app: web.Application,
@@ -1035,6 +1198,135 @@ async def test_transcribe_rejects_audio_beyond_endpoint_deadline(
     assert response.status == 400
     assert "must not exceed" in (await response.json())["error"]
     assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+    retry = await client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload())
+    assert retry.status == 200
+
+
+@pytest.mark.asyncio
+async def test_transcribe_timeout_logs_only_normalized_audio_diagnostics(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def timeout_transcript(*_: Any) -> str:
+        raise TimeoutError
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", timeout_transcript)
+    client = await aiohttp_client(bridge_app)
+    pcm = b"\x00\x40" * 240
+    with caplog.at_level(logging.WARNING, logger="bridge.service"):
+        response = await client.post(
+            "/v1/transcribe",
+            headers=AUTH,
+            json={
+                "audio": base64.b64encode(pcm).decode(),
+                "format": "pcm",
+                "sample_rate": 24_000,
+                "channels": 1,
+            },
+        )
+
+    assert response.status == 504
+    assert await response.json() == {"error": "Codex operation timed out"}
+    assert caplog.text.count("Realtime transcription attempt timed out") == 3
+    assert "stage=transcript normalized_duration_seconds=0.010" in caplog.text
+    assert "normalized_peak=0.5000 normalized_rms=0.5000" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transcribe_retries_after_terminal_event_timeout(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def flaky_transcript(*_: Any) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError
+        return "Recovered transcript"
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", flaky_transcript)
+    client = await aiohttp_client(bridge_app)
+    response = await client.post(
+        "/v1/transcribe", headers=AUTH, json=_transcription_payload()
+    )
+
+    assert response.status == 200
+    assert await response.json() == {"text": "Recovered transcript"}
+    assert attempts == 2
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+    assert [
+        method
+        for method, _ in fake_rpc.calls
+        if method in {"thread/start", "thread/delete"}
+    ] == ["thread/start", "thread/delete", "thread/start", "thread/delete"]
+
+
+@pytest.mark.asyncio
+async def test_transcribe_retries_after_input_drain_timeout(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_wait = bridge_service.RealtimeSession.wait_input_drained
+    attempts = 0
+
+    async def flaky_wait(session: Any, timeout: float | None = None) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError
+        await original_wait(session, timeout)
+
+    monkeypatch.setattr(
+        bridge_service.RealtimeSession, "wait_input_drained", flaky_wait
+    )
+    client = await aiohttp_client(bridge_app)
+    response = await client.post(
+        "/v1/transcribe", headers=AUTH, json=_transcription_payload()
+    )
+
+    assert response.status == 200
+    assert await response.json() == {"text": "Turn on the kitchen"}
+    assert attempts == 2
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_transcribe_does_not_retry_ambiguous_thread_start_timeout(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    state = bridge_app[bridge_service.STATE_KEY]
+    attempts = 0
+
+    async def timeout_start(*_: Any, **__: Any) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError
+
+    monkeypatch.setattr(state, "start_thread", timeout_start)
+    client = await aiohttp_client(bridge_app)
+    with caplog.at_level(logging.WARNING, logger="bridge.service"):
+        response = await client.post(
+            "/v1/transcribe", headers=AUTH, json=_transcription_payload()
+        )
+
+    assert response.status == 504
+    assert attempts == 1
+    assert "attempt=1/3 stage=thread_start" in caplog.text
+    assert "reached its total deadline" not in caplog.text
 
 
 @pytest.mark.asyncio
