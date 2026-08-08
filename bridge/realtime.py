@@ -135,7 +135,15 @@ class RealtimeSession:
             raise ProtocolError("realtime session has not started")
         self.peer.feed_audio(pcm)
 
-    async def wait_input_drained(self, timeout: float | None = None) -> None:
+    async def wait_input_drained(
+        self,
+        timeout: float | None = None,
+        *,
+        monitor_app_server_exit: bool = True,
+    ) -> None:
+        if not monitor_app_server_exit:
+            await self.peer.wait_input_drained(timeout)
+            return
         drain_task = asyncio.create_task(self.peer.wait_input_drained(timeout))
         exit_task = asyncio.create_task(self._watch_for_app_server_exit())
         try:

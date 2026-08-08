@@ -298,3 +298,32 @@ async def test_wait_input_drained_detects_exit_and_bounds_rebuffered_events() ->
         range(6, 70)
     )
     await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_unmonitored_input_drain_preserves_app_server_events() -> None:
+    rpc = SdpFirstRpc()
+    peer = BlockingDrainPeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    drain = asyncio.create_task(
+        session.wait_input_drained(monitor_app_server_exit=False)
+    )
+    await peer.drain_started.wait()
+    event = {
+        "method": "thread/realtime/transcript/delta",
+        "params": {
+            "threadId": "thread-1",
+            "role": "user",
+            "delta": "Turn on the lights.",
+        },
+    }
+    await rpc.subscription.events.put(event)
+
+    await asyncio.sleep(0)
+    assert rpc.subscription.events.qsize() == 1
+    assert not session._backlog
+
+    peer.release_drain.set()
+    await drain
+    assert await asyncio.wait_for(session.next_event(), timeout=0.2) == event
+    await session.stop()

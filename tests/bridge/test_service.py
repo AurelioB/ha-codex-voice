@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import wave
+from array import array
 from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
@@ -80,20 +81,24 @@ class FakePeer:
     def feed_audio(self, pcm: bytes) -> None:
         self.fed.extend(pcm)
         if self.thread_id is not None:
-            task = asyncio.create_task(
-                self.rpc.broadcast(
-                    {
-                        "method": "thread/realtime/transcript/done",
-                        "params": {
-                            "threadId": self.thread_id,
-                            "role": "user",
-                            "text": "Turn on the kitchen",
-                        },
-                    }
-                )
-            )
+            task = asyncio.create_task(self._broadcast_transcript())
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
+
+    async def _broadcast_transcript(self) -> None:
+        self.rpc.transcript_started.set()
+        if self.rpc.transcript_gate is not None:
+            await self.rpc.transcript_gate.wait()
+        await self.rpc.broadcast(
+            {
+                "method": "thread/realtime/transcript/done",
+                "params": {
+                    "threadId": self.thread_id,
+                    "role": "user",
+                    "text": "Turn on the kitchen",
+                },
+            }
+        )
 
     async def wait_input_drained(self, timeout: float | None = None) -> None:
         self.rpc.input_drain_started.set()
@@ -154,6 +159,8 @@ class FakeRpc:
         self.turn_gate: asyncio.Event | None = None
         self.input_drain_gate: asyncio.Event | None = None
         self.input_drain_started = asyncio.Event()
+        self.transcript_gate: asyncio.Event | None = None
+        self.transcript_started = asyncio.Event()
         self.synthesis_append_gate: asyncio.Event | None = None
         self.synthesis_append_started = asyncio.Event()
         self.tasks: set[asyncio.Task[None]] = set()
@@ -375,6 +382,36 @@ def test_codex_child_environment_excludes_credentials(
     assert "HA_CODEX_BRIDGE_TOKEN" not in environment
     assert "HASS_TOKEN" not in environment
     assert "GH_TOKEN" not in environment
+
+
+def test_adaptive_transcription_gain_lifts_quiet_audio_without_clipping() -> None:
+    samples = array("h", [26] * 999 + [1_000])
+    source = samples.tobytes()
+
+    amplified, gain = bridge_service._apply_transcription_gain(source)
+    peak, rms = bridge_service._normalized_pcm16_levels(amplified)
+
+    assert gain > 20
+    assert peak <= bridge_service.TRANSCRIPTION_TARGET_PEAK + 0.001
+    assert rms > bridge_service._normalized_pcm16_levels(source)[1]
+
+
+def test_adaptive_transcription_gain_leaves_healthy_audio_unchanged() -> None:
+    source = array("h", [16_384, -16_384] * 20).tobytes()
+
+    amplified, gain = bridge_service._apply_transcription_gain(source)
+
+    assert amplified == source
+    assert gain == 1.0
+
+
+def test_adaptive_transcription_gain_leaves_silence_unchanged() -> None:
+    source = b"\x00\x00" * 20
+
+    amplified, gain = bridge_service._apply_transcription_gain(source)
+
+    assert amplified == source
+    assert gain == 1.0
 
 
 def test_isolated_codex_runtime_links_only_secure_auth(
@@ -1079,12 +1116,12 @@ async def test_active_transcription_rejects_synthesis_and_realtime_without_queue
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
     """STT owns the shared channel until cleanup and then permits a retry."""
-    fake_rpc.input_drain_gate = asyncio.Event()
+    fake_rpc.transcript_gate = asyncio.Event()
     client = await aiohttp_client(bridge_app)
     active = asyncio.create_task(
         client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload())
     )
-    await asyncio.wait_for(fake_rpc.input_drain_started.wait(), timeout=1)
+    await asyncio.wait_for(fake_rpc.transcript_started.wait(), timeout=1)
 
     synthesis = await asyncio.wait_for(
         client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload()),
@@ -1096,7 +1133,7 @@ async def test_active_transcription_rejects_synthesis_and_realtime_without_queue
     await _assert_busy(synthesis)
     await _assert_busy(realtime)
 
-    fake_rpc.input_drain_gate.set()
+    fake_rpc.transcript_gate.set()
     transcription = await asyncio.wait_for(active, timeout=2)
     assert transcription.status == 200
     retry = await asyncio.wait_for(
@@ -1210,7 +1247,7 @@ async def test_transcribe_timeout_logs_only_normalized_audio_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    async def timeout_transcript(*_: Any) -> str:
+    async def timeout_transcript(*_: Any, **__: Any) -> str:
         raise TimeoutError
 
     monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", timeout_transcript)
@@ -1244,7 +1281,7 @@ async def test_transcribe_retries_after_terminal_event_timeout(
 ) -> None:
     attempts = 0
 
-    async def flaky_transcript(*_: Any) -> str:
+    async def flaky_transcript(*_: Any, **__: Any) -> str:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -1270,35 +1307,26 @@ async def test_transcribe_retries_after_terminal_event_timeout(
 
 
 @pytest.mark.asyncio
-async def test_transcribe_retries_after_input_drain_timeout(
+async def test_transcribe_does_not_wait_for_stalled_input_drain(
     aiohttp_client: Any,
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_wait = bridge_service.RealtimeSession.wait_input_drained
-    attempts = 0
-
-    async def flaky_wait(session: Any, timeout: float | None = None) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise TimeoutError
-        await original_wait(session, timeout)
-
-    monkeypatch.setattr(
-        bridge_service.RealtimeSession, "wait_input_drained", flaky_wait
-    )
+    fake_rpc.input_drain_gate = asyncio.Event()
+    fake_rpc.transcript_gate = asyncio.Event()
     client = await aiohttp_client(bridge_app)
-    response = await client.post(
-        "/v1/transcribe", headers=AUTH, json=_transcription_payload()
+    pending = asyncio.create_task(
+        client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload())
     )
+    await asyncio.wait_for(fake_rpc.input_drain_started.wait(), timeout=1)
+    fake_rpc.transcript_gate.set()
+    response = await asyncio.wait_for(pending, timeout=1)
 
     assert response.status == 200
     assert await response.json() == {"text": "Turn on the kitchen"}
-    assert attempts == 2
-    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
-    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+    assert not fake_rpc.input_drain_gate.is_set()
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 1
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1539,17 +1567,429 @@ async def test_transcription_uses_v3_data_channel_final() -> None:
         json.dumps(
             {
                 "type": "input_transcript.added",
-                "text": "The front door is locked.",
+                "item": {"type": "input_transcript", "text": "The front "},
             }
         )
     )
-    session.data.put_nowait(json.dumps({"type": "turn.done"}))
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {
+                    "role": "user",
+                    "transcript": "The front door is locked.",
+                },
+            }
+        )
+    )
 
     transcript = await asyncio.wait_for(
         bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
     )
 
     assert transcript == "The front door is locked."
+
+
+@pytest.mark.asyncio
+async def test_transcription_does_not_duplicate_normalized_and_raw_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.01)
+    session = FakeCollectorSession()
+    for fragment in ("Open ", "the blinds."):
+        session.events.put_nowait(
+            {
+                "method": "thread/realtime/transcript/delta",
+                "params": {"role": "user", "delta": fragment},
+            }
+        )
+        session.data.put_nowait(
+            json.dumps(
+                {
+                    "type": "input_transcript.added",
+                    "item": {"type": "input_transcript", "text": fragment},
+                }
+            )
+        )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Open the blinds."
+
+
+@pytest.mark.asyncio
+async def test_transcription_replaces_replayed_raw_fragment_by_item_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.01)
+    session = FakeCollectorSession()
+    for fragment in ("Turn", "Turn on the lights."):
+        session.events.put_nowait(
+            {
+                "method": "thread/realtime/transcript/delta",
+                "params": {"role": "user", "delta": fragment},
+            }
+        )
+        session.data.put_nowait(
+            json.dumps(
+                {
+                    "type": "input_transcript.added",
+                    "item": {
+                        "id": "provisional-item",
+                        "type": "input_transcript",
+                        "text": fragment,
+                    },
+                }
+            )
+        )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Turn on the lights."
+
+
+@pytest.mark.asyncio
+async def test_transcription_finalizes_nested_v3_fragments_after_quiet_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finite STT audio does not need a terminal event after transcript chunks."""
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.01)
+    session = FakeCollectorSession()
+    for item_id, fragment in (
+        ("fragment-1", "The front "),
+        ("fragment-2", "door is locked."),
+    ):
+        session.data.put_nowait(
+            json.dumps(
+                {
+                    "type": "input_transcript.added",
+                    "item": {
+                        "id": item_id,
+                        "type": "input_transcript",
+                        "text": fragment,
+                    },
+                }
+            )
+        )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "The front door is locked."
+
+
+@pytest.mark.asyncio
+async def test_transcription_waits_for_expected_audio_end_before_fragment_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.001)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "fragment-1",
+                    "type": "input_transcript",
+                    "text": "Open the curtains.",
+                },
+            }
+        )
+    )
+    loop = asyncio.get_running_loop()
+    expected_audio_end = loop.time() + 0.1
+    pending = asyncio.create_task(
+        bridge_service._wait_for_user_transcript(
+            session,
+            1.0,
+            fragment_finalization_at=expected_audio_end,
+        )
+    )
+
+    await asyncio.sleep(0.01)
+    assert not pending.done()
+    transcript = await asyncio.wait_for(pending, timeout=0.3)
+
+    assert transcript == "Open the curtains."
+    assert loop.time() >= expected_audio_end
+
+
+@pytest.mark.asyncio
+async def test_transcription_does_not_return_partial_fragment_at_earlier_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.001)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "fragment-1",
+                    "type": "input_transcript",
+                    "text": "Possibly partial",
+                },
+            }
+        )
+    )
+    expected_audio_end = asyncio.get_running_loop().time() + 0.2
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session,
+                0.02,
+                fragment_finalization_at=expected_audio_end,
+            ),
+            timeout=0.2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_transcription_finalizes_app_server_deltas_after_quiet_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.01)
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {"role": "user", "delta": "Turn on "},
+        }
+    )
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {"role": "user", "delta": "the kitchen."},
+        }
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Turn on the kitchen."
+
+
+@pytest.mark.asyncio
+async def test_transcription_uses_handoff_item_as_terminal_transcript() -> None:
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/itemAdded",
+            "params": {
+                "item": {
+                    "type": "handoff_request",
+                    "input_transcript": "Set the thermostat to twenty two.",
+                }
+            },
+        }
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Set the thermostat to twenty two."
+
+
+@pytest.mark.asyncio
+async def test_transcription_uses_latest_user_handoff_transcript_entry() -> None:
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/itemAdded",
+            "params": {
+                "item": {
+                    "type": "handoff_request",
+                    "input_transcript": "",
+                    "active_transcript": [
+                        {"role": "user", "text": "Earlier words"},
+                        {"role": "assistant", "text": "Assistant response"},
+                        {"role": "user", "text": "Close the garage door."},
+                    ],
+                }
+            },
+        }
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Close the garage door."
+
+
+@pytest.mark.asyncio
+async def test_transcription_uses_nested_v3_delegation_content() -> None:
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "delegation.created",
+                "item": {
+                    "type": "delegation",
+                    "target": "client",
+                    "content": [{"type": "input_text", "text": "Turn off the lights."}],
+                },
+            }
+        )
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Turn off the lights."
+
+
+@pytest.mark.asyncio
+async def test_transcription_ignores_assistant_data_channel_turn() -> None:
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "text": "Top-level assistant text must also be ignored.",
+                "turn": {
+                    "role": "assistant",
+                    "transcript": "This must not become user input.",
+                },
+            }
+        )
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(session, 0.02), timeout=0.2
+        )
+
+
+@pytest.mark.asyncio
+async def test_transcription_prefers_terminal_data_when_session_closes() -> None:
+    """A ready close event cannot mask a simultaneously ready final transcript."""
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {"method": "thread/realtime/closed", "params": {"reason": "completed"}}
+    )
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"role": "user", "transcript": "Lock the front door."},
+            }
+        )
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Lock the front door."
+
+
+@pytest.mark.asyncio
+async def test_transcription_drains_queued_fragments_after_session_close() -> None:
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {"method": "thread/realtime/closed", "params": {"reason": "completed"}}
+    )
+    for item_id, fragment in (
+        ("fragment-1", "Lock the "),
+        ("fragment-2", "front door."),
+    ):
+        session.data.put_nowait(
+            json.dumps(
+                {
+                    "type": "input_transcript.added",
+                    "item": {
+                        "id": item_id,
+                        "type": "input_transcript",
+                        "text": fragment,
+                    },
+                }
+            )
+        )
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"role": "user", "transcript": "Lock the front door."},
+            }
+        )
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Lock the front door."
+
+
+@pytest.mark.asyncio
+async def test_transcription_treats_empty_session_close_as_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.01)
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {"method": "thread/realtime/closed", "params": {"reason": "transport"}}
+    )
+
+    with pytest.raises(TimeoutError, match="closed before transcription"):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+        )
+
+
+@pytest.mark.asyncio
+async def test_transcription_ignores_non_object_data_events() -> None:
+    session = FakeCollectorSession()
+    session.data.put_nowait("[]")
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"role": "user", "transcript": "Open the front door."},
+            }
+        )
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Open the front door."
+
+
+@pytest.mark.asyncio
+async def test_transcription_ignores_non_string_delta() -> None:
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {"role": "user", "delta": None},
+        }
+    )
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"role": "user", "transcript": "Close the front door."},
+            }
+        )
+    )
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+    )
+
+    assert transcript == "Close the front door."
 
 
 @pytest.mark.asyncio

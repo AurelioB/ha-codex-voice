@@ -55,6 +55,10 @@ TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
 TRANSCRIPTION_MAX_ATTEMPTS = 3
 TRANSCRIPTION_SESSION_TIMEOUT_SECONDS = 20.0
 TRANSCRIPTION_RESULT_TIMEOUT_SECONDS = 15.0
+TRANSCRIPTION_FRAGMENT_QUIET_SECONDS = 2.0
+TRANSCRIPTION_TARGET_RMS = 0.05
+TRANSCRIPTION_TARGET_PEAK = 0.8
+TRANSCRIPTION_MAX_GAIN = 64.0
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
 
 
@@ -494,6 +498,7 @@ async def _transcribe_admitted(
         state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
     )
     peak, rms = _normalized_pcm16_levels(pcm)
+    pcm, adaptive_gain = _apply_transcription_gain(pcm, peak=peak, rms=rms)
     transcript: str | None = None
     last_timeout: _TranscriptionAttemptTimeout | None = None
     current_attempt = 0
@@ -514,36 +519,40 @@ async def _transcribe_admitted(
                     LOGGER.warning(
                         "Realtime transcription attempt timed out: attempt=%d/%d "
                         "stage=%s normalized_duration_seconds=%.3f "
-                        "normalized_peak=%.4f normalized_rms=%.4f",
+                        "normalized_peak=%.4f normalized_rms=%.4f "
+                        "adaptive_gain=%.2f",
                         current_attempt,
                         TRANSCRIPTION_MAX_ATTEMPTS,
                         err.stage,
                         duration,
                         peak,
                         rms,
+                        adaptive_gain,
                     )
     except _TranscriptionStartTimeout as err:
         LOGGER.warning(
             "Realtime transcription could not start: attempt=%d/%d stage=thread_start "
             "normalized_duration_seconds=%.3f normalized_peak=%.4f "
-            "normalized_rms=%.4f",
+            "normalized_rms=%.4f adaptive_gain=%.2f",
             current_attempt,
             TRANSCRIPTION_MAX_ATTEMPTS,
             duration,
             peak,
             rms,
+            adaptive_gain,
         )
         raise TimeoutError from err
     except TimeoutError:
         LOGGER.warning(
             "Realtime transcription reached its total deadline: attempt=%d/%d "
             "normalized_duration_seconds=%.3f "
-            "normalized_peak=%.4f normalized_rms=%.4f",
+            "normalized_peak=%.4f normalized_rms=%.4f adaptive_gain=%.2f",
             current_attempt,
             TRANSCRIPTION_MAX_ATTEMPTS,
             duration,
             peak,
             rms,
+            adaptive_gain,
         )
         raise
     if transcript is None:
@@ -593,16 +602,33 @@ async def _run_transcription_attempt(
             client_managed_handoffs=True,
         )
         timeout_stage = "input_drain"
-        session.feed_audio(pcm + silence_pcm16(state.config.silence_ms))
-        await session.wait_input_drained(timeout=max(10.0, duration + 10.0))
-        timeout_stage = "transcript"
-        return await _wait_for_user_transcript(
-            session,
-            min(
-                state.config.transcript_timeout,
-                TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
-            ),
+        trailing_silence = silence_pcm16(state.config.silence_ms)
+        feed_started = asyncio.get_running_loop().time()
+        session.feed_audio(pcm + trailing_silence)
+        feed_duration = duration + state.config.silence_ms / 1_000
+        drain_task = asyncio.create_task(
+            session.wait_input_drained(
+                timeout=max(10.0, duration + 10.0),
+                monitor_app_server_exit=False,
+            )
         )
+        timeout_stage = "transcript"
+        try:
+            # The remote recognizer can stop pulling the trailing silence once it
+            # has emitted a transcript, leaving the local track's drain marker
+            # unset. Transcript events are therefore the completion authority.
+            return await _wait_for_user_transcript(
+                session,
+                min(
+                    state.config.transcript_timeout,
+                    feed_duration + TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
+                ),
+                fragment_finalization_at=feed_started + feed_duration,
+            )
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
     except TimeoutError as err:
         raise _TranscriptionAttemptTimeout(timeout_stage) from err
     finally:
@@ -629,6 +655,33 @@ def _normalized_pcm16_levels(pcm: bytes) -> tuple[float, float]:
         square_sum += sample * sample
     scale = 32_768.0
     return peak / scale, math.sqrt(square_sum / len(samples)) / scale
+
+
+def _apply_transcription_gain(
+    pcm: bytes, *, peak: float | None = None, rms: float | None = None
+) -> tuple[bytes, float]:
+    """Lift unusually quiet finite utterances while preventing clipping."""
+    if peak is None or rms is None:
+        peak, rms = _normalized_pcm16_levels(pcm)
+    if not pcm or peak <= 0 or rms <= 0:
+        return pcm, 1.0
+    gain = min(
+        TRANSCRIPTION_MAX_GAIN,
+        TRANSCRIPTION_TARGET_PEAK / peak,
+        TRANSCRIPTION_TARGET_RMS / rms,
+    )
+    if gain <= 1.0:
+        return pcm, 1.0
+
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = max(-32_768, min(32_767, round(sample * gain)))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes(), gain
 
 
 async def _synthesize(request: web.Request) -> web.Response:
@@ -1296,24 +1349,68 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _wait_for_user_transcript(session: RealtimeSession, timeout: float) -> str:
+async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
+    session: RealtimeSession,
+    timeout: float,
+    *,
+    fragment_finalization_at: float | None = None,
+) -> str:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     deltas: list[str] = []
-    data_transcript = ""
+    data_deltas: OrderedDict[str, str] = OrderedDict()
+    last_fragment_at: float | None = None
+    realtime_closed_at: float | None = None
     event_task = asyncio.create_task(session.next_event())
     data_task = asyncio.create_task(session.recv_data_event())
     try:
         while True:
-            remaining = deadline - loop.time()
+            now = loop.time()
+            remaining = deadline - now
             if remaining <= 0:
                 raise TimeoutError
+            transcript = _assembled_transcript(deltas, list(data_deltas.values()))
+            if transcript and last_fragment_at is not None:
+                fragment_ready_at = last_fragment_at + (
+                    TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                )
+                if fragment_finalization_at is not None:
+                    fragment_ready_at = max(fragment_ready_at, fragment_finalization_at)
+                quiet_remaining = fragment_ready_at - now
+                if quiet_remaining <= 0:
+                    return transcript.strip()
+                remaining = min(remaining, quiet_remaining)
+            elif realtime_closed_at is not None:
+                close_remaining = TRANSCRIPTION_FRAGMENT_QUIET_SECONDS - (
+                    now - realtime_closed_at
+                )
+                if close_remaining <= 0:
+                    raise TimeoutError(
+                        "realtime session closed before transcription completed"
+                    )
+                remaining = min(remaining, close_remaining)
             done, _ = await asyncio.wait(
                 {event_task, data_task},
                 timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
+                now = loop.time()
+                transcript = _assembled_transcript(deltas, list(data_deltas.values()))
+                if transcript and last_fragment_at is not None:
+                    fragment_ready_at = last_fragment_at + (
+                        TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                    )
+                    if fragment_finalization_at is not None:
+                        fragment_ready_at = max(
+                            fragment_ready_at, fragment_finalization_at
+                        )
+                    if now >= fragment_ready_at:
+                        return transcript.strip()
+                if realtime_closed_at is not None:
+                    raise TimeoutError(
+                        "realtime session closed before transcription completed"
+                    )
                 raise TimeoutError
             if event_task in done:
                 event = event_task.result()
@@ -1337,19 +1434,28 @@ async def _wait_for_user_transcript(session: RealtimeSession, timeout: float) ->
                     "user",
                     "input",
                 }:
-                    deltas.append(str(params.get("delta", "")))
+                    fragment = params.get("delta")
+                    if isinstance(fragment, str) and fragment:
+                        deltas.append(fragment)
+                        last_fragment_at = loop.time()
                 if method == "thread/realtime/transcript/done" and role in {
                     "user",
                     "input",
                 }:
                     text = params.get("text")
-                    transcript = text if isinstance(text, str) else "".join(deltas)
+                    transcript = (
+                        text
+                        if isinstance(text, str) and text.strip()
+                        else "".join(deltas)
+                    )
                     if transcript.strip():
                         return transcript.strip()
+                if method == "thread/realtime/itemAdded":
+                    transcript = _realtime_item_user_transcript(params.get("item"))
+                    if transcript:
+                        return transcript
                 if method == "thread/realtime/closed":
-                    raise ProtocolError(
-                        "realtime session closed before transcription completed"
-                    )
+                    realtime_closed_at = loop.time()
                 event_task = asyncio.create_task(session.next_event())
             if data_task in done:
                 data_event = data_task.result()
@@ -1359,12 +1465,28 @@ async def _wait_for_user_transcript(session: RealtimeSession, timeout: float) ->
                     decoded_event = json.loads(data_event)
                 except (json.JSONDecodeError, TypeError):  # fmt: skip
                     decoded_event = {}
+                if not isinstance(decoded_event, Mapping):
+                    decoded_event = {}
                 event_type = decoded_event.get("type")
                 candidate = _data_channel_transcript(decoded_event)
-                if candidate:
-                    data_transcript = candidate
-                if event_type == "turn.done" and data_transcript:
-                    return data_transcript.strip()
+                if event_type == "input_transcript.added" and candidate:
+                    item = decoded_event.get("item")
+                    item_id = item.get("id") if isinstance(item, Mapping) else None
+                    fragment_id = (
+                        item_id
+                        if isinstance(item_id, str) and item_id
+                        else f"anonymous-{len(data_deltas)}"
+                    )
+                    data_deltas[fragment_id] = candidate
+                    last_fragment_at = loop.time()
+                elif candidate:
+                    return candidate
+                elif event_type == "turn.done":
+                    transcript = _assembled_transcript(
+                        deltas, list(data_deltas.values())
+                    )
+                    if transcript:
+                        return transcript
                 data_task = asyncio.create_task(session.recv_data_event())
     finally:
         event_task.cancel()
@@ -1376,26 +1498,90 @@ def _data_channel_transcript(event: Mapping[str, Any]) -> str:
     """Extract a user transcript from known realtime v3 data events."""
     event_type = event.get("type")
     if event_type == "input_transcript.added":
-        value = event.get("text")
-        return value.strip() if isinstance(value, str) else ""
+        item = event.get("item")
+        value = (
+            item.get("text")
+            if isinstance(item, Mapping) and item.get("type") == "input_transcript"
+            else event.get("text")
+        )
+        return value if isinstance(value, str) and value.strip() else ""
     if event_type == "delegation.created":
         value = event.get("input_transcript")
-        return value.strip() if isinstance(value, str) else ""
-    if event_type != "turn.done":
-        return ""
-    for value in (
-        event.get("input_transcript"),
-        event.get("transcript"),
-        event.get("text"),
-    ):
         if isinstance(value, str) and value.strip():
             return value.strip()
+        item = event.get("item")
+        if isinstance(item, Mapping) and item.get("type") == "delegation":
+            content = item.get("content")
+            if isinstance(content, list):
+                transcript = "".join(
+                    part["text"]
+                    for part in content
+                    if isinstance(part, Mapping)
+                    and part.get("type") == "input_text"
+                    and isinstance(part.get("text"), str)
+                ).strip()
+                if transcript:
+                    return transcript
+        return ""
+    if event_type != "turn.done":
+        return ""
     turn = event.get("turn")
+    event_role = str(event.get("role", "")).lower()
+    turn_role = str(turn.get("role", "")).lower() if isinstance(turn, Mapping) else ""
+    role = turn_role or event_role
+    if role and role not in {"user", "input"}:
+        return ""
+    value = event.get("input_transcript")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if role in {"user", "input"}:
+        for key in ("transcript", "text"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     if isinstance(turn, Mapping):
-        for key in ("input_transcript", "transcript", "text"):
+        for key in ("input_transcript",):
             value = turn.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        if role in {"user", "input"}:
+            for key in ("transcript", "text"):
+                value = turn.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _assembled_transcript(*fragment_groups: list[str]) -> str:
+    """Reconcile normalized deltas with identity-preserving raw fragments."""
+    normalized = "".join(fragment_groups[0]).strip() if fragment_groups else ""
+    raw = "".join(fragment_groups[1]).strip() if len(fragment_groups) > 1 else ""
+    if not raw:
+        return normalized
+    if not normalized or raw.startswith(normalized):
+        return raw
+    if normalized.startswith(raw):
+        return normalized
+    return raw
+
+
+def _realtime_item_user_transcript(value: object) -> str:
+    """Return the complete user transcript from a v3 handoff item."""
+    if not isinstance(value, Mapping) or value.get("type") != "handoff_request":
+        return ""
+    transcript = value.get("input_transcript")
+    if isinstance(transcript, str) and transcript.strip():
+        return transcript.strip()
+    active = value.get("active_transcript")
+    if isinstance(active, list):
+        for entry in reversed(active):
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("role", "")).lower() not in {"user", "input"}:
+                continue
+            text = entry.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
     return ""
 
 
