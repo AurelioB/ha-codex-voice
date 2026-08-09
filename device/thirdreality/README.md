@@ -1,29 +1,39 @@
 # ThirdReality v1.1.7 wake-latency overlay
 
-The Python-based ThirdReality `1.01.07`/upstream `v1.1.7` client waits for the
-wake confirmation cue to finish before it asks Home Assistant to prepare the
-Assist pipeline. On the measured device that leaves a 0.399592-second local
-setup gap after wake detection, even with the shortened cue.
+The Python-based ThirdReality `1.01.07`/upstream `v1.1.7` client starts the wake
+confirmation cue but waits for cue EOF before it asks Home Assistant to prepare
+the Assist pipeline. After starting that asynchronous cue, its ThirdReality
+wrapper performs a synchronous LED DBus call on the microphone thread with a
+two-second timeout. In three 2026-08-09 human baselines, Home Assistant VAD
+began 1.37, 2.46, and 3.27 seconds after pipeline start. Those end-to-end values
+include the combined device and Home Assistant path; they do not isolate the
+LED call by itself.
 
 [`latency_sitecustomize/sitecustomize.py`](latency_sitecustomize/sitecustomize.py)
-sends the pipeline start request immediately after wake detection, then keeps
-microphone forwarding disabled until the cue reaches EOF. This overlaps Home
-Assistant setup without sending the device's own cue into STT on hardware
-without active acoustic echo cancellation.
+uses an LED-only acknowledgement on this hardware without active acoustic echo
+cancellation. On the pinned single microphone thread, it pre-arms forwarding,
+queues the pipeline start request, and ducks music without playing the local
+wake cue; no microphone frame can be handled until those calls return. The
+ThirdReality LED command is queued on one daemon worker, so the DBus subprocess
+can no longer block microphone capture. Commands are serialized and bounded by
+the vendor's two-second timeout. If the bounded queue fills, stale pending
+animations are coalesced into the newest state; timed-out children are reaped.
+Both the vendor base class and the pinned ThirdReality subclass are patched
+directly. This prevents a later base-method rebinding during device startup from
+restoring the cue gate while retaining the guarded LED behavior.
 
-The EOF callback carries a per-wake generation token and checks the current
-pipeline, connection, and mute state. A callback from a cancelled, disconnected,
-ended, or replaced wake cannot re-enable microphone streaming. The override is
-applied only when SHA-256 hashes of both installed vendor code objects match the
-tested build. A mismatch logs a warning and leaves all vendor behavior intact.
+The override is applied atomically only when SHA-256 hashes of all four
+installed vendor code objects match the tested build: the base wake and cue-EOF
+methods plus the ThirdReality wake wrapper and LED helper. A mismatch logs a
+warning and leaves both vendor modules intact.
 
-Wake setup is transactional: a send, duck, player, mute, or disconnect failure
-rolls local pipeline and streaming flags back to idle and best-effort cancels a
-start request that already reached Home Assistant. A two-second watchdog also
-aborts the run if mpv never reports cue EOF (for example, because another sound
-replaced playback), so later wake words cannot remain blocked behind a phantom
-active pipeline. Microphone forwarding is explicitly disabled before every
-start request.
+Wake setup is transactional: a send or duck failure rolls local pipeline and
+streaming flags back to idle and best-effort queues a cancellation if a start
+request was attempted. Pre-arming occurs on the same microphone thread that
+forwards audio, so it cannot leak a frame before wake setup returns. The overlay
+rechecks the armed state after both external calls, and never sets it again;
+pinned VAD/STT-end, mute, disconnect, and run-end teardown therefore wins any
+startup race.
 
 The overlay does not replace vendor modules, change Home Assistant, modify the
 wake audio file, reboot the speaker, or enable/disable USB or TCP ADB.
@@ -42,9 +52,23 @@ Copy the file to a dedicated device directory such as
 `PYTHONDONTWRITEBYTECODE=1` on the same launch line: this prevents a permissive
 device umask from creating a group/world-writable `__pycache__` beneath a
 root-process import path. Back up the exact init script before changing its
-launch line and restart only the `voice-assistant` service. Verify the process
-command, source ownership/mode/hash, absence of `__pycache__` in the import
-directory, and TCP ADB connection after restart.
+launch line.
+
+The v1.1.7 unified init script keeps its supervision functions in a long-lived
+shell. Editing the script does not update the function already held by that
+monitor: a voice-only restart can briefly launch the overlay and then be
+replaced by the stale monitor without `PYTHONPATH`. Refresh the unified monitor
+once through the device's normal service manager (or reboot during an approved
+maintenance window), then start the voice child from the updated definition.
+When invoking the service manager through ADB, ensure its background monitor is
+detached from the controlling shell rather than relying on a short-lived remote
+shell job.
+
+Verify the *long-lived* process PID after at least one monitor interval, its
+`PYTHONPATH`/`PYTHONDONTWRITEBYTECODE` environment, source ownership/mode/hash,
+absence of `__pycache__` in the import directory, and TCP ADB connection. A
+physical wake must also show no `wake_word_triggered_old.wav` playback. Merely
+importing `sitecustomize` in a separate probe process is not acceptance.
 
 Python imports `sitecustomize` during process startup. The script validates all
 compatibility guards before mutating the vendor class. An import failure or
@@ -53,14 +77,16 @@ the original wake implementation remains installed.
 
 ## Acceptance and rollback
 
-The repository test covers normal cue completion, Home Assistant run end,
-manual cancellation, disconnect and mute races, setup exceptions, a replaced
-wake, missing EOF/watchdog cancellation, request ordering, and the
-unknown-bytecode fail-closed path. On the physical device, additionally test
-immediate and delayed commands, short and long speech, mute during the cue,
-reconnects, continued conversation, timers, and repeated wakes. Reject the
-overlay if it clips initial phonemes, forwards cue audio, leaks microphone audio
-after cancellation, fails to return to idle, or destabilizes wake detection.
+The repository test covers immediate request/duck/stream ordering, the first
+post-wake microphone frame, VAD/run-end/disconnect/mute flag races during setup,
+startup guards and exceptions, timer interruption, serialized non-blocking LED
+execution, newest-state overload coalescing, DBus timeout/nonzero handling,
+explicit worker shutdown, and the atomic unknown-bytecode fail-closed path.
+On the physical device, additionally test immediate and delayed commands, short
+and long speech, reconnects, continued conversation, timers, and repeated
+wakes. Reject the overlay if it clips initial phonemes, plays or forwards cue
+audio, leaks microphone audio after cancellation, fails to return to idle,
+leaves stale LED state during repeated wakes, or destabilizes wake detection.
 
 Rollback consists of removing the process-specific `PYTHONPATH` assignment and
 restarting only `voice-assistant`; the untouched vendor bytecode then supplies

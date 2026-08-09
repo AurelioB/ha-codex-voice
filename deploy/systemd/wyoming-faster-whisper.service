@@ -1,0 +1,56 @@
+[Unit]
+Description=Local Wyoming faster-whisper service for Home Assistant Assist
+Documentation=https://github.com/OHF-Voice/wyoming-faster-whisper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=HA_CODEX_STT_URI=tcp://127.0.0.1:10300
+Environment=HA_CODEX_STT_MODEL=%h/.local/share/ha-codex-voice/models/faster-whisper-base
+Environment=HA_CODEX_STT_THREADS=4
+EnvironmentFile=-%h/.config/ha-codex-voice/local-stt.env
+ExecStart=%h/.local/share/ha-codex-voice/wyoming-stt-venv/bin/python \
+  %h/.local/share/ha-codex-voice/wyoming-stt-runner.py \
+  --uri ${HA_CODEX_STT_URI} \
+  --model ${HA_CODEX_STT_MODEL} \
+  --data-dir %h/.local/share/ha-codex-voice/models \
+  --download-dir %h/.local/share/ha-codex-voice/models \
+  --device cpu \
+  --compute-type int8 \
+  --beam-size 1 \
+  --cpu-threads ${HA_CODEX_STT_THREADS} \
+  --vad-filter \
+  --stt-library faster-whisper \
+  --local-files-only
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/share/ha-codex-voice
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=default.target

@@ -1,10 +1,11 @@
 # Performance and ThirdReality tuning
 
-Codex Voice removes avoidable local waits, but most turn latency still comes
-from an experimental remote realtime session. Treat the figures below as
-diagnostic reference points, not service-level guarantees. Network path,
-ChatGPT load and quota, Codex CLI version, Home Assistant pipeline choices,
-utterance length, and media-player buffering all affect a turn.
+The production pipeline uses local Wyoming faster-whisper for STT. Remaining
+remote latency comes from the ChatGPT-backed Conversation and experimental TTS
+stages. Treat the figures below as diagnostic reference points, not
+service-level guarantees. CPU load, network path, ChatGPT load and quota, Codex
+CLI version, Home Assistant pipeline choices, utterance length, and
+media-player buffering all affect a turn.
 
 ## What is optimized
 
@@ -16,38 +17,93 @@ wake cue -> capture -> STT -> Conversation -> TTS -> speaker playback
 
 Several enabled optimizations shorten different parts of that path:
 
-1. Streaming STT sends microphone frames to the bridge while Home Assistant is
-   still capturing. The bridge starts the Codex thread and WebRTC handshake as
-   soon as it receives the stream's start frame. After bounded calibration on
-   sustained speech, it feeds normalized audio while capture continues. Quiet
-   or ambiguous audio stays buffered until EOF, and a complete raw copy remains
-   available for a fresh normalized retry.
+1. Home Assistant streams 16 kHz PCM to its native Wyoming integration. A
+   persistent faster-whisper `base` model performs finite STT locally without
+   a remote handshake, subscription speech lease, or same-path retry.
 2. Streaming TTS returns an EOF-terminated PCM16 WAV stream as realtime speech
    frames arrive. Home Assistant can begin serving audio without waiting for
    the complete rendered response and remote cleanup.
-3. Speech peers use an explicit empty ICE-server list for this local
-   subscription-backed path, avoiding the default public STUN probe. Voice
-   newly created Conversation profiles default to low reasoning effort and App
-   Server's `priority` service tier to favor response latency. Existing
+3. Speech peers use an explicit empty ICE-server list for the
+   subscription-backed TTS/realtime path, avoiding the default public STUN
+   probe. Newly created Conversation profiles default to low reasoning effort
+   and App Server's `priority` service tier to favor response latency. Existing
    profiles preserve standard usage until reconfigured, and users can select
    `standard` to reduce subscription usage.
 
-Automatic STT-to-TTS session reuse is not enabled. Live validation found that
-the realtime v3 session can start genuine assistant output before the user
-transcript completes, and the supported tagged Frameless Bidi outbound protocol
-does not define a response-cancel message.
+Automatic experimental Codex STT-to-TTS session reuse is not enabled. Live
+validation found that the realtime v3 session can start genuine assistant
+output before the user transcript completes, and the supported tagged
+Frameless Bidi outbound protocol does not define a response-cancel message.
 
 These paths preserve the finite Home Assistant provider contracts. They do not
 turn the standard Assist pipeline into a full-duplex or barge-in session.
 
-## Live measurements
+## Local STT measurement
 
-All figures in this section are **live measurements from 2026-08-08**, not
-simulated test results. Physical pipeline measurements used one ThirdReality
-3RSPK whose Home Assistant firmware display reported `1.01.07`; the direct
-bridge/session probes use narrower timing boundaries and are labeled
-separately. Sample sizes are deliberately shown because these small probes are
-not population benchmarks.
+On 2026-08-09, the official Wyoming faster-whisper 3.5.0 server used the
+multilingual `base` model with CPU `int8`, beam size 1, eight CPU threads, and
+VAD filtering on the measured i5-13600K host. Three warm requests for the same
+non-sensitive 16 kHz reference WAV returned the expected transcript in 0.775,
+0.617, and 0.599 seconds. The model remained resident between requests.
+
+This narrow test excludes microphone capture and later Conversation/TTS stages.
+It establishes that repeated finite local recognition is both working and far
+below the prior remote failure tail; it is not a p95 latency claim.
+
+### Physical local-STT canary
+
+After the production pipeline switch, a 2026-08-09 self-acoustic canary
+exercised the ThirdReality speaker, microphone, wake detector, Home Assistant
+VAD, local Wyoming STT, Codex Conversation/TTS, and response playback. The
+successful run had these event boundaries:
+
+| Interval from pipeline start | Time |
+|---|---:|
+| VAD start | 1.710 s |
+| VAD end | 4.147 s |
+| STT end | 4.644 s |
+| Intent/TTS result ready | 7.703 s |
+
+Local recognition after VAD end took **0.497 s**. The transcript contained all
+25 expected characters, the response played, and the satellite returned to
+idle. The device log for that run contained no wake-confirmation WAV playback,
+and the Wyoming journal contained only numeric duration/VAD messages—not the
+transcript. This is one controlled physical path check, not a latency guarantee.
+
+## Historical remote-adapter measurements
+
+Unless another date is shown, figures in this section are **live measurements
+from 2026-08-08** of the experimental Codex STT adapter, not simulated test
+results. They explain why local Wyoming replaced it as the production STT
+boundary. Physical pipeline measurements used one ThirdReality 3RSPK whose
+Home Assistant firmware display reported `1.01.07`; the direct bridge/session
+probes use narrower timing boundaries and are labeled separately. Sample sizes
+are deliberately shown because these small probes are not population
+benchmarks.
+
+### Confirmed missing-transcript boundary
+
+A physical 2026-08-09 run reached Home Assistant capture, VAD end, bridge
+normalization, and successful WebRTC signaling. The first remote attempt spent
+9.698 seconds and the fresh same-path retry spent 9.687 seconds; neither
+received an accepted user-transcript event. The stream returned an error after
+19.386 seconds total. The retry used the complete normalized utterance at a
+higher bounded gain, so additional gain, silence, or device wake tuning was not
+an evidence-backed fix.
+
+An isolated Codex 0.147.0 canary also missed one of four requests for a clean
+known WAV while the other three succeeded. That small sample does not estimate
+a failure rate, but it proves the failure is not exclusive to the physical
+ThirdReality microphone. The public pipeline therefore does not describe the
+second session as a fallback and does not select this adapter for production
+STT.
+
+Developers can repeat that opt-in protocol check with a non-sensitive PCM16
+WAV. The command prints the transcript and consumes ChatGPT subscription quota:
+
+```bash
+uv run --extra bridge python scripts/probe_transcription.py sample.wav
+```
 
 ### Physical pipeline reference
 
@@ -90,25 +146,40 @@ audio traversed the device's physical output/input path, but it is still a
 controlled self-acoustic test rather than a substitute for near-, normal-, and
 far-field human trials in the deployment room.
 
-### Wake-pipeline overlap overlay
+### Immediate wake and non-blocking LED overlay
 
-The pinned v1.1.7 Python client normally waits for the confirmation cue to end
-before it asks Home Assistant to start Assist. The reversible device overlay
-instead sends that request immediately after wake detection, allowing Home
-Assistant to prepare the pipeline during the measured 0.399592 s shortened
-cue. It deliberately leaves microphone forwarding disabled until the cue's EOF
-callback, so the device does not send its own confirmation sound as speech on
-hardware without active acoustic echo cancellation.
+The pinned v1.1.7 Python client normally starts the confirmation cue and waits
+for cue EOF before it asks Home Assistant to start Assist. After starting that
+asynchronous cue, its ThirdReality wrapper calls the LED DBus helper
+synchronously on the microphone thread with a two-second timeout. Three
+successful human baselines captured on 2026-08-09 reached Home Assistant VAD
+1.37, 2.46, and 3.27 seconds after pipeline start. Those end-to-end figures
+include the combined device and Home Assistant path; they show the user-visible
+variable delay but do not isolate the LED call.
 
-The override is guarded by SHA-256 hashes of both installed vendor code objects
-and skips itself if either changes. An isolated player test verified request
-ordering and that no microphone audio is forwarded before cue EOF. Transactional
-rollback and a two-second missing-EOF watchdog prevent mute, disconnect, player
-replacement, or setup failure from leaving a phantom active pipeline that
-blocks later wakes. A single low-volume acoustic comparison was inconclusive
-because wake-detection jitter was larger than this sub-second boundary; the
-optimization therefore has no claimed fixed end-to-end saving. See the device
-overlay README for deployment and rollback checks.
+The reversible device overlay uses an LED-only acknowledgement on this hardware
+without active acoustic echo cancellation. It sends the Home Assistant start
+request and music duck while pre-arming microphone forwarding on the same
+pinned microphone thread, without playing the local cue. Forwarding cannot
+actually handle a frame until wake setup returns. It also serializes LED DBus
+commands on a separate daemon worker. The vendor's two-second command timeout
+remains, but it cannot hold the microphone processing thread; timed-out children
+are reaped, and an overloaded pending queue coalesces toward the newest state.
+
+The pinned ThirdReality subclass is patched directly in addition to the base
+class. Live diagnosis found that a voice-only restart could be replaced by a
+long-running vendor monitor whose shell still held the pre-edit launch function,
+silently restoring a process without the overlay environment. Deployment must
+refresh that monitor once after changing its init script and then verify the
+actual long-lived voice process environment; checking only the file on disk or a
+short-lived test process is insufficient.
+
+The override is guarded atomically by SHA-256 hashes of four installed vendor
+code objects spanning both base and ThirdReality modules. Tests verify
+request/duck/stream ordering, first-frame forwarding, transactional rollback,
+ordered non-blocking LED work, newest-state overload handling, explicit worker
+shutdown, and the fail-closed path. See the device overlay README for deployment
+and rollback checks.
 
 ### Streaming TTS probe
 
@@ -327,17 +398,22 @@ These settings affect device and Home Assistant satellite behavior, not the
 bridge. Change one variable at a time, keep the original value, and repeat a
 fixed phrase set before accepting it.
 
-### Short wake cue
+### Wake acknowledgement
 
-Firmware `1.01.07` waits for the entire wake confirmation file to finish before
+Firmware `1.01.07` normally waits for the entire wake confirmation file before
 it begins forwarding microphone audio. The measured stock cue was 0.946979 s;
-a patched older cue was 0.399592 s, removing about 0.547 s from this gate.
+an older patched cue was 0.399592 s. Because the measured v1.1.7 device has no
+active acoustic echo cancellation, safely listening during either audible cue
+is not possible: the microphone would also receive the device's own
+acknowledgement.
 
-Replacing the cue is a firmware modification. Back up the original asset and
-full recoverable firmware first. Keep an audible confirmation, preserve the
-audio format expected by the player, and test immediate and delayed speech at
-several distances. Reject the change if initial phonemes disappear, the cue is
-not reliably audible, playback blocks, or wake cycles become unstable.
+The pinned overlay therefore skips audible-cue playback and uses the listening
+LED as best-effort visual acknowledgement. This avoids both self-audio and the
+cue gate. Test users must speak immediately after the wake phrase rather than
+wait for a sound or for the LED; visual feedback is deliberately off the
+microphone path and may lag a serialized DBus backlog. Roll back the overlay if
+an audible confirmation is a hard requirement; do not forward a
+cue-contaminated pre-roll into STT.
 
 ### Finished speaking detection
 

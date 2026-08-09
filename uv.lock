@@ -1101,7 +1101,7 @@ wheels = [
 
 [[package]]
 name = "ha-codex-voice-development"
-version = "0.1.10"
+version = "0.2.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1127,6 +1127,7 @@ test = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "pytest-homeassistant-custom-component" },
+    { name = "wyoming" },
 ]
 
 [package.metadata]
@@ -1148,6 +1149,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "pytest-homeassistant-custom-component", marker = "extra == 'test'", specifier = ">=0.13.300" },
     { name = "ruff", marker = "extra == 'lint'", specifier = ">=0.12" },
+    { name = "wyoming", marker = "extra == 'test'", specifier = "==1.10.0" },
 ]
 provides-extras = ["bridge", "test", "lint"]
 
@@ -3017,6 +3019,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/55/70/2869ea2112c565caace73c9301afd1d7afcc49bdd37fac058f0178ba95d4/winrt_windows_storage_streams-3.2.1-cp314-cp314-win32.whl", hash = "sha256:5cd0dbad86fcc860366f6515fce97177b7eaa7069da261057be4813819ba37ee", size = 131701, upload-time = "2025-09-20T07:17:16.849Z" },
     { url = "https://files.pythonhosted.org/packages/f4/3d/aae50b1d0e37b5a61055759aedd42c6c99d7c17ab8c3e568ab33c0288938/winrt_windows_storage_streams-3.2.1-cp314-cp314-win_amd64.whl", hash = "sha256:3c5bf41d725369b9986e6d64bad7079372b95c329897d684f955d7028c7f27a0", size = 135566, upload-time = "2025-09-20T07:17:17.69Z" },
     { url = "https://files.pythonhosted.org/packages/bb/c3/6d3ce7a58e6c828e0795c9db8790d0593dd7fdf296e513c999150deb98d4/winrt_windows_storage_streams-3.2.1-cp314-cp314-win_arm64.whl", hash = "sha256:293e09825559d0929bbe5de01e1e115f7a6283d8996ab55652e5af365f032987", size = 134393, upload-time = "2025-09-20T07:17:18.802Z" },
+]
+
+[[package]]
+name = "wyoming"
+version = "1.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/ae/f676bf8c5cda90283978e7569c96df0b96295c68b1e1b65e3249a67996a7/wyoming-1.10.0.tar.gz", hash = "sha256:50f2aa61d95131a379482d096975a822d61a5d7d2bad1b74d05b38fce9ce2d05", size = 41871, upload-time = "2026-07-02T20:59:58.897Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/50/c9/0b9b2eca91e240bb3390472306fb8e2aa45d491dd5a2de1bc765e041177c/wyoming-1.10.0-py3-none-any.whl", hash = "sha256:83b23ab9fb7e0a9ad92387e62497728949603b97a25f4e61706c222d2b2c63d1", size = 42277, upload-time = "2026-07-02T20:59:57.6Z" },
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-codex-voice-development"
-version = "0.1.10"
+version = "0.2.0"
 description = "Development tooling for the Codex Voice Home Assistant integration"
 requires-python = ">=3.14.2"
 dependencies = []
@@ -28,6 +28,7 @@ test = [
   "pytest-asyncio>=1.2",
   "pytest-cov>=7.0",
   "pytest-homeassistant-custom-component>=0.13.300",
+  "wyoming==1.10.0",
 ]
 lint = [
   "mypy>=1.17",
@@ -153,6 +154,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"deploy/systemd/*.py" = ["INP001"]
 "bridge/**/*.py" = ["D100", "D101", "D102", "D103", "D105", "D107"]
 "scripts/**/*.py" = ["D102", "D107", "T201"]
 "tests/bridge/**/*.py" = [

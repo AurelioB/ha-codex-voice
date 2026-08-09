@@ -79,7 +79,14 @@ _CONNECTION_SCHEMA = vol.Schema(
 
 
 def _default_subentries() -> list[ConfigSubentryData]:
-    """Return the three default Assist provider subentries."""
+    """Return the stable default Assist provider subentries.
+
+    Home Assistant composes STT, Conversation, and TTS providers independently.
+    Codex realtime input transcription is not a deterministic STT API, so new
+    installations use a native Wyoming/Whisper entity for that pipeline stage.
+    The experimental STT subentry remains available for existing users and
+    explicit diagnostics.
+    """
     return [
         {
             "subentry_type": SUBENTRY_TYPE_CONVERSATION,
@@ -92,12 +99,6 @@ def _default_subentries() -> list[ConfigSubentryData]:
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
             },
-        },
-        {
-            "subentry_type": SUBENTRY_TYPE_STT,
-            "title": DEFAULT_STT_NAME,
-            "unique_id": None,
-            "data": {},
         },
         {
             "subentry_type": SUBENTRY_TYPE_TTS,

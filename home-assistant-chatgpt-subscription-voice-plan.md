@@ -2,15 +2,39 @@
 
 ## Decision
 
+> [!IMPORTANT]
+> **Validated architecture update (2026-08-09):** the Phase 0 feasibility gate
+> failed for deterministic subscription-backed STT. Codex OAuth WebRTC can
+> accept a complete utterance without emitting an input transcript, and the
+> available alternate transcription transport requires a separately billed API
+> key. The production milestone now uses Home Assistant's native Wyoming
+> integration with local faster-whisper for STT. Codex Voice continues to own
+> ChatGPT OAuth Conversation and experimental TTS/realtime. The old Codex STT
+> entity is retained only as an explicit diagnostic compatibility adapter.
+
 Build this as a hybrid Home Assistant custom integration plus a local companion add-on:
 
-- The custom integration exposes standard Home Assistant Conversation, STT, and TTS entities.
+- The custom integration exposes standard Home Assistant Conversation and TTS
+  entities plus an explicitly experimental Codex STT diagnostic entity.
+- The production Assist pipeline selects a local Wyoming faster-whisper STT
+  entity, which Home Assistant composes independently with Codex Conversation
+  and TTS.
 - The add-on runs a pinned `codex app-server` process, owns its JSON-RPC connection, and terminates the WebRTC media session used by subscription-backed voice.
 - Codex owns the ChatGPT browser/device-code OAuth flow, token persistence, and refresh.
-- All model traffic in subscription mode goes through the ChatGPT-authenticated Codex process. The integration never treats the OAuth token as a general OpenAI API key and never calls private ChatGPT endpoints itself.
+- All Codex model traffic goes through the ChatGPT-authenticated Codex process.
+  Local Whisper STT does not use ChatGPT or OpenAI Platform quota. The
+  integration never treats the OAuth token as a general OpenAI API key and
+  never calls private ChatGPT endpoints itself.
 - There is no silent fallback to a separately billed Platform API key.
 
-This is technically viable as an **experimental local Codex client**. ChatGPT sign-in for subscription access is an officially documented Codex authentication mode, and App Server exposes managed browser and device-code login. The STT/TTS compatibility layer relies on the experimental `thread/realtime/*` WebRTC surface, so the Codex version, generated protocol schema, and media behavior must be pinned and tested. See [Codex authentication](https://learn.chatgpt.com/docs/auth) and the [Codex App Server protocol](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/app-server/README.md).
+This is technically viable as an **experimental local Codex client** for
+Conversation, TTS, and realtime work. ChatGPT sign-in for subscription access
+is an officially documented Codex authentication mode, and App Server exposes
+managed browser and device-code login. The TTS/realtime compatibility layer
+relies on the experimental `thread/realtime/*` WebRTC surface, so the Codex
+version, generated protocol schema, and media behavior must be pinned and
+tested. See [Codex authentication](https://learn.chatgpt.com/docs/auth) and the
+[Codex App Server protocol](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/app-server/README.md).
 
 In the researched App Server version, managed ChatGPT authentication works through the WebRTC call-creation path. Its raw realtime WebSocket path still requires API-key authentication. Therefore, subscription mode must create a genuine WebRTC offer with an audio track/transceiver and the `oai-events` data channel; it cannot implement voice by sending PCM only through JSON-RPC. See the pinned [realtime conversation source](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/core/src/realtime_conversation.rs).
 
@@ -44,7 +68,8 @@ The add-on is the trust boundary. It must not mount the Home Assistant configura
 | Home Assistant surface | HA contract | Codex App Server mapping | Maturity |
 |---|---|---|---|
 | Conversation agent | `ConversationEntity._async_handle_message(...)` with `ChatLog` | `thread/start`/`thread/resume`, `turn/start`, streamed agent messages; map selected HA LLM tools to App Server dynamic tools | Thread lifecycle is supported; dynamic tools are experimental |
-| Speech-to-text | `SpeechToTextEntity.async_process_audio_stream(...)` | Feed HA audio into the WebRTC microphone track and harvest final user transcript events from the conversational session | Experimental compatibility adapter, not a dedicated transcription API; response suppression and correlation must be proven |
+| Speech-to-text | Native Wyoming `SpeechToTextEntity` | Stream HA PCM to a persistent local faster-whisper service over Wyoming | Production path; finite local result, no ChatGPT/API quota |
+| Experimental Codex STT | `SpeechToTextEntity.async_process_audio_stream(...)` | Feed HA audio into the WebRTC microphone track and opportunistically harvest user transcript events | Diagnostics only; a completed media session may produce no transcript |
 | Text-to-speech | `TextToSpeechEntity.async_get_tts_audio(...)`, followed by streaming support | Send `thread/realtime/appendSpeech`, receive/decode the WebRTC remote audio track, and package it as a HA-supported format | Experimental compatibility adapter, not the public Speech API; exact-text behavior must be proven |
 | Authentication | Config flow backed by the add-on | `account/login/start` with `chatgptDeviceCode` or `chatgpt`; observe `account/login/completed` and `account/updated` | Managed ChatGPT auth is documented by App Server |
 | Quota diagnostics | Integration diagnostics/options UI | `account/rateLimits/read`, `account/rateLimits/updated`, and `account/usage/read` where available | Report only fields actually supplied by the active account |
@@ -104,7 +129,9 @@ Use a unique domain such as `chatgpt_subscription_voice`; do not override Home A
 - Validate the local bridge and authenticated account during setup.
 - Provide redacted diagnostics with App Server version, protocol compatibility, auth mode, plan type, feature availability, and rate-limit fields.
 
-Exit gate: all three providers appear as selectable Assist pipeline components and reload cleanly without restarting HA.
+Exit gate: Codex Conversation/TTS and native Wyoming STT appear as selectable
+Assist pipeline components and reload cleanly without restarting HA. The
+experimental Codex STT entity must not be selected automatically.
 
 ### 3. Conversation agent and Home Assistant tools
 
@@ -120,16 +147,22 @@ Home Assistant's built-in LLM API restricts control to user-exposed capabilities
 
 Exit gate: multi-turn text conversation works, only exposed entities are visible, and failed or unauthorized tool calls cannot escape the add-on sandbox.
 
-### 4. Speech-to-text entity
+### 4. Speech-to-text pipeline
 
-- Advertise only the audio metadata combinations verified by the bridge.
-- Convert HA's incoming audio stream to the WebRTC microphone track's negotiated format without unbounded buffering.
-- Start or borrow an ephemeral WebRTC realtime conversation with startup context disabled and its output locally muted for transcription-only calls.
-- Collect only the final transcript whose role is `user`; serialize requests until the pinned protocol provides reliable item-level correlation.
-- Stop and destroy the realtime session immediately after success, timeout, cancellation, or error.
-- Return standard `SpeechResult` success/error states without logging audio or transcript contents by default.
+- Run the official Wyoming faster-whisper service outside the HACS component
+  with a resident model. The supplied pinned runner serializes native batch
+  inference; other deployments must document and test their own concurrency.
+- Register it through Home Assistant's native Wyoming integration and select
+  that `stt.*` entity in the pipeline.
+- Preserve Home Assistant's 16 kHz mono PCM contract, language selection,
+  cancellation, and standard `SpeechResult` behavior.
+- Never fall back silently to the experimental Codex adapter or a paid API key.
+- Keep the old bridge adapter available only for opt-in protocol probes, with
+  bounded timeouts and no audio/transcript logging.
 
-Exit gate: empty input, multiple languages, long utterances, cancellation, rate limiting, and App Server restart all produce bounded and valid HA results.
+Exit gate: repeated known WAVs and physical wake-word commands produce bounded
+local transcripts, and STT continues to work independently of Codex App Server
+restart or subscription speech availability.
 
 ### 5. Text-to-speech entity
 

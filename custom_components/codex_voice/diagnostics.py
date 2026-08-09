@@ -39,7 +39,8 @@ async def async_get_config_entry_diagnostics(
     return {
         "config_entry": async_redact_data(entry.as_dict(), _TO_REDACT),
         "bridge": _redact_nested(health),
-        "speech_adapter": "conversational-best-effort",
+        "recommended_stt_architecture": "home-assistant-wyoming-local",
+        "codex_stt_adapter": "experimental-conversational-best-effort",
     }
 
 
