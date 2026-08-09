@@ -5,6 +5,34 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-08
+
+### Added
+
+- Reuse an eligible realtime v3 transcription session for the official Assist
+  pipeline's prepared TTS result with a private, single-use, 30-second ticket
+  bound to the exact bridge client, chat session, voice, and language.
+- Document measured latency boundaries, ThirdReality tuning acceptance checks,
+  firmware backup and rollback, and the requirement to preserve TCP ADB on the
+  measured device.
+
+### Changed
+
+- Start the Codex thread and WebRTC handshake when streaming STT capture opens,
+  overlapping remote setup with the finite Home Assistant microphone capture.
+- Stream only sanitized retained sessions into `appendSpeech`, with exact
+  language and voice matching and a single cold fallback before any PCM is
+  exposed.
+
+### Fixed
+
+- Make retained-session expiry, replacement, cancellation, remote invalidation,
+  component unload, and successful consumption converge on bounded, exactly-once
+  session and thread cleanup.
+- Reject assistant audio or output at every STT-to-TTS boundary, including
+  simultaneous receiver and claim races, instead of handing an ambiguous
+  realtime session to TTS.
+
 ## [0.1.7] - 2026-08-08
 
 ### Added
