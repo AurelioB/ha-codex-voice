@@ -19,6 +19,93 @@ MAX_PCM_SAMPLE_RATE = 192_000
 MAX_PCM_DURATION_SECONDS = 300
 
 
+class Pcm16Mono24KhzResampler:
+    """Incrementally resample aligned mono PCM16 without chunk-boundary drift."""
+
+    def __init__(self, source_rate: int) -> None:
+        if not MIN_PCM_SAMPLE_RATE <= source_rate <= MAX_PCM_SAMPLE_RATE:
+            raise ProtocolError(
+                f"sample_rate must be between {MIN_PCM_SAMPLE_RATE} and "
+                f"{MAX_PCM_SAMPLE_RATE} Hz"
+            )
+        self.source_rate = source_rate
+        self._buffer = array("h")
+        self._buffer_start = 0
+        self._input_frames = 0
+        self._output_frames = 0
+        self._closed = False
+
+    def feed(self, data: bytes) -> bytes:
+        """Accept another sample-aligned source chunk and return ready output."""
+        if self._closed:
+            raise ProtocolError("PCM resampler input is already finished")
+        if len(data) % PCM_SAMPLE_WIDTH:
+            raise ProtocolError("PCM byte length is not sample-aligned")
+        if not data:
+            return b""
+
+        samples = array("h")
+        samples.frombytes(data)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        next_input_frames = self._input_frames + len(samples)
+        if next_input_frames > self.source_rate * MAX_PCM_DURATION_SECONDS:
+            raise ProtocolError(
+                f"PCM input must not exceed {MAX_PCM_DURATION_SECONDS} seconds"
+            )
+        self._buffer.extend(samples)
+        self._input_frames = next_input_frames
+        return self._drain(final=False)
+
+    def finish(self) -> bytes:
+        """Flush the final interpolation sample and close the stream."""
+        if self._closed:
+            return b""
+        self._closed = True
+        output = self._drain(final=True)
+        self._buffer = array("h")
+        return output
+
+    def _drain(self, *, final: bool) -> bytes:
+        output = array("h")
+        target_frames = (
+            max(
+                1,
+                round(self._input_frames * REALTIME_SAMPLE_RATE / self.source_rate),
+            )
+            if final and self._input_frames
+            else None
+        )
+        while target_frames is None or self._output_frames < target_frames:
+            position_numerator = self._output_frames * self.source_rate
+            left_index = position_numerator // REALTIME_SAMPLE_RATE
+            fraction_numerator = position_numerator % REALTIME_SAMPLE_RATE
+            if left_index >= self._input_frames:
+                break
+            right_index = left_index + 1
+            if fraction_numerator and right_index >= self._input_frames and not final:
+                break
+            right_index = min(right_index, self._input_frames - 1)
+            left = self._buffer[left_index - self._buffer_start]
+            right = self._buffer[right_index - self._buffer_start]
+            fraction = fraction_numerator / REALTIME_SAMPLE_RATE
+            value = round(left * (1.0 - fraction) + right * fraction)
+            output.append(max(-32_768, min(32_767, value)))
+            self._output_frames += 1
+
+        if final:
+            self._buffer_start = self._input_frames
+        else:
+            next_left = self._output_frames * self.source_rate // REALTIME_SAMPLE_RATE
+            discard = min(len(self._buffer), max(0, next_left - self._buffer_start))
+            if discard:
+                del self._buffer[:discard]
+                self._buffer_start += discard
+        if sys.byteorder != "little":
+            output.byteswap()
+        return output.tobytes()
+
+
 def decode_base64_audio(value: object) -> bytes:
     """Decode a strict base64 payload and reject ambiguous input."""
 

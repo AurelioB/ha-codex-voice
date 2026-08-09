@@ -1486,6 +1486,64 @@ async def test_transcription_stream_overlaps_handshake_and_assembles_result(
 
 
 @pytest.mark.asyncio
+async def test_transcription_stream_feeds_confident_speech_before_eof(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await websocket.send_json(_transcription_stream_start())
+        assert (await websocket.receive_json())["type"] == "started"
+        await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+        await websocket.send_bytes(b"\x00\x20" * 6_400)
+        for _ in range(100):
+            if fake_rpc.peers[-1].fed:
+                break
+            await asyncio.sleep(0)
+
+        assert fake_rpc.peers[-1].fed
+        assert not websocket.closed
+        await websocket.send_json({"type": "end"})
+        assert await websocket.receive_json(timeout=1) == {
+            "type": "result",
+            "text": "Turn on the kitchen",
+        }
+        await websocket.receive(timeout=1)
+
+    assert "Realtime live transcription timing: live_feed=True" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_quiet_audio_keeps_normalized_eof_fallback(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await websocket.send_json(_transcription_stream_start())
+        assert (await websocket.receive_json())["type"] == "started"
+        await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+        await websocket.send_bytes(b"\x00\x01" * 6_400)
+        await asyncio.sleep(0)
+        assert fake_rpc.peers[-1].fed == b""
+
+        await websocket.send_json({"type": "end"})
+        assert (await websocket.receive_json(timeout=1))["type"] == "result"
+        await websocket.receive(timeout=1)
+
+    assert fake_rpc.peers[-1].fed
+    assert "Realtime live transcription timing: live_feed=False" in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("overrides", "expected_error"),
     [

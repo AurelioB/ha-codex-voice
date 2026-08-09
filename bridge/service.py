@@ -24,6 +24,7 @@ from aiohttp import WSMsgType, web
 from .app_server import CodexAppServer
 from .audio import (
     REALTIME_SAMPLE_RATE,
+    Pcm16Mono24KhzResampler,
     decode_base64_audio,
     encode_base64_audio,
     pcm16_mono_24khz,
@@ -74,6 +75,8 @@ TRANSCRIPTION_TRIM_MIN_REMOVABLE_MS = 2_000
 TRANSCRIPTION_TRIM_MIN_RMS = 0.015
 TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES = 3
 TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES = 5
+TRANSCRIPTION_STREAM_ACTIVATION_RMS = 0.01
+TRANSCRIPTION_STREAM_GAIN_PROBE_MS = 200
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
 SPEECH_SESSION_HANDOFF_VERSION = 1
 SPEECH_SESSION_HANDOFF_TTL_SECONDS = 30.0
@@ -188,6 +191,49 @@ class _TranscriptionOverlapTiming:
 
     attempt_started_at: float | None = None
     handshake_finished_at: float | None = None
+
+
+@dataclass(slots=True)
+class _LiveTranscriptionInput:
+    """Bounded capture chunks shared with the first realtime STT attempt."""
+
+    sample_rate: int
+    chunks: asyncio.Queue[bytes | None] = field(
+        default_factory=asyncio.Queue,
+        repr=False,
+    )
+
+
+class _StreamingTranscriptionNormalizer:
+    """Calibrate once on sustained speech, then apply a bounded streaming gain."""
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self.gain: float | None = None
+        self.output_bytes = 0
+
+    def feed(self, pcm: bytes) -> bytes:
+        if not pcm:
+            return b""
+        if self.gain is None:
+            self._pending.extend(pcm)
+            gain = _streaming_transcription_gain(bytes(self._pending))
+            if gain is None:
+                return b""
+            self.gain = gain
+            output = _apply_pcm16_gain(bytes(self._pending), gain)
+            self._pending.clear()
+        else:
+            peak, _ = _normalized_pcm16_levels(pcm)
+            if peak > 0:
+                self.gain = min(self.gain, TRANSCRIPTION_TARGET_PEAK / peak)
+            output = _apply_pcm16_gain(pcm, self.gain)
+        self.output_bytes += len(output)
+        return output
+
+    @property
+    def active(self) -> bool:
+        return self.gain is not None
 
 
 @dataclass(slots=True)
@@ -1435,6 +1481,7 @@ async def _transcribe_stream_admitted(
     capture_started_at: float | None = None
     capture_ended_at: float | None = None
     overlap_timing = _TranscriptionOverlapTiming()
+    live_input: _LiveTranscriptionInput | None = None
     audio_ready: asyncio.Future[_PreparedTranscriptionAudio] | None = None
     transcription_task: asyncio.Task[_TranscriptionAttemptOutcome] | None = None
     capture_task: asyncio.Task[bytes] | None = None
@@ -1464,11 +1511,13 @@ async def _transcribe_stream_admitted(
             else None
         )
         audio_ready = asyncio.get_running_loop().create_future()
+        live_input = _LiveTranscriptionInput(sample_rate=sample_rate)
         transcription_task = asyncio.create_task(
             _run_streaming_transcription(
                 state,
                 payload,
                 audio_ready,
+                live_input,
                 _transcription_prompt(language, prompt),
                 overlap_timing,
                 retain_voice=retained_voice,
@@ -1479,7 +1528,7 @@ async def _transcribe_stream_admitted(
         await websocket.send_json({"type": "started", "protocol_version": 1})
         capture_started_at = time.monotonic()
         capture_task = asyncio.create_task(
-            _capture_transcription_stream(websocket, sample_rate),
+            _capture_transcription_stream(websocket, sample_rate, live_input),
             name="codex-transcription-capture",
         )
 
@@ -1502,6 +1551,16 @@ async def _transcribe_stream_admitted(
             prepared_audio = _prepare_transcription_audio(pcm)
         except ProtocolError as err:
             raise _TranscriptionStreamProtocolError(str(err)) from None
+        LOGGER.info(
+            "Realtime transcription audio: input_duration_seconds=%.3f "
+            "normalized_duration_seconds=%.3f peak=%.4f rms=%.4f "
+            "adaptive_gain=%.2f",
+            prepared_audio.input_duration,
+            prepared_audio.duration,
+            prepared_audio.peak,
+            prepared_audio.rms,
+            prepared_audio.adaptive_gain,
+        )
         audio_ready.set_result(prepared_audio)
         cancellation_task = asyncio.create_task(
             _watch_transcription_stream_cancellation(websocket),
@@ -1705,7 +1764,9 @@ def _require_stream_integer(
 
 
 async def _capture_transcription_stream(
-    websocket: web.WebSocketResponse, sample_rate: int
+    websocket: web.WebSocketResponse,
+    sample_rate: int,
+    live_input: _LiveTranscriptionInput | None = None,
 ) -> bytes:
     """Collect bounded PCM16LE frames until the client's explicit EOF."""
     raw_pcm = bytearray()
@@ -1736,6 +1797,8 @@ async def _capture_transcription_stream(
                             "for transcription"
                         )
                     raw_pcm.extend(chunk)
+                    if live_input is not None:
+                        live_input.chunks.put_nowait(chunk)
                     continue
                 if message.type == WSMsgType.TEXT:
                     try:
@@ -1750,6 +1813,8 @@ async def _capture_transcription_stream(
                         )
                     message_type = value.get("type")
                     if message_type == "end":
+                        if live_input is not None:
+                            live_input.chunks.put_nowait(None)
                         return bytes(raw_pcm)
                     if message_type == "cancel":
                         raise _TranscriptionStreamCancelled
@@ -1808,6 +1873,7 @@ async def _run_streaming_transcription(
     state: BridgeState,
     payload: Mapping[str, Any],
     audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+    live_input: _LiveTranscriptionInput,
     prompt: str,
     overlap_timing: _TranscriptionOverlapTiming,
     *,
@@ -1837,14 +1903,22 @@ async def _run_streaming_transcription(
             try:
                 for current_attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
                     try:
+                        if current_attempt == 1:
+                            return await _run_live_transcription_attempt(
+                                state,
+                                payload,
+                                audio_ready,
+                                live_input,
+                                prompt,
+                                overlap_timing=overlap_timing,
+                                retain_voice=retain_voice,
+                                retain_language=retain_language,
+                            )
                         return await _run_transcription_attempt_when_audio_ready(
                             state,
                             payload,
                             audio_ready,
                             prompt,
-                            overlap_timing=(
-                                overlap_timing if current_attempt == 1 else None
-                            ),
                             retain_voice=retain_voice,
                             retain_language=retain_language,
                         )
@@ -1910,6 +1984,204 @@ def _stream_transcription_diagnostics(
         return 0.0, 0.0, 0.0, 1.0
     audio = audio_ready.result()
     return audio.duration, audio.peak, audio.rms, audio.adaptive_gain
+
+
+async def _run_live_transcription_attempt(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+    live_input: _LiveTranscriptionInput,
+    prompt: str,
+    *,
+    overlap_timing: _TranscriptionOverlapTiming,
+    retain_voice: str | None = None,
+    retain_language: str | None = None,
+) -> _TranscriptionAttemptOutcome:
+    """Feed confidently calibrated audio during capture on the first attempt."""
+    attempt_started = time.monotonic()
+    overlap_timing.attempt_started_at = attempt_started
+    thread_start_seconds = 0.0
+    realtime_handshake_seconds = 0.0
+    transcript_wait_seconds = 0.0
+    session_stop_peer_close_seconds = 0.0
+    thread_delete_seconds = 0.0
+    live_feed = False
+    live_gain = 1.0
+    feed_backlog_seconds = 0.0
+    try:
+        thread_start_started = time.monotonic()
+        try:
+            thread_id = await state.start_thread(
+                payload,
+                base_instructions=(
+                    "Act only as a speech recognition adapter. Never call tools, "
+                    "inspect files, or answer the user's speech."
+                ),
+            )
+        except TimeoutError as err:
+            raise _TranscriptionStartTimeout from err
+        finally:
+            thread_start_seconds = time.monotonic() - thread_start_started
+
+        session: RealtimeSession | None = None
+        thread_owned = True
+        timeout_stage = "handshake"
+        try:
+            session = RealtimeSession(
+                state.rpc,
+                thread_id,
+                peer=state.peer_factory(),
+                version=state.config.realtime_version,
+                timeout=min(
+                    state.config.transcript_timeout,
+                    TRANSCRIPTION_SESSION_TIMEOUT_SECONDS,
+                ),
+            )
+            handshake_started = time.monotonic()
+            try:
+                await session.start(
+                    prompt=prompt,
+                    voice=retain_voice,
+                    include_startup_context=False,
+                    client_managed_handoffs=True,
+                )
+            finally:
+                realtime_handshake_seconds = time.monotonic() - handshake_started
+                overlap_timing.handshake_finished_at = time.monotonic()
+
+            timeout_stage = "capture"
+            resampler = Pcm16Mono24KhzResampler(live_input.sample_rate)
+            normalizer = _StreamingTranscriptionNormalizer()
+            feed_started: float | None = None
+            while True:
+                chunk = await live_input.chunks.get()
+                if chunk is None:
+                    break
+                output = normalizer.feed(resampler.feed(chunk))
+                if output:
+                    if feed_started is None:
+                        feed_started = asyncio.get_running_loop().time()
+                    session.feed_audio(output)
+            output = normalizer.feed(resampler.finish())
+            if output:
+                if feed_started is None:
+                    feed_started = asyncio.get_running_loop().time()
+                session.feed_audio(output)
+
+            timeout_stage = "audio_ready"
+            prepared_audio = await audio_ready
+            if normalizer.active:
+                live_feed = True
+                live_gain = normalizer.gain or 1.0
+                duration = normalizer.output_bytes / (REALTIME_SAMPLE_RATE * 2)
+            else:
+                feed_started = asyncio.get_running_loop().time()
+                session.feed_audio(prepared_audio.pcm)
+                duration = prepared_audio.duration
+                live_gain = prepared_audio.adaptive_gain
+            if feed_started is None:
+                raise ProtocolError("transcription audio contains no output samples")
+
+            trailing_silence = silence_pcm16(state.config.silence_ms)
+            session.feed_audio(trailing_silence)
+            feed_duration = duration + state.config.silence_ms / 1_000
+            final_input_at = feed_started + feed_duration
+            feed_backlog_seconds = max(
+                0.0,
+                final_input_at - asyncio.get_running_loop().time(),
+            )
+            drain_task = asyncio.create_task(
+                session.wait_input_drained(
+                    timeout=max(10.0, feed_backlog_seconds + 10.0),
+                    monitor_app_server_exit=False,
+                )
+            )
+            timeout_stage = "transcript"
+            transcript_wait_started = time.monotonic()
+            handoff_boundary_state = (
+                _SpeechHandoffBoundaryState() if retain_voice is not None else None
+            )
+            try:
+                transcript_timeout = min(
+                    state.config.transcript_timeout,
+                    feed_backlog_seconds + TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
+                )
+                transcript = await _wait_for_user_transcript(
+                    session,
+                    transcript_timeout,
+                    fragment_finalization_at=feed_started + duration,
+                    strict_handoff_boundary=retain_voice is not None,
+                    handoff_boundary_state=handoff_boundary_state,
+                )
+            finally:
+                transcript_wait_seconds = time.monotonic() - transcript_wait_started
+                if not drain_task.done():
+                    drain_task.cancel()
+                await asyncio.gather(drain_task, return_exceptions=True)
+
+            retained_session: _RetainedSpeechSession | None = None
+            if (
+                retain_voice is not None
+                and handoff_boundary_state is not None
+                and not handoff_boundary_state.invalidated
+            ):
+                try:
+                    await _sanitize_speech_handoff_session(
+                        session,
+                        handoff_boundary_state,
+                    )
+                except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                    pass
+                else:
+                    retained_session = _RetainedSpeechSession(
+                        session=session,
+                        thread_id=thread_id,
+                        voice=retain_voice,
+                        language=retain_language,
+                        boundary_state=handoff_boundary_state,
+                    )
+                    session = None
+                    thread_owned = False
+            return _TranscriptionAttemptOutcome(transcript, retained_session)
+        except TimeoutError as err:
+            raise _TranscriptionAttemptTimeout(timeout_stage) from err
+        finally:
+            try:
+                if session is not None:
+                    session_stop_started = time.monotonic()
+                    try:
+                        await session.stop()
+                    finally:
+                        session_stop_peer_close_seconds = (
+                            time.monotonic() - session_stop_started
+                        )
+            finally:
+                if thread_owned:
+                    thread_delete_started = time.monotonic()
+                    try:
+                        await _dispose_thread(state.rpc, thread_id)
+                    finally:
+                        thread_delete_seconds = time.monotonic() - thread_delete_started
+    finally:
+        LOGGER.info(
+            "Realtime live transcription timing: live_feed=%s live_gain=%.2f "
+            "feed_backlog_seconds=%.3f",
+            live_feed,
+            live_gain,
+            feed_backlog_seconds,
+        )
+        LOGGER.info(
+            "Realtime transcription attempt timing: thread_start_seconds=%.3f "
+            "realtime_handshake_seconds=%.3f transcript_wait_seconds=%.3f "
+            "session_stop_peer_close_seconds=%.3f thread_delete_seconds=%.3f "
+            "total_seconds=%.3f",
+            thread_start_seconds,
+            realtime_handshake_seconds,
+            transcript_wait_seconds,
+            session_stop_peer_close_seconds,
+            thread_delete_seconds,
+            time.monotonic() - attempt_started,
+        )
 
 
 async def _run_transcription_attempt(
@@ -2218,14 +2490,26 @@ def _apply_transcription_gain(
         peak, rms = _normalized_pcm16_levels(pcm)
     if not pcm or peak <= 0 or rms <= 0:
         return pcm, 1.0
-    gain = min(
-        TRANSCRIPTION_MAX_GAIN,
-        TRANSCRIPTION_TARGET_PEAK / peak,
-        TRANSCRIPTION_TARGET_RMS / rms,
-    )
-    if gain <= 1.0:
-        return pcm, 1.0
+    gain = _transcription_gain_for_levels(peak, rms)
+    return _apply_pcm16_gain(pcm, gain), gain
 
+
+def _transcription_gain_for_levels(peak: float, rms: float) -> float:
+    if peak <= 0 or rms <= 0:
+        return 1.0
+    return max(
+        1.0,
+        min(
+            TRANSCRIPTION_MAX_GAIN,
+            TRANSCRIPTION_TARGET_PEAK / peak,
+            TRANSCRIPTION_TARGET_RMS / rms,
+        ),
+    )
+
+
+def _apply_pcm16_gain(pcm: bytes, gain: float) -> bytes:
+    if not pcm or gain <= 1.0:
+        return pcm
     samples = array.array("h")
     samples.frombytes(pcm)
     if sys.byteorder != "little":
@@ -2234,7 +2518,44 @@ def _apply_transcription_gain(
         samples[index] = max(-32_768, min(32_767, round(sample * gain)))
     if sys.byteorder != "little":
         samples.byteswap()
-    return samples.tobytes(), gain
+    return samples.tobytes()
+
+
+def _streaming_transcription_gain(pcm: bytes) -> float | None:
+    """Return a gain only after a sustained speech-like calibration window."""
+    if not pcm or len(pcm) % 2:
+        return None
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    frame_samples = REALTIME_SAMPLE_RATE * TRANSCRIPTION_TRIM_FRAME_MS // 1_000
+    frame_levels: list[float] = []
+    scale = 32_768.0
+    for frame_start in range(0, len(samples), frame_samples):
+        frame = samples[frame_start : frame_start + frame_samples]
+        if len(frame) < frame_samples:
+            break
+        square_sum = sum(sample * sample for sample in frame)
+        frame_levels.append(math.sqrt(square_sum / len(frame)) / scale)
+    onset_frame = _first_sustained_transcription_frame(
+        frame_levels,
+        TRANSCRIPTION_STREAM_ACTIVATION_RMS,
+    )
+    if onset_frame is None:
+        return None
+    probe_frames = max(
+        TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES,
+        TRANSCRIPTION_STREAM_GAIN_PROBE_MS // TRANSCRIPTION_TRIM_FRAME_MS,
+    )
+    if len(frame_levels) < onset_frame + probe_frames:
+        return None
+    probe_start = onset_frame * frame_samples
+    probe_end = (onset_frame + probe_frames) * frame_samples
+    probe = samples[probe_start:probe_end]
+    peak = max(abs(sample) for sample in probe) / scale
+    rms = math.sqrt(sum(sample * sample for sample in probe) / len(probe)) / scale
+    return _transcription_gain_for_levels(peak, rms)
 
 
 def _trim_transcription_silence(pcm: bytes) -> bytes:
