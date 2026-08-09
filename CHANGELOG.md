@@ -5,6 +5,67 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-09
+
+### Added
+
+- Add a strict, content-private realtime wire protocol v2 and a standard-library
+  ThirdReality v1.1.7 client that runs inside the existing voice process.
+  “Okay Computer” selects direct subscription-backed chat voice while “Okay
+  Nabu” preserves the official Home Assistant Assist and home-control flow.
+- Add a release archive containing the guarded `sitecustomize.py`, realtime
+  client package, secret-free disabled configuration example, and device
+  deployment/rollback contract, with the repository's MIT license included in
+  both standalone release archives.
+- Advertise the `es-MX` Home Assistant speech locale and add optional bounded
+  direct-device voice and prompt settings, with the example configured for a
+  concise Mexican Spanish language and accent policy.
+
+### Changed
+
+- Bound device startup and fallback PCM to 64 KiB (2.048 s), transfer startup
+  backlog at no more than 2× capture rate, cap v2 host input independently at
+  2,250 ms, and bound device playback to 48 KiB (about 1.024 s). Finite STT
+  retains its whole-utterance input capacity.
+- Retain up to six idle recorder frames for Okay Computer only: a RAM-only,
+  12 KiB/384 ms pre-roll that is discarded for Okay Nabu and all teardown
+  paths. Trim or omit it for smaller queues so at least 32 KiB of live
+  post-wake capacity remains. One physical regression canary captured and
+  answered the previously failing 308 ms wake-to-command sample; it is a
+  single-case validation, not a latency distribution.
+- Keep the released realtime path turn-taking with microphone gating during
+  output. Interruption flushes local playback and requires a fresh session with
+  `remote_cancel: false`; acoustic echo cancellation, true full duplex, and
+  barge-in remain future work. Device configuration rejects `full_duplex: true`
+  and guarantees that every valid message-size bound can carry one fixed
+  2,048-byte recorder frame.
+
+### Fixed
+
+- Serialize outbound Home Assistant Conversation start and tool-result events
+  with Home Assistant's canonical JSON policy, preserving nested temporal
+  values such as speech slots in ISO form and rejecting unsupported objects
+  before transmission with a data-safe protocol error.
+- Bind the route-scoped device bearer to a successfully negotiated v2 session
+  before provider startup while retaining primary-token compatibility for
+  legacy v1 clients.
+- Release the single subscription speech lane promptly when a realtime device
+  disconnects during thread or WebRTC startup, so official Home Assistant
+  fallback cannot remain blocked behind an abandoned direct session.
+- End speaking epochs only after terminal metadata and a bounded media-idle
+  tail, and isolate pre-response audio by epoch and age so delayed WebRTC PCM is
+  neither truncated nor replayed into a later response.
+- Apply Home Assistant's trusted Assist pipeline locale to Codex conversation
+  turns so a Mexican Spanish pipeline does not rely on implicit language
+  detection alone.
+
+### Security
+
+- Add an optional route-scoped, v2-only realtime-device bearer, a root-owned
+  mode-0600 device configuration contract, and a chat-only v2 boundary that
+  exposes no transcripts, raw provider events, or tools. Device deployment
+  preserves and verifies the approved TCP ADB port 5555 recovery path.
+
 ## [0.2.0] - 2026-08-09
 
 ### Added

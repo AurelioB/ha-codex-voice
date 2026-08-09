@@ -8,12 +8,35 @@ permissions:
   contents: write
 
 jobs:
-  integration-zip:
+  release-assets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build HACS archive
-        run: cd custom_components/codex_voice && zip -r ../../codex_voice.zip .
+        run: |
+          git archive --format=zip \
+            --output=codex_voice.zip \
+            HEAD:custom_components/codex_voice
+          zip -j codex_voice.zip LICENSE
+      - name: Build ThirdReality realtime archive
+        run: |
+          mkdir -p release/thirdreality-realtime/latency_sitecustomize
+          mkdir -p release/thirdreality-realtime/realtime_client
+          install -m 0644 \
+            device/thirdreality/latency_sitecustomize/sitecustomize.py \
+            release/thirdreality-realtime/latency_sitecustomize/sitecustomize.py
+          install -m 0644 device/thirdreality/realtime_client/*.py \
+            release/thirdreality-realtime/realtime_client/
+          install -m 0644 \
+            device/thirdreality/codex-realtime.example.json \
+            release/thirdreality-realtime/codex-realtime.example.json
+          install -m 0644 device/thirdreality/README.md \
+            release/thirdreality-realtime/README.md
+          install -m 0644 LICENSE release/thirdreality-realtime/LICENSE
+          cd release/thirdreality-realtime
+          zip -r ../../thirdreality-realtime.zip .
       - uses: softprops/action-gh-release@v2
         with:
-          files: codex_voice.zip
+          files: |
+            codex_voice.zip
+            thirdreality-realtime.zip
