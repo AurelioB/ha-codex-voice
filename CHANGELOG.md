@@ -5,8 +5,22 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-08
+
+### Added
+
+- Negotiate Home Assistant's native mono 16-bit WAV output at 16 or 24 kHz
+  and incrementally resample realtime speech when 16 kHz is requested.
+- Record privacy-safe successful-capture level and live-feed metrics for
+  diagnosing microphone gain and recognition overlap without logging speech.
+
 ### Changed
 
+- Feed bounded, one-time calibrated speech to realtime recognition while Home
+  Assistant capture continues, retaining the complete raw utterance for a
+  fresh normalized retry and buffering quiet or ambiguous captures until EOF.
+- Default voice conversation turns to low reasoning effort to favor latency;
+  the integration option remains configurable.
 - Set the ThirdReality v1.2.1 production decision to no-go after confirming
   that the target is single-slot and the available files cannot provide exact
   rollback. A future spare-device canary remains conditional on authenticated
@@ -14,6 +28,14 @@ and releases use semantic versioning.
 - Record end-to-end acoustic wake canaries at 700 ms and 300 ms command gaps,
   both completing STT, a local intent, TTS playback, and satellite recovery
   without pipeline errors.
+
+### Fixed
+
+- Use an explicit empty ICE-server configuration so the local
+  subscription-backed WebRTC path does not wait five seconds for the default
+  public STUN probe during every STT and TTS handshake.
+- Bound missing-transcript retries to two attempts and each result wait to four
+  seconds, reducing the penalty of failed or exceptionally quiet recognition.
 
 ## [0.1.8] - 2026-08-08
 
