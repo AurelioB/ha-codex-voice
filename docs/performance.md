@@ -38,6 +38,70 @@ Frameless Bidi outbound protocol does not define a response-cancel message.
 These paths preserve the finite Home Assistant provider contracts. They do not
 turn the standard Assist pipeline into a full-duplex or barge-in session.
 
+## Direct realtime turn-taking path
+
+The Milestone 2 ThirdReality client is a separate path selected by “Okay
+Computer.” “Okay Nabu” retains the standard Assist pipeline and all Home
+Assistant entity control. The direct path removes finite STT, Conversation,
+and TTS provider boundaries from the middle of a turn, but it still has to
+create a Codex thread, negotiate App Server/WebRTC, wait for provider
+endpointing and response generation, and buffer physical playback.
+
+The shipped bounds are intentionally small and fail closed:
+
+| Boundary | Default bound | Purpose |
+|---|---:|---|
+| Direct-wake idle pre-roll | 12 KiB / 384 ms | Retains the newest six 64 ms recorder frames in RAM for Okay Computer only |
+| Device microphone queue | 64 KiB / 2.048 s | Holds PCM while the network thread connects and while paced transfer catches up |
+| Device pre-ready fallback copy | 64 KiB / 2.048 s | Replays the retained prefix into official Assist if direct startup fails |
+| Reserved live startup headroom | 32 KiB / 1.024 s | Trims or omits pre-roll before it can consume this post-wake allowance |
+| Bridge v2 WebRTC input track | 2,250 ms | Limits only live device lag; finite STT retains its whole-utterance capacity |
+| Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
+| Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
+
+The pre-roll is included inside the microphone and fallback bounds; it is not
+additional queue capacity. It is transferred only for Okay Computer. Okay Nabu
+discards it before official Assist starts, and lifecycle teardown clears it.
+The microphone and fallback rows describe two ownership copies of the same
+pre-ready audio, not a 4.096-second serial buffer. If the handshake becomes
+ready within the bound, the client transfers queued frames at no more than 2×
+capture cadence while more than one frame remains. It then sends at normal
+cadence. This shrinks startup lag without a burst and without dropping accepted
+audio. If the pre-ready bound is exhausted, the official Assist fallback wins;
+after readiness, a bound failure terminates the direct session safely.
+
+The 2× catch-up does not shorten the cold handshake or provider response time.
+Time to first audible output must therefore be reported with at least wake to
+v2 `started`, `started` to the first speaking epoch, speaking epoch to first
+PCM, and first PCM to audible playback. Reporting only the catch-up interval
+would hide the dominant remote stages.
+
+Direct output is turn-taking on v1.1.7. The microphone gate stays closed from
+`speaking.started` until the corresponding PCM has drained from both the local
+queue and playback child. There is no active acoustic echo cancellation, so
+simultaneous listening would make the device hear its own speaker. An interrupt
+aborts local playback and closes the session; `remote_cancel: false` means the
+next turn pays for a fresh WebSocket, thread, and realtime handshake. Full
+duplex, double-talk, and barge-in are not performance claims for this release.
+
+Physical acceptance must cover both wake routes, normal-wake preemption,
+pre-ready fallback, stop-word latency, first-audio latency, queue failures,
+repeated turns, memory stability, player cleanup, and recovery after bridge and
+Wi-Fi loss. It must also verify TCP ADB port 5555 before and after every device
+restart or reboot; the overlay never changes the ADB service.
+
+### Physical quick-command regression canary
+
+One post-deployment 2026-08-09 physical canary replayed the exact sample that
+had previously failed, with 308 ms of silence between the Okay Computer wake
+phrase and its command. Device-local input playback began at 21:52:39 and ended
+at 21:52:42. The bridge completed its handshake in 1.308 s, the command was
+captured, and device-local answer playback began at 21:52:45.
+
+This is an end-to-end regression result for that short-gap clipping case. It is
+one controlled run, not a benchmark distribution, percentile, or general
+latency guarantee.
+
 ## Local STT measurement
 
 On 2026-08-09, the official Wyoming faster-whisper 3.5.0 server used the
@@ -373,7 +437,9 @@ has a new remote context. Direct calls do the same.
 The bridge does not keep an always-on remote speech session waiting for a
 future wake word. Home Assistant exposes no custom STT-provider callback before
 wake detection; the earliest reliable component hook is the STT stream itself,
-which already overlaps setup with capture.
+which already overlaps setup with capture. The ThirdReality direct client can
+start at its own wake callback, but that is still a cold, explicitly owned
+session—not a pre-wake or automatically replenished prewarm.
 
 Always-on remote prewarming would also:
 
@@ -412,8 +478,9 @@ LED as best-effort visual acknowledgement. This avoids both self-audio and the
 cue gate. Test users must speak immediately after the wake phrase rather than
 wait for a sound or for the LED; visual feedback is deliberately off the
 microphone path and may lag a serialized DBus backlog. Roll back the overlay if
-an audible confirmation is a hard requirement; do not forward a
-cue-contaminated pre-roll into STT.
+an audible confirmation is a hard requirement. The overlay's 384 ms RAM
+pre-roll is consumed only by cue-free Okay Computer direct mode. Okay Nabu
+discards it rather than forwarding wake-tail history into official Assist STT.
 
 ### Finished speaking detection
 
