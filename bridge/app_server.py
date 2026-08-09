@@ -46,6 +46,10 @@ class RpcSubscription:
             return await self.queue.get()
         return await asyncio.wait_for(self.queue.get(), timeout)
 
+    def get_nowait(self) -> JsonObject:
+        """Return one already-buffered event without yielding."""
+        return self.queue.get_nowait()
+
     def close(self) -> None:
         if not self._closed:
             self._closed = True

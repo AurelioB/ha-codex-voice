@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import re
+import time
 import wave
 from array import array
 from collections.abc import Mapping
@@ -47,8 +48,38 @@ def _transcription_stream_start(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+async def _request_speech_session_handoff(
+    client: Any, *, voice: str = "cove", language: str = "en-US"
+) -> dict[str, Any]:
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    start = _transcription_stream_start(
+        language=language,
+        speech_session_handoff={
+            "version": 1,
+            "voice": voice,
+            "language": language,
+        },
+    )
+    await websocket.send_json(start)
+    assert await websocket.receive_json() == {
+        "type": "started",
+        "protocol_version": 1,
+    }
+    await websocket.send_bytes(b"\x00\x20" * 160)
+    await websocket.send_json({"type": "end"})
+    result = await websocket.receive_json(timeout=1)
+    close = await websocket.receive(timeout=1)
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    return result
+
+
 def _synthesis_payload() -> dict[str, Any]:
-    return {"text": "Welcome home", "voice": "cove", "format": "wav"}
+    return {
+        "text": "Welcome home",
+        "voice": "cove",
+        "language": "en-US",
+        "format": "wav",
+    }
 
 
 async def _assert_busy(response: Any) -> None:
@@ -69,6 +100,9 @@ class FakeSubscription:
             return await self.queue.get()
         return await asyncio.wait_for(self.queue.get(), timeout)
 
+    def get_nowait(self) -> dict[str, Any]:
+        return self.queue.get_nowait()
+
     def close(self) -> None:
         self.rpc.subscriptions.discard(self)
 
@@ -82,6 +116,7 @@ class FakePeer:
         self.audio: asyncio.Queue[bytes] = asyncio.Queue()
         self.data: asyncio.Queue[str | bytes] = asyncio.Queue()
         self.closed = False
+        self.pending_input_discarded = False
         self.tasks: set[asyncio.Task[None]] = set()
 
     async def create_offer(self) -> str:
@@ -119,6 +154,25 @@ class FakePeer:
         self.rpc.input_drain_started.set()
         if self.rpc.input_drain_gate is not None:
             await self.rpc.input_drain_gate.wait()
+
+    def discard_pending_input(self) -> None:
+        self.pending_input_discarded = True
+
+    def drain_audio_nowait(self) -> list[bytes]:
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunks.append(self.audio.get_nowait())
+            except asyncio.QueueEmpty:
+                return chunks
+
+    def drain_data_events_nowait(self) -> list[str | bytes]:
+        events: list[str | bytes] = []
+        while True:
+            try:
+                events.append(self.data.get_nowait())
+            except asyncio.QueueEmpty:
+                return events
 
     async def recv_audio(self, timeout: float | None = None) -> bytes:
         if timeout is None:
@@ -180,8 +234,11 @@ class FakeRpc:
         self.transcript_started = asyncio.Event()
         self.realtime_start_gate: asyncio.Event | None = None
         self.realtime_start_started = asyncio.Event()
+        self.realtime_stop_gate: asyncio.Event | None = None
+        self.realtime_stop_started = asyncio.Event()
         self.synthesis_append_gate: asyncio.Event | None = None
         self.synthesis_append_started = asyncio.Event()
+        self.handoff_append_error: Exception | None = None
         self.tasks: set[asyncio.Task[None]] = set()
 
     def peer_factory(self) -> FakePeer:
@@ -291,29 +348,52 @@ class FakeRpc:
                 }
             )
             return {}
+        if method == "thread/realtime/stop":
+            self.realtime_stop_started.set()
+            if self.realtime_stop_gate is not None:
+                await self.realtime_stop_gate.wait()
+            return {}
         is_synthesis_append = method == "thread/realtime/appendText" and str(
             values.get("text", "")
         ).startswith("Vocalize only")
         if method == "thread/realtime/appendSpeech" or is_synthesis_append:
-            if is_synthesis_append:
+            if method == "thread/realtime/appendSpeech":
+                handoff_error = self.handoff_append_error
+                self.handoff_append_error = None
+                if handoff_error is not None:
+                    raise handoff_error
+            if method == "thread/realtime/appendSpeech" or is_synthesis_append:
                 self.synthesis_append_started.set()
                 if self.synthesis_append_gate is not None:
                     await self.synthesis_append_gate.wait()
             peer = self.peers[-1]
-            peer.audio.put_nowait(b"\x01\x00" * 480)
-            peer.data.put_nowait(json.dumps({"type": "turn.done"}))
-            await self.broadcast(
-                {
-                    "method": "thread/realtime/transcript/done",
-                    "params": {
-                        "threadId": values["threadId"],
-                        "role": "assistant",
-                        "text": "Conversational rendering",
-                    },
-                }
-            )
+            if method == "thread/realtime/appendSpeech":
+                task = asyncio.create_task(
+                    self._emit_synthesis_result(peer, values["threadId"])
+                )
+                peer.tasks.add(task)
+                task.add_done_callback(peer.tasks.discard)
+            else:
+                await self._emit_synthesis_result(peer, values["threadId"])
             return {}
         return {}
+
+    async def _emit_synthesis_result(self, peer: FakePeer, thread_id: str) -> None:
+        await asyncio.sleep(0)
+        if peer.closed:
+            return
+        peer.audio.put_nowait(b"\x01\x00" * 480)
+        peer.data.put_nowait(json.dumps({"type": "turn.done"}))
+        await self.broadcast(
+            {
+                "method": "thread/realtime/transcript/done",
+                "params": {
+                    "threadId": thread_id,
+                    "role": "assistant",
+                    "text": "Conversational rendering",
+                },
+            }
+        )
 
     async def respond_result(
         self, request_id: int | str, result: Mapping[str, Any]
@@ -646,24 +726,81 @@ async def test_speech_session_lease_releases_when_owner_is_cancelled(
     blocked = asyncio.Event()
 
     async def hold_lease() -> None:
-        with state.speech_session_lease():
+        async with state.speech_session_lease():
             entered.set()
             await blocked.wait()
 
     owner = asyncio.create_task(hold_lease())
     await entered.wait()
-    with (
-        pytest.raises(BridgeBusyError, match="already active"),
-        state.speech_session_lease(),
-    ):
-        pass
+    with pytest.raises(BridgeBusyError, match="already active"):
+        async with state.speech_session_lease():
+            pass
 
     owner.cancel()
     with pytest.raises(asyncio.CancelledError):
         await owner
 
-    with state.speech_session_lease():
+    async with state.speech_session_lease():
         pass
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_multiple_retained_cleanups_keep_speech_lane_busy(
+    fake_rpc: FakeRpc,
+) -> None:
+    """One completed cleanup cannot release the lane while another is pending."""
+
+    class GatedSession:
+        def __init__(self, started: asyncio.Event, gate: asyncio.Event) -> None:
+            self.rpc = fake_rpc
+            self.started = started
+            self.gate = gate
+
+        async def stop(self) -> None:
+            self.started.set()
+            await self.gate.wait()
+
+    state = BridgeState(BridgeConfig(bearer_token="test-token"), rpc=fake_rpc)
+    first_started = asyncio.Event()
+    first_gate = asyncio.Event()
+    second_started = asyncio.Event()
+    second_gate = asyncio.Event()
+    first = bridge_service._RetainedSpeechSession(
+        session=GatedSession(first_started, first_gate),  # type: ignore[arg-type]
+        thread_id="first-thread",
+        voice="cove",
+    )
+    second = bridge_service._RetainedSpeechSession(
+        session=GatedSession(second_started, second_gate),  # type: ignore[arg-type]
+        thread_id="second-thread",
+        voice="cove",
+    )
+    first_waiter = asyncio.create_task(state.close_speech_session_resource(first))
+    second_waiter = asyncio.create_task(state.close_speech_session_resource(second))
+    await asyncio.gather(first_started.wait(), second_started.wait())
+
+    first_gate.set()
+    await first_waiter
+
+    assert len(state._speech_cleanup_tasks) == 1
+    admission_entered = asyncio.Event()
+
+    async def wait_for_cleanup() -> None:
+        async with state.speech_session_lease():
+            admission_entered.set()
+
+    admission = asyncio.create_task(wait_for_cleanup())
+    await asyncio.sleep(0)
+    assert not admission.done()
+
+    second_gate.set()
+    await second_waiter
+    await admission
+
+    assert not state._speech_cleanup_tasks
+    assert admission_entered.is_set()
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
     await state.close()
 
 
@@ -1351,6 +1488,33 @@ async def test_transcription_stream_overlaps_handshake_and_assembles_result(
         ({"bit_rate": 24}, "bit_rate must be 16"),
         ({"channels": 2}, "channels must be 1"),
         ({"prompt": None}, "prompt must be a string"),
+        (
+            {"speech_session_handoff": "enabled"},
+            "speech_session_handoff must be an object",
+        ),
+        (
+            {"speech_session_handoff": {"version": 2, "voice": "cove"}},
+            "version must be 1",
+        ),
+        (
+            {"speech_session_handoff": {"version": 1, "voice": ""}},
+            "speech_session_handoff voice must be a non-empty string",
+        ),
+        (
+            {"speech_session_handoff": {"version": 1, "voice": "cove"}},
+            "speech_session_handoff language must be a non-empty language tag",
+        ),
+        (
+            {
+                "language": "en-US",
+                "speech_session_handoff": {
+                    "version": 1,
+                    "voice": "cove",
+                    "language": "es-MX",
+                },
+            },
+            "speech_session_handoff language must match transcription language",
+        ),
     ],
 )
 async def test_transcription_stream_rejects_malformed_start(
@@ -1559,8 +1723,9 @@ async def test_transcription_stream_auth_and_busy_fail_before_upgrade(
     assert unauthorized.value.status == 401
 
     state = bridge_app[bridge_service.STATE_KEY]
-    with state.speech_session_lease(), pytest.raises(WSServerHandshakeError) as busy:
-        await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    async with state.speech_session_lease():
+        with pytest.raises(WSServerHandshakeError) as busy:
+            await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
     assert busy.value.status == 409
 
 
@@ -1760,6 +1925,1102 @@ async def test_transcription_stream_logs_no_private_material(
         assert private_value not in service_log
     assert service_log.count("Realtime transcription attempt timing:") == 1
     assert service_log.count("Realtime transcription stream timing:") == 1
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_reuses_exact_realtime_session(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    with caplog.at_level(logging.INFO):
+        transcription = await _request_speech_session_handoff(client)
+
+        handoff = transcription["speech_session_handoff"]
+        assert handoff["version"] == 1
+        assert handoff["expires_in_ms"] == 30_000
+        assert handoff["voice"] == "cove"
+        token = handoff["token"]
+        padded_token = token + "=" * ((4 - len(token) % 4) % 4)
+        assert len(base64.urlsafe_b64decode(padded_token)) == 32
+        state = bridge_app[bridge_service.STATE_KEY]
+        offer = state._speech_session_offer
+        assert offer is not None
+        assert token not in repr(offer)
+        assert not fake_rpc.peers[0].closed
+        assert fake_rpc.peers[0].pending_input_discarded
+        assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
+
+        payload = _synthesis_payload()
+        payload["speech_session_handoff_token"] = token
+        response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    with wave.open(BytesIO(await response.read()), "rb") as audio:
+        assert audio.readframes(audio.getnframes())
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 1
+    assert sum(method == "thread/realtime/start" for method, _ in fake_rpc.calls) == 1
+    assert any(method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls)
+    assert not any(
+        method == "thread/realtime/appendText"
+        and str(params.get("text", "")).startswith("Vocalize only")
+        for method, params in fake_rpc.calls
+    )
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert token not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_transcription_handoff_reuses_exact_realtime_session(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _transcription_payload()
+    payload["speech_session_handoff"] = {
+        "version": 1,
+        "voice": " COVE ",
+        "language": "en-US",
+    }
+    payload["language"] = "EN_us"
+
+    transcription_response = await client.post(
+        "/v1/transcribe", headers=AUTH, json=payload
+    )
+
+    assert transcription_response.status == 200
+    transcription = await transcription_response.json()
+    assert transcription["text"] == "Turn on the kitchen"
+    handoff = transcription["speech_session_handoff"]
+    assert handoff["version"] == 1
+    assert handoff["voice"] == "cove"
+    assert handoff["language"] == "en-US"
+    assert handoff["expires_in_ms"] == 30_000
+    token = handoff["token"]
+    state = bridge_app[bridge_service.STATE_KEY]
+    assert state._speech_session_offer is not None
+    assert token not in repr(state._speech_session_offer)
+    assert not fake_rpc.peers[0].closed
+
+    synthesis_payload = _synthesis_payload()
+    synthesis_payload["speech_session_handoff_token"] = token
+    synthesis_payload["language"] = "en-US"
+    synthesis_response = await client.post(
+        "/v1/synthesize", headers=AUTH, json=synthesis_payload
+    )
+
+    assert synthesis_response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 1
+    assert sum(method == "thread/realtime/start" for method, _ in fake_rpc.calls) == 1
+    assert (
+        sum(method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls)
+        == 1
+    )
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_language_mismatch_uses_cold_path(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client, language="EN_us")
+    handoff = transcription["speech_session_handoff"]
+    assert handoff["language"] == "en-US"
+    payload = _synthesis_payload()
+    payload["language"] = "es-MX"
+    payload["speech_session_handoff_token"] = handoff["token"]
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert not any(
+        method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls
+    )
+    assert all(peer.closed for peer in fake_rpc.peers)
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handoff", "expected_error"),
+    [
+        ("enabled", "speech_session_handoff must be an object"),
+        ({"version": 2, "voice": "cove"}, "version must be 1"),
+        (
+            {"version": 1, "voice": ""},
+            "speech_session_handoff voice must be a non-empty string",
+        ),
+        (
+            {"version": 1, "voice": "cove"},
+            "speech_session_handoff language must be a non-empty language tag",
+        ),
+    ],
+)
+async def test_post_transcription_rejects_invalid_handoff_request(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    handoff: object,
+    expected_error: str,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _transcription_payload()
+    payload["speech_session_handoff"] = handoff
+
+    response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
+
+    assert response.status == 400
+    assert await response.json() == {"error": expected_error}
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+
+
+@pytest.mark.asyncio
+async def test_post_transcription_rejects_contradictory_handoff_language(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _transcription_payload()
+    payload["language"] = "en-US"
+    payload["speech_session_handoff"] = {
+        "version": 1,
+        "voice": "cove",
+        "language": "es-MX",
+    }
+
+    response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
+
+    assert response.status == 400
+    assert await response.json() == {
+        "error": "speech_session_handoff language must match transcription language"
+    }
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+
+
+@pytest.mark.asyncio
+async def test_post_transcription_handoff_timeout_cleans_every_attempt(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def timeout_transcript(*_: Any, **__: Any) -> str:
+        raise TimeoutError
+
+    monkeypatch.setattr(bridge_service, "_wait_for_user_transcript", timeout_transcript)
+    client = await aiohttp_client(bridge_app)
+    payload = _transcription_payload()
+    payload["speech_session_handoff"] = {
+        "version": 1,
+        "voice": "cove",
+        "language": "en-US",
+    }
+    payload["language"] = "en-US"
+
+    response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
+
+    assert response.status == 504
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert len(fake_rpc.peers) == bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
+    assert all(peer.closed for peer in fake_rpc.peers)
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_post_transcription_v1_cleans_up_without_handoff_offer(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", realtime_version="v1"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    payload = _transcription_payload()
+    payload["speech_session_handoff"] = {
+        "version": 1,
+        "voice": "cove",
+        "language": "en-US",
+    }
+    payload["language"] = "en-US"
+
+    response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    result = await response.json()
+    assert result["text"] == "Turn on the kitchen"
+    assert "speech_session_handoff" not in result
+    assert app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_stt_preempts_unused_offer_before_starting(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    await _request_speech_session_handoff(client)
+    state = bridge_app[bridge_service.STATE_KEY]
+    for _ in range(100):
+        if state._speech_owner is None:
+            break
+        await asyncio.sleep(0)
+    payload = _transcription_payload()
+    payload["speech_session_handoff"] = {
+        "version": 1,
+        "voice": "cove",
+        "language": "en-US",
+    }
+    payload["language"] = "en-US"
+
+    response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    result = await response.json()
+    final_token = result["speech_session_handoff"]["token"]
+    assert fake_rpc.peers[0].closed
+    assert not fake_rpc.peers[1].closed
+    assert [
+        method
+        for method, _ in fake_rpc.calls
+        if method in {"thread/start", "thread/delete"}
+    ] == ["thread/start", "thread/delete", "thread/start"]
+
+    await state.release_speech_session_offer(final_token)
+
+    assert state._speech_session_offer is None
+    assert not state._speech_cleanup_tasks
+    assert all(peer.closed for peer in fake_rpc.peers)
+    assert [
+        method
+        for method, _ in fake_rpc.calls
+        if method in {"thread/start", "thread/delete"}
+    ] == ["thread/start", "thread/delete", "thread/start", "thread/delete"]
+
+
+@pytest.mark.asyncio
+async def test_release_race_delays_new_stt_instead_of_dropping_it(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    state = bridge_app[bridge_service.STATE_KEY]
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    release = asyncio.create_task(state.release_speech_session_offer(token))
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+
+    next_stt = asyncio.create_task(
+        client.post("/v1/transcribe", headers=AUTH, json=_transcription_payload())
+    )
+    await asyncio.sleep(0)
+    assert not next_stt.done()
+
+    fake_rpc.realtime_stop_gate.set()
+    await release
+    response = await asyncio.wait_for(next_stt, timeout=2)
+
+    assert response.status == 200
+    assert [
+        method
+        for method, _ in fake_rpc.calls
+        if method in {"thread/start", "thread/delete"}
+    ] == ["thread/start", "thread/delete", "thread/start", "thread/delete"]
+    assert state._speech_session_offer is None
+    assert not state._speech_cleanup_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "incompatibility",
+    ["missing", "token", "voice", "instructions"],
+)
+async def test_incompatible_synthesis_preempts_offer_and_uses_cold_path(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    incompatibility: str,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = token
+    if incompatibility == "missing":
+        payload.pop("speech_session_handoff_token")
+    elif incompatibility == "token":
+        payload["speech_session_handoff_token"] = "unrelated-token"
+    elif incompatibility == "voice":
+        payload["voice"] = "alloy"
+    else:
+        payload["instructions"] = "Speak quietly"
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert sum(method == "thread/realtime/start" for method, _ in fake_rpc.calls) == 2
+    assert not any(
+        method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls
+    )
+    assert any(
+        method == "thread/realtime/appendText"
+        and str(params.get("text", "")).startswith("Vocalize only")
+        for method, params in fake_rpc.calls
+    )
+    assert [
+        method
+        for method, _ in fake_rpc.calls
+        if method in {"thread/start", "thread/delete"}
+    ] == ["thread/start", "thread/delete", "thread/start", "thread/delete"]
+    assert all(peer.closed for peer in fake_rpc.peers)
+
+
+@pytest.mark.asyncio
+async def test_incompatible_offer_cleanup_survives_pre_yield_cancellation(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    await _request_speech_session_handoff(client)
+    state = bridge_app[bridge_service.STATE_KEY]
+    for _ in range(100):
+        if state._speech_owner is None:
+            break
+        await asyncio.sleep(0)
+    assert state._speech_owner is None
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    lease_entered = asyncio.Event()
+
+    async def preempt_offer() -> None:
+        async with state.speech_session_lease(
+            handoff_token="unrelated-token",
+            voice="cove",
+        ):
+            lease_entered.set()
+
+    preemption = asyncio.create_task(preempt_offer())
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    preemption.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await preemption
+
+    assert not lease_entered.is_set()
+    assert state._speech_session_offer is None
+    assert len(state._speech_cleanup_tasks) == 1
+
+    retry_entered = asyncio.Event()
+
+    async def wait_for_cleanup() -> None:
+        async with state.speech_session_lease():
+            retry_entered.set()
+
+    retry = asyncio.create_task(wait_for_cleanup())
+    await asyncio.sleep(0)
+    assert not retry.done()
+
+    fake_rpc.realtime_stop_gate.set()
+    for _ in range(100):
+        if not state._speech_cleanup_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert not state._speech_cleanup_tasks
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+    await retry
+    assert retry_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_release_is_idempotent(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+
+    unknown = await client.post(
+        "/v1/speech-session/release",
+        headers=AUTH,
+        json={"speech_session_handoff_token": "unrelated-token"},
+    )
+    assert unknown.status == 204
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is not None
+    first = await client.post(
+        "/v1/speech-session/release",
+        headers=AUTH,
+        json={"speech_session_handoff_token": token},
+    )
+    second = await client.post(
+        "/v1/speech-session/release",
+        headers=AUTH,
+        json={"speech_session_handoff_token": token},
+    )
+
+    assert first.status == 204
+    assert second.status == 204
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_speech_session_release_keeps_cleanup_tracked(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    state = bridge_app[bridge_service.STATE_KEY]
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+
+    release = asyncio.create_task(state.release_speech_session_offer(token))
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    release.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await release
+
+    assert state._speech_session_offer is None
+    assert len(state._speech_cleanup_tasks) == 1
+    contender = asyncio.create_task(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload())
+    )
+    await asyncio.sleep(0)
+    assert not contender.done()
+
+    fake_rpc.realtime_stop_gate.set()
+    for _ in range(100):
+        if not state._speech_cleanup_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert not state._speech_cleanup_tasks
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+    response = await asyncio.wait_for(contender, timeout=2)
+    assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_expires_and_cleans_up(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "SPEECH_SESSION_HANDOFF_TTL_SECONDS", 0.01)
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    expired_token = transcription["speech_session_handoff"]["token"]
+    assert transcription["speech_session_handoff"]["expires_in_ms"] == 10
+
+    for _ in range(100):
+        if bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None:
+            break
+        await asyncio.sleep(0.002)
+
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = expired_token
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_watchdog_invalidates_assistant_audio(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    await _request_speech_session_handoff(client)
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is not None
+
+    fake_rpc.peers[0].audio.put_nowait(b"\x01\x00")
+    for _ in range(100):
+        if (
+            bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+            and fake_rpc.peers[0].closed
+        ):
+            break
+        await asyncio.sleep(0)
+
+    assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "result"),
+    [
+        ("audio", b"\x01\x00"),
+        (
+            "app",
+            {
+                "method": "thread/realtime/transcript/done",
+                "params": {
+                    "threadId": "race-thread",
+                    "role": "assistant",
+                    "text": "assistant-output",
+                },
+            },
+        ),
+    ],
+)
+async def test_speech_session_handoff_claim_validates_ready_watchdog_child(
+    fake_rpc: FakeRpc,
+    source: str,
+    result: object,
+) -> None:
+    """A claim cannot hide an unsafe result already dequeued by the watchdog."""
+
+    class RacingSession:
+        def __init__(self) -> None:
+            self.rpc = fake_rpc
+            self.receiver_started = asyncio.Event()
+            self.release_result = asyncio.Event()
+            self.claim_ready = asyncio.Event()
+            self.receiver_task: asyncio.Task[Any] | None = None
+            self.closed = False
+
+        async def _receive(self, receiver: str) -> object:
+            if source != receiver:
+                await asyncio.Future()
+                raise AssertionError("unreachable")
+            self.receiver_started.set()
+            await self.release_result.wait()
+            self.receiver_task = asyncio.current_task()
+            self.claim_ready.set()
+            return result
+
+        async def recv_audio(self) -> Any:
+            return await self._receive("audio")
+
+        async def next_event(self) -> Any:
+            return await self._receive("app")
+
+        async def recv_data_event(self) -> Any:
+            return await self._receive("data")
+
+        def discard_pending_input(self) -> None:
+            return None
+
+        def drain_audio_nowait(self) -> list[bytes]:
+            return []
+
+        def drain_app_events_nowait(self) -> list[dict[str, Any]]:
+            return []
+
+        def drain_data_events_nowait(self) -> list[str | bytes]:
+            return []
+
+        async def stop(self) -> None:
+            self.closed = True
+
+    state = BridgeState(BridgeConfig(bearer_token="test-token"), rpc=fake_rpc)
+    session = RacingSession()
+    resource = bridge_service._RetainedSpeechSession(
+        session=session,  # type: ignore[arg-type]
+        thread_id="race-thread",
+        voice="cove",
+        language="en-US",
+    )
+    handoff = await state.offer_speech_session(resource)
+    claimed: list[bridge_service._RetainedSpeechSession | None] = []
+
+    async def claim_offer() -> None:
+        await session.claim_ready.wait()
+        assert session.receiver_task is not None
+        assert session.receiver_task.done()
+        async with state.speech_session_lease(
+            handoff_token=handoff["token"],
+            voice="cove",
+            language="en-US",
+        ) as retained:
+            claimed.append(retained)
+
+    claim = asyncio.create_task(claim_offer())
+    await session.receiver_started.wait()
+    session.release_result.set()
+    await asyncio.wait_for(claim, timeout=1)
+
+    assert claimed == [None]
+    assert resource.invalidated
+    assert session.closed
+    assert state._speech_session_offer is None
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_handoff_watchdog_rejects_mixed_active_transcript(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    await _request_speech_session_handoff(client)
+    state = bridge_app[bridge_service.STATE_KEY]
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/itemAdded",
+            "params": {
+                "threadId": "thread-1",
+                "item": {
+                    "type": "handoff_request",
+                    "input_transcript": "valid-input",
+                    "active_transcript": [
+                        {"role": "user", "text": "valid-input"},
+                        {"role": "assistant", "text": "assistant-output"},
+                    ],
+                },
+            },
+        }
+    )
+    for _ in range(100):
+        if state._speech_session_offer is None and fake_rpc.peers[0].closed:
+            break
+        await asyncio.sleep(0)
+
+    assert state._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "turn.done", "turn": {"role": "assistant"}},
+        {"type": "output_transcript.added", "text": "private-output"},
+    ],
+)
+def test_speech_handoff_data_validator_rejects_output_shapes(
+    event: dict[str, Any],
+) -> None:
+    with pytest.raises(ProtocolError):
+        bridge_service._validate_speech_handoff_data_event(json.dumps(event))
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "assistant",
+                "text": "private-output",
+            },
+        },
+        {
+            "method": "item/tool/call",
+            "params": {"threadId": "thread-1", "role": "user"},
+        },
+        {
+            "method": "thread/realtime/unknown",
+            "params": {"threadId": "thread-1"},
+        },
+        {
+            "method": "thread/realtime/itemAdded",
+            "params": {
+                "threadId": "thread-1",
+                "item": {
+                    "type": "handoff_request",
+                    "input_transcript": "valid-input",
+                    "active_transcript": [
+                        {"role": "user", "text": "valid-input"},
+                        {"role": "assistant", "text": "assistant-output"},
+                    ],
+                },
+            },
+        },
+    ],
+)
+def test_speech_handoff_app_validator_rejects_non_input_shapes(
+    event: dict[str, Any],
+) -> None:
+    with pytest.raises(ProtocolError):
+        bridge_service._validate_speech_handoff_app_event(event)
+
+
+def test_speech_handoff_validators_accept_known_input_shapes() -> None:
+    bridge_service._validate_speech_handoff_app_event(
+        {
+            "method": "thread/realtime/started",
+            "params": {
+                "threadId": "thread-1",
+                "realtimeSessionId": "session-1",
+                "version": "v3",
+            },
+        }
+    )
+    bridge_service._validate_speech_handoff_data_event(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"role": "user", "input_transcript": "private-input"},
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "turn.done", "turn": {"role": "assistant"}},
+        {"type": "output_transcript.added", "text": "private-output"},
+    ],
+)
+async def test_speech_handoff_watchdog_invalid_data_forces_cold_fallback(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    event: dict[str, Any],
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    state = bridge_app[bridge_service.STATE_KEY]
+
+    fake_rpc.peers[0].data.put_nowait(json.dumps(event))
+    for _ in range(100):
+        if state._speech_session_offer is None and fake_rpc.peers[0].closed:
+            break
+        await asyncio.sleep(0)
+
+    assert state._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = token
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert not any(
+        method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls
+    )
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_claim_rechecks_watchdog_invalidation(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    state = bridge_app[bridge_service.STATE_KEY]
+    original_cancel = bridge_service._cancel_speech_offer_watchdog
+
+    async def invalidate_after_claim(
+        offer: bridge_service._SpeechSessionOffer,
+    ) -> None:
+        assert state._speech_session_offer is None
+        offer.resource.invalidated = True
+        await original_cancel(offer)
+
+    monkeypatch.setattr(
+        bridge_service,
+        "_cancel_speech_offer_watchdog",
+        invalidate_after_claim,
+    )
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = token
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert not any(
+        method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls
+    )
+    assert all(peer.closed for peer in fake_rpc.peers)
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_speech_session_handoff_rejects_pre_offer_assistant_audio(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    fake_rpc.transcript_gate = asyncio.Event()
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+    await websocket.send_json(
+        _transcription_stream_start(
+            language="en-US",
+            speech_session_handoff={
+                "version": 1,
+                "voice": "cove",
+                "language": "en-US",
+            },
+        )
+    )
+    assert (await websocket.receive_json())["type"] == "started"
+    await websocket.send_bytes(b"\x00\x20" * 160)
+    await websocket.send_json({"type": "end"})
+    await asyncio.wait_for(fake_rpc.transcript_started.wait(), timeout=1)
+    fake_rpc.peers[0].audio.put_nowait(b"\x01\x00")
+    fake_rpc.transcript_gate.set()
+
+    result = await websocket.receive_json(timeout=1)
+
+    assert result["type"] == "result"
+    assert "speech_session_handoff" not in result
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_warm_synthesis_failure_before_audio_retries_cold_once(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    fake_rpc.handoff_append_error = ProtocolError("private warm failure")
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = token
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert (
+        sum(method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls)
+        == 1
+    )
+    assert (
+        sum(
+            method == "thread/realtime/appendText"
+            and str(params.get("text", "")).startswith("Vocalize only")
+            for method, params in fake_rpc.calls
+        )
+        == 1
+    )
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_late_stt_audio_during_warm_append_forces_cold_fallback(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    fake_rpc.synthesis_append_gate = asyncio.Event()
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = token
+
+    synthesis = asyncio.create_task(
+        client.post("/v1/synthesize", headers=AUTH, json=payload)
+    )
+    await asyncio.wait_for(fake_rpc.synthesis_append_started.wait(), timeout=1)
+    fake_rpc.peers[0].audio.put_nowait(b"\x55\x00" * 48)
+    fake_rpc.synthesis_append_gate.set()
+    response = await asyncio.wait_for(synthesis, timeout=2)
+
+    assert response.status == 200
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 2
+    assert (
+        sum(method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls)
+        == 1
+    )
+    assert (
+        sum(
+            method == "thread/realtime/appendText"
+            and str(params.get("text", "")).startswith("Vocalize only")
+            for method, params in fake_rpc.calls
+        )
+        == 1
+    )
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_warm_synthesis_failure_after_pcm_does_not_retry(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+
+    async def fail_after_pcm(
+        session: Any,
+        _timeout: float,
+        *,
+        timing: Any = None,
+        async_handle_chunk: Any = None,
+    ) -> bytes:
+        chunk = await session.recv_audio()
+        assert chunk
+        if async_handle_chunk is not None:
+            await async_handle_chunk(chunk)
+        if timing is not None:
+            timing.first_audio_at = time.monotonic()
+            timing.last_audio_at = timing.first_audio_at
+        raise ProtocolError("failure after private PCM")
+
+    monkeypatch.setattr(bridge_service, "_collect_speech_audio", fail_after_pcm)
+    payload = _synthesis_payload()
+    payload["speech_session_handoff_token"] = token
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 400
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 1
+    assert (
+        sum(method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls)
+        == 1
+    )
+    assert not any(
+        method == "thread/realtime/appendText"
+        and str(params.get("text", "")).startswith("Vocalize only")
+        for method, params in fake_rpc.calls
+    )
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_speech_session_release_cleanup_delays_new_admission(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    transcription = await _request_speech_session_handoff(client)
+    token = transcription["speech_session_handoff"]["token"]
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    releasing = asyncio.create_task(
+        client.post(
+            "/v1/speech-session/release",
+            headers=AUTH,
+            json={"speech_session_handoff_token": token},
+        )
+    )
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+
+    contender = asyncio.create_task(
+        client.post("/v1/synthesize", headers=AUTH, json=_synthesis_payload())
+    )
+
+    await asyncio.sleep(0)
+    assert not contender.done()
+    fake_rpc.realtime_stop_gate.set()
+    released = await asyncio.wait_for(releasing, timeout=1)
+    assert released.status == 204
+    response = await asyncio.wait_for(contender, timeout=2)
+    assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_bridge_shutdown_disposes_speech_session_offer(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    await _request_speech_session_handoff(client)
+    state = bridge_app[bridge_service.STATE_KEY]
+    assert state._speech_session_offer is not None
+
+    await state.close()
+
+    assert state._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bridge_shutdown_keeps_authoritative_cleanup_running(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    await _request_speech_session_handoff(client)
+    state = bridge_app[bridge_service.STATE_KEY]
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+
+    shutdown = asyncio.create_task(state.close())
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    shutdown.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+
+    assert state._close_task is not None
+    assert not state._close_task.done()
+    assert state._speech_cleanup_tasks
+    fake_rpc.realtime_stop_gate.set()
+    await asyncio.wait_for(asyncio.shield(state._close_task), timeout=1)
+
+    assert not state._speech_cleanup_tasks
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+    assert not fake_rpc.running
+
+
+@pytest.mark.asyncio
+async def test_v1_realtime_never_offers_speech_session_handoff(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", realtime_version="v1"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+
+    result = await _request_speech_session_handoff(client)
+
+    assert result["type"] == "result"
+    assert "speech_session_handoff" not in result
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -2432,11 +3693,11 @@ async def test_synthesis_collector_stops_after_terminal_event_with_continuous_au
             await asyncio.sleep(0.002)
 
     producer = asyncio.create_task(produce_audio())
-    session.data.put_nowait(json.dumps({"type": "turn.done"}))
+    collection = asyncio.create_task(bridge_service._collect_speech_audio(session, 1.0))
     try:
-        result = await asyncio.wait_for(
-            bridge_service._collect_speech_audio(session, 1.0), timeout=0.25
-        )
+        await asyncio.sleep(0.01)
+        session.data.put_nowait(json.dumps({"type": "turn.done"}))
+        result = await asyncio.wait_for(collection, timeout=0.25)
     finally:
         producer.cancel()
         await asyncio.gather(producer, return_exceptions=True)
@@ -2480,17 +3741,42 @@ async def test_synthesis_collector_does_not_truncate_after_transcript_done(
 
 
 @pytest.mark.asyncio
-async def test_synthesis_terminal_before_audio_is_a_protocol_error(
+async def test_synthesis_collector_ignores_stale_completion_before_first_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(bridge_service, "SYNTHESIS_TAIL_GRACE_SECONDS", 0.01)
     session = FakeCollectorSession()
     session.data.put_nowait(json.dumps({"type": "turn.done"}))
+    collection = asyncio.create_task(bridge_service._collect_speech_audio(session, 1.0))
 
-    with pytest.raises(ProtocolError, match="produced no audio"):
-        await asyncio.wait_for(
-            bridge_service._collect_speech_audio(session, 1.0), timeout=0.2
-        )
+    await asyncio.sleep(0.03)
+    assert not collection.done()
+    session.audio.put_nowait(b"\x01\x00" * 24)
+    await asyncio.sleep(0.01)
+    session.data.put_nowait(json.dumps({"type": "turn.done"}))
+
+    assert await asyncio.wait_for(collection, timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_synthesis_collector_ignores_stale_turn_across_natural_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old STT turn cannot apply the short completed-turn idle cutoff."""
+    monkeypatch.setattr(bridge_service, "SYNTHESIS_TAIL_GRACE_SECONDS", 0.01)
+    session = FakeCollectorSession()
+    marker = b"post-pause-audio"
+    session.data.put_nowait(json.dumps({"type": "turn.done"}))
+    session.audio.put_nowait(b"\x01\x00" * 24)
+    collection = asyncio.create_task(bridge_service._collect_speech_audio(session, 2.0))
+
+    await asyncio.sleep(0.7)
+    assert not collection.done()
+    session.audio.put_nowait(marker)
+    session.data.put_nowait(json.dumps({"type": "turn.done"}))
+
+    result = await asyncio.wait_for(collection, timeout=0.2)
+    assert marker in result
 
 
 @pytest.mark.asyncio
@@ -2522,6 +3808,35 @@ async def test_transcription_uses_v3_data_channel_final() -> None:
     )
 
     assert transcript == "The front door is locked."
+
+
+@pytest.mark.asyncio
+async def test_handoff_transcription_rejects_simultaneous_assistant_data() -> None:
+    """A terminal user transcript cannot hide a ready unsafe sibling event."""
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "text": "Turn on the kitchen.",
+            },
+        }
+    )
+    session.data.put_nowait(
+        json.dumps(
+            {"type": "turn.done", "turn": {"role": "assistant", "text": "unsafe"}}
+        )
+    )
+
+    with pytest.raises(ProtocolError):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session, 1.0, strict_handoff_boundary=True
+            ),
+            timeout=0.2,
+        )
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,10 @@ import base64
 import json
 import struct
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from contextlib import suppress
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, Final, NoReturn
 
 from aiohttp import (
@@ -18,6 +21,7 @@ from aiohttp import (
     WSMsgType,
     WSServerHandshakeError,
 )
+from homeassistant.helpers import chat_session
 
 from .const import (
     CONVERSATION_TIMEOUT,
@@ -48,6 +52,9 @@ _STREAMING_WAV_HEADER: Final = struct.pack(
 )
 _WAV_STREAM_PREAMBLE_BYTES: Final = len(_STREAMING_WAV_HEADER) + 2
 _AUDIO_STREAM_CHUNK_BYTES: Final = 64 * 1024
+_SPEECH_SESSION_HANDOFF_VERSION: Final = 1
+_SPEECH_SESSION_HANDOFF_OPTION: Final = "_codex_voice_pipeline_handoff"
+_SPEECH_SESSION_HANDOFF_OPTION_VALUE: Final = 1
 
 JsonObject = dict[str, Any]
 DeltaHandler = Callable[[str], Awaitable[None]]
@@ -103,6 +110,54 @@ class BridgeAudio:
     sample_width: int = 2
 
 
+@dataclass(frozen=True, slots=True)
+class _SpeechSessionHandoffRequest:
+    """Private correlation for one Assist pipeline transcription."""
+
+    client: BridgeClient
+    session: chat_session.ChatSession
+    preparation: _SpeechSessionHandoffPreparation
+    voice: str
+    language: str
+
+
+@dataclass(slots=True)
+class _SpeechSessionHandoffPreparation:
+    """One pre-STT pipeline preparation shared by copied async contexts."""
+
+    client: BridgeClient
+    session: chat_session.ChatSession
+    voice: str
+    consumed: bool = False
+
+
+@dataclass(slots=True)
+class _PendingSpeechSessionHandoff:
+    """Mutable one-shot ticket shared by copied async contexts."""
+
+    client: BridgeClient
+    session: chat_session.ChatSession
+    preparation: _SpeechSessionHandoffPreparation
+    token: str = field(repr=False)
+    voice: str
+    language: str
+    expires_at: float
+    consumed_or_revoked: bool = False
+    expiry_handle: asyncio.TimerHandle | None = None
+
+
+_SPEECH_SESSION_HANDOFF_PREPARATION: ContextVar[
+    _SpeechSessionHandoffPreparation | None
+] = ContextVar("codex_voice_speech_session_handoff_preparation", default=None)
+_PENDING_SPEECH_SESSION_HANDOFF: ContextVar[_PendingSpeechSessionHandoff | None] = (
+    ContextVar(
+        "codex_voice_pending_speech_session_handoff",
+        default=None,
+    )
+)
+_HANDOFF_RELEASE_TASKS: set[asyncio.Task[None]] = set()
+
+
 def normalize_bridge_url(url: str) -> str:
     """Return a stable bridge URL without a trailing slash."""
     return url.strip().rstrip("/")
@@ -121,6 +176,12 @@ class BridgeClient:
         self._session = session
         self.base_url = normalize_bridge_url(base_url)
         self._headers = {"Authorization": f"Bearer {access_token}"}
+        self._handoff_release_tasks: set[asyncio.Task[None]] = set()
+
+    def cancel_handoff_release_tasks(self) -> None:
+        """Cancel best-effort cleanup jobs when the owning entry unloads."""
+        for task in tuple(self._handoff_release_tasks):
+            task.cancel()
 
     def _url(self, path: str) -> str:
         """Build a bridge URL."""
@@ -245,6 +306,7 @@ class BridgeClient:
         metadata: Mapping[str, Any],
         *,
         prompt: str | None,
+        speech_session_handoff: _SpeechSessionHandoffRequest | None = None,
     ) -> str:
         """Transcribe raw PCM with the bridge."""
         if len(audio) > MAX_AUDIO_BYTES:
@@ -258,11 +320,13 @@ class BridgeClient:
         }
         if prompt:
             payload["prompt"] = prompt
+        self._add_speech_session_handoff_request(payload, speech_session_handoff)
 
         response_payload = await self._async_post_json("/v1/transcribe", payload)
         text = response_payload.get("text", response_payload.get("transcript"))
         if not isinstance(text, str):
             raise BridgeProtocolError("Transcription response did not contain text")
+        self._store_speech_session_handoff(response_payload, speech_session_handoff)
         return text
 
     async def async_transcribe_stream(
@@ -271,9 +335,11 @@ class BridgeClient:
         metadata: Mapping[str, Any],
         *,
         prompt: str | None,
+        speech_session_handoff: _SpeechSessionHandoffRequest | None = None,
     ) -> str:
         """Transcribe a bounded PCM stream over an authenticated WebSocket."""
         start = self._transcription_start(metadata, prompt=prompt)
+        self._add_speech_session_handoff_request(start, speech_session_handoff)
 
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
@@ -324,7 +390,11 @@ class BridgeClient:
 
                             await websocket.send_json({"type": "end"})
                             result = await self._receive_transcription_event(websocket)
-                            return self._decode_transcription_result(result)
+                            text = self._decode_transcription_result(result)
+                            self._store_speech_session_handoff(
+                                result, speech_session_handoff
+                            )
+                            return text
                         finally:
                             await websocket.close()
                 except WSServerHandshakeError as err:
@@ -343,6 +413,7 @@ class BridgeClient:
         language: str,
         voice: str,
         instructions: str | None,
+        speech_session_handoff_token: str | None = None,
     ) -> BridgeAudio:
         """Synthesize text and return WAV or PCM audio."""
         payload: JsonObject = {
@@ -353,6 +424,8 @@ class BridgeClient:
         }
         if instructions:
             payload["instructions"] = instructions
+        if speech_session_handoff_token:
+            payload["speech_session_handoff_token"] = speech_session_handoff_token
 
         try:
             async with self._session.post(
@@ -385,6 +458,7 @@ class BridgeClient:
         language: str,
         voice: str,
         instructions: str | None,
+        speech_session_handoff_token: str | None = None,
     ) -> AsyncGenerator[bytes]:
         """Yield a bounded WAV response as the bridge produces it."""
         payload: JsonObject = {
@@ -395,6 +469,8 @@ class BridgeClient:
         }
         if instructions:
             payload["instructions"] = instructions
+        if speech_session_handoff_token:
+            payload["speech_session_handoff_token"] = speech_session_handoff_token
 
         try:
             async with self._session.post(
@@ -458,6 +534,21 @@ class BridgeClient:
             raise
         except (TimeoutError, ClientError) as err:
             raise BridgeConnectionError("Speech synthesis failed") from err
+
+    async def async_release_speech_session_handoff(self, token: str) -> None:
+        """Best-effort release is exposed for private component coordination."""
+        try:
+            async with self._session.post(
+                self._url("/v1/speech-session/release"),
+                headers=self._headers,
+                json={"speech_session_handoff_token": token},
+                timeout=ClientTimeout(total=HEALTH_TIMEOUT),
+            ) as response:
+                await self._raise_for_status(response)
+        except BridgeError:
+            raise
+        except (TimeoutError, ClientError) as err:
+            raise BridgeConnectionError("Speech session release failed") from err
 
     async def _async_post_json(self, path: str, payload: JsonObject) -> JsonObject:
         """POST JSON and return a JSON object."""
@@ -602,6 +693,30 @@ class BridgeClient:
             raise BridgeProtocolError("Transcription result language must be text")
         return text
 
+    def _add_speech_session_handoff_request(
+        self,
+        payload: JsonObject,
+        request: _SpeechSessionHandoffRequest | None,
+    ) -> None:
+        """Add the private v1 handoff opt-in for this exact client."""
+        if request is None or request.client is not self:
+            return
+        payload["speech_session_handoff"] = {
+            "version": _SPEECH_SESSION_HANDOFF_VERSION,
+            "voice": request.voice,
+            "language": request.language,
+        }
+
+    def _store_speech_session_handoff(
+        self,
+        payload: JsonObject,
+        request: _SpeechSessionHandoffRequest | None,
+    ) -> None:
+        """Privately retain valid one-time result metadata for downstream TTS."""
+        if request is None or request.client is not self:
+            return
+        _store_pending_speech_session_handoff(payload, request)
+
     @staticmethod
     def _raise_transcription_handshake_error(
         error: WSServerHandshakeError,
@@ -717,3 +832,249 @@ class BridgeClient:
             raise BridgeProtocolError("Synthesis stream was not a valid WAV file")
         if audio[: len(_STREAMING_WAV_HEADER)] != _STREAMING_WAV_HEADER:
             raise BridgeProtocolError("Synthesis stream was not a valid WAV file")
+
+
+def _prepare_speech_session_handoff(
+    client: BridgeClient,
+    *,
+    voice: str,
+) -> bool:
+    """Mark one active-session TTS preparation before pipeline STT begins."""
+    session = chat_session.current_session.get()
+    if session is None:
+        return False
+
+    preparation = _SPEECH_SESSION_HANDOFF_PREPARATION.get()
+    if preparation is not None:
+        if preparation.session is session:
+            return (
+                preparation.client is client
+                and preparation.voice == voice
+                and not preparation.consumed
+            )
+        if not preparation.consumed:
+            return False
+
+    _SPEECH_SESSION_HANDOFF_PREPARATION.set(
+        _SpeechSessionHandoffPreparation(
+            client=client,
+            session=session,
+            voice=voice,
+        )
+    )
+    return True
+
+
+def _begin_speech_session_handoff(
+    client: BridgeClient,
+    *,
+    language: str,
+) -> _SpeechSessionHandoffRequest | None:
+    """Consume only the exact pipeline preparation made before this STT call."""
+    _revoke_pending_speech_session_handoff()
+    session = chat_session.current_session.get()
+    if session is None:
+        return None
+
+    preparation = _SPEECH_SESSION_HANDOFF_PREPARATION.get()
+    if (
+        preparation is None
+        or preparation.consumed
+        or preparation.client is not client
+        or preparation.session is not session
+    ):
+        return None
+
+    normalized_language = _normalize_speech_language(language)
+    if not normalized_language:
+        return None
+
+    preparation.consumed = True
+    return _SpeechSessionHandoffRequest(
+        client=client,
+        session=session,
+        preparation=preparation,
+        voice=preparation.voice,
+        language=normalized_language,
+    )
+
+
+def _claim_speech_session_handoff(
+    client: BridgeClient,
+    *,
+    language: str,
+    voice: str,
+    instructions: str | None,
+    options: dict[str, Any],
+) -> str | None:
+    """Strip the pipeline marker and atomically claim before the first await."""
+    marker = options.pop(_SPEECH_SESSION_HANDOFF_OPTION, None)
+    if marker != _SPEECH_SESSION_HANDOFF_OPTION_VALUE:
+        return None
+
+    pending = _PENDING_SPEECH_SESSION_HANDOFF.get()
+    if pending is None:
+        return None
+    if pending.consumed_or_revoked:
+        _PENDING_SPEECH_SESSION_HANDOFF.set(None)
+        return None
+
+    session = chat_session.current_session.get()
+    if (
+        pending.client is not client
+        or pending.session is not session
+        or pending.preparation is not _SPEECH_SESSION_HANDOFF_PREPARATION.get()
+    ):
+        return None
+
+    if pending.expires_at <= monotonic():
+        _revoke_pending_speech_session_handoff()
+        return None
+    if (
+        pending.voice != voice
+        or pending.language != _normalize_speech_language(language)
+        or instructions
+    ):
+        _revoke_pending_speech_session_handoff()
+        return None
+
+    pending.consumed_or_revoked = True
+    if pending.expiry_handle is not None:
+        pending.expiry_handle.cancel()
+        pending.expiry_handle = None
+    _PENDING_SPEECH_SESSION_HANDOFF.set(None)
+    return pending.token
+
+
+def _revoke_pending_speech_session_handoff() -> None:
+    """Atomically revoke and best-effort release this context's pending ticket."""
+    pending = _PENDING_SPEECH_SESSION_HANDOFF.get()
+    _PENDING_SPEECH_SESSION_HANDOFF.set(None)
+    if pending is None or pending.consumed_or_revoked:
+        return
+    pending.consumed_or_revoked = True
+    if pending.expiry_handle is not None:
+        pending.expiry_handle.cancel()
+        pending.expiry_handle = None
+    _schedule_speech_session_handoff_release(pending.client, pending.token)
+
+
+def _schedule_speech_session_handoff_release(
+    client: BridgeClient,
+    token: str,
+) -> None:
+    """Schedule an idempotent release without retaining secrets in task names."""
+    task = asyncio.create_task(
+        _async_release_speech_session_handoff(client, token),
+        name="codex-voice-speech-session-release",
+    )
+    client_tasks = getattr(client, "_handoff_release_tasks", None)
+    if client_tasks is None:
+        client_tasks = set()
+        client._handoff_release_tasks = client_tasks  # noqa: SLF001
+    client_tasks.add(task)
+    _HANDOFF_RELEASE_TASKS.add(task)
+
+    def release_done(done: asyncio.Task[None]) -> None:
+        """Drop ownership and always retrieve a best-effort task exception."""
+        client_tasks.discard(done)
+        _HANDOFF_RELEASE_TASKS.discard(done)
+        with suppress(asyncio.CancelledError):
+            done.exception()
+
+    task.add_done_callback(release_done)
+
+
+async def _async_release_speech_session_handoff(
+    client: BridgeClient,
+    token: str,
+) -> None:
+    """Release a ticket without logging or surfacing best-effort failures."""
+    with suppress(BridgeError, RuntimeError):
+        await client.async_release_speech_session_handoff(token)
+
+
+def _store_pending_speech_session_handoff(
+    payload: JsonObject,
+    request: _SpeechSessionHandoffRequest,
+) -> None:
+    """Validate opaque result metadata and bind it to the originating context."""
+    value = payload.get("speech_session_handoff")
+    if not isinstance(value, Mapping):
+        return
+    version = value.get("version")
+    token = value.get("token")
+    expires_in_ms = value.get("expires_in_ms")
+    voice = value.get("voice")
+    language = value.get("language")
+    if (
+        type(version) is not int
+        or version != _SPEECH_SESSION_HANDOFF_VERSION
+        or not isinstance(token, str)
+        or not token
+        or len(token) > 4096
+        or type(expires_in_ms) is not int
+        or expires_in_ms <= 0
+        or not isinstance(voice, str)
+        or not voice
+        or not isinstance(language, str)
+        or not language
+    ):
+        return
+
+    normalized_language = _normalize_speech_language(language)
+
+    if (
+        chat_session.current_session.get() is not request.session
+        or _SPEECH_SESSION_HANDOFF_PREPARATION.get() is not request.preparation
+        or not request.preparation.consumed
+        or voice != request.voice
+        or normalized_language != request.language
+    ):
+        _schedule_speech_session_handoff_release(request.client, token)
+        return
+
+    _revoke_pending_speech_session_handoff()
+    loop = asyncio.get_running_loop()
+    pending = _PendingSpeechSessionHandoff(
+        client=request.client,
+        session=request.session,
+        preparation=request.preparation,
+        token=token,
+        voice=voice,
+        language=normalized_language,
+        expires_at=monotonic() + expires_in_ms / 1000,
+    )
+    _PENDING_SPEECH_SESSION_HANDOFF.set(pending)
+    pending.expiry_handle = loop.call_at(
+        pending.expires_at,
+        _expire_speech_session_handoff,
+        pending,
+    )
+
+
+def _expire_speech_session_handoff(
+    pending: _PendingSpeechSessionHandoff,
+) -> None:
+    """Revoke an unclaimed ticket at its local monotonic deadline."""
+    pending.expiry_handle = None
+    if pending.consumed_or_revoked:
+        return
+    pending.consumed_or_revoked = True
+    _schedule_speech_session_handoff_release(pending.client, pending.token)
+
+
+def _normalize_speech_language(language: str) -> str:
+    """Return the private handoff's stable BCP-47 comparison form."""
+    parts = language.strip().replace("_", "-").split("-")
+    if not parts or any(not part for part in parts):
+        return ""
+    return "-".join(
+        [
+            parts[0].lower(),
+            *(
+                part.upper() if len(part) == 2 and part.isalpha() else part
+                for part in parts[1:]
+            ),
+        ]
+    )

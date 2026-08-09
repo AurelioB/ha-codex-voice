@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 from aiohttp import web
+from homeassistant.helpers import chat_session
 
 from custom_components.codex_voice import api as api_module
 from custom_components.codex_voice.api import (
@@ -42,6 +43,26 @@ def _streaming_wav_audio(pcm: bytes = b"\x00\x01\x02\x03") -> bytes:
     audio[4:8] = b"\xff\xff\xff\xff"
     audio[40:44] = b"\xff\xff\xff\xff"
     return bytes(audio)
+
+
+def _prepare_pipeline_handoff(
+    client: BridgeClient,
+    *,
+    voice: str = "cove",
+    language: str = "en-US",
+) -> tuple[api_module._SpeechSessionHandoffRequest, dict[str, Any]]:
+    """Simulate HA preparing its TTS ResultStream before pipeline STT."""
+    assert api_module._prepare_speech_session_handoff(client, voice=voice)
+    request = api_module._begin_speech_session_handoff(
+        client,
+        language=language,
+    )
+    assert request is not None
+    return request, {
+        api_module._SPEECH_SESSION_HANDOFF_OPTION: (
+            api_module._SPEECH_SESSION_HANDOFF_OPTION_VALUE
+        )
+    }
 
 
 async def test_health_and_authentication(
@@ -178,6 +199,229 @@ async def test_transcribe_sends_base64_pcm(
     assert received["sample_rate"] == 16000
 
 
+async def test_finite_transcription_handoff_is_private_and_one_time(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Finite STT metadata is retained privately and sent once to matching TTS."""
+    received: dict[str, Any] = {}
+
+    async def transcribe(request: web.Request) -> web.Response:
+        received["transcribe"] = await request.json()
+        return web.json_response(
+            {
+                "text": "Private transcript",
+                "speech_session_handoff": {
+                    "version": 1,
+                    "token": "opaque-ticket",
+                    "expires_in_ms": 30_000,
+                    "voice": "cove",
+                    "language": "en-US",
+                },
+            }
+        )
+
+    async def synthesize(request: web.Request) -> web.Response:
+        received["synthesize"] = await request.json()
+        return web.json_response(
+            {
+                "audio": base64.b64encode(b"\x00\x01").decode(),
+                "format": "pcm",
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/transcribe", transcribe)
+    app.router.add_post("/v1/synthesize", synthesize)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+    session = chat_session.ChatSession("assist-session")
+    session_context = chat_session.current_session.set(session)
+    try:
+        handoff, claim_options = _prepare_pipeline_handoff(client)
+        transcript = await client.async_transcribe(
+            b"\x00\x01",
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+            speech_session_handoff=handoff,
+        )
+        handoff_token = api_module._claim_speech_session_handoff(
+            client,
+            language="en-US",
+            voice="cove",
+            instructions=None,
+            options=dict(claim_options),
+        )
+        assert transcript == "Private transcript"
+        assert handoff_token == "opaque-ticket"
+        assert (
+            api_module._claim_speech_session_handoff(
+                client,
+                language="en-US",
+                voice="cove",
+                instructions=None,
+                options=dict(claim_options),
+            )
+            is None
+        )
+        await client.async_synthesize(
+            "Spoken response",
+            language="en-US",
+            voice="cove",
+            instructions=None,
+            speech_session_handoff_token=handoff_token,
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert received["transcribe"]["speech_session_handoff"] == {
+        "version": 1,
+        "voice": "cove",
+        "language": "en-US",
+    }
+    assert received["synthesize"]["speech_session_handoff_token"] == ("opaque-ticket")
+    assert "opaque-ticket" not in transcript
+
+
+async def test_transcription_without_handoff_metadata_stays_cold(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """An old bridge can ignore the opt-in without affecting transcription."""
+
+    async def transcribe(request: web.Request) -> web.Response:
+        assert (await request.json())["speech_session_handoff"]["version"] == 1
+        return web.json_response({"text": "Cold transcript"})
+
+    app = web.Application()
+    app.router.add_post("/v1/transcribe", transcribe)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
+    )
+    try:
+        handoff, claim_options = _prepare_pipeline_handoff(client)
+        result = await client.async_transcribe(
+            b"\x00\x01",
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+            speech_session_handoff=handoff,
+        )
+        claimed = api_module._claim_speech_session_handoff(
+            client,
+            language="en-US",
+            voice="cove",
+            instructions=None,
+            options=claim_options,
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert result == "Cold transcript"
+    assert claimed is None
+
+
+async def test_finite_handoff_rejects_mismatched_result_language(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """A finite bridge result cannot change the normalized STT language binding."""
+    released: list[str] = []
+
+    async def transcribe(request: web.Request) -> web.Response:
+        payload = await request.json()
+        assert payload["speech_session_handoff"]["language"] == "en-US"
+        return web.json_response(
+            {
+                "text": "Cold transcript",
+                "speech_session_handoff": {
+                    "version": 1,
+                    "token": "wrong-language-ticket",
+                    "expires_in_ms": 30_000,
+                    "voice": "cove",
+                    "language": "en-GB",
+                },
+            }
+        )
+
+    async def release(request: web.Request) -> web.Response:
+        released.append((await request.json())["speech_session_handoff_token"])
+        return web.Response(status=204)
+
+    app = web.Application()
+    app.router.add_post("/v1/transcribe", transcribe)
+    app.router.add_post("/v1/speech-session/release", release)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
+    )
+    try:
+        handoff, claim_options = _prepare_pipeline_handoff(
+            client,
+            language=" EN_us ",
+        )
+        result = await client.async_transcribe(
+            b"\x00\x01",
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt=None,
+            speech_session_handoff=handoff,
+        )
+        claimed = api_module._claim_speech_session_handoff(
+            client,
+            language="en-US",
+            voice="cove",
+            instructions=None,
+            options=claim_options,
+        )
+        while client._handoff_release_tasks:
+            await asyncio.gather(*tuple(client._handoff_release_tasks))
+            await asyncio.sleep(0)
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert result == "Cold transcript"
+    assert claimed is None
+    assert released == ["wrong-language-ticket"]
+
+
+def test_handoff_claim_always_strips_private_pipeline_marker() -> None:
+    """Private correlation metadata never reaches supported bridge options."""
+    options = {
+        api_module._SPEECH_SESSION_HANDOFF_OPTION: (
+            api_module._SPEECH_SESSION_HANDOFF_OPTION_VALUE
+        )
+    }
+
+    assert (
+        api_module._claim_speech_session_handoff(
+            cast("BridgeClient", object()),
+            language="en-US",
+            voice="cove",
+            instructions=None,
+            options=options,
+        )
+        is None
+    )
+    assert api_module._SPEECH_SESSION_HANDOFF_OPTION not in options
+
+
 async def test_transcribe_stream_opens_before_consuming_and_preserves_chunks(
     aiohttp_client: Any,
     socket_enabled: None,
@@ -201,7 +445,18 @@ async def test_transcribe_stream_opens_before_consuming_and_preserves_chunks(
             assert message.type is web.WSMsgType.TEXT
             received["end"] = message.json()
             await websocket.send_json(
-                {"type": "result", "text": "Streamed speech", "language": "en-US"}
+                {
+                    "type": "result",
+                    "text": "Streamed speech",
+                    "language": "en-US",
+                    "speech_session_handoff": {
+                        "version": 1,
+                        "token": "stream-ticket",
+                        "expires_in_ms": 30_000,
+                        "voice": "cove",
+                        "language": "en-US",
+                    },
+                }
             )
             break
         return websocket
@@ -217,19 +472,34 @@ async def test_transcribe_stream_opens_before_consuming_and_preserves_chunks(
     app.router.add_get("/v1/transcribe/stream", transcribe)
     test_client = await aiohttp_client(app)
     client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
-
-    result = await client.async_transcribe_stream(
-        audio_stream(),
-        {
-            "sample_rate": 16000,
-            "bit_rate": 16,
-            "channels": 1,
-            "language": "en-US",
-        },
-        prompt="Home automation",
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
     )
+    try:
+        handoff, claim_options = _prepare_pipeline_handoff(client)
+        result = await client.async_transcribe_stream(
+            audio_stream(),
+            {
+                "sample_rate": 16000,
+                "bit_rate": 16,
+                "channels": 1,
+                "language": "en-US",
+            },
+            prompt="Home automation",
+            speech_session_handoff=handoff,
+        )
+        claimed = api_module._claim_speech_session_handoff(
+            client,
+            language="en-US",
+            voice="cove",
+            instructions=None,
+            options=claim_options,
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
 
     assert result == "Streamed speech"
+    assert claimed == "stream-ticket"
     assert iterator_advanced.is_set()
     assert received["start"] == {
         "type": "start",
@@ -241,6 +511,11 @@ async def test_transcribe_stream_opens_before_consuming_and_preserves_chunks(
         "channels": 1,
         "language": "en-US",
         "prompt": "Home automation",
+        "speech_session_handoff": {
+            "version": 1,
+            "voice": "cove",
+            "language": "en-US",
+        },
     }
     assert received["audio"] == [b"a" * (64 * 1024), b"ab", b"cd"]
     assert received["end"] == {"type": "end"}
@@ -633,6 +908,82 @@ async def test_synthesize_decodes_json_pcm(
     assert audio.sample_rate == 24000
 
 
+async def test_release_speech_session_handoff_is_authenticated_and_body_only(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Best-effort release keeps the opaque ticket out of URLs and headers."""
+    received: dict[str, Any] = {}
+
+    async def release(request: web.Request) -> web.Response:
+        received["path"] = request.path
+        received["authorization"] = request.headers.get("Authorization")
+        received["payload"] = await request.json()
+        return web.Response(status=204)
+
+    app = web.Application()
+    app.router.add_post("/v1/speech-session/release", release)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    await client.async_release_speech_session_handoff("opaque-ticket")
+
+    assert received == {
+        "path": "/v1/speech-session/release",
+        "authorization": "Bearer token",
+        "payload": {"speech_session_handoff_token": "opaque-ticket"},
+    }
+
+
+async def test_handoff_release_jobs_are_client_owned_and_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entry unload cancellation reaches every release job owned by its client."""
+    client = BridgeClient(cast("Any", object()), "http://bridge.test", "token")
+    release_started = asyncio.Event()
+
+    async def release(token: str) -> None:
+        assert token == "private-ticket"
+        release_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(client, "async_release_speech_session_handoff", release)
+    api_module._schedule_speech_session_handoff_release(client, "private-ticket")
+    await asyncio.wait_for(release_started.wait(), timeout=1)
+    assert len(client._handoff_release_tasks) == 1
+    task = next(iter(client._handoff_release_tasks))
+
+    client.cancel_handoff_release_tasks()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert not client._handoff_release_tasks
+    assert task not in api_module._HANDOFF_RELEASE_TASKS
+
+
+async def test_handoff_release_suppresses_closed_session_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanup racing aiohttp shutdown completes without an orphaned failure."""
+    client = BridgeClient(cast("Any", object()), "http://bridge.test", "token")
+
+    async def release(token: str) -> None:
+        assert token == "private-ticket"
+        raise RuntimeError("Session is closed")
+
+    monkeypatch.setattr(client, "async_release_speech_session_handoff", release)
+    api_module._schedule_speech_session_handoff_release(client, "private-ticket")
+    task = next(iter(client._handoff_release_tasks))
+
+    await task
+    await asyncio.sleep(0)
+
+    assert task.exception() is None
+    assert not client._handoff_release_tasks
+    assert task not in api_module._HANDOFF_RELEASE_TASKS
+
+
 async def test_synthesize_rejects_mislabeled_wav(
     aiohttp_client: Any,
     socket_enabled: None,
@@ -690,6 +1041,7 @@ async def test_synthesize_stream_yields_before_response_completes(
         language="en-US",
         voice="cove",
         instructions="Be brief",
+        speech_session_handoff_token="stream-ticket",
     )
 
     first_chunk_task = asyncio.create_task(anext(stream))
@@ -719,6 +1071,7 @@ async def test_synthesize_stream_yields_before_response_completes(
         "voice": "cove",
         "format": "wav",
         "instructions": "Be brief",
+        "speech_session_handoff_token": "stream-ticket",
     }
 
 

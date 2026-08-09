@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterable
-from typing import override
+from typing import Any, override
 
 from homeassistant.components import stt
 from homeassistant.const import CONF_PROMPT
@@ -16,8 +16,15 @@ from .api import (
     BridgeAuthenticationError,
     BridgeError,
     BridgeStreamingUnsupported,
+    _begin_speech_session_handoff,
+    _normalize_speech_language,
+    _revoke_pending_speech_session_handoff,
 )
-from .const import MAX_AUDIO_BYTES, SUBENTRY_TYPE_STT, SUPPORTED_LANGUAGES
+from .const import (
+    MAX_AUDIO_BYTES,
+    SUBENTRY_TYPE_STT,
+    SUPPORTED_LANGUAGES,
+)
 from .entity import CodexVoiceEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -91,20 +98,29 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
         stream: AsyncIterable[bytes],
     ) -> stt.SpeechResult:
         """Stream bounded PCM to the bridge and return a standard STT result."""
+        language = _normalize_speech_language(metadata.language)
         bridge_metadata = {
-            "language": metadata.language,
+            "language": language,
             "codec": metadata.codec.value,
             "sample_rate": metadata.sample_rate.value,
             "bit_rate": metadata.bit_rate.value,
             "channels": metadata.channel.value,
         }
         prompt = self.subentry.data.get(CONF_PROMPT)
+        client = self.entry.runtime_data
+        handoff = _begin_speech_session_handoff(
+            client,
+            language=language,
+        )
+        transcribe_kwargs: dict[str, Any] = {"prompt": prompt}
+        if handoff is not None:
+            transcribe_kwargs["speech_session_handoff"] = handoff
         try:
             try:
-                transcript = await self.entry.runtime_data.async_transcribe_stream(
+                transcript = await client.async_transcribe_stream(
                     stream,
                     bridge_metadata,
-                    prompt=prompt,
+                    **transcribe_kwargs,
                 )
             except BridgeStreamingUnsupported:
                 audio = await _async_collect_audio(stream)
@@ -113,10 +129,10 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
                     return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
                 if not audio:
                     return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
-                transcript = await self.entry.runtime_data.async_transcribe(
+                transcript = await client.async_transcribe(
                     audio,
                     bridge_metadata,
-                    prompt=prompt,
+                    **transcribe_kwargs,
                 )
         except BridgeAuthenticationError:
             self.entry.async_start_reauth(self.hass)
@@ -129,6 +145,7 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
                     transcript,
                     stt.SpeechResultState.SUCCESS,
                 )
+            _revoke_pending_speech_session_handoff()
 
         return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
 

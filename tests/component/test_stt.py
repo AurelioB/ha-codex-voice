@@ -13,18 +13,23 @@ import pytest
 from homeassistant.components import stt
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import CONF_PROMPT
+from homeassistant.helpers import chat_session
 
 from custom_components.codex_voice import CodexVoiceConfigEntry
+from custom_components.codex_voice import api as api_module
 from custom_components.codex_voice import stt as stt_module
 from custom_components.codex_voice.api import (
     BridgeAuthenticationError,
     BridgeBusyError,
+    BridgeClient,
     BridgeConnectionError,
     BridgeProtocolError,
     BridgeQuotaError,
     BridgeStreamingUnsupported,
 )
+from custom_components.codex_voice.const import CONF_INSTRUCTIONS, CONF_VOICE
 from custom_components.codex_voice.stt import CodexVoiceSTTEntity
+from custom_components.codex_voice.tts import CodexVoiceTTSEntity
 
 
 async def _audio_stream(*chunks: bytes) -> AsyncIterator[bytes]:
@@ -33,19 +38,30 @@ async def _audio_stream(*chunks: bytes) -> AsyncIterator[bytes]:
         yield chunk
 
 
-def _make_entry(client: Any) -> CodexVoiceConfigEntry:
+def _make_entry(
+    client: Any,
+    *,
+    subentries: dict[str, ConfigSubentry] | None = None,
+) -> CodexVoiceConfigEntry:
     """Create the minimal config-entry interface required by an entity."""
     return cast(
         "CodexVoiceConfigEntry",
-        SimpleNamespace(runtime_data=client, async_start_reauth=Mock()),
+        SimpleNamespace(
+            runtime_data=client,
+            async_start_reauth=Mock(),
+            subentries=subentries or {},
+        ),
     )
 
 
 def _make_entity(
-    client: Any, *, data: dict[str, Any] | None = None
+    client: Any,
+    *,
+    data: dict[str, Any] | None = None,
+    entry_subentries: dict[str, ConfigSubentry] | None = None,
 ) -> CodexVoiceSTTEntity:
     """Create an STT entity with a minimal config subentry."""
-    entry = _make_entry(client)
+    entry = _make_entry(client, subentries=entry_subentries)
     subentry = ConfigSubentry(
         data=MappingProxyType(data or {}),
         subentry_type="stt",
@@ -55,10 +71,10 @@ def _make_entity(
     return CodexVoiceSTTEntity(entry, subentry)
 
 
-def _metadata() -> stt.SpeechMetadata:
+def _metadata(language: str = "en-US") -> stt.SpeechMetadata:
     """Return supported mono PCM metadata."""
     return stt.SpeechMetadata(
-        language="en-US",
+        language=language,
         format=stt.AudioFormats.WAV,
         codec=stt.AudioCodecs.PCM,
         bit_rate=stt.AudioBitRates.BITRATE_16,
@@ -101,6 +117,118 @@ async def test_stt_forwards_stream_and_metadata() -> None:
     finite_transcribe.assert_not_awaited()
 
 
+async def test_stt_opts_in_only_after_pipeline_tts_preparation() -> None:
+    """HA's pre-STT TTS options bind one normalized private handoff request."""
+    stream_transcribe = AsyncMock(return_value="Active transcript")
+    client = SimpleNamespace(
+        async_transcribe_stream=stream_transcribe,
+        async_transcribe=AsyncMock(),
+    )
+    tts_subentry = ConfigSubentry(
+        data=MappingProxyType({CONF_VOICE: "ember"}),
+        subentry_type="tts",
+        title="Test TTS",
+        unique_id=None,
+    )
+    entity = _make_entity(
+        client,
+        entry_subentries={tts_subentry.subentry_id: tts_subentry},
+    )
+    tts_entity = CodexVoiceTTSEntity(_make_entry(client), tts_subentry)
+    session = chat_session.ChatSession("assist-session")
+    session_context = chat_session.current_session.set(session)
+    try:
+        pipeline_options = dict(tts_entity.default_options)
+        assert (
+            pipeline_options[api_module._SPEECH_SESSION_HANDOFF_OPTION]
+            == api_module._SPEECH_SESSION_HANDOFF_OPTION_VALUE
+        )
+        result = await entity.async_process_audio_stream(
+            _metadata(" EN_us "), _audio_stream(b"\x00\x01")
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert result.result is stt.SpeechResultState.SUCCESS
+    assert stream_transcribe.await_args is not None
+    handoff = stream_transcribe.await_args.kwargs["speech_session_handoff"]
+    assert handoff.client is client
+    assert handoff.session is session
+    assert handoff.voice == "ember"
+    assert handoff.language == "en-US"
+    assert stream_transcribe.await_args.args[1] == _bridge_metadata()
+
+
+async def test_stt_active_session_without_pipeline_preparation_stays_cold() -> None:
+    """A ChatSession and configured TTS voice alone cannot opt STT into reuse."""
+    stream_transcribe = AsyncMock(return_value="Cold transcript")
+    client = SimpleNamespace(
+        async_transcribe_stream=stream_transcribe,
+        async_transcribe=AsyncMock(),
+    )
+    tts_subentry = ConfigSubentry(
+        data=MappingProxyType({CONF_VOICE: "ember"}),
+        subentry_type="tts",
+        title="Test TTS",
+        unique_id=None,
+    )
+    entity = _make_entity(
+        client,
+        entry_subentries={tts_subentry.subentry_id: tts_subentry},
+    )
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
+    )
+    try:
+        result = await entity.async_process_audio_stream(
+            _metadata(), _audio_stream(b"\x00\x01")
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert result.result is stt.SpeechResultState.SUCCESS
+    assert stream_transcribe.await_args is not None
+    assert "speech_session_handoff" not in stream_transcribe.await_args.kwargs
+
+
+async def test_instruction_configured_tts_does_not_prepare_stt_handoff() -> None:
+    """A synthesis profile requiring instructions stays cold from preparation."""
+    stream_transcribe = AsyncMock(return_value="Cold transcript")
+    client = SimpleNamespace(
+        async_transcribe_stream=stream_transcribe,
+        async_transcribe=AsyncMock(),
+    )
+    tts_subentry = ConfigSubentry(
+        data=MappingProxyType(
+            {
+                CONF_VOICE: "ember",
+                CONF_INSTRUCTIONS: "Speak quietly",
+            }
+        ),
+        subentry_type="tts",
+        title="Instruction TTS",
+        unique_id=None,
+    )
+    tts_entity = CodexVoiceTTSEntity(_make_entry(client), tts_subentry)
+    stt_entity = _make_entity(client)
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
+    )
+    try:
+        assert (
+            api_module._SPEECH_SESSION_HANDOFF_OPTION not in tts_entity.default_options
+        )
+        result = await stt_entity.async_process_audio_stream(
+            _metadata(), _audio_stream(b"\x00\x01")
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert result.result is stt.SpeechResultState.SUCCESS
+    assert stream_transcribe.await_args is not None
+    assert "speech_session_handoff" not in stream_transcribe.await_args.kwargs
+
+
 async def test_stt_returns_standard_error_for_blank_result() -> None:
     """A blank streaming transcript returns the standard STT error state."""
     stream_transcribe = AsyncMock(return_value="  ")
@@ -123,6 +251,7 @@ async def test_stt_returns_standard_error_for_blank_result() -> None:
 async def test_stt_falls_back_without_prior_stream_consumption() -> None:
     """A pre-upgrade unsupported response safely reuses the untouched iterable."""
     yielded_chunks = 0
+    streaming_handoff: Any = None
 
     async def audio_stream() -> AsyncIterator[bytes]:
         nonlocal yielded_chunks
@@ -135,8 +264,11 @@ async def test_stt_falls_back_without_prior_stream_consumption() -> None:
         metadata: dict[str, Any],
         *,
         prompt: str | None,
+        speech_session_handoff: Any,
     ) -> str:
+        nonlocal streaming_handoff
         assert yielded_chunks == 0
+        streaming_handoff = speech_session_handoff
         raise BridgeStreamingUnsupported
 
     finite_transcribe = AsyncMock(return_value="Legacy result")
@@ -145,8 +277,17 @@ async def test_stt_falls_back_without_prior_stream_consumption() -> None:
         async_transcribe=finite_transcribe,
     )
     entity = _make_entity(client, data={CONF_PROMPT: "Short commands"})
-
-    result = await entity.async_process_audio_stream(_metadata(), audio_stream())
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
+    )
+    try:
+        assert api_module._prepare_speech_session_handoff(
+            cast("BridgeClient", client),
+            voice="cove",
+        )
+        result = await entity.async_process_audio_stream(_metadata(), audio_stream())
+    finally:
+        chat_session.current_session.reset(session_context)
 
     assert result.result is stt.SpeechResultState.SUCCESS
     assert result.text == "Legacy result"
@@ -155,6 +296,7 @@ async def test_stt_falls_back_without_prior_stream_consumption() -> None:
         b"\x00\x01\x02\x03",
         _bridge_metadata(),
         prompt="Short commands",
+        speech_session_handoff=streaming_handoff,
     )
 
 

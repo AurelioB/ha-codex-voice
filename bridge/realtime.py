@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections import deque
 from collections.abc import Mapping
 from time import monotonic
@@ -13,6 +14,7 @@ from .errors import AppServerExited, ProtocolError
 from .webrtc import WebRtcPeer
 
 _EVENT_BACKLOG_LIMIT = 64
+LOGGER = logging.getLogger(__name__)
 
 
 class PeerLike(Protocol):
@@ -25,6 +27,12 @@ class PeerLike(Protocol):
     def feed_audio(self, pcm: bytes) -> None: ...
 
     async def wait_input_drained(self, timeout: float | None = None) -> None: ...
+
+    def discard_pending_input(self) -> None: ...
+
+    def drain_audio_nowait(self) -> list[bytes]: ...
+
+    def drain_data_events_nowait(self) -> list[str | bytes]: ...
 
     async def recv_audio(self, timeout: float | None = None) -> bytes: ...
 
@@ -68,8 +76,11 @@ class RealtimeSession:
         client_managed_handoffs: bool = True,
         initial_items: list[dict[str, str]] | None = None,
     ) -> None:
+        handshake_started = monotonic()
         deadline = monotonic() + self.timeout
+        offer_started = monotonic()
         offer = await self.peer.create_offer()
+        offer_ice_seconds = monotonic() - offer_started
         params: dict[str, Any] = {
             "threadId": self.thread_id,
             "outputModality": "audio",
@@ -91,10 +102,14 @@ class RealtimeSession:
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError("realtime handshake timed out")
+        realtime_start_started = monotonic()
         await self.rpc.call("thread/realtime/start", params, timeout=remaining)
+        realtime_start_rpc_seconds = monotonic() - realtime_start_started
 
         answer: str | None = None
         started = False
+        realtime_start_to_started_seconds = 0.0
+        realtime_start_to_sdp_seconds = 0.0
         while answer is None or not started:
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -115,20 +130,40 @@ class RealtimeSession:
                     session_id if isinstance(session_id, str) else None
                 )
                 started = True
+                realtime_start_to_started_seconds = monotonic() - realtime_start_started
                 self._backlog.append(event)
             elif method == "thread/realtime/sdp":
                 candidate = event_params.get("sdp")
                 if not isinstance(candidate, str) or not candidate:
                     raise ProtocolError("app-server returned an invalid SDP answer")
                 answer = candidate
+                realtime_start_to_sdp_seconds = monotonic() - realtime_start_started
             else:
                 self._backlog.append(event)
+        set_answer_started = monotonic()
         await self.peer.set_answer(answer)
+        set_answer_seconds = monotonic() - set_answer_started
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError("realtime handshake timed out")
+        connect_started = monotonic()
         await self.peer.wait_connected(timeout=min(remaining, 15))
+        connect_seconds = monotonic() - connect_started
         self._started = True
+        LOGGER.info(
+            "Realtime handshake timing: offer_ice_seconds=%.3f "
+            "realtime_start_rpc_seconds=%.3f "
+            "realtime_start_to_started_seconds=%.3f "
+            "realtime_start_to_sdp_seconds=%.3f set_answer_seconds=%.3f "
+            "connect_seconds=%.3f total_seconds=%.3f",
+            offer_ice_seconds,
+            realtime_start_rpc_seconds,
+            realtime_start_to_started_seconds,
+            realtime_start_to_sdp_seconds,
+            set_answer_seconds,
+            connect_seconds,
+            monotonic() - handshake_started,
+        )
 
     def feed_audio(self, pcm: bytes) -> None:
         if not self._started:
@@ -193,6 +228,32 @@ class RealtimeSession:
 
     async def recv_data_event(self, timeout: float | None = None) -> str | bytes:
         return await self.peer.recv_data_event(timeout)
+
+    def discard_pending_input(self) -> None:
+        """Drop finite STT PCM that has not yet left the paced input track."""
+        self.peer.discard_pending_input()
+
+    def drain_audio_nowait(self) -> list[bytes]:
+        """Drain already-buffered remote audio without yielding."""
+        return self.peer.drain_audio_nowait()
+
+    def drain_data_events_nowait(self) -> list[str | bytes]:
+        """Drain already-buffered data-channel events without yielding."""
+        return self.peer.drain_data_events_nowait()
+
+    def drain_app_events_nowait(self) -> list[dict[str, Any]]:
+        """Drain thread events buffered before a handoff boundary."""
+        events = list(self._backlog)
+        self._backlog.clear()
+        while True:
+            try:
+                event = self.subscription.get_nowait()
+            except asyncio.QueueEmpty:
+                return events
+            if event.get(
+                "method"
+            ) == "bridge/appServerExited" or self._belongs_to_thread(event):
+                events.append(event)
 
     async def stop(self) -> None:
         if self._closed:

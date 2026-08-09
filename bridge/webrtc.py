@@ -69,6 +69,11 @@ class PcmAudioTrack(MediaStreamTrack):  # type: ignore[misc,valid-type]
         else:
             await asyncio.wait_for(self._drained.wait(), timeout)
 
+    def discard_pending(self) -> None:
+        """Drop unsent input after finite STT has reached its final transcript."""
+        self._buffer.clear()
+        self._drained.set()
+
     async def recv(self) -> Any:
         loop = asyncio.get_running_loop()
         if self._started_at is None:
@@ -197,6 +202,28 @@ class WebRtcPeer:
 
     async def wait_input_drained(self, timeout: float | None = None) -> None:
         await self.input_track.wait_drained(timeout)
+
+    def discard_pending_input(self) -> None:
+        """Prevent a finite STT input tail from entering a reused session."""
+        self.input_track.discard_pending()
+
+    def drain_audio_nowait(self) -> list[bytes]:
+        """Remove and return already-buffered remote PCM."""
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunks.append(self.audio.get_nowait())
+            except asyncio.QueueEmpty:
+                return chunks
+
+    def drain_data_events_nowait(self) -> list[str | bytes]:
+        """Remove and return already-buffered data-channel events."""
+        events: list[str | bytes] = []
+        while True:
+            try:
+                events.append(self.data_events.get_nowait())
+            except asyncio.QueueEmpty:
+                return events
 
     async def recv_audio(self, timeout: float | None = None) -> bytes:
         if timeout is None:
