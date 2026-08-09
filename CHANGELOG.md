@@ -5,6 +5,17 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Make the pinned ThirdReality v1.1.7 wake path use an LED-only acknowledgement:
+  pre-arm microphone forwarding on the pinned microphone thread, queue the
+  Home Assistant Assist start request, and duck music without playing the local
+  confirmation cue. Dispatch serialized LED DBus calls on a bounded daemon
+  worker so their two-second vendor timeout cannot stall microphone capture,
+  coalescing an overloaded backlog toward the newest state. The overlay now
+  requires an atomic match across four exact vendor bytecode hashes and
+  preserves transactional rollback while ensuring teardown wins startup races.
+
 ## [0.1.10] - 2026-08-09
 
 ### Changed

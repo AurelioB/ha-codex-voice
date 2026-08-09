@@ -42,12 +42,12 @@ turn the standard Assist pipeline into a full-duplex or barge-in session.
 
 ## Live measurements
 
-All figures in this section are **live measurements from 2026-08-08**, not
-simulated test results. Physical pipeline measurements used one ThirdReality
-3RSPK whose Home Assistant firmware display reported `1.01.07`; the direct
-bridge/session probes use narrower timing boundaries and are labeled
-separately. Sample sizes are deliberately shown because these small probes are
-not population benchmarks.
+Unless another date is shown, figures in this section are **live measurements
+from 2026-08-08**, not simulated test results. Physical pipeline measurements
+used one ThirdReality 3RSPK whose Home Assistant firmware display reported
+`1.01.07`; the direct bridge/session probes use narrower timing boundaries and
+are labeled separately. Sample sizes are deliberately shown because these
+small probes are not population benchmarks.
 
 ### Physical pipeline reference
 
@@ -90,25 +90,32 @@ audio traversed the device's physical output/input path, but it is still a
 controlled self-acoustic test rather than a substitute for near-, normal-, and
 far-field human trials in the deployment room.
 
-### Wake-pipeline overlap overlay
+### Immediate wake and non-blocking LED overlay
 
-The pinned v1.1.7 Python client normally waits for the confirmation cue to end
-before it asks Home Assistant to start Assist. The reversible device overlay
-instead sends that request immediately after wake detection, allowing Home
-Assistant to prepare the pipeline during the measured 0.399592 s shortened
-cue. It deliberately leaves microphone forwarding disabled until the cue's EOF
-callback, so the device does not send its own confirmation sound as speech on
-hardware without active acoustic echo cancellation.
+The pinned v1.1.7 Python client normally starts the confirmation cue and waits
+for cue EOF before it asks Home Assistant to start Assist. After starting that
+asynchronous cue, its ThirdReality wrapper calls the LED DBus helper
+synchronously on the microphone thread with a two-second timeout. Three
+successful human baselines captured on 2026-08-09 reached Home Assistant VAD
+1.37, 2.46, and 3.27 seconds after pipeline start. Those end-to-end figures
+include the combined device and Home Assistant path; they show the user-visible
+variable delay but do not isolate the LED call.
 
-The override is guarded by SHA-256 hashes of both installed vendor code objects
-and skips itself if either changes. An isolated player test verified request
-ordering and that no microphone audio is forwarded before cue EOF. Transactional
-rollback and a two-second missing-EOF watchdog prevent mute, disconnect, player
-replacement, or setup failure from leaving a phantom active pipeline that
-blocks later wakes. A single low-volume acoustic comparison was inconclusive
-because wake-detection jitter was larger than this sub-second boundary; the
-optimization therefore has no claimed fixed end-to-end saving. See the device
-overlay README for deployment and rollback checks.
+The reversible device overlay uses an LED-only acknowledgement on this hardware
+without active acoustic echo cancellation. It sends the Home Assistant start
+request and music duck while pre-arming microphone forwarding on the same
+pinned microphone thread, without playing the local cue. Forwarding cannot
+actually handle a frame until wake setup returns. It also serializes LED DBus
+commands on a separate daemon worker. The vendor's two-second command timeout
+remains, but it cannot hold the microphone processing thread; timed-out children
+are reaped, and an overloaded pending queue coalesces toward the newest state.
+
+The override is guarded atomically by SHA-256 hashes of four installed vendor
+code objects spanning both base and ThirdReality modules. Tests verify
+request/duck/stream ordering, first-frame forwarding, transactional rollback,
+ordered non-blocking LED work, newest-state overload handling, explicit worker
+shutdown, and the fail-closed path. See the device overlay README for deployment
+and rollback checks.
 
 ### Streaming TTS probe
 
@@ -327,17 +334,22 @@ These settings affect device and Home Assistant satellite behavior, not the
 bridge. Change one variable at a time, keep the original value, and repeat a
 fixed phrase set before accepting it.
 
-### Short wake cue
+### Wake acknowledgement
 
-Firmware `1.01.07` waits for the entire wake confirmation file to finish before
+Firmware `1.01.07` normally waits for the entire wake confirmation file before
 it begins forwarding microphone audio. The measured stock cue was 0.946979 s;
-a patched older cue was 0.399592 s, removing about 0.547 s from this gate.
+an older patched cue was 0.399592 s. Because the measured v1.1.7 device has no
+active acoustic echo cancellation, safely listening during either audible cue
+is not possible: the microphone would also receive the device's own
+acknowledgement.
 
-Replacing the cue is a firmware modification. Back up the original asset and
-full recoverable firmware first. Keep an audible confirmation, preserve the
-audio format expected by the player, and test immediate and delayed speech at
-several distances. Reject the change if initial phonemes disappear, the cue is
-not reliably audible, playback blocks, or wake cycles become unstable.
+The pinned overlay therefore skips audible-cue playback and uses the listening
+LED as best-effort visual acknowledgement. This avoids both self-audio and the
+cue gate. Test users must speak immediately after the wake phrase rather than
+wait for a sound or for the LED; visual feedback is deliberately off the
+microphone path and may lag a serialized DBus backlog. Roll back the overlay if
+an audible confirmation is a hard requirement; do not forward a
+cue-contaminated pre-roll into STT.
 
 ### Finished speaking detection
 

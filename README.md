@@ -256,13 +256,16 @@ opt-in and must never print OAuth tokens or recorded audio.
   Assistant Assist satellite entity. Direct full-duplex firmware transport
   depends on hardware/firmware support for the bridge's authenticated PCM
   WebSocket protocol.
-- ThirdReality firmware 1.01.07 does not forward microphone audio until its
-  wake confirmation sound has completely finished. The optional pinned overlay
-  can ask Home Assistant to prepare the pipeline during that cue while still
-  withholding microphone audio until EOF. Shortening the cue, applying the
-  overlay, selecting aggressive finished-speaking detection, or raising
-  hardware microphone gain are device-side changes with explicit accuracy,
-  compatibility, and clipping acceptance checks.
+- ThirdReality firmware 1.01.07 normally withholds microphone audio until its
+  wake confirmation sound finishes, then may block the microphone thread for
+  up to two seconds while updating the LED. The optional pinned overlay uses an
+  LED-only acknowledgement, makes microphone forwarding effective as soon as
+  the local Assist request and music-duck calls complete, and dispatches
+  serialized LED updates off the microphone thread. Applying the overlay,
+  selecting aggressive finished-speaking detection, or raising hardware
+  microphone gain are
+  device-side changes with explicit accuracy, compatibility, and clipping
+  acceptance checks.
 - The official ThirdReality v1.2 firmware is a substantial Python-to-C++
   rewrite, but the target has one boot/system/recovery set rather than A/B
   slots. Do not flash the sole production speaker. Test only on a spare after
