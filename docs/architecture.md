@@ -140,12 +140,13 @@ described in [the ThirdReality plan](../thirdreality-codex-realtime-plan.md).
 
 ThirdReality v1.2 is a native C++ rewrite with a changed audio, AEC, playback,
 and continued-conversation path; it is not merely a drop-in performance flag.
-Upgrade testing needs a complete backup, paired physical A/B measurements, and
-a proven rollback. Its v1.2.1 image also exposes unauthenticated root ADB on
-TCP port 5555 and password-authenticated root SSH with a documented default;
-both services must be isolated, hardened, and re-verified after reboot and
-updates. The tagged updater also disables TLS peer and hostname verification,
-so use a separately downloaded and SHA-256-verified image. The safe settings,
-A/B matrix, recovery checklist, and access-service overrides are documented in
+The target is single-slot, so upgrade testing needs a separate canary device,
+complete partition/data/environment read-backs, authenticated image provenance,
+and a physically rehearsed full-image downgrade and restoration; flashing the
+only production speaker is not an A/B test. Its v1.2.1 image also exposes
+unauthenticated root ADB on TCP port 5555 and password-authenticated root SSH
+with a documented default; both services must be isolated, hardened, and
+re-verified after reboot and updates. The safe settings, canary matrix,
+recovery checklist, and access-service requirements are documented in
 [performance and ThirdReality
-tuning](performance.md#official-v12-c-firmware-ab).
+tuning](performance.md#official-v12-c-firmware-canary-evaluation).

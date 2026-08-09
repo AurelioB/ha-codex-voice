@@ -194,7 +194,7 @@ wake word, an idle WebRTC peer still sends silent RTP, App Server does not
 document idle sessions as quota-neutral, and speculative sessions would occupy
 the single speech lane. See [performance and ThirdReality
 tuning](docs/performance.md) for measurement scope, handoff privacy and
-fallback behavior, safe device settings, and the firmware A/B procedure.
+fallback behavior, safe device settings, and the firmware canary decision.
 
 ## Development
 
@@ -244,12 +244,17 @@ opt-in and must never print OAuth tokens or recorded audio.
   microphone gain can reduce waits or improve recognition, but each is a
   device-side change with explicit accuracy and clipping acceptance checks.
 - The official ThirdReality v1.2 firmware is a substantial Python-to-C++
-  rewrite and should be A/B tested with a verified backup and rollback path.
+  rewrite, but the target has one boot/system/recovery set rather than A/B
+  slots. Do not flash the sole production speaker. Test only on a spare after
+  capturing the actual partitions, data, boot environment, and device security
+  state, then physically rehearsing a full-image downgrade and restoration.
   v1.2.1 also enables unauthenticated root ADB over TCP port 5555 and ships
   password-authenticated root SSH with a documented default. Isolate and
-  harden both services, then verify the ports after reboot and updates. Prefer
-  a manually downloaded, SHA-256-verified image because the tagged built-in
-  updater disables TLS peer and hostname verification.
+  harden both services, then verify the ports after reboot and updates. The
+  tagged updater disables TLS peer and hostname verification, and a locally
+  calculated SHA-256 identifies bytes but does not authenticate their
+  publisher. No production flash is allowed without independently
+  authenticated provenance.
 
 ## License
 

@@ -5,6 +5,16 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Set the ThirdReality v1.2.1 production decision to no-go after confirming
+  that the target is single-slot and the available files cannot provide exact
+  rollback. A future spare-device canary remains conditional on authenticated
+  provenance, complete device read-backs, and physically rehearsed recovery.
+- Record end-to-end acoustic wake canaries at 700 ms and 300 ms command gaps,
+  both completing STT, a local intent, TTS playback, and satellite recovery
+  without pipeline errors.
+
 ## [0.1.8] - 2026-08-08
 
 ### Added

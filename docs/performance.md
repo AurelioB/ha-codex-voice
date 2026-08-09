@@ -59,6 +59,31 @@ finished” includes generation, Home Assistant serving, device buffering, and
 physical playback, so it should not be compared directly with a bridge
 first-byte measurement.
 
+### Controlled acoustic wake canary
+
+Two additional 2026-08-08 canaries exercised the actual speaker, microphone,
+wake detector, shortened confirmation cue, Home Assistant pipeline, Codex STT,
+local intent routing, TTS, and speaker playback. Each WAV used the repository's
+two-second “Okay Nabu” test sample, then a fixed non-sensitive “What time is
+it?” command. The second run reduced the silence between those source clips
+from 700 ms to 300 ms.
+
+All intervals below begin at Home Assistant's pipeline `run-start` event, not
+at the start of WAV playback.
+
+| Source gap | Run to VAD start | Run to VAD end | Run to STT end | Run to pipeline end | Run to satellite idle |
+|---:|---:|---:|---:|---:|---:|
+| 700 ms | 1.852 s | 2.892 s | 9.655 s | 9.669 s | 23.082 s |
+| 300 ms | 1.613 s | 2.523 s | 9.422 s | 9.423 s | 22.580 s |
+
+Both runs returned the local `action_done` response type, emitted no pipeline
+error, played the answer, and returned the Assist satellite to `idle`. The
+300 ms source gap therefore did not lose enough initial speech to prevent
+correct routing. This is stronger than a software-only injection because the
+audio traversed the device's physical output/input path, but it is still a
+controlled self-acoustic test rather than a substitute for near-, normal-, and
+far-field human trials in the deployment room.
+
 ### Streaming TTS probe
 
 One v0.1.7 live bridge probe of the same synthesis request measured:
@@ -231,7 +256,7 @@ clipping cannot be repaired by the bridge's bounded adaptive normalization.
 Use the bridge's privacy-safe numeric peak/RMS and adaptive-gain logs for
 comparison; they never include speech or transcripts.
 
-## Official v1.2 C++ firmware A/B
+## Official v1.2 C++ firmware canary evaluation
 
 Home Assistant reported `1.01.07` installed and `1.02.01` available on the
 measured unit. Those display versions correspond to upstream firmware tags
@@ -245,6 +270,27 @@ stability fixes. The [v1.2.1 release](https://github.com/thirdreality/voice-musi
 dated 2026-07-30, updates Sendspin, fixes DNS handling, and enables ADB over USB
 and TCP.
 
+### Production-device decision: no-go
+
+The measured speaker must remain on its known-good 1.01.07 image. The vendor
+images and tagged board source establish a single boot/system/recovery layout,
+not two independently bootable slots: the board configuration leaves
+[`CONFIG_AB_SYSTEM`](https://github.com/thirdreality/voice-music-assistant/blob/v1.2.1/sources/uboot/board/amlogic/configs/axg_s420_v1_trspk.h)
+disabled, and the UBI configuration defines one dynamic
+[`rootfs`](https://github.com/thirdreality/voice-music-assistant/blob/v1.2.1/buildroot/fs/ubi/ubinize.cfg)
+volume. The tree contains generic A/B support, but this board does not select
+it. A flash of the only speaker is therefore not an A/B experiment.
+
+The cached 1.1.7 file is a stock full-burn image, not a bit-for-bit read-back of
+this device, and the configuration backup does not contain bootloader, boot,
+recovery, rootfs/UBI, U-Boot environment, or device security state. Recovery
+exposes neither SSH nor ADB, so TCP/5555 cannot rescue a system that fails
+before the normal root filesystem boots. Until physical burn-mode entry and a
+full 1.2.1-to-stock-1.1.7 downgrade have been rehearsed on identical spare
+hardware, the production upgrade decision is **no-go**. Even a successful
+stock-image downgrade is not exact restoration without this speaker's own
+complete pre-flash read-backs.
+
 Native C++ and lower memory use do not by themselves guarantee a faster Assist
 turn. The v1.2.1
 [`Satellite.cpp`](https://github.com/thirdreality/voice-music-assistant/blob/v1.2.1/buildroot/package/thirdreality/linux-voice-assistant-cpp/src/satellite/Satellite.cpp)
@@ -256,8 +302,10 @@ gate. Its short-sound-safe
 sets mpv's `audio-buffer` to `0.8`. That setting must be measured; it should not
 be treated as an additive 0.8 s delay without evidence.
 
-Run a paired A/B in the same room with the same device, wake word, pipeline,
-voice, network path, command set, and playback volume. Record at least:
+Only after those gates pass, run a paired comparison using a physically
+separate canary while the known-good speaker remains untouched. Use the same
+room, wake word, pipeline, voice, network path, command set, and playback
+volume. Record at least:
 
 - wake detection to microphone-stream start and the cue duration;
 - utterance length and trailing-silence endpoint;
@@ -271,34 +319,40 @@ Keep each raw run rather than reporting only the best result. Compare medians
 and ranges, and return to the old image if accuracy, echo control, stability,
 or tail latency regresses even when one median improves.
 
-### Backup and rollback before flashing
+### Backup and rollback before a canary flash
 
 Firmware flashing can erase configuration or make a device temporarily
-unbootable. Before the v1.2 A/B:
+unbootable. Before a v1.2 canary flash:
 
-1. Save complete, restorable images for both the current known-good firmware
-   and the candidate image. Record full SHA-256 hashes, byte sizes, source URLs,
-   and acquisition dates in a private manifest. Acquire the candidate manually
-   from the tagged GitHub release and verify it before flashing: the v1.2.1
+1. Require independently authenticated image provenance. After provenance is
+   established, record SHA-256 hashes, byte sizes, source URLs, and acquisition
+   dates in a private manifest. A locally calculated hash is only an identifier
+   and later-corruption check; it does not authenticate the publisher. The
+   v1.2.1
    [`UpdateEntity_Ota.cpp`](https://github.com/thirdreality/voice-music-assistant/blob/v1.2.1/buildroot/package/thirdreality/linux-voice-assistant-cpp/src/entities/UpdateEntity_Ota.cpp)
    and
    [`OtaClient.cpp`](https://github.com/thirdreality/voice-music-assistant/blob/v1.2.1/buildroot/package/thirdreality/linux-voice-assistant-cpp/src/tr/OtaClient.cpp)
    disable TLS peer and hostname verification for update metadata and image
-   downloads. The MD5 received over that same channel is not a substitute for
-   an independently recorded SHA-256.
-2. Export the complete device configuration, including `/data/conf`, plus every
-   locally modified init script and audio asset. Treat Wi-Fi and service
-   configuration as secrets; do not publish the archive or its host path.
-3. Document and, preferably on a spare device, test the USB/serial recovery and
-   full-image restore procedure before changing the primary speaker.
+   downloads.
+2. Capture raw, verified read-backs of this exact device's bootloader, DTB,
+   boot, recovery, rootfs/UBI, U-Boot environment, and complete `/data` before
+   flashing. Record read-only secure-boot, lock, fuse, and anti-rollback state.
+   Include `/data/conf`, every locally modified init script, and every modified
+   audio asset. Treat Wi-Fi and service configuration as secrets; do not
+   publish the archive or its host path.
+3. On identical spare hardware, physically enter USB/burn recovery without
+   Linux, ADB, or SSH; flash the exact candidate; then perform and verify the
+   complete stock-image downgrade and restoration procedure. This rehearsal is
+   mandatory, not optional.
 4. Use stable power during flashing. After boot, verify the reported firmware,
    Home Assistant entities, wake/stop words, microphone, TTS, volume, network,
    and restart recovery before performance testing. The v1.2.0 release notes
    warn that the first v1.1-to-v1.2 OTA can leave a stale Home Assistant entity.
-5. Roll back with the complete known-good image when possible. Restore
-   version-specific configuration only to the matching firmware, or migrate
-   selected settings deliberately; do not blindly overlay one version's root
-   filesystem onto the other.
+5. Do not flash the production speaker unless exact restoration from its own
+   read-backs is proven. A stock 1.1.7 reflash proves only a downgrade, not
+   recovery of the device's prior state. Restore version-specific configuration
+   only to matching firmware; never blindly overlay one version's rootfs onto
+   another.
 
 ### Harden root access after v1.2.1
 
@@ -317,9 +371,9 @@ authentication and runs as root, a broad trusted-LAN rule is not an adequate
 substitute for source restriction. Repeat both the allowed- and denied-source
 checks after every firmware update.
 
-For the measured device in this project, TCP ADB is an explicit operational
-requirement: the A/B, reboot, and rollback procedures must leave port 5555
-enabled and verify that the administration path can reconnect.
+For the measured device in this project, TCP ADB is an explicit normal-OS
+remote-administration requirement: canary, reboot, and rollback procedures must
+leave port 5555 enabled and verify that the administration path can reconnect.
 
 Only deployments that do not require TCP ADB should turn it off. Use a local
 or serial console—not the TCP session being disabled—and create or edit
