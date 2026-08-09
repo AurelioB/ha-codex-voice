@@ -25,6 +25,7 @@ from .app_server import CodexAppServer
 from .audio import (
     REALTIME_SAMPLE_RATE,
     Pcm16Mono24KhzResampler,
+    Pcm16MonoResampler,
     decode_base64_audio,
     encode_base64_audio,
     pcm16_mono_24khz,
@@ -2651,6 +2652,20 @@ def _first_sustained_transcription_frame(
     return None
 
 
+def _synthesis_output_sample_rate(payload: Mapping[str, Any]) -> int:
+    """Validate the bridge's supported mono PCM16 output preferences."""
+    sample_rate = payload.get("sample_rate", REALTIME_SAMPLE_RATE)
+    channels = payload.get("channels", 1)
+    sample_width = payload.get("sample_width", 2)
+    if type(sample_rate) is not int or sample_rate not in {16_000, 24_000}:
+        raise ProtocolError("synthesis sample_rate must be 16000 or 24000")
+    if type(channels) is not int or channels != 1:
+        raise ProtocolError("synthesis channels must be 1")
+    if type(sample_width) is not int or sample_width != 2:
+        raise ProtocolError("synthesis sample_width must be 2")
+    return sample_rate
+
+
 async def _synthesize(request: web.Request) -> web.Response:
     return await _synthesize_request(request)
 
@@ -2723,12 +2738,13 @@ async def _synthesize_admitted(
     requested_format = str(payload.get("format", "wav")).lower()
     if requested_format not in {"wav", "wave", "audio/wav"}:
         raise ProtocolError("synthesis currently supports WAV output only")
+    output_sample_rate = _synthesis_output_sample_rate(payload)
     voice_value = payload.get("voice")
     voice = (
         voice_value.lower() if isinstance(voice_value, str) and voice_value else None
     )
     response_headers = {
-        "X-Audio-Sample-Rate": str(REALTIME_SAMPLE_RATE),
+        "X-Audio-Sample-Rate": str(output_sample_rate),
         "X-Audio-Channels": "1",
         "X-Codex-Synthesis-Mode": "conversational-best-effort",
     }
@@ -2739,6 +2755,10 @@ async def _synthesize_admitted(
         stream_response.content_type = "audio/wav"
     stream_started = False
     pcm: bytes | None = None
+    output_resampler = Pcm16MonoResampler(
+        REALTIME_SAMPLE_RATE,
+        output_sample_rate,
+    )
     synthesis_deadline = (
         asyncio.get_running_loop().time() + state.config.synthesis_timeout
     )
@@ -2749,8 +2769,11 @@ async def _synthesize_admitted(
         if not stream_started:
             await stream_response.prepare(request)
             stream_started = True
-            await stream_response.write(streaming_wav_header())
-        await stream_response.write(chunk)
+            await stream_response.write(
+                streaming_wav_header(sample_rate=output_sample_rate)
+            )
+        if output := output_resampler.feed(chunk):
+            await stream_response.write(output)
 
     async def run_session(
         retained: _RetainedSpeechSession | None,
@@ -2858,6 +2881,8 @@ async def _synthesize_admitted(
                 if stream_response is not None:
                     if not stream_started:
                         raise ProtocolError("realtime synthesis produced no audio")
+                    if output := output_resampler.finish():
+                        await stream_response.write(output)
                     await stream_response.write_eof()
             finally:
                 audio_collection_seconds += time.monotonic() - collection_started
@@ -2891,8 +2916,13 @@ async def _synthesize_admitted(
         if stream_response is not None:
             return stream_response
         assert pcm is not None
+        finite_resampler = Pcm16MonoResampler(
+            REALTIME_SAMPLE_RATE,
+            output_sample_rate,
+        )
+        output_pcm = finite_resampler.feed(pcm) + finite_resampler.finish()
         return web.Response(
-            body=wav_bytes(pcm),
+            body=wav_bytes(output_pcm, sample_rate=output_sample_rate),
             content_type="audio/wav",
             headers=response_headers,
         )

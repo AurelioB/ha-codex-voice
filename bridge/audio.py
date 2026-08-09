@@ -19,16 +19,19 @@ MAX_PCM_SAMPLE_RATE = 192_000
 MAX_PCM_DURATION_SECONDS = 300
 
 
-class Pcm16Mono24KhzResampler:
+class Pcm16MonoResampler:
     """Incrementally resample aligned mono PCM16 without chunk-boundary drift."""
 
-    def __init__(self, source_rate: int) -> None:
-        if not MIN_PCM_SAMPLE_RATE <= source_rate <= MAX_PCM_SAMPLE_RATE:
+    def __init__(self, source_rate: int, output_rate: int) -> None:
+        if not MIN_PCM_SAMPLE_RATE <= source_rate <= MAX_PCM_SAMPLE_RATE or not (
+            MIN_PCM_SAMPLE_RATE <= output_rate <= MAX_PCM_SAMPLE_RATE
+        ):
             raise ProtocolError(
-                f"sample_rate must be between {MIN_PCM_SAMPLE_RATE} and "
+                f"sample rates must be between {MIN_PCM_SAMPLE_RATE} and "
                 f"{MAX_PCM_SAMPLE_RATE} Hz"
             )
         self.source_rate = source_rate
+        self.output_rate = output_rate
         self._buffer = array("h")
         self._buffer_start = 0
         self._input_frames = 0
@@ -71,15 +74,15 @@ class Pcm16Mono24KhzResampler:
         target_frames = (
             max(
                 1,
-                round(self._input_frames * REALTIME_SAMPLE_RATE / self.source_rate),
+                round(self._input_frames * self.output_rate / self.source_rate),
             )
             if final and self._input_frames
             else None
         )
         while target_frames is None or self._output_frames < target_frames:
             position_numerator = self._output_frames * self.source_rate
-            left_index = position_numerator // REALTIME_SAMPLE_RATE
-            fraction_numerator = position_numerator % REALTIME_SAMPLE_RATE
+            left_index = position_numerator // self.output_rate
+            fraction_numerator = position_numerator % self.output_rate
             if left_index >= self._input_frames:
                 break
             right_index = left_index + 1
@@ -88,7 +91,7 @@ class Pcm16Mono24KhzResampler:
             right_index = min(right_index, self._input_frames - 1)
             left = self._buffer[left_index - self._buffer_start]
             right = self._buffer[right_index - self._buffer_start]
-            fraction = fraction_numerator / REALTIME_SAMPLE_RATE
+            fraction = fraction_numerator / self.output_rate
             value = round(left * (1.0 - fraction) + right * fraction)
             output.append(max(-32_768, min(32_767, value)))
             self._output_frames += 1
@@ -96,7 +99,7 @@ class Pcm16Mono24KhzResampler:
         if final:
             self._buffer_start = self._input_frames
         else:
-            next_left = self._output_frames * self.source_rate // REALTIME_SAMPLE_RATE
+            next_left = self._output_frames * self.source_rate // self.output_rate
             discard = min(len(self._buffer), max(0, next_left - self._buffer_start))
             if discard:
                 del self._buffer[:discard]
@@ -104,6 +107,13 @@ class Pcm16Mono24KhzResampler:
         if sys.byteorder != "little":
             output.byteswap()
         return output.tobytes()
+
+
+class Pcm16Mono24KhzResampler(Pcm16MonoResampler):
+    """Incrementally resample aligned mono PCM16 to the realtime wire rate."""
+
+    def __init__(self, source_rate: int) -> None:
+        super().__init__(source_rate, REALTIME_SAMPLE_RATE)
 
 
 def decode_base64_audio(value: object) -> bytes:

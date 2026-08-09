@@ -26,20 +26,28 @@ from custom_components.codex_voice.api import (
 )
 
 
-def _wav_audio(pcm: bytes = b"\x00\x01\x02\x03") -> bytes:
+def _wav_audio(
+    pcm: bytes = b"\x00\x01\x02\x03",
+    *,
+    sample_rate: int = 24000,
+) -> bytes:
     """Return a small, valid PCM16 WAV file."""
     output = io.BytesIO()
     with wave.open(output, "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
-        wav_file.setframerate(24000)
+        wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm)
     return output.getvalue()
 
 
-def _streaming_wav_audio(pcm: bytes = b"\x00\x01\x02\x03") -> bytes:
+def _streaming_wav_audio(
+    pcm: bytes = b"\x00\x01\x02\x03",
+    *,
+    sample_rate: int = 24000,
+) -> bytes:
     """Return the bridge's canonical EOF-terminated PCM16 WAV framing."""
-    audio = bytearray(_wav_audio(pcm))
+    audio = bytearray(_wav_audio(pcm, sample_rate=sample_rate))
     audio[4:8] = b"\xff\xff\xff\xff"
     audio[40:44] = b"\xff\xff\xff\xff"
     return bytes(audio)
@@ -877,10 +885,11 @@ async def test_synthesize_decodes_json_pcm(
     socket_enabled: None,
 ) -> None:
     """Synthesis accepts the bridge's base64 PCM response."""
+    received: dict[str, Any] = {}
 
     async def synthesize(request: web.Request) -> web.Response:
         payload = await request.json()
-        assert payload["voice"] == "alloy"
+        received.update(payload)
         return web.json_response(
             {
                 "audio": base64.b64encode(b"\x00\x01").decode(),
@@ -906,6 +915,84 @@ async def test_synthesize_decodes_json_pcm(
     assert audio.data == b"\x00\x01"
     assert audio.audio_format == "pcm"
     assert audio.sample_rate == 24000
+    assert received == {
+        "text": "Hello",
+        "language": "en-US",
+        "voice": "alloy",
+        "format": "wav",
+    }
+
+
+async def test_synthesize_forwards_native_audio_preferences(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Finite synthesis sends normalized native WAV preferences."""
+    received: dict[str, Any] = {}
+
+    async def synthesize(request: web.Request) -> web.Response:
+        received.update(await request.json())
+        return web.json_response(
+            {
+                "audio": base64.b64encode(b"\x00\x01").decode(),
+                "format": "pcm",
+                "sample_rate": 16000,
+                "channels": 1,
+                "sample_width": 2,
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/synthesize", synthesize)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    audio = await client.async_synthesize(
+        "Hello",
+        language="en-US",
+        voice="alloy",
+        instructions=None,
+        sample_rate=16000,
+        channels=1,
+        sample_width=2,
+    )
+
+    assert audio.sample_rate == 16000
+    assert received == {
+        "text": "Hello",
+        "language": "en-US",
+        "voice": "alloy",
+        "format": "wav",
+        "sample_rate": 16000,
+        "channels": 1,
+        "sample_width": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"sample_rate": 22050}, "sample_rate"),
+        ({"sample_rate": True}, "sample_rate"),
+        ({"channels": 2}, "channels"),
+        ({"sample_width": 1}, "sample_width"),
+    ],
+)
+async def test_synthesize_rejects_invalid_audio_preferences(
+    kwargs: dict[str, Any],
+    error: str,
+) -> None:
+    """Finite synthesis rejects unsupported output preferences before I/O."""
+    client = BridgeClient(cast("Any", object()), "http://bridge.test", "token")
+
+    with pytest.raises(BridgeProtocolError, match=error):
+        await client.async_synthesize(
+            "Hello",
+            language="en-US",
+            voice="alloy",
+            instructions=None,
+            **kwargs,
+        )
 
 
 async def test_release_speech_session_handoff_is_authenticated_and_body_only(
@@ -1012,7 +1099,7 @@ async def test_synthesize_stream_yields_before_response_completes(
     socket_enabled: None,
 ) -> None:
     """Streaming synthesis validates its header and applies backpressure."""
-    audio = _streaming_wav_audio()
+    audio = _streaming_wav_audio(sample_rate=16000)
     header_started = asyncio.Event()
     release_header = asyncio.Event()
     release_audio = asyncio.Event()
@@ -1042,6 +1129,9 @@ async def test_synthesize_stream_yields_before_response_completes(
         voice="cove",
         instructions="Be brief",
         speech_session_handoff_token="stream-ticket",
+        sample_rate=16000,
+        channels=1,
+        sample_width=2,
     )
 
     first_chunk_task = asyncio.create_task(anext(stream))
@@ -1072,7 +1162,64 @@ async def test_synthesize_stream_yields_before_response_completes(
         "format": "wav",
         "instructions": "Be brief",
         "speech_session_handoff_token": "stream-ticket",
+        "sample_rate": 16000,
+        "channels": 1,
+        "sample_width": 2,
     }
+
+
+async def test_synthesize_stream_rejects_invalid_audio_preferences() -> None:
+    """Streaming synthesis validates output preferences before HTTP I/O."""
+    client = BridgeClient(cast("Any", object()), "http://bridge.test", "token")
+
+    with pytest.raises(BridgeProtocolError, match="sample_rate"):
+        _ = [
+            chunk
+            async for chunk in client.async_synthesize_stream(
+                "Hello",
+                language="en-US",
+                voice="cove",
+                instructions=None,
+                sample_rate=22050,
+                channels=1,
+                sample_width=2,
+            )
+        ]
+
+
+async def test_synthesize_stream_accepts_legacy_default_output(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """A rolling-upgrade bridge may ignore native output preferences."""
+    audio = _streaming_wav_audio(sample_rate=24000)
+
+    async def synthesize(request: web.Request) -> web.Response:
+        payload = await request.json()
+        assert payload["sample_rate"] == 16000
+        return web.Response(body=audio, content_type="audio/wav")
+
+    app = web.Application()
+    app.router.add_post("/v1/synthesize/stream", synthesize)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    result = b"".join(
+        [
+            chunk
+            async for chunk in client.async_synthesize_stream(
+                "Hello",
+                language="en-US",
+                voice="cove",
+                instructions=None,
+                sample_rate=16000,
+                channels=1,
+                sample_width=2,
+            )
+        ]
+    )
+
+    assert result == audio
 
 
 async def test_synthesize_stream_rejects_fragmented_invalid_header(

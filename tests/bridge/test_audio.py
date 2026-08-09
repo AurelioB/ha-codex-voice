@@ -8,6 +8,7 @@ import pytest
 
 from bridge.audio import (
     Pcm16Mono24KhzResampler,
+    Pcm16MonoResampler,
     decode_base64_audio,
     pcm16_mono_24khz,
     streaming_wav_header,
@@ -86,3 +87,19 @@ def test_streaming_resampler_rejects_unaligned_or_late_input() -> None:
     assert resampler.finish() == b""
     with pytest.raises(ProtocolError, match="already finished"):
         resampler.feed(b"\x00\x00")
+
+
+def test_streaming_resampler_converts_24khz_to_16khz() -> None:
+    source = b"".join(
+        sample.to_bytes(2, "little", signed=True) for sample in (0, 1_000, 2_000)
+    )
+    resampler = Pcm16MonoResampler(24_000, 16_000)
+
+    output = resampler.feed(source[:2]) + resampler.feed(source[2:])
+    output += resampler.finish()
+
+    samples = [
+        int.from_bytes(output[index : index + 2], "little", signed=True)
+        for index in range(0, len(output), 2)
+    ]
+    assert samples == [0, 1_500]

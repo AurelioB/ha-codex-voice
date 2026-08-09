@@ -3701,6 +3701,54 @@ async def test_synthesize_returns_best_effort_wav(
 
 
 @pytest.mark.asyncio
+async def test_synthesize_returns_requested_native_16khz_wav(
+    aiohttp_client: Any, bridge_app: web.Application
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _synthesis_payload()
+    payload.update({"sample_rate": 16_000, "channels": 1, "sample_width": 2})
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert response.headers["X-Audio-Sample-Rate"] == "16000"
+    with wave.open(BytesIO(await response.read()), "rb") as audio:
+        assert audio.getframerate() == 16_000
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+        assert audio.readframes(audio.getnframes()) == b"\x01\x00" * 320
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preference", "value", "expected_error"),
+    [
+        ("sample_rate", 22_050, "sample_rate"),
+        ("sample_rate", True, "sample_rate"),
+        ("channels", 2, "channels"),
+        ("sample_width", 1, "sample_width"),
+    ],
+)
+async def test_synthesize_rejects_unsupported_output_preferences(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    preference: str,
+    value: object,
+    expected_error: str,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _synthesis_payload()
+    payload[preference] = value
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 400
+    assert expected_error in (await response.json())["error"]
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+
+@pytest.mark.asyncio
 async def test_synthesize_stream_yields_first_pcm_before_cleanup(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
@@ -3726,6 +3774,32 @@ async def test_synthesize_stream_yields_first_pcm_before_cleanup(
         "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_resamples_incrementally_to_16khz(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _synthesis_payload()
+    payload.update({"sample_rate": 16_000, "channels": 1, "sample_width": 2})
+
+    response = await client.post(
+        "/v1/synthesize/stream",
+        headers=AUTH,
+        json=payload,
+    )
+
+    assert response.status == 200
+    assert response.headers["X-Audio-Sample-Rate"] == "16000"
+    first_audio = await response.content.readexactly(44 + 640)
+    assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
+    complete_audio = first_audio + await response.read()
+    with wave.open(BytesIO(complete_audio), "rb") as audio:
+        assert audio.getframerate() == 16_000
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+        assert audio.readframes(audio.getnframes()) == b"\x01\x00" * 320
 
 
 @pytest.mark.asyncio

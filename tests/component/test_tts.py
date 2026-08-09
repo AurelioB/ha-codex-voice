@@ -12,7 +12,13 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from homeassistant.components.tts import ATTR_PREFERRED_FORMAT, TTSAudioRequest
+from homeassistant.components.tts import (
+    ATTR_PREFERRED_FORMAT,
+    ATTR_PREFERRED_SAMPLE_BYTES,
+    ATTR_PREFERRED_SAMPLE_CHANNELS,
+    ATTR_PREFERRED_SAMPLE_RATE,
+    TTSAudioRequest,
+)
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import chat_session
@@ -161,6 +167,84 @@ async def test_tts_wraps_pcm_in_wav() -> None:
         assert wav_file.getframerate() == 24000
         assert wav_file.getnchannels() == 1
         assert wav_file.readframes(2) == b"\x00\x01\x02\x03"
+    synthesize.assert_awaited_once_with(
+        "Hello",
+        language="en-US",
+        voice="cove",
+        instructions=None,
+    )
+
+
+async def test_tts_forwards_native_audio_preferences() -> None:
+    """HA's preferred WAV shape is validated and forwarded to the bridge."""
+    synthesize = AsyncMock(
+        return_value=BridgeAudio(
+            data=b"\x00\x01\x02\x03",
+            audio_format="pcm",
+            sample_rate=16000,
+            channels=1,
+            sample_width=2,
+        )
+    )
+    entity = _make_tts_entity(SimpleNamespace(async_synthesize=synthesize))
+
+    audio_format, audio_data = await entity.async_get_tts_audio(
+        "Hello",
+        "en-US",
+        {
+            ATTR_PREFERRED_FORMAT: "wav",
+            ATTR_PREFERRED_SAMPLE_RATE: "16000",
+            ATTR_PREFERRED_SAMPLE_CHANNELS: "1",
+            ATTR_PREFERRED_SAMPLE_BYTES: "2",
+        },
+    )
+
+    assert audio_format == "wav"
+    assert audio_data is not None
+    with wave.open(io.BytesIO(audio_data), "rb") as wav_file:
+        assert wav_file.getframerate() == 16000
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+    synthesize.assert_awaited_once_with(
+        "Hello",
+        language="en-US",
+        voice="cove",
+        instructions=None,
+        sample_rate=16000,
+        channels=1,
+        sample_width=2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        (ATTR_PREFERRED_SAMPLE_RATE, 22_050),
+        (ATTR_PREFERRED_SAMPLE_CHANNELS, 2),
+        (ATTR_PREFERRED_SAMPLE_BYTES, 4),
+    ],
+)
+async def test_tts_uses_default_output_for_unsupported_audio_preferences(
+    option: str,
+    value: int,
+) -> None:
+    """Unsupported HA output hints retain the bridge's compatible defaults."""
+    synthesize = AsyncMock(
+        return_value=BridgeAudio(data=b"\x00\x01", audio_format="pcm")
+    )
+    entity = _make_tts_entity(SimpleNamespace(async_synthesize=synthesize))
+
+    await entity.async_get_tts_audio(
+        "Hello",
+        "en-US",
+        {
+            ATTR_PREFERRED_SAMPLE_RATE: 16000,
+            ATTR_PREFERRED_SAMPLE_CHANNELS: 1,
+            ATTR_PREFERRED_SAMPLE_BYTES: 2,
+            option: value,
+        },
+    )
+
     synthesize.assert_awaited_once_with(
         "Hello",
         language="en-US",
@@ -589,6 +673,10 @@ async def test_tts_streams_bridge_audio_and_merges_options() -> None:
             options={
                 CONF_VOICE: "ember",
                 CONF_INSTRUCTIONS: "Request instructions",
+                ATTR_PREFERRED_FORMAT: "wav",
+                ATTR_PREFERRED_SAMPLE_RATE: 16000,
+                ATTR_PREFERRED_SAMPLE_CHANNELS: 1,
+                ATTR_PREFERRED_SAMPLE_BYTES: 2,
             },
             message_gen=_message_chunks("Hel", "lo"),
         )
@@ -596,7 +684,12 @@ async def test_tts_streams_bridge_audio_and_merges_options() -> None:
 
     assert entity.async_supports_streaming_input()
     assert entity.supported_options is not None
-    assert ATTR_PREFERRED_FORMAT not in entity.supported_options
+    assert {
+        ATTR_PREFERRED_FORMAT,
+        ATTR_PREFERRED_SAMPLE_RATE,
+        ATTR_PREFERRED_SAMPLE_CHANNELS,
+        ATTR_PREFERRED_SAMPLE_BYTES,
+    }.issubset(entity.supported_options)
     assert api_module._SPEECH_SESSION_HANDOFF_OPTION not in entity.supported_options
     assert api_module._SPEECH_SESSION_HANDOFF_OPTION not in entity.default_options
     assert entity.default_options[ATTR_PREFERRED_FORMAT] == "wav"
@@ -611,6 +704,9 @@ async def test_tts_streams_bridge_audio_and_merges_options() -> None:
         language="en-US",
         voice="ember",
         instructions="Request instructions",
+        sample_rate=16000,
+        channels=1,
+        sample_width=2,
     )
 
 
