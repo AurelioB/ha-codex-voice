@@ -872,6 +872,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
     start = {
         "type": "start",
         "conversation_id": "conversation-1",
+        "effort": "low",
         "instructions": "Current Home Assistant context: morning",
         "messages": [
             {"role": "user", "content": "Remember the kitchen"},
@@ -940,6 +941,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
         "Turn on the kitchen",
         "And the dining room",
     ]
+    assert [turn["effort"] for turn in turns] == ["low", "low"]
     assert (
         turns[0]["additionalContext"]["home_assistant_instructions"]["value"]
         == "Current Home Assistant context: morning"
@@ -993,6 +995,8 @@ async def test_one_shot_conversation_deletes_private_thread(
         "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
+    turn = next(params for method, params in fake_rpc.calls if method == "turn/start")
+    assert turn["effort"] == bridge_service.DEFAULT_CONVERSATION_EFFORT
 
 
 @pytest.mark.asyncio

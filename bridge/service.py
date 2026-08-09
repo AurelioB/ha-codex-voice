@@ -52,6 +52,7 @@ MAX_CONVERSATIONS = 128
 CONVERSATION_TTL = 60 * 60
 MAX_HISTORY_CONTEXT_CHARS = 16_000
 MAX_EARLY_TURN_EVENTS = 64
+DEFAULT_CONVERSATION_EFFORT = "low"
 MAX_SYNTHESIS_TEXT_CHARS = 8_000
 MAX_TRANSCRIPTION_DURATION_SECONDS = 60.0
 TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
@@ -2763,6 +2764,9 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                     model = start_payload.get("model")
                     if isinstance(model, str) and model:
                         turn_params["model"] = model
+                    effort = start_payload.get("effort", DEFAULT_CONVERSATION_EFFORT)
+                    if isinstance(effort, str) and effort:
+                        turn_params["effort"] = effort
                     instructions = start_payload.get("instructions")
                     additional_context: dict[str, dict[str, str]] = {}
                     if isinstance(instructions, str) and instructions:
