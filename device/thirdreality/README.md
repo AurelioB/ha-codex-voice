@@ -18,6 +18,9 @@ ThirdReality LED command is queued on one daemon worker, so the DBus subprocess
 can no longer block microphone capture. Commands are serialized and bounded by
 the vendor's two-second timeout. If the bounded queue fills, stale pending
 animations are coalesced into the newest state; timed-out children are reaped.
+Both the vendor base class and the pinned ThirdReality subclass are patched
+directly. This prevents a later base-method rebinding during device startup from
+restoring the cue gate while retaining the guarded LED behavior.
 
 The override is applied atomically only when SHA-256 hashes of all four
 installed vendor code objects match the tested build: the base wake and cue-EOF
@@ -49,9 +52,23 @@ Copy the file to a dedicated device directory such as
 `PYTHONDONTWRITEBYTECODE=1` on the same launch line: this prevents a permissive
 device umask from creating a group/world-writable `__pycache__` beneath a
 root-process import path. Back up the exact init script before changing its
-launch line and restart only the `voice-assistant` service. Verify the process
-command, source ownership/mode/hash, absence of `__pycache__` in the import
-directory, and TCP ADB connection after restart.
+launch line.
+
+The v1.1.7 unified init script keeps its supervision functions in a long-lived
+shell. Editing the script does not update the function already held by that
+monitor: a voice-only restart can briefly launch the overlay and then be
+replaced by the stale monitor without `PYTHONPATH`. Refresh the unified monitor
+once through the device's normal service manager (or reboot during an approved
+maintenance window), then start the voice child from the updated definition.
+When invoking the service manager through ADB, ensure its background monitor is
+detached from the controlling shell rather than relying on a short-lived remote
+shell job.
+
+Verify the *long-lived* process PID after at least one monitor interval, its
+`PYTHONPATH`/`PYTHONDONTWRITEBYTECODE` environment, source ownership/mode/hash,
+absence of `__pycache__` in the import directory, and TCP ADB connection. A
+physical wake must also show no `wake_word_triggered_old.wav` playback. Merely
+importing `sitecustomize` in a separate probe process is not acceptance.
 
 Python imports `sitecustomize` during process startup. The script validates all
 compatibility guards before mutating the vendor class. An import failure or

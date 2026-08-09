@@ -26,10 +26,13 @@ sides of a narrow bridge API.
 - Startup audits App Server's effective configuration layers and fails closed
   if a local or managed layer still configures an MCP server.
 - Threads are deliberately non-ephemeral inside that isolated home so App
-  Server can delete them immediately with `thread/delete`. One-shot STT, TTS,
-  and realtime threads are deleted when their session ends; reusable
+  Server can delete them immediately with `thread/delete`. Experimental Codex
+  STT, TTS, and realtime threads are deleted when their session ends; reusable
   Conversation threads are deleted when retired, evicted, or the bridge shuts
   down.
+- Production STT audio travels only from Home Assistant to the selected local
+  Wyoming faster-whisper service. It does not enter Codex App Server or consume
+  ChatGPT/OpenAI quota.
 
 The authentication source is resolved from `HA_CODEX_AUTH_FILE`,
 `${CODEX_HOME}/auth.json`, or `${HOME}/.codex/auth.json`. The bridge fails
@@ -47,6 +50,10 @@ rules restrict the bridge port to the Home Assistant host. Use HTTPS/WSS through
 a reverse proxy across any shared or untrusted network. Do not expose port 8787
 directly to the internet.
 
+Wyoming TCP has no application bearer authentication. Bind port 10300 to an
+explicit trusted-LAN address and restrict it to the Home Assistant host. Never
+expose it to the internet or an untrusted network.
+
 Generate a unique high-entropy token for this service. Do not reuse a Home
 Assistant token, Codex credential, GitHub token, or password. Keep it in a
 root- or service-user-readable environment file rather than a shell history or
@@ -59,6 +66,12 @@ email addresses, and nested fields whose names imply secrets. The bridge does
 not log audio payloads, transcripts, SDP, authorization headers, or raw account
 objects at normal log levels.
 
+Upstream `wyoming-faster-whisper` 3.5.0 logs recognized text at INFO. The
+supplied systemd unit deliberately starts it through the privacy runner, which
+raises only `wyoming_faster_whisper.dispatch_handler` to WARNING. Do not replace
+that runner with the package's direct console entry point unless transcript
+logging is explicitly acceptable for the deployment.
+
 ## Experimental subscription transport
 
 Subscription audio uses an under-development Codex App Server WebRTC interface
@@ -66,10 +79,12 @@ and consumes ChatGPT subscription availability rather than OpenAI Platform API
 quota. It must never silently fall back to an OpenAI Platform API key. Upgrade
 Codex only after running the local contract tests and the opt-in WebRTC probe.
 
-Realtime transcription and speech rendering are behaviors of a conversational
-voice model. They are not the separately billed Speech-to-Text and Text-to-
-Speech APIs. In particular, spoken output may paraphrase supplied text. Do not
-use it for safety-critical, compliance-sensitive, or legally exact messages.
+Experimental Codex transcription and speech rendering are behaviors of a
+conversational voice model. They are not the separately billed Speech-to-Text
+and Text-to-Speech APIs. A realtime input session may return no transcript, and
+spoken output may paraphrase supplied text. Production STT therefore uses local
+Wyoming faster-whisper. Do not use experimental speech output for
+safety-critical, compliance-sensitive, or legally exact messages.
 
 ## Reporting vulnerabilities
 

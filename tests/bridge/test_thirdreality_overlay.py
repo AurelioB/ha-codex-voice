@@ -406,6 +406,7 @@ def test_overlay_fails_closed_atomically_on_any_hash_mismatch(
         _protocol, module, tr_satellite = load_overlay(tuple(hashes))
 
     assert _FakeProtocol.wakeup is _VENDOR_BASE_WAKEUP
+    assert _FakeTRProtocol.wakeup is _VENDOR_TR_WAKEUP
     assert tr_satellite._led_fire is _vendor_led_fire  # type: ignore[attr-defined]
     assert module._LED_WORKER is None
     assert (

@@ -7,6 +7,7 @@ import pytest
 from homeassistant import config_entries
 from homeassistant.components.homeassistant.const import DATA_EXPOSED_ENTITIES
 from homeassistant.components.homeassistant.exposed_entities import ExposedEntities
+from homeassistant.const import CONF_NAME, CONF_PROMPT
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import (  # type: ignore[import-untyped]
@@ -34,10 +35,10 @@ def mock_exposed_entities(hass: HomeAssistant) -> None:
     )
 
 
-async def test_user_flow_creates_three_provider_subentries(
+async def test_user_flow_creates_stable_provider_subentries(
     hass: HomeAssistant,
 ) -> None:
-    """A validated bridge creates Conversation, STT, and TTS providers."""
+    """A validated bridge defaults to Conversation and TTS providers."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": config_entries.SOURCE_USER},
@@ -71,7 +72,6 @@ async def test_user_flow_creates_three_provider_subentries(
     }
     assert [item["subentry_type"] for item in result["subentries"]] == [
         "conversation",
-        "stt",
         "tts",
     ]
     assert result["subentries"][0]["data"][CONF_REASONING_EFFORT] == (
@@ -80,6 +80,41 @@ async def test_user_flow_creates_three_provider_subentries(
     assert result["subentries"][0]["data"][CONF_SERVICE_TIER] == (
         DEFAULT_CONVERSATION_SERVICE_TIER
     )
+
+
+async def test_experimental_stt_subentry_remains_manually_available(
+    hass: HomeAssistant,
+) -> None:
+    """Existing users can explicitly add the diagnostic Codex STT provider."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_BRIDGE_URL: "http://bridge.local:8787",
+            CONF_ACCESS_TOKEN: "bridge-token",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "stt"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Protocol diagnostic",
+            CONF_PROMPT: "Known phrase",
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Protocol diagnostic"
+    assert result["data"] == {CONF_PROMPT: "Known phrase"}
+    subentry = next(iter(entry.subentries.values()))
+    assert subentry.subentry_type == "stt"
+    assert subentry.title == "Protocol diagnostic"
 
 
 async def test_user_flow_reports_invalid_auth(hass: HomeAssistant) -> None:

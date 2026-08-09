@@ -25,7 +25,7 @@ SUBENTRY_TYPE_TTS: Final = "tts"
 
 DEFAULT_BRIDGE_URL: Final = "http://localhost:8787"
 DEFAULT_CONVERSATION_NAME: Final = "Codex Voice"
-DEFAULT_STT_NAME: Final = "Codex Speech-to-Text"
+DEFAULT_STT_NAME: Final = "Experimental Codex Realtime STT"
 DEFAULT_TTS_NAME: Final = "Codex Text-to-Speech"
 DEFAULT_CONVERSATION_MODEL: Final = "gpt-5.6-sol"
 DEFAULT_CONVERSATION_REASONING_EFFORT: Final = "low"

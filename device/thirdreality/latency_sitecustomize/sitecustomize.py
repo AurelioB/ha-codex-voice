@@ -145,6 +145,14 @@ def _fast_wakeup(instance: Any, wake_word: Any) -> None:
         raise
 
 
+def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
+    """Apply the fast wake path directly to the pinned device subclass."""
+    previous_active = instance._pipeline_active  # noqa: SLF001
+    _fast_wakeup(instance, wake_word)
+    if not previous_active and instance._pipeline_active:  # noqa: SLF001
+        _nonblocking_led_fire("listening")
+
+
 def _decode_stderr(stderr: Any) -> str:
     """Return subprocess stderr as safe log text."""
     if isinstance(stderr, bytes):
@@ -287,6 +295,7 @@ _expected_hashes = (
 
 if _observed_hashes == _expected_hashes:
     VoiceSatelliteProtocol.wakeup = _fast_wakeup
+    thirdreality_satellite.TRSatelliteProtocol.wakeup = _fast_thirdreality_wakeup
     thirdreality_satellite._led_fire = _nonblocking_led_fire  # noqa: SLF001
     atexit.register(_shutdown_led_worker)
 else:

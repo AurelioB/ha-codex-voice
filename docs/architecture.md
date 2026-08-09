@@ -5,19 +5,27 @@
 ```text
 ThirdReality Assist satellite
   -> Home Assistant Assist pipeline
-     -> Codex Voice STT entity
+     -> Wyoming faster-whisper STT entity
      -> Codex Voice Conversation entity
      -> Codex Voice TTS entity
+  -> ThirdReality speaker
+
+Codex Voice Conversation/TTS
   -> authenticated HTTP/WebSocket bridge API
-  -> local bridge process
   -> Codex App Server over JSON-RPC/stdio
   -> Codex-managed ChatGPT login
+
+Wyoming STT
+  -> local persistent faster-whisper model
 ```
 
 The component is a normal Home Assistant integration with one parent config
-entry and Conversation, STT, and TTS config subentries. This makes all three
-providers selectable in the official Assist pipeline. The existing
-ThirdReality satellite needs no firmware change for this turn-based mode.
+entry. New entries create Conversation and TTS subentries; Home Assistant's
+native Wyoming integration owns the reliable STT entity. The retained Codex
+STT subentry is an explicit experimental diagnostic because Codex realtime
+conversation does not provide a deterministic finite transcription contract.
+The existing ThirdReality satellite needs no firmware change for this
+turn-based mode.
 
 Conversation turns use stable App Server thread and turn methods. Selected Home
 Assistant LLM tools are advertised as dynamic tools. When Codex requests a tool,
@@ -51,10 +59,11 @@ future protocol work. Cached Conversation threads are deleted when retired,
 evicted, or the bridge closes. Deletion unloads the thread immediately instead
 of retaining it for App Server's idle-unload period.
 
-## Subscription audio adapter
+## Subscription audio adapters
 
-Codex 0.146.0 does not expose independent subscription-backed STT or TTS RPCs.
-The bridge therefore creates short-lived realtime-conversation sessions:
+Codex App Server does not expose independent subscription-backed STT or TTS
+RPCs. The TTS entity and retained experimental STT entity therefore create
+short-lived realtime-conversation sessions:
 
 1. Create an `aiortc` peer with a paced audio track and `oai-events` data
    channel.
@@ -76,26 +85,40 @@ requires API-key authentication, while the WebRTC call-creation path works with
 Codex-managed ChatGPT OAuth and consumes ChatGPT subscription availability,
 not OpenAI Platform API quota.
 
-## Finite speech latency and session ownership
+## Reliable finite STT boundary
 
-Home Assistant's STT provider opens `/v1/transcribe/stream` before consuming
-the microphone iterator. After validating the start message, the bridge starts
-the thread and WebRTC handshake in a task while it continues receiving bounded
-PCM frames. Once sustained speech supplies enough evidence for a bounded,
-one-time level calibration, normalized audio is released to that task during
-capture. Quiet or ambiguous input is held until explicit EOF. The bridge keeps
-the complete raw capture so any retry uses a fresh session and a normalized
-whole utterance. This overlaps both remote setup and recognition with capture
-while preserving a finite Home Assistant result boundary.
-
-The production lifecycle creates a fresh realtime resource per speech
-operation. Automatic reuse is disabled because live v3 sessions emitted
-assistant output before finite STT completion and the supported Frameless Bidi
-outbound protocol has no response-cancel control. This keeps the official Home
-Assistant provider flow isolated and deterministic.
+The production pipeline sends Home Assistant's bounded PCM16 stream to a local
+Wyoming faster-whisper service. Home Assistant owns stream cancellation and
+language selection; Wyoming keeps the model warm and returns one standard STT
+result after capture EOF. This path does not open a Codex thread, consume a
+subscription speech slot, or silently fall back to the experimental adapter.
 
 ```text
-STT active
+capture -> local Wyoming STT -> transcript -> Codex Conversation -> Codex TTS
+```
+
+See [reliable local speech-to-text](local-stt.md) for deployment and acceptance
+checks.
+
+## Experimental finite subscription adapter
+
+When explicitly configured, the Codex STT provider opens
+`/v1/transcribe/stream` before consuming the microphone iterator. After
+validating the start message, the bridge starts the thread and WebRTC handshake
+in a task while it continues receiving bounded PCM frames. Once sustained
+speech supplies enough evidence for a bounded, one-time level calibration,
+normalized audio is released to that task during capture. The bridge retains
+the complete raw utterance for a same-path retry. Neither successful signaling
+nor complete media delivery guarantees that the conversational backend emits a
+user transcript, so this cannot serve as the reliable pipeline boundary.
+
+The experimental lifecycle creates a fresh realtime resource per speech
+operation. Automatic reuse is disabled because live v3 sessions emitted
+assistant output before finite STT completion and the supported Frameless Bidi
+outbound protocol has no response-cancel control.
+
+```text
+Experimental Codex STT active
   -> transcript result -> stop session -> delete thread
   -> TTS -> start fresh session -> stream speech -> stop/delete
 ```
