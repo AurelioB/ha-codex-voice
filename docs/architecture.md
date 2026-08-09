@@ -30,7 +30,25 @@ turn-based mode.
 Conversation turns use stable App Server thread and turn methods. Selected Home
 Assistant LLM tools are advertised as dynamic tools. When Codex requests a tool,
 the component executes it through Home Assistant's LLM API; the bridge has no
-direct home-control authority.
+direct home-control authority. Conversation start and tool-result events are
+encoded with Home Assistant's canonical JSON serializer, including nested
+temporal values such as `date`, `time`, and `datetime`. Values outside that
+policy are rejected locally with a data-safe protocol error before a WebSocket
+message is sent.
+
+The pinned v1.1.7 device overlay adds a second, explicitly separate route:
+
+```text
+"Okay Nabu" -> stock satellite protocol -> Home Assistant Assist/tools
+"Okay Computer" -> in-process stdlib client -> realtime wire v2 -> bridge
+                 -> Codex App Server WebRTC -> local device playback
+```
+
+The direct route is chat-only. It never receives a Home Assistant credential,
+does not advertise tools, rejects tool results, and does not proxy provider
+tool calls or transcript content back to the device. A normal Okay Nabu wake
+can preempt direct mode and regain the microphone on the same vendor capture
+thread.
 
 ## Isolated App Server profile and thread lifecycle
 
@@ -148,21 +166,70 @@ The bridge does not prewarm a remote session before a future wake word. A
 custom STT provider has no reliable Home Assistant callback before wake
 detection, an idle peer continues sending paced silent RTP, and a speculative
 session would occupy the single subscription speech lane without a documented
-quota-neutral idle lifetime. Current latency work is therefore limited to
-capture overlap and progressive TTS delivery. See [performance and ThirdReality
-tuning](performance.md) for the live measurements and acceptance criteria.
+quota-neutral idle lifetime. Standard Assist adapter optimization is therefore
+limited to capture overlap and progressive TTS delivery. The direct device mode
+below begins only after its explicit wake; it is not a speculative prewarm. See
+[performance and ThirdReality tuning](performance.md) for the live measurements
+and acceptance criteria.
 
 ## Realtime client mode
 
 The bridge's `/v1/realtime` WebSocket is a project-owned LAN protocol, not the
-App Server transport. A capable client sends PCM/control messages to the bridge;
-the bridge relays them through its internal WebRTC peer and returns transcripts
-and PCM output. This separates the ThirdReality firmware protocol from the
-version-coupled Codex protocol.
+App Server transport. Legacy v1 keeps its JSON/base64 compatibility behavior;
+strict v2 accepts binary 16 kHz mono PCM16 input and returns binary 24 kHz mono
+PCM16 only between explicit speaking-epoch controls. The bridge owns the
+version-coupled App Server WebRTC peer and filters v2 events at that trust
+boundary.
 
-Stock ThirdReality firmware can use only the standard Assist path. Full duplex,
-continuous listening, and barge-in require the firmware audio-stream extension
-described in [the ThirdReality plan](../thirdreality-codex-realtime-plan.md).
+The pinned ThirdReality v1.1.7 overlay imports a standard-library-only client
+inside the existing root voice process. It does not replace vendor modules or
+add a second daemon. Its exact vendor bytecode guards are evaluated before any
+patch is installed. A missing, disabled, insecure, or invalid root-only config
+leaves direct mode inactive; unrecognized vendor code leaves all target methods
+untouched.
+
+```text
+vendor microphone callback (16 kHz PCM16)
+  -> direct-only idle pre-roll (up to 6 × 64 ms / 12 KiB in RAM)
+  -> bounded device input/fallback queues (64 KiB / 2.048 s)
+  -> paced v2 binary WebSocket (up to 2x while catching up)
+  -> bridge v2-only WebRTC input cap (2,250 ms)
+  -> Codex App Server realtime v3
+
+provider audio (48 kHz WebRTC)
+  -> bridge downmix/resample and content-free epoch gate (24 kHz PCM16)
+  -> bounded device playback queue (48 KiB / about 1.024 s)
+  -> fixed-argument paplay child
+```
+
+The recorder callback runs before local wake-model activation. The overlay
+therefore retains the newest six idle frames and atomically transfers them only
+when Okay Computer selects the direct route. Okay Nabu discards that history
+before official Assist starts. Stop, mute, disconnect, and teardown clear it,
+and no copy is written to disk or logs. Pre-roll remains inside the configured
+queue bounds and is trimmed or omitted to reserve at least 32 KiB (1.024 s) of
+live post-wake capacity in both the direct input and pre-ready fallback queues.
+
+The 2× transfer is bounded catch-up, not burst replay: it runs only while more
+than one captured frame is queued and returns to capture cadence at the live
+edge. It preserves accepted startup audio and prevents a permanent
+handshake-sized delay, but cannot remove cold thread/WebRTC setup or provider
+latency. The v2 2,250 ms input limit is applied per session before start;
+finite STT retains its existing whole-utterance track capacity.
+
+The released client is turn-taking. A speaking epoch gates microphone
+submission until both its queued PCM and playback child have drained. There is
+no enabled acoustic echo cancellation, simultaneous listen/speak, or verified
+barge-in. Interruption aborts local playback and closes the socket/session. The
+bridge truthfully negotiates `local_flush: true` and `remote_cancel: false`, so
+continuation requires a fresh WebSocket, thread, and realtime session rather
+than pretending remote output was truncated.
+
+The device stores a distinct route-scoped bearer in a root-owned mode-0600
+file. The bridge accepts it only on `/v1/realtime`; the primary Home Assistant
+bridge token, ChatGPT credential, and Home Assistant token do not go to the
+speaker. See the [wire protocol](../protocol/realtime-wire-v2.md) and [device
+deployment contract](../device/thirdreality/README.md).
 
 ThirdReality v1.2 is a native C++ rewrite with a changed audio, AEC, playback,
 and continued-conversation path; it is not merely a drop-in performance flag.
@@ -176,3 +243,7 @@ re-verified after reboot and updates. The safe settings, canary matrix,
 recovery checklist, and access-service requirements are documented in
 [performance and ThirdReality
 tuning](performance.md#official-v12-c-firmware-canary-evaluation).
+
+The v1.1.7 in-process overlay does not require this firmware canary. It neither
+starts nor stops `adbd`; deployment, restart, rollback, and reboot verification
+must preserve the approved TCP ADB port 5555 recovery path.

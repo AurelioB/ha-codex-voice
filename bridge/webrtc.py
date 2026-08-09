@@ -16,7 +16,12 @@ RTP_SAMPLE_RATE = 48_000
 INPUT_FRAME_SAMPLES = REALTIME_SAMPLE_RATE * FRAME_DURATION_MS // 1_000
 INPUT_FRAME_BYTES = INPUT_FRAME_SAMPLES * PCM_SAMPLE_WIDTH
 RTP_FRAME_SAMPLES = RTP_SAMPLE_RATE * FRAME_DURATION_MS // 1_000
-MAX_INPUT_BUFFER_BYTES = REALTIME_SAMPLE_RATE * PCM_SAMPLE_WIDTH * 300
+MAX_INPUT_BUFFER_MILLISECONDS = 300_000
+MAX_INPUT_BUFFER_BYTES = (
+    REALTIME_SAMPLE_RATE * PCM_SAMPLE_WIDTH * MAX_INPUT_BUFFER_MILLISECONDS // 1_000
+)
+MAX_REMOTE_AUDIO_QUEUE_CHUNKS = 25
+MAX_DATA_EVENT_QUEUE_ITEMS = 64
 
 try:  # Imported lazily enough that text-only conversation can report a useful error.
     from aiortc import (
@@ -55,6 +60,8 @@ class PcmAudioTrack(MediaStreamTrack):  # type: ignore[misc,valid-type]
             ) from _IMPORT_ERROR
         super().__init__()
         self._buffer = bytearray()
+        self._maximum_buffer_milliseconds = MAX_INPUT_BUFFER_MILLISECONDS
+        self._maximum_buffer_bytes = MAX_INPUT_BUFFER_BYTES
         self._pts = 0
         self._started_at: float | None = None
         self._drained = asyncio.Event()
@@ -63,11 +70,23 @@ class PcmAudioTrack(MediaStreamTrack):  # type: ignore[misc,valid-type]
     def feed(self, pcm: bytes) -> None:
         if len(pcm) % PCM_SAMPLE_WIDTH:
             raise ProtocolError("outgoing PCM16 audio is not sample-aligned")
-        if len(self._buffer) + len(pcm) > MAX_INPUT_BUFFER_BYTES:
-            raise ProtocolError("outgoing audio buffer exceeds five minutes")
+        if len(self._buffer) + len(pcm) > self._maximum_buffer_bytes:
+            raise ProtocolError(
+                f"outgoing audio buffer exceeds {self._maximum_buffer_milliseconds} ms"
+            )
         if pcm:
             self._buffer.extend(pcm)
             self._drained.clear()
+
+    def set_maximum_buffer_milliseconds(self, maximum: int) -> None:
+        """Narrow the input bound before feeding a latency-sensitive session."""
+        if maximum <= 0:
+            raise ValueError("maximum input buffer duration must be positive")
+        maximum_bytes = REALTIME_SAMPLE_RATE * PCM_SAMPLE_WIDTH * maximum // 1_000
+        if len(self._buffer) > maximum_bytes:
+            raise ProtocolError("queued audio exceeds the requested input bound")
+        self._maximum_buffer_milliseconds = maximum
+        self._maximum_buffer_bytes = maximum_bytes
 
     async def wait_drained(self, timeout: float | None = None) -> None:
         if timeout is None:
@@ -136,10 +155,16 @@ class WebRtcPeer:
         self.input_track = PcmAudioTrack()
         self.pc.addTrack(self.input_track)
         self.data_channel = self.pc.createDataChannel("oai-events")
-        self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2_048)
-        self.data_events: asyncio.Queue[str | bytes] = asyncio.Queue(maxsize=128)
+        self.audio: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=MAX_REMOTE_AUDIO_QUEUE_CHUNKS
+        )
+        self.data_events: asyncio.Queue[str | bytes] = asyncio.Queue(
+            maxsize=MAX_DATA_EVENT_QUEUE_ITEMS
+        )
         self.connection_state = asyncio.Event()
         self.closed = False
+        self._transport_failed = asyncio.Event()
+        self._transport_error: ProtocolError | None = None
         self._consumer_tasks: set[asyncio.Task[None]] = set()
 
         @self.pc.on("track")
@@ -159,6 +184,9 @@ class WebRtcPeer:
             if self.pc.connectionState == "failed" or (
                 self.pc.connectionState == "closed" and not self.closed
             ):
+                self._fail_transport(
+                    f"WebRTC connection entered {self.pc.connectionState} state"
+                )
                 LOGGER.warning(
                     "Codex WebRTC connection state: %s", self.pc.connectionState
                 )
@@ -168,7 +196,12 @@ class WebRtcPeer:
             try:
                 self.data_events.put_nowait(message)
             except asyncio.QueueFull:
-                LOGGER.warning("Dropping Codex WebRTC data-channel event")
+                self._fail_transport("WebRTC data-channel event buffer overflow")
+
+        @self.data_channel.on("close")
+        def on_data_channel_close() -> None:
+            if not self.closed:
+                self._fail_transport("WebRTC data channel ended unexpectedly")
 
     async def create_offer(self) -> str:
         gathering_complete = asyncio.Event()
@@ -212,6 +245,10 @@ class WebRtcPeer:
         else:
             await asyncio.wait_for(wait(), timeout)
 
+    def set_input_buffer_limit(self, maximum_milliseconds: int) -> None:
+        """Apply a per-session input bound to the paced microphone track."""
+        self.input_track.set_maximum_buffer_milliseconds(maximum_milliseconds)
+
     def feed_audio(self, pcm: bytes) -> None:
         self.input_track.feed(pcm)
 
@@ -241,14 +278,14 @@ class WebRtcPeer:
                 return events
 
     async def recv_audio(self, timeout: float | None = None) -> bytes:
-        if timeout is None:
-            return await self.audio.get()
-        return await asyncio.wait_for(self.audio.get(), timeout)
+        value = await self._recv_transport_queue(self.audio, timeout)
+        assert isinstance(value, bytes)
+        return value
 
     async def recv_data_event(self, timeout: float | None = None) -> str | bytes:
-        if timeout is None:
-            return await self.data_events.get()
-        return await asyncio.wait_for(self.data_events.get(), timeout)
+        value = await self._recv_transport_queue(self.data_events, timeout)
+        assert isinstance(value, (str, bytes))
+        return value
 
     async def close(self) -> None:
         if self.closed:
@@ -267,7 +304,42 @@ class WebRtcPeer:
         if task.cancelled():
             return
         if error := task.exception():
+            self._fail_transport(f"WebRTC audio transport failed: {error}")
             LOGGER.error("Codex WebRTC audio consumer failed: %s", error)
+
+    def _fail_transport(self, message: str) -> None:
+        """Wake all media consumers with the first terminal transport fault."""
+        if self.closed or self._transport_error is not None:
+            return
+        self._transport_error = ProtocolError(message)
+        self._transport_failed.set()
+
+    async def _recv_transport_queue(
+        self,
+        queue: asyncio.Queue[Any],
+        timeout: float | None,
+    ) -> Any:
+        if self._transport_error is not None:
+            raise self._transport_error
+        item_task = asyncio.create_task(queue.get())
+        failure_task = asyncio.create_task(self._transport_failed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {item_task, failure_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError
+            if failure_task in done:
+                assert self._transport_error is not None
+                raise self._transport_error
+            return item_task.result()
+        finally:
+            for task in (item_task, failure_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(item_task, failure_task, return_exceptions=True)
 
     async def _consume_audio(self, track: Any) -> None:
         assert AudioResampler is not None
@@ -305,7 +377,8 @@ class WebRtcPeer:
                     if not pcm:
                         continue
                     if self.audio.full():
-                        self.audio.get_nowait()
+                        self._fail_transport("WebRTC remote audio buffer overflow")
+                        return
                     self.audio.put_nowait(pcm)
                     if not logged_queue:
                         LOGGER.debug(
@@ -315,4 +388,5 @@ class WebRtcPeer:
                         logged_queue = True
         except MediaStreamError as exc:
             if not self.closed:
+                self._fail_transport("WebRTC remote audio transport ended")
                 LOGGER.debug("Codex WebRTC audio track ended: %s", exc)

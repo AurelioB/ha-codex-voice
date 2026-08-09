@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-codex-voice-development"
-version = "0.2.0"
+version = "0.3.0"
 description = "Development tooling for the Codex Voice Home Assistant integration"
 requires-python = ">=3.14.2"
 dependencies = []
@@ -54,6 +54,7 @@ extend-exclude = [".git"]
 
 [tool.ruff.per-file-target-version]
 "bridge/**/*.py" = "py311"
+"device/thirdreality/**/*.py" = "py311"
 "scripts/**/*.py" = "py311"
 "tests/bridge/**/*.py" = "py311"
 

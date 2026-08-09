@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import importlib
 import logging
 import marshal
 import subprocess
@@ -33,6 +34,31 @@ _EXPECTED_TR_WAKEUP = "4aff556b90696a3b425978641a48022021b9ffd13f4176c6bed939635
 _EXPECTED_TR_LED_FIRE = (
     "bd6ddee49d623fff2224b5ec0dfb302075d0be9ce3c245f6cf1cf993478f9efc"
 )
+_EXPECTED_BASE_HANDLE_AUDIO_OPCODES = (
+    "ecc9e6112426a14c798736e18244af1cea526ec072882e4d95c622106a06a41d"
+)
+_EXPECTED_BASE_STOP_OPCODES = (
+    "b249e6254095ee6c19fa26795eeb424b762972adf52ba931b2a04ae3985c80ea"
+)
+
+_VENDOR_BASE_HANDLE_AUDIO = VoiceSatelliteProtocol.handle_audio
+_VENDOR_BASE_STOP = VoiceSatelliteProtocol.stop
+_REALTIME_SUPPORT: Any = None
+_REALTIME_CONFIG: Any = None
+_REALTIME_PATCH_ACTIVE = False
+_REALTIME_OWNER_ATTRIBUTE = "_codex_realtime_owner"
+_REALTIME_PREROLL_ATTRIBUTE = "_codex_realtime_preroll"
+_REALTIME_LOCK_ATTRIBUTE = "_codex_realtime_lock"
+_REALTIME_STOP_REQUESTED_ATTRIBUTE = "_codex_realtime_stop_requested"
+# The pinned recorder emits 2,048-byte PCM16 frames every 64 ms. Wake
+# activation happens after handle_audio sees the triggering frame, so retain
+# six idle frames for the direct wake path. This is RAM-only and small enough
+# for the client's bounded 2x startup catch-up.
+_REALTIME_PREROLL_MAX_BYTES = 12 * 1024
+# Preserve one second of live PCM capacity behind pre-roll so legal, smaller
+# custom queues do not fall back merely because the cold handshake is pending.
+_REALTIME_STARTUP_HEADROOM_BYTES = 32 * 1024
+_REALTIME_LOCK_CREATION = threading.Lock()
 
 _LED_TIMEOUT_SECONDS = 2.0
 _LED_THREAD_PREFIX = "thirdreality-led"
@@ -46,6 +72,554 @@ _LED_SHUT_DOWN = False
 def _code_hash(function: Any) -> str:
     """Return a stable hash for one installed Python code object."""
     return hashlib.sha256(marshal.dumps(function.__code__)).hexdigest()
+
+
+def _opcode_hash(function: Any) -> str:
+    """Return the exact installed opcode-stream hash for a narrow patch."""
+    return hashlib.sha256(function.__code__.co_code).hexdigest()
+
+
+class _RealtimeOwner:
+    """Synchronized vendor state around a vendor-agnostic session."""
+
+    __slots__ = (
+        "ducked",
+        "fallback_audio",
+        "fallback_bytes",
+        "ready_seen",
+        "released",
+        "session",
+        "stop_requested",
+        "stop_word_id",
+        "stop_word_was_active",
+        "wake_word",
+    )
+
+    def __init__(
+        self,
+        *,
+        session: Any,
+        wake_word: Any,
+        stop_word_id: Any,
+        stop_word_was_active: bool,
+    ) -> None:
+        self.session = session
+        self.wake_word = wake_word
+        self.stop_word_id = stop_word_id
+        self.stop_word_was_active = stop_word_was_active
+        self.ducked = False
+        self.ready_seen = False
+        self.released = False
+        self.stop_requested = False
+        self.fallback_bytes = 0
+        self.fallback_audio: deque[bytes] = deque()
+
+
+def _load_realtime_config() -> None:
+    """Load optional support without making the normal HA path depend on it."""
+    global _REALTIME_CONFIG, _REALTIME_SUPPORT  # noqa: PLW0603
+    try:
+        support = importlib.import_module("realtime_client")
+    except ModuleNotFoundError as exc:
+        if exc.name != "realtime_client":
+            _LOGGER.warning("ThirdReality realtime client import failed")
+        return
+    except Exception:  # noqa: BLE001 - optional code must not break vendor startup
+        _LOGGER.warning("ThirdReality realtime client import failed")
+        return
+    try:
+        config = support.load_config()
+    except FileNotFoundError:
+        return
+    except (OSError, support.ConfigError):
+        _LOGGER.warning("ThirdReality realtime configuration is invalid")
+        return
+    except Exception:  # noqa: BLE001 - fail closed around optional package code
+        _LOGGER.warning("ThirdReality realtime configuration could not be loaded")
+        return
+    if config is None:
+        return
+    _REALTIME_SUPPORT = support
+    _REALTIME_CONFIG = config
+
+
+def _is_realtime_wake(wake_word: Any) -> bool:
+    if (
+        not _REALTIME_PATCH_ACTIVE
+        or _REALTIME_CONFIG is None
+        or _REALTIME_SUPPORT is None
+    ):
+        return False
+    phrase = getattr(wake_word, "wake_word", "")
+    if not isinstance(phrase, str):
+        return False
+    return (
+        _REALTIME_SUPPORT.normalize_wake_phrase(phrase) == _REALTIME_CONFIG.wake_phrase
+    )
+
+
+def _stop_word_membership(instance: Any) -> tuple[Any, bool]:
+    stop_word = getattr(instance.state, "stop_word", None)
+    stop_word_id = getattr(stop_word, "id", None)
+    active = getattr(instance.state, "active_wake_words", None)
+    if stop_word_id is None or active is None:
+        return None, False
+    was_active = stop_word_id in active
+    if not was_active:
+        active.add(stop_word_id)
+    return stop_word_id, was_active
+
+
+def _restore_stop_word_membership(instance: Any, owner: _RealtimeOwner) -> None:
+    if owner.stop_word_id is None:
+        return
+    active = getattr(instance.state, "active_wake_words", None)
+    if active is None:
+        return
+    if owner.stop_word_was_active:
+        active.add(owner.stop_word_id)
+    else:
+        active.discard(owner.stop_word_id)
+
+
+def _realtime_state_lock(instance: Any) -> Any:
+    """Return the per-protocol reentrant lock, creating it exactly once."""
+    lock = getattr(instance, _REALTIME_LOCK_ATTRIBUTE, None)
+    if lock is not None:
+        return lock
+    with _REALTIME_LOCK_CREATION:
+        lock = getattr(instance, _REALTIME_LOCK_ATTRIBUTE, None)
+        if lock is None:
+            lock = threading.RLock()
+            setattr(instance, _REALTIME_LOCK_ATTRIBUTE, lock)
+    return lock
+
+
+def _remember_realtime_preroll(instance: Any, audio_chunk: bytes) -> None:
+    """Retain only the newest bounded idle PCM for delayed wake activation."""
+    preroll = getattr(instance, _REALTIME_PREROLL_ATTRIBUTE, None)
+    if not isinstance(preroll, deque):
+        preroll = deque()
+        setattr(instance, _REALTIME_PREROLL_ATTRIBUTE, preroll)
+
+    retained = bytes(audio_chunk)
+    if len(retained) > _REALTIME_PREROLL_MAX_BYTES:
+        retained = retained[-_REALTIME_PREROLL_MAX_BYTES:]
+    if retained:
+        preroll.append(retained)
+
+    retained_bytes = sum(len(chunk) for chunk in preroll)
+    while preroll and retained_bytes > _REALTIME_PREROLL_MAX_BYTES:
+        retained_bytes -= len(preroll.popleft())
+
+
+def _take_realtime_preroll(instance: Any) -> list[bytes]:
+    """Atomically detach idle pre-roll on the pinned microphone thread."""
+    preroll = getattr(instance, _REALTIME_PREROLL_ATTRIBUTE, None)
+    setattr(instance, _REALTIME_PREROLL_ATTRIBUTE, None)
+    if not isinstance(preroll, deque):
+        return []
+    return list(preroll)
+
+
+def _discard_realtime_preroll(instance: Any) -> None:
+    """Forget idle PCM without forwarding it to either backend."""
+    setattr(instance, _REALTIME_PREROLL_ATTRIBUTE, None)
+
+
+def _preroll_with_startup_headroom(preroll_audio: list[bytes]) -> list[bytes]:
+    """Keep newest PCM without consuming the live cold-start allowance."""
+    fallback_capacity = _REALTIME_CONFIG.fallback_buffer_bytes
+    input_capacity = getattr(
+        _REALTIME_CONFIG,
+        "input_queue_bytes",
+        fallback_capacity,
+    )
+    budget = min(
+        _REALTIME_PREROLL_MAX_BYTES,
+        max(
+            0,
+            min(fallback_capacity, input_capacity) - _REALTIME_STARTUP_HEADROOM_BYTES,
+        ),
+    )
+    if budget == 0:
+        return []
+
+    selected: deque[bytes] = deque()
+    remaining = budget
+    for chunk in reversed(preroll_audio):
+        if len(chunk) <= remaining:
+            selected.appendleft(chunk)
+            remaining -= len(chunk)
+        else:
+            aligned_remaining = remaining - (remaining % 2)
+            if aligned_remaining:
+                selected.appendleft(chunk[-aligned_remaining:])
+            break
+        if remaining == 0:
+            break
+    return list(selected)
+
+
+def _start_realtime_wakeup(
+    instance: Any,
+    wake_word: Any,
+    preroll_audio: list[bytes],
+) -> None:
+    """Claim audio for a fresh direct session without touching HA networking."""
+    with _realtime_state_lock(instance):
+        if instance._timer_finished:  # noqa: SLF001
+            _fast_wakeup(instance, wake_word)
+            return
+        if instance.state.muted or not instance.state.connected:
+            return
+        if instance._pipeline_active:  # noqa: SLF001
+            _LOGGER.debug("Ignoring wake word - pipeline already active")
+            return
+
+        preroll_audio = _preroll_with_startup_headroom(preroll_audio)
+        try:
+            session = _REALTIME_SUPPORT.RealtimeSession(_REALTIME_CONFIG)
+        except Exception:  # noqa: BLE001 - optional client must fail closed
+            if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
+                return
+            _LOGGER.warning("ThirdReality realtime startup fell back to Home Assistant")
+            _fast_wakeup(instance, wake_word)
+            if _wake_is_armed(instance):
+                for chunk in preroll_audio:
+                    _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
+            return
+
+        if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
+            try:
+                session.stop()
+            except Exception:  # noqa: BLE001 - best-effort unowned cleanup
+                _LOGGER.warning("Failed to stop unowned ThirdReality session")
+            return
+        try:
+            owner = _RealtimeOwner(
+                session=session,
+                wake_word=wake_word,
+                stop_word_id=None,
+                stop_word_was_active=False,
+            )
+            stop_word_id, stop_word_was_active = _stop_word_membership(instance)
+            owner.stop_word_id = stop_word_id
+            owner.stop_word_was_active = stop_word_was_active
+        except Exception:  # noqa: BLE001 - preserve the normal wake path
+            try:
+                session.stop()
+            except Exception:  # noqa: BLE001 - best-effort unowned cleanup
+                _LOGGER.warning("Failed to stop unowned ThirdReality session")
+            if not getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
+                _LOGGER.warning(
+                    "ThirdReality realtime startup fell back to Home Assistant"
+                )
+                _fast_wakeup(instance, wake_word)
+                if _wake_is_armed(instance):
+                    for chunk in preroll_audio:
+                        _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
+            return
+        owner.fallback_audio.extend(preroll_audio)
+        owner.fallback_bytes = sum(len(chunk) for chunk in preroll_audio)
+        setattr(instance, _REALTIME_OWNER_ATTRIBUTE, owner)
+        # The pinned capture loop already uses these flags to decide whether to
+        # call handle_audio and suppress duplicate wakes. The guarded wrapper
+        # owns every frame until this synchronized owner is detached.
+        instance._pipeline_active = True  # noqa: SLF001
+        instance._is_streaming_audio = True  # noqa: SLF001
+        try:
+            session.start()
+            if owner.stop_requested:
+                _interrupt_realtime_owner(instance, owner)
+                return
+            # Mark the side effect as attempted before calling vendor code so a
+            # partial duck that raises is still undone during rollback.
+            owner.ducked = True
+            instance.duck()
+            if owner.stop_requested:
+                _interrupt_realtime_owner(instance, owner)
+                return
+            for chunk in preroll_audio:
+                result = session.submit_audio(chunk)
+                if owner.stop_requested:
+                    _interrupt_realtime_owner(instance, owner)
+                    return
+                if result not in {
+                    _REALTIME_SUPPORT.SubmitResult.ACCEPTED,
+                    _REALTIME_SUPPORT.SubmitResult.GATED,
+                }:
+                    _fallback_realtime_to_ha(instance, owner)
+                    return
+        except Exception:  # noqa: BLE001 - vendor calls have no stable exception API
+            if owner.stop_requested:
+                _interrupt_realtime_owner(instance, owner)
+            else:
+                _fallback_realtime_to_ha(instance, owner)
+
+
+def _detach_realtime_owner(
+    instance: Any,
+    owner: _RealtimeOwner,
+    *,
+    unduck: bool,
+) -> None:
+    """Idempotently release only state added for this direct session."""
+    with _realtime_state_lock(instance):
+        if owner.released:
+            return
+        if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner:
+            return
+        owner.released = True
+        setattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+        _discard_realtime_preroll(instance)
+        instance._is_streaming_audio = False  # noqa: SLF001
+        instance._pipeline_active = False  # noqa: SLF001
+        _restore_stop_word_membership(instance, owner)
+        owner.fallback_audio.clear()
+        owner.fallback_bytes = 0
+        should_unduck = unduck and owner.ducked
+        owner.ducked = False
+        if should_unduck:
+            try:
+                instance.unduck()
+            except Exception:  # noqa: BLE001 - best-effort vendor cleanup
+                _LOGGER.warning("Failed to unduck after ThirdReality realtime session")
+        _nonblocking_led_fire("idle", to_idle=True)
+
+
+def _interrupt_realtime_owner(instance: Any, owner: _RealtimeOwner) -> None:
+    """Interrupt and release one current owner without starting HA fallback."""
+    with _realtime_state_lock(instance):
+        if owner.released:
+            return
+        if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner:
+            return
+        try:
+            owner.session.interrupt()
+        except Exception:  # noqa: BLE001 - cleanup must still release vendor state
+            _LOGGER.warning("Failed to interrupt ThirdReality realtime session")
+        finally:
+            _detach_realtime_owner(instance, owner, unduck=owner.ducked)
+
+
+def _begin_realtime_fallback_handoff(instance: Any, owner: _RealtimeOwner) -> bool:
+    """Release direct state but retain a stop-visible HA handoff marker."""
+    if owner.released:
+        return False
+    if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner:
+        return False
+    _discard_realtime_preroll(instance)
+    instance._is_streaming_audio = False  # noqa: SLF001
+    instance._pipeline_active = False  # noqa: SLF001
+    _restore_stop_word_membership(instance, owner)
+    owner.fallback_audio.clear()
+    owner.fallback_bytes = 0
+    should_unduck = owner.ducked
+    owner.ducked = False
+    if should_unduck:
+        try:
+            instance.unduck()
+        except Exception:  # noqa: BLE001 - HA fallback must continue safely
+            _LOGGER.warning("Failed to unduck before Home Assistant fallback")
+    return True
+
+
+def _finish_realtime_fallback_handoff(instance: Any, owner: _RealtimeOwner) -> None:
+    """Detach a completed marker without altering HA-owned pipeline state."""
+    if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is owner:
+        owner.released = True
+        setattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+
+
+def _cancel_realtime_fallback_handoff(instance: Any, owner: _RealtimeOwner) -> None:
+    """Explicitly cancel an HA pipeline started during a concurrent stop."""
+    if _wake_is_armed(instance):
+        phrase = getattr(owner.wake_word, "wake_word", "")
+        _rollback_wakeup(
+            instance,
+            phrase,
+            notify_home_assistant=True,
+            unduck=True,
+        )
+
+
+def _fallback_realtime_to_ha(
+    instance: Any,
+    owner: _RealtimeOwner,
+    trailing_audio: bytes | None = None,
+) -> None:
+    """Return startup failure to HA on the vendor microphone thread."""
+    with _realtime_state_lock(instance):
+        if owner.released or owner.stop_requested:
+            return
+        if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner:
+            return
+        replay = list(owner.fallback_audio)
+        try:
+            owner.session.stop()
+        except Exception:  # noqa: BLE001 - HA fallback must survive cleanup errors
+            _LOGGER.warning("Failed to stop ThirdReality realtime session")
+        if owner.stop_requested or getattr(
+            instance,
+            _REALTIME_STOP_REQUESTED_ATTRIBUTE,
+            False,
+        ):
+            _detach_realtime_owner(instance, owner, unduck=owner.ducked)
+            return
+        if not _begin_realtime_fallback_handoff(instance, owner):
+            return
+        try:
+            if owner.stop_requested or getattr(
+                instance,
+                _REALTIME_STOP_REQUESTED_ATTRIBUTE,
+                False,
+            ):
+                return
+            _LOGGER.warning("ThirdReality realtime startup fell back to Home Assistant")
+            _fast_wakeup(instance, owner.wake_word)
+            if owner.stop_requested or getattr(
+                instance,
+                _REALTIME_STOP_REQUESTED_ATTRIBUTE,
+                False,
+            ):
+                _cancel_realtime_fallback_handoff(instance, owner)
+                return
+            if not _wake_is_armed(instance):
+                return
+            for chunk in replay:
+                if owner.stop_requested or getattr(
+                    instance,
+                    _REALTIME_STOP_REQUESTED_ATTRIBUTE,
+                    False,
+                ):
+                    _cancel_realtime_fallback_handoff(instance, owner)
+                    return
+                _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
+            if trailing_audio:
+                if owner.stop_requested or getattr(
+                    instance,
+                    _REALTIME_STOP_REQUESTED_ATTRIBUTE,
+                    False,
+                ):
+                    _cancel_realtime_fallback_handoff(instance, owner)
+                    return
+                _VENDOR_BASE_HANDLE_AUDIO(instance, trailing_audio)
+        finally:
+            if owner.stop_requested or getattr(
+                instance,
+                _REALTIME_STOP_REQUESTED_ATTRIBUTE,
+                False,
+            ):
+                _cancel_realtime_fallback_handoff(instance, owner)
+            _finish_realtime_fallback_handoff(instance, owner)
+
+
+def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
+    """Route mic PCM only while a compatible direct session owns capture."""
+    with _realtime_state_lock(instance):
+        owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+        if owner is None:
+            if (
+                not instance._pipeline_active  # noqa: SLF001
+                and not instance._is_streaming_audio  # noqa: SLF001
+                and instance.state.connected
+                and not instance.state.muted
+            ):
+                _remember_realtime_preroll(instance, audio_chunk)
+            else:
+                _discard_realtime_preroll(instance)
+            _VENDOR_BASE_HANDLE_AUDIO(instance, audio_chunk)
+            return
+        if owner.released or owner.stop_requested:
+            return
+        if instance.state.muted:
+            owner.stop_requested = True
+            _interrupt_realtime_owner(instance, owner)
+            return
+        if owner.session.failed_before_ready:
+            _fallback_realtime_to_ha(instance, owner, audio_chunk)
+            return
+        if owner.session.terminal:
+            _detach_realtime_owner(instance, owner, unduck=owner.ducked)
+            return
+
+        if not owner.session.ready:
+            maximum = _REALTIME_CONFIG.fallback_buffer_bytes
+            if owner.fallback_bytes + len(audio_chunk) > maximum:
+                _fallback_realtime_to_ha(instance, owner, audio_chunk)
+                return
+            owner.fallback_audio.append(audio_chunk)
+            owner.fallback_bytes += len(audio_chunk)
+        elif not owner.ready_seen:
+            owner.ready_seen = True
+            owner.fallback_audio.clear()
+            owner.fallback_bytes = 0
+
+        try:
+            result = owner.session.submit_audio(audio_chunk)
+        except Exception:  # noqa: BLE001 - client failure must release capture
+            if owner.stop_requested:
+                _interrupt_realtime_owner(instance, owner)
+            elif not owner.ready_seen:
+                _fallback_realtime_to_ha(instance, owner)
+            else:
+                _interrupt_realtime_owner(instance, owner)
+            return
+        if owner.stop_requested or owner.released:
+            return
+        if result in {
+            _REALTIME_SUPPORT.SubmitResult.ACCEPTED,
+            _REALTIME_SUPPORT.SubmitResult.GATED,
+        }:
+            return
+        if not owner.ready_seen:
+            # The current frame is already in the fallback deque when capacity
+            # in the session queue, rather than fallback storage, was exhausted.
+            _fallback_realtime_to_ha(instance, owner)
+            return
+        _interrupt_realtime_owner(instance, owner)
+        _LOGGER.warning("ThirdReality realtime audio session ended safely")
+
+
+def _realtime_stop(instance: Any) -> None:
+    """Interrupt one direct session, then preserve pinned vendor stop behavior."""
+    setattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, True)
+    observed_owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+    if observed_owner is not None:
+        observed_owner.stop_requested = True
+    try:
+        with _realtime_state_lock(instance):
+            _discard_realtime_preroll(instance)
+            owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+            if owner is not None:
+                owner.stop_requested = True
+                _interrupt_realtime_owner(instance, owner)
+            try:
+                _VENDOR_BASE_STOP(instance)
+            finally:
+                # The pinned stop function may alter both values. Direct mode
+                # must be observably idle even if cleanup raises part-way.
+                instance._is_streaming_audio = False  # noqa: SLF001
+                instance._pipeline_active = False  # noqa: SLF001
+                restore_owner = owner if owner is not None else observed_owner
+                if restore_owner is not None:
+                    _restore_stop_word_membership(instance, restore_owner)
+    finally:
+        setattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False)
+
+
+def _preempt_realtime_for_normal_wake(instance: Any) -> None:
+    """Let a normal wake atomically reclaim the mic on its vendor thread."""
+    observed_owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+    if observed_owner is not None:
+        observed_owner.stop_requested = True
+    with _realtime_state_lock(instance):
+        owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+        if owner is None:
+            return
+        owner.stop_requested = True
+        _interrupt_realtime_owner(instance, owner)
 
 
 def _rollback_wakeup(
@@ -147,10 +721,18 @@ def _fast_wakeup(instance: Any, wake_word: Any) -> None:
 
 def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
     """Apply the fast wake path directly to the pinned device subclass."""
-    previous_active = instance._pipeline_active  # noqa: SLF001
-    _fast_wakeup(instance, wake_word)
-    if not previous_active and instance._pipeline_active:  # noqa: SLF001
-        _nonblocking_led_fire("listening")
+    with _realtime_state_lock(instance):
+        preroll_audio = _take_realtime_preroll(instance)
+        realtime_wake = _is_realtime_wake(wake_word)
+        if not realtime_wake:
+            _preempt_realtime_for_normal_wake(instance)
+        previous_active = instance._pipeline_active  # noqa: SLF001
+        if realtime_wake:
+            _start_realtime_wakeup(instance, wake_word, preroll_audio)
+        else:
+            _fast_wakeup(instance, wake_word)
+        if not previous_active and instance._pipeline_active:  # noqa: SLF001
+            _nonblocking_led_fire("listening")
 
 
 def _decode_stderr(stderr: Any) -> str:
@@ -293,11 +875,31 @@ _expected_hashes = (
     _EXPECTED_TR_LED_FIRE,
 )
 
+_load_realtime_config()
+
 if _observed_hashes == _expected_hashes:
     VoiceSatelliteProtocol.wakeup = _fast_wakeup
     thirdreality_satellite.TRSatelliteProtocol.wakeup = _fast_thirdreality_wakeup
     thirdreality_satellite._led_fire = _nonblocking_led_fire  # noqa: SLF001
     atexit.register(_shutdown_led_worker)
+    if _REALTIME_CONFIG is not None:
+        _observed_realtime_hashes = (
+            _opcode_hash(_VENDOR_BASE_HANDLE_AUDIO),
+            _opcode_hash(_VENDOR_BASE_STOP),
+        )
+        _expected_realtime_hashes = (
+            _EXPECTED_BASE_HANDLE_AUDIO_OPCODES,
+            _EXPECTED_BASE_STOP_OPCODES,
+        )
+        if _observed_realtime_hashes == _expected_realtime_hashes:
+            _REALTIME_PATCH_ACTIVE = True
+            VoiceSatelliteProtocol.handle_audio = _realtime_handle_audio
+            VoiceSatelliteProtocol.stop = _realtime_stop
+            atexit.register(_REALTIME_SUPPORT.shutdown_all_sessions)
+        else:
+            _LOGGER.warning(
+                "Skipping ThirdReality realtime client: unrecognized vendor bytecode"
+            )
 else:
     _LOGGER.warning(
         "Skipping ThirdReality latency overlay: unrecognized vendor bytecode"

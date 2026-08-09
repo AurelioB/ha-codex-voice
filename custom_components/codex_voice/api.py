@@ -29,6 +29,7 @@ from aiohttp import (
     WSServerHandshakeError,
 )
 from homeassistant.helpers import chat_session
+from homeassistant.helpers.json import JSON_DUMP
 
 from .const import (
     CONVERSATION_TIMEOUT,
@@ -113,6 +114,16 @@ class BridgeQuotaError(BridgeError):
 
 class BridgeStreamingUnsupported(BridgeError):
     """The bridge predates the streaming transcription endpoint."""
+
+
+def _serialize_conversation_message(payload: JsonObject) -> str:
+    """Serialize an outbound conversation event using Home Assistant's policy."""
+    try:
+        return JSON_DUMP(payload)
+    except TypeError, ValueError:
+        raise BridgeProtocolError(
+            "Conversation payload contains unsupported JSON values"
+        ) from None
 
 
 def _validate_synthesis_audio_preferences(
@@ -279,6 +290,7 @@ class BridgeClient:
         async_handle_tool: ToolHandler,
     ) -> JsonObject:
         """Run one conversation turn over the bridge WebSocket."""
+        start_message = _serialize_conversation_message({"type": "start", **start})
         try:
             async with asyncio.timeout(CONVERSATION_TIMEOUT):
                 async with self._session.ws_connect(
@@ -286,7 +298,7 @@ class BridgeClient:
                     headers=self._headers,
                     heartbeat=30,
                 ) as websocket:
-                    await websocket.send_json({"type": "start", **start})
+                    await websocket.send_str(start_message)
                     tool_calls = 0
                     received_delta = False
                     async for message in websocket:
@@ -320,14 +332,16 @@ class BridgeClient:
                                 )
                             tool_call = self._decode_tool_call(event)
                             result = await async_handle_tool(tool_call)
-                            await websocket.send_json(
-                                {
-                                    "type": "tool_result",
-                                    "request_id": tool_call.request_id,
-                                    "call_id": tool_call.call_id,
-                                    "result": result,
-                                    "success": "error" not in result,
-                                }
+                            await websocket.send_str(
+                                _serialize_conversation_message(
+                                    {
+                                        "type": "tool_result",
+                                        "request_id": tool_call.request_id,
+                                        "call_id": tool_call.call_id,
+                                        "result": result,
+                                        "success": "error" not in result,
+                                    }
+                                )
                             )
                             continue
 

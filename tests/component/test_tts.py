@@ -73,6 +73,13 @@ def _make_tts_entity(
     )
 
 
+def test_tts_advertises_mexican_spanish() -> None:
+    """Expose the BCP-47 locale used by Mexican Spanish Assist pipelines."""
+    entity = _make_tts_entity(AsyncMock())
+
+    assert "es-MX" in entity.supported_languages
+
+
 def _offer_handoff(
     client: Any,
     *,

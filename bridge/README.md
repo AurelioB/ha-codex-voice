@@ -17,6 +17,7 @@ fail closed.
 python -m venv .venv
 .venv/bin/pip install -r bridge/requirements.txt
 export HA_CODEX_BRIDGE_TOKEN="$(openssl rand -hex 32)"
+export HA_CODEX_REALTIME_DEVICE_TOKEN="$(openssl rand -hex 32)"
 .venv/bin/python -m bridge
 ```
 
@@ -48,8 +49,15 @@ profile selected by `HA_CODEX_PERMISSION_PROFILE` (default
 `ha-voice-minimal`) on every thread. Do not weaken the inline profile or
 replace it with legacy `read-only`, which permits broad host reads.
 
-All routes, including `GET /health`, require
-`Authorization: Bearer <HA_CODEX_BRIDGE_TOKEN>`.
+All routes, including `GET /health`, accept
+`Authorization: Bearer <HA_CODEX_BRIDGE_TOKEN>`. The primary token retains
+legacy realtime v1 compatibility. When the optional, distinct
+`HA_CODEX_REALTIME_DEVICE_TOKEN` is set, it is accepted only for
+`GET /v1/realtime` and only after the first start message successfully
+negotiates strict v2. A device-token v1 or malformed negotiation is rejected
+before provider/thread startup, and the device token is rejected by every
+other route. This lets a speaker use content-private realtime audio without
+storing the Home Assistant/component credential.
 
 ## API
 
@@ -72,8 +80,35 @@ All routes, including `GET /health`, require
   rate.
 - `POST /v1/speech-session/release`: idempotently release a private,
   unconsumed STT-to-TTS handoff ticket.
-- `GET /v1/realtime` WebSocket: full-duplex PCM16 `audio`, `text`, `speech`,
-  transcripts, tool calls, and stop messages.
+- `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages or the strict
+  device-facing v2 binary PCM16 transport. V2 emits content-free lifecycle
+  controls, filters continuous WebRTC silence, gates output with monotonic
+  epochs, and supports local-flush/fresh-session interruption. It does not
+  expose transcripts, provider payloads, or tools. See the
+  [v2 wire contract](../protocol/realtime-wire-v2.md).
+
+Device-facing v2 is the transport used by the pinned ThirdReality v1.1.7
+in-process client. “Okay Computer” enters this direct chat-only mode; “Okay
+Nabu” remains on Home Assistant's official Assist flow for exposed-entity
+control. The device sends 16 kHz mono PCM16 and receives 24 kHz mono PCM16. The
+bridge applies a 2,250 ms input-track limit only to v2 live sessions; finite STT
+keeps its existing whole-utterance input capacity.
+
+The reference device keeps at most 64 KiB (2.048 s) of startup/fallback input,
+drains a post-handshake backlog at no more than 2× capture rate, and keeps at
+most 48 KiB (about 1.024 s) queued for playback. Provider output also crosses a
+bounded bridge queue. A bound violation is terminal or triggers the documented
+pre-ready Home Assistant fallback; audio is never silently discarded to make
+latency metrics look better. Catch-up prevents a permanent handshake-sized
+offset once v2 becomes ready, but it cannot make the cold App Server/WebRTC
+handshake or provider response generation disappear.
+
+The released device mode is turn-taking. It gates microphone input while local
+output remains potentially audible and does not configure acoustic echo
+cancellation. `interrupt` flushes local output, closes the socket and remote
+resource, and requires a fresh session; the negotiated capability remains
+`remote_cancel: false` because the provider transport has no reliable response
+truncate operation.
 
 Audio uses Codex app-server's experimental WebRTC v3 path by default. The peer
 creates a real paced outbound audio track and `oai-events` data channel before
@@ -170,4 +205,6 @@ verify overlap without recording content.
 
 Interactive approvals, permission requests, and unsupported server-initiated
 requests fail closed. Only explicitly declared dynamic Home Assistant tools are
-relayed to an attached WebSocket client.
+relayed to the official Conversation WebSocket or a legacy v1 realtime client.
+Device-facing realtime v2 is chat-only; the normal Home Assistant Assist path
+retains home-control authority.
