@@ -34,7 +34,7 @@ The OpenAI credentials, Codex runtime, thread state, and tool execution stay on 
 
 | Phase | Work | Exit gate |
 |---|---|---|
-| 0. Hardware and security baseline | Back up a recoverable firmware image; measure CPU, memory, audio xruns, and Wi-Fi jitter; disable unauthenticated ADB on port 5555 and default-password SSH. | Device can be recovered, remote root access is closed, and baseline measurements are recorded. |
+| 0. Hardware and security baseline | Back up a recoverable firmware image; measure CPU, memory, audio xruns, and Wi-Fi jitter; preserve required TCP ADB on port 5555 behind source-restricted network isolation, and rotate or disable default-password SSH. | Device can be recovered, ADB still works only from the intended administration path, default SSH access is closed, and baseline measurements are recorded. |
 | 1. Host-side mechanism spike | Build the gateway with a Realtime session and a `delegate_to_codex` tool. Implement Codex thread start/resume/status/cancel using the SDK or stable App Server calls. Use simulated audio initially. | Spoken request can launch a persistent Codex task and receive a concise spoken result. |
 | 2. Stock-firmware feasibility test | Use the existing HA/ESPHome satellite path to validate wake word, thread handoff, credentials, and UX. | Control-plane behavior works. This phase is explicitly not considered full-duplex acceptance. |
 | 3. Realtime firmware audio path | Fork the ThirdReality firmware; add a post-AEC microphone tap, authenticated WSS transport to the gateway, streaming PCM playback, and shared audio-focus routing. Preserve stock HA and Sendspin behavior. | Simultaneous capture/playback works for 30 minutes with usable echo cancellation and bounded memory. |
