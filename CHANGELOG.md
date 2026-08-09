@@ -5,16 +5,37 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-09
+
+### Added
+
+- Add a hardened user-service template and deployment guide for the official
+  Wyoming faster-whisper server, keeping the multilingual `base` model warm for
+  Home Assistant's native streaming STT provider while suppressing the
+  upstream INFO-level transcript log. The validated dependency stack and model
+  revision are pinned, native inference is serialized, and the service can read
+  only its isolated runtime directory within the user's home.
+- Add a local Wyoming known-WAV smoke test that hides transcript text by default
+  and an opt-in Codex WebRTC transcription probe that prints its transcript and
+  consumes ChatGPT subscription quota.
+
 ### Changed
 
+- Make the production Assist architecture use local Wyoming faster-whisper for
+  a reliable finite STT boundary while retaining ChatGPT OAuth for Codex Voice
+  Conversation and the experimental TTS/realtime paths. New integrations create
+  Conversation and TTS subentries by default. Existing Codex STT subentries are
+  preserved; users must manually select Wyoming in stored Assist pipelines, and
+  the entity/setup UI describes Codex STT as an experimental diagnostic.
 - Make the pinned ThirdReality v1.1.7 wake path use an LED-only acknowledgement:
   pre-arm microphone forwarding on the pinned microphone thread, queue the
   Home Assistant Assist start request, and duck music without playing the local
   confirmation cue. Dispatch serialized LED DBus calls on a bounded daemon
   worker so their two-second vendor timeout cannot stall microphone capture,
   coalescing an overloaded backlog toward the newest state. The overlay now
-  requires an atomic match across four exact vendor bytecode hashes and
-  preserves transactional rollback while ensuring teardown wins startup races.
+  requires an atomic match across four exact vendor bytecode hashes, patches the
+  pinned ThirdReality subclass directly, and preserves transactional rollback
+  while ensuring teardown wins startup races.
 
 ## [0.1.10] - 2026-08-09
 
