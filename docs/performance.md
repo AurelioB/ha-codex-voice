@@ -14,17 +14,21 @@ The standard Assist path remains turn-based:
 wake cue -> capture -> STT -> Conversation -> TTS -> speaker playback
 ```
 
-Two enabled optimizations shorten different parts of that path:
+Several enabled optimizations shorten different parts of that path:
 
 1. Streaming STT sends microphone frames to the bridge while Home Assistant is
    still capturing. The bridge starts the Codex thread and WebRTC handshake as
-   soon as it receives the stream's start frame, then feeds the completed,
-   normalized utterance when Home Assistant signals end of capture. Setup and
-   capture therefore overlap; audio is not sent to the recognizer before the
-   finite capture has been normalized.
+   soon as it receives the stream's start frame. After bounded calibration on
+   sustained speech, it feeds normalized audio while capture continues. Quiet
+   or ambiguous audio stays buffered until EOF, and a complete raw copy remains
+   available for a fresh normalized retry.
 2. Streaming TTS returns an EOF-terminated PCM16 WAV stream as realtime speech
    frames arrive. Home Assistant can begin serving audio without waiting for
    the complete rendered response and remote cleanup.
+3. Speech peers use an explicit empty ICE-server list for this local
+   subscription-backed path, avoiding the default public STUN probe. Voice
+   conversation turns default to low reasoning effort to favor response
+   latency.
 
 Automatic STT-to-TTS session reuse is not enabled. Live validation found that
 the realtime v3 session can start genuine assistant output before the user
@@ -113,6 +117,31 @@ The three-run median was 9.680 s, 2.029 s below the reference run. This is a
 small live comparison, not proof of a fixed two-second saving. The overlap log
 is the useful verification signal: setup should advance while microphone
 capture is active instead of beginning only after the final audio chunk.
+
+### Calibrated live STT feed
+
+A later paired physical-speaker canary used the same ThirdReality device,
+command audio, runtime microphone gain, and aggressive finished-speaking
+detection. The second run enabled calibrated feeding during capture:
+
+| Path | Capture | After capture | Total STT |
+|---|---:|---:|---:|
+| finite feed at EOF | 3.858 s | 5.661 s | 9.519 s |
+| calibrated live feed | 3.984 s | 2.153 s | 6.138 s |
+
+The live-feed run had 0.905 s of queued audio when the remote handshake became
+ready and saved 3.381 s overall. It completed without a retry or pipeline
+error. This is one controlled self-acoustic A/B, not a latency guarantee or a
+replacement for human near-, normal-, and far-field trials.
+
+### Native TTS output format
+
+The component advertises mono 16-bit WAV at 16 and 24 kHz and forwards Home
+Assistant's selected native tuple to the bridge. The bridge incrementally
+resamples its 24 kHz realtime output when 16 kHz is requested, without waiting
+for the full response. This removes a format mismatch at the provider boundary;
+downstream Home Assistant or media-player conversion and buffering can still
+add latency.
 
 ### Retained-session exploratory probe
 

@@ -158,12 +158,16 @@ The standard TTS entity uses the authenticated
 `POST /v1/synthesize/stream` route. It sends an EOF-terminated PCM16 WAV stream
 through Home Assistant's TTS proxy as audio arrives; the finite
 `POST /v1/synthesize` route remains available for older clients and diagnostics.
+The component negotiates mono 16-bit WAV at 16 or 24 kHz and the bridge emits
+the requested native rate, avoiding an extra bridge-side format mismatch.
 
 The standard STT entity opens the authenticated `/v1/transcribe/stream`
 WebSocket before consuming the microphone stream. Codex thread and WebRTC
 setup begin after the validated start message while Home Assistant continues
-capture. The normalized finite utterance is fed only after explicit capture
-EOF.
+capture. After a bounded, one-time level calibration finds sustained speech,
+normalized audio is fed while capture continues. Quiet or ambiguous input stays
+buffered until explicit capture EOF, and every attempt retains the complete raw
+utterance for a fresh normalized retry.
 
 The bridge converts that narrow WebSocket protocol to a genuine WebRTC peer:
 an active audio track carries media and the `oai-events` data channel carries
@@ -180,6 +184,13 @@ and overlapping a 2.0-second STT capture reduced one reference completion time
 from 11.709 seconds to a three-run median of 9.680 seconds. These are
 single-device diagnostic observations, not latency guarantees or directly
 comparable whole-room timings.
+
+A later controlled acoustic A/B on the same ThirdReality device reduced STT
+completion from 9.519 to 6.138 seconds by feeding calibrated speech during
+capture; post-capture recognition fell from 5.661 to 2.153 seconds. Explicit
+empty ICE configuration also removed a repeatable five-second public STUN wait
+from each speech handshake. These paired measurements are diagnostic samples,
+not latency guarantees.
 
 Automatic STT-to-TTS session reuse is deliberately disabled in the bundled
 component. Live v3 validation observed genuine assistant output before the
