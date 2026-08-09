@@ -2197,7 +2197,9 @@ async def test_post_transcription_handoff_timeout_cleans_every_attempt(
     assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
     assert len(fake_rpc.peers) == bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
     assert all(peer.closed for peer in fake_rpc.peers)
-    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 3
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == (
+        bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
+    )
 
 
 @pytest.mark.asyncio
@@ -3353,16 +3355,18 @@ async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_deadline: float | None = None
+    captured_timeout: float | None = None
     wait_called_at: float | None = None
 
     async def capture_finalization(
         _session: Any,
-        _timeout: float,
+        timeout: float,
         *,
         fragment_finalization_at: float | None = None,
     ) -> str:
-        nonlocal captured_deadline, wait_called_at
+        nonlocal captured_deadline, captured_timeout, wait_called_at
         captured_deadline = fragment_finalization_at
+        captured_timeout = timeout
         wait_called_at = asyncio.get_running_loop().time()
         return "Synthetic transcript"
 
@@ -3391,6 +3395,9 @@ async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
 
     assert response.status == 200
     assert captured_deadline is not None
+    assert captured_timeout == pytest.approx(
+        duration + 1.0 + bridge_service.TRANSCRIPTION_RESULT_TIMEOUT_SECONDS
+    )
     assert wait_called_at is not None
     assert captured_deadline - wait_called_at == pytest.approx(duration, abs=0.02)
     assert len(fake_rpc.peers[-1].fed) == len(pcm) + len(
@@ -3425,7 +3432,9 @@ async def test_transcribe_timeout_logs_only_normalized_audio_diagnostics(
 
     assert response.status == 504
     assert await response.json() == {"error": "Codex operation timed out"}
-    assert caplog.text.count("Realtime transcription attempt timed out") == 3
+    assert caplog.text.count("Realtime transcription attempt timed out") == (
+        bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
+    )
     assert "stage=transcript normalized_duration_seconds=0.010" in caplog.text
     assert "normalized_peak=0.5000 normalized_rms=0.5000" in caplog.text
 
@@ -3549,7 +3558,10 @@ async def test_transcribe_does_not_retry_ambiguous_thread_start_timeout(
 
     assert response.status == 504
     assert attempts == 1
-    assert "attempt=1/3 stage=thread_start" in caplog.text
+    assert (
+        f"attempt=1/{bridge_service.TRANSCRIPTION_MAX_ATTEMPTS} stage=thread_start"
+        in caplog.text
+    )
     assert "reached its total deadline" not in caplog.text
 
 
