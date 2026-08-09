@@ -19,7 +19,12 @@ RTP_FRAME_SAMPLES = RTP_SAMPLE_RATE * FRAME_DURATION_MS // 1_000
 MAX_INPUT_BUFFER_BYTES = REALTIME_SAMPLE_RATE * PCM_SAMPLE_WIDTH * 300
 
 try:  # Imported lazily enough that text-only conversation can report a useful error.
-    from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
+    from aiortc import (
+        MediaStreamTrack,
+        RTCConfiguration,
+        RTCPeerConnection,
+        RTCSessionDescription,
+    )
     from aiortc.mediastreams import MediaStreamError
     from av import AudioFrame
     from av.audio.resampler import AudioResampler
@@ -27,6 +32,7 @@ except (
     ImportError
 ) as import_error:  # pragma: no cover - exercised in dependency-free installs.
     MediaStreamTrack = object  # type: ignore[assignment,misc]
+    RTCConfiguration = None  # type: ignore[assignment]
     RTCPeerConnection = None  # type: ignore[assignment]
     RTCSessionDescription = None  # type: ignore[assignment]
     AudioFrame = None  # type: ignore[assignment]
@@ -113,11 +119,20 @@ class WebRtcPeer:
     """Create an SDP offer, carry microphone PCM, and expose received PCM."""
 
     def __init__(self) -> None:
-        if _IMPORT_ERROR is not None or RTCPeerConnection is None:
+        if (
+            _IMPORT_ERROR is not None
+            or RTCConfiguration is None
+            or RTCPeerConnection is None
+        ):
             raise WebRtcUnavailable(
                 "aiortc and av are required for audio endpoints"
             ) from _IMPORT_ERROR
-        self.pc = RTCPeerConnection()
+        # aiortc otherwise injects its public default STUN server. On hosts where
+        # that UDP probe is filtered, gathering blocks for five seconds even
+        # though host candidates connect to Codex successfully through ordinary
+        # outbound ICE checks. Codex supplies the remote service candidates, so
+        # do not make every finite STT and TTS request depend on third-party STUN.
+        self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
         self.input_track = PcmAudioTrack()
         self.pc.addTrack(self.input_track)
         self.data_channel = self.pc.createDataChannel("oai-events")

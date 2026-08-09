@@ -17,6 +17,8 @@ from custom_components.codex_voice.api import BridgeAuthenticationError
 from custom_components.codex_voice.const import (
     CONF_ACCESS_TOKEN,
     CONF_BRIDGE_URL,
+    CONF_REASONING_EFFORT,
+    DEFAULT_CONVERSATION_REASONING_EFFORT,
     DOMAIN,
 )
 
@@ -70,6 +72,9 @@ async def test_user_flow_creates_three_provider_subentries(
         "stt",
         "tts",
     ]
+    assert result["subentries"][0]["data"][CONF_REASONING_EFFORT] == (
+        DEFAULT_CONVERSATION_REASONING_EFFORT
+    )
 
 
 async def test_user_flow_reports_invalid_auth(hass: HomeAssistant) -> None:

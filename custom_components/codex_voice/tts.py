@@ -11,6 +11,9 @@ from typing import Any, Final, override
 
 from homeassistant.components.tts import (
     ATTR_PREFERRED_FORMAT,
+    ATTR_PREFERRED_SAMPLE_BYTES,
+    ATTR_PREFERRED_SAMPLE_CHANNELS,
+    ATTR_PREFERRED_SAMPLE_RATE,
     ATTR_VOICE,
     TextToSpeechEntity,
     TTSAudioRequest,
@@ -30,10 +33,12 @@ from .api import (
     BridgeAudio,
     BridgeAuthenticationError,
     BridgeError,
+    BridgeProtocolError,
     _claim_speech_session_handoff,
     _normalize_speech_language,
     _prepare_speech_session_handoff,
     _schedule_speech_session_handoff_release,
+    _validate_synthesis_audio_preferences,
 )
 from .const import (
     CONF_INSTRUCTIONS,
@@ -73,7 +78,13 @@ async def async_setup_entry(
 class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
     """Codex Voice text-to-speech entity."""
 
-    _attr_supported_options = [ATTR_VOICE]
+    _attr_supported_options = [
+        ATTR_VOICE,
+        ATTR_PREFERRED_FORMAT,
+        ATTR_PREFERRED_SAMPLE_RATE,
+        ATTR_PREFERRED_SAMPLE_CHANNELS,
+        ATTR_PREFERRED_SAMPLE_BYTES,
+    ]
     _attr_supported_languages = list(SUPPORTED_LANGUAGES)
     _attr_default_language = "en-US"
     _attr_has_entity_name = False
@@ -126,6 +137,7 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
     ) -> TtsAudioType:
         """Synthesize a message through the Codex Voice bridge."""
         merged_options = {**self.default_options, **self.subentry.data, **options}
+        audio_preferences = _synthesis_audio_preferences(merged_options)
         client = self.entry.runtime_data
         language = _normalize_speech_language(language)
         voice = merged_options.get(ATTR_VOICE, DEFAULT_VOICE)
@@ -141,6 +153,7 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
             "language": language,
             "voice": voice,
             "instructions": instructions,
+            **audio_preferences,
         }
         if handoff_token is not None:
             synthesize_kwargs["speech_session_handoff_token"] = handoff_token
@@ -186,6 +199,7 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
             **self.subentry.data,
             **request.options,
         }
+        audio_preferences = _synthesis_audio_preferences(merged_options)
         client = self.entry.runtime_data
         language = _normalize_speech_language(request.language)
         voice = merged_options.get(ATTR_VOICE, DEFAULT_VOICE)
@@ -209,6 +223,7 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
             "language": language,
             "voice": voice,
             "instructions": instructions,
+            **audio_preferences,
         }
         if handoff_token is not None:
             synthesize_kwargs["speech_session_handoff_token"] = handoff_token
@@ -252,6 +267,43 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
                         _schedule_speech_session_handoff_release(client, handoff_token)
 
         return TTSAudioResponse(extension="wav", data_gen=data_gen())
+
+
+def _synthesis_audio_preferences(options: Mapping[str, Any]) -> dict[str, int]:
+    """Translate Home Assistant output hints to validated bridge options."""
+    preferred_format = options.get(ATTR_PREFERRED_FORMAT, "wav")
+    if not isinstance(preferred_format, str) or preferred_format.lower() != "wav":
+        return {}
+
+    requested_preferences = (
+        options.get(ATTR_PREFERRED_SAMPLE_RATE),
+        options.get(ATTR_PREFERRED_SAMPLE_CHANNELS),
+        options.get(ATTR_PREFERRED_SAMPLE_BYTES),
+    )
+    if any(value is None for value in requested_preferences):
+        return {}
+
+    try:
+        sample_rate, channels, sample_width = _validate_synthesis_audio_preferences(
+            sample_rate=requested_preferences[0],
+            channels=requested_preferences[1],
+            sample_width=requested_preferences[2],
+        )
+    except BridgeProtocolError:
+        # HA can request other satellite-native layouts. Leaving the bridge
+        # fields absent preserves its 24 kHz mono PCM16 default and lets HA's
+        # TTS manager apply its normal conversion fallback.
+        return {}
+
+    assert sample_rate is not None
+    assert channels is not None
+    assert sample_width is not None
+
+    return {
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "sample_width": sample_width,
+    }
 
 
 def _as_wav(audio: BridgeAudio) -> bytes:

@@ -6,7 +6,14 @@ import asyncio
 import base64
 import json
 import struct
-from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Collection,
+    Mapping,
+)
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -34,23 +41,42 @@ from .const import (
 
 _JSON_CONTENT_TYPES: Final = ("application/json", "text/json")
 _WAV_CONTENT_TYPES: Final = ("audio/wav", "audio/wave", "audio/x-wav")
-_STREAMING_WAV_HEADER: Final = struct.pack(
-    "<4sI4s4sIHHIIHH4sI",
-    b"RIFF",
-    0xFFFFFFFF,
-    b"WAVE",
-    b"fmt ",
-    16,
-    1,
-    1,
-    24_000,
-    48_000,
-    2,
-    16,
-    b"data",
-    0xFFFFFFFF,
+_DEFAULT_SYNTHESIS_SAMPLE_RATE: Final = 24_000
+_DEFAULT_SYNTHESIS_CHANNELS: Final = 1
+_DEFAULT_SYNTHESIS_SAMPLE_WIDTH: Final = 2
+_SUPPORTED_SYNTHESIS_SAMPLE_RATES: Final = frozenset({16_000, 24_000})
+
+
+def _streaming_wav_header(
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+) -> bytes:
+    """Return the bridge's canonical EOF-terminated PCM WAV header."""
+    block_align = channels * sample_width
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        sample_rate * block_align,
+        block_align,
+        sample_width * 8,
+        b"data",
+        0xFFFFFFFF,
+    )
+
+
+_STREAMING_WAV_HEADER: Final = _streaming_wav_header(
+    _DEFAULT_SYNTHESIS_SAMPLE_RATE,
+    _DEFAULT_SYNTHESIS_CHANNELS,
+    _DEFAULT_SYNTHESIS_SAMPLE_WIDTH,
 )
-_WAV_STREAM_PREAMBLE_BYTES: Final = len(_STREAMING_WAV_HEADER) + 2
 _AUDIO_STREAM_CHUNK_BYTES: Final = 64 * 1024
 _SPEECH_SESSION_HANDOFF_VERSION: Final = 1
 _SPEECH_SESSION_HANDOFF_OPTION: Final = "_codex_voice_pipeline_handoff"
@@ -87,6 +113,43 @@ class BridgeQuotaError(BridgeError):
 
 class BridgeStreamingUnsupported(BridgeError):
     """The bridge predates the streaming transcription endpoint."""
+
+
+def _validate_synthesis_audio_preferences(
+    *,
+    sample_rate: object = None,
+    channels: object = None,
+    sample_width: object = None,
+) -> tuple[int | None, int | None, int | None]:
+    """Validate optional bridge output preferences and normalize integers."""
+
+    def optional_int(value: object, key: str) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise BridgeProtocolError(f"Synthesis {key} must be an integer")
+        try:
+            return int(value)
+        except ValueError as err:
+            raise BridgeProtocolError(f"Synthesis {key} must be an integer") from err
+
+    normalized_sample_rate = optional_int(sample_rate, "sample_rate")
+    normalized_channels = optional_int(channels, "channels")
+    normalized_sample_width = optional_int(sample_width, "sample_width")
+    if (
+        normalized_sample_rate is not None
+        and normalized_sample_rate not in _SUPPORTED_SYNTHESIS_SAMPLE_RATES
+    ):
+        raise BridgeProtocolError("Synthesis sample_rate must be 16000 or 24000")
+    if normalized_channels is not None and normalized_channels != 1:
+        raise BridgeProtocolError("Synthesis channels must be 1")
+    if normalized_sample_width is not None and normalized_sample_width != 2:
+        raise BridgeProtocolError("Synthesis sample_width must be 2")
+    return (
+        normalized_sample_rate,
+        normalized_channels,
+        normalized_sample_width,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,8 +477,16 @@ class BridgeClient:
         voice: str,
         instructions: str | None,
         speech_session_handoff_token: str | None = None,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+        sample_width: int | None = None,
     ) -> BridgeAudio:
         """Synthesize text and return WAV or PCM audio."""
+        sample_rate, channels, sample_width = _validate_synthesis_audio_preferences(
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_width=sample_width,
+        )
         payload: JsonObject = {
             "text": text,
             "language": language,
@@ -426,6 +497,12 @@ class BridgeClient:
             payload["instructions"] = instructions
         if speech_session_handoff_token:
             payload["speech_session_handoff_token"] = speech_session_handoff_token
+        if sample_rate is not None:
+            payload["sample_rate"] = sample_rate
+        if channels is not None:
+            payload["channels"] = channels
+        if sample_width is not None:
+            payload["sample_width"] = sample_width
 
         try:
             async with self._session.post(
@@ -459,8 +536,16 @@ class BridgeClient:
         voice: str,
         instructions: str | None,
         speech_session_handoff_token: str | None = None,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+        sample_width: int | None = None,
     ) -> AsyncGenerator[bytes]:
         """Yield a bounded WAV response as the bridge produces it."""
+        sample_rate, channels, sample_width = _validate_synthesis_audio_preferences(
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_width=sample_width,
+        )
         payload: JsonObject = {
             "text": text,
             "language": language,
@@ -471,6 +556,28 @@ class BridgeClient:
             payload["instructions"] = instructions
         if speech_session_handoff_token:
             payload["speech_session_handoff_token"] = speech_session_handoff_token
+        if sample_rate is not None:
+            payload["sample_rate"] = sample_rate
+        if channels is not None:
+            payload["channels"] = channels
+        if sample_width is not None:
+            payload["sample_width"] = sample_width
+
+        effective_sample_rate = sample_rate or _DEFAULT_SYNTHESIS_SAMPLE_RATE
+        effective_channels = channels or _DEFAULT_SYNTHESIS_CHANNELS
+        effective_sample_width = sample_width or _DEFAULT_SYNTHESIS_SAMPLE_WIDTH
+        expected_header = _streaming_wav_header(
+            effective_sample_rate,
+            effective_channels,
+            effective_sample_width,
+        )
+        acceptable_headers = (
+            (expected_header,)
+            if expected_header == _STREAMING_WAV_HEADER
+            else (expected_header, _STREAMING_WAV_HEADER)
+        )
+        frame_bytes = effective_channels * effective_sample_width
+        preamble_bytes = len(expected_header) + frame_bytes
 
         try:
             async with self._session.post(
@@ -514,17 +621,21 @@ class BridgeClient:
                             continue
 
                         header.extend(chunk)
-                        if len(header) < _WAV_STREAM_PREAMBLE_BYTES:
+                        if len(header) < preamble_bytes:
                             continue
-                        self._validate_streaming_wav_header(bytes(header))
+                        self._validate_streaming_wav_header(
+                            bytes(header), acceptable_headers
+                        )
                         header_validated = True
                         yield bytes(header)
 
                     if not header_validated:
-                        self._validate_streaming_wav_header(bytes(header))
-                    if (total_bytes - len(_STREAMING_WAV_HEADER)) % 2:
+                        self._validate_streaming_wav_header(
+                            bytes(header), acceptable_headers
+                        )
+                    if (total_bytes - len(expected_header)) % frame_bytes:
                         raise BridgeProtocolError(
-                            "Synthesis stream contained incomplete PCM16 audio"
+                            "Synthesis stream contained an incomplete audio frame"
                         )
                 finally:
                     # aiohttp's context manager also releases the response, but
@@ -826,11 +937,17 @@ class BridgeClient:
             raise BridgeProtocolError("Synthesis response was not a valid WAV file")
 
     @staticmethod
-    def _validate_streaming_wav_header(audio: bytes) -> None:
+    def _validate_streaming_wav_header(
+        audio: bytes,
+        expected_headers: Collection[bytes] = (_STREAMING_WAV_HEADER,),
+    ) -> None:
         """Require the bridge's canonical EOF-terminated PCM16 WAV framing."""
-        if len(audio) < _WAV_STREAM_PREAMBLE_BYTES:
+        if len(audio) < len(_STREAMING_WAV_HEADER) + 2:
             raise BridgeProtocolError("Synthesis stream was not a valid WAV file")
-        if audio[: len(_STREAMING_WAV_HEADER)] != _STREAMING_WAV_HEADER:
+        if not any(
+            audio[: len(expected_header)] == expected_header
+            for expected_header in expected_headers
+        ):
             raise BridgeProtocolError("Synthesis stream was not a valid WAV file")
 
 

@@ -81,9 +81,12 @@ not OpenAI Platform API quota.
 Home Assistant's STT provider opens `/v1/transcribe/stream` before consuming
 the microphone iterator. After validating the start message, the bridge starts
 the thread and WebRTC handshake in a task while it continues receiving bounded
-PCM frames. The completed capture is normalized and released to that task only
-after explicit EOF. This overlaps remote setup with capture while preserving a
-finite, whole-utterance recognition boundary.
+PCM frames. Once sustained speech supplies enough evidence for a bounded,
+one-time level calibration, normalized audio is released to that task during
+capture. Quiet or ambiguous input is held until explicit EOF. The bridge keeps
+the complete raw capture so any retry uses a fresh session and a normalized
+whole utterance. This overlaps both remote setup and recognition with capture
+while preserving a finite Home Assistant result boundary.
 
 The production lifecycle creates a fresh realtime resource per speech
 operation. Automatic reuse is disabled because live v3 sessions emitted

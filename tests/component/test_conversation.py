@@ -93,6 +93,7 @@ async def test_conversation_streams_assistant_text(hass: HomeAssistant) -> None:
 
     assert result.response.speech["plain"]["speech"] == "Hello from Codex"
     assert captured["model"] == "gpt-test"
+    assert captured["effort"] == "low"
     assert captured["messages"][-1] == {"role": "user", "content": "Hello"}
 
 

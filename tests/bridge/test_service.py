@@ -872,6 +872,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
     start = {
         "type": "start",
         "conversation_id": "conversation-1",
+        "effort": "low",
         "instructions": "Current Home Assistant context: morning",
         "messages": [
             {"role": "user", "content": "Remember the kitchen"},
@@ -940,6 +941,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
         "Turn on the kitchen",
         "And the dining room",
     ]
+    assert [turn["effort"] for turn in turns] == ["low", "low"]
     assert (
         turns[0]["additionalContext"]["home_assistant_instructions"]["value"]
         == "Current Home Assistant context: morning"
@@ -993,6 +995,8 @@ async def test_one_shot_conversation_deletes_private_thread(
         "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
+    turn = next(params for method, params in fake_rpc.calls if method == "turn/start")
+    assert turn["effort"] == bridge_service.DEFAULT_CONVERSATION_EFFORT
 
 
 @pytest.mark.asyncio
@@ -1479,6 +1483,64 @@ async def test_transcription_stream_overlaps_handshake_and_assembles_result(
     assert match is not None
     assert all(float(value) >= 0 for value in match.groups())
     assert private_prompt not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_feeds_confident_speech_before_eof(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await websocket.send_json(_transcription_stream_start())
+        assert (await websocket.receive_json())["type"] == "started"
+        await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+        await websocket.send_bytes(b"\x00\x20" * 6_400)
+        for _ in range(100):
+            if fake_rpc.peers[-1].fed:
+                break
+            await asyncio.sleep(0)
+
+        assert fake_rpc.peers[-1].fed
+        assert not websocket.closed
+        await websocket.send_json({"type": "end"})
+        assert await websocket.receive_json(timeout=1) == {
+            "type": "result",
+            "text": "Turn on the kitchen",
+        }
+        await websocket.receive(timeout=1)
+
+    assert "Realtime live transcription timing: live_feed=True" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_quiet_audio_keeps_normalized_eof_fallback(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await websocket.send_json(_transcription_stream_start())
+        assert (await websocket.receive_json())["type"] == "started"
+        await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+        await websocket.send_bytes(b"\x00\x01" * 6_400)
+        await asyncio.sleep(0)
+        assert fake_rpc.peers[-1].fed == b""
+
+        await websocket.send_json({"type": "end"})
+        assert (await websocket.receive_json(timeout=1))["type"] == "result"
+        await websocket.receive(timeout=1)
+
+    assert fake_rpc.peers[-1].fed
+    assert "Realtime live transcription timing: live_feed=False" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2193,7 +2255,9 @@ async def test_post_transcription_handoff_timeout_cleans_every_attempt(
     assert bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
     assert len(fake_rpc.peers) == bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
     assert all(peer.closed for peer in fake_rpc.peers)
-    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 3
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == (
+        bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
+    )
 
 
 @pytest.mark.asyncio
@@ -3349,16 +3413,18 @@ async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_deadline: float | None = None
+    captured_timeout: float | None = None
     wait_called_at: float | None = None
 
     async def capture_finalization(
         _session: Any,
-        _timeout: float,
+        timeout: float,
         *,
         fragment_finalization_at: float | None = None,
     ) -> str:
-        nonlocal captured_deadline, wait_called_at
+        nonlocal captured_deadline, captured_timeout, wait_called_at
         captured_deadline = fragment_finalization_at
+        captured_timeout = timeout
         wait_called_at = asyncio.get_running_loop().time()
         return "Synthetic transcript"
 
@@ -3387,6 +3453,9 @@ async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
 
     assert response.status == 200
     assert captured_deadline is not None
+    assert captured_timeout == pytest.approx(
+        duration + 1.0 + bridge_service.TRANSCRIPTION_RESULT_TIMEOUT_SECONDS
+    )
     assert wait_called_at is not None
     assert captured_deadline - wait_called_at == pytest.approx(duration, abs=0.02)
     assert len(fake_rpc.peers[-1].fed) == len(pcm) + len(
@@ -3421,7 +3490,9 @@ async def test_transcribe_timeout_logs_only_normalized_audio_diagnostics(
 
     assert response.status == 504
     assert await response.json() == {"error": "Codex operation timed out"}
-    assert caplog.text.count("Realtime transcription attempt timed out") == 3
+    assert caplog.text.count("Realtime transcription attempt timed out") == (
+        bridge_service.TRANSCRIPTION_MAX_ATTEMPTS
+    )
     assert "stage=transcript normalized_duration_seconds=0.010" in caplog.text
     assert "normalized_peak=0.5000 normalized_rms=0.5000" in caplog.text
 
@@ -3545,7 +3616,10 @@ async def test_transcribe_does_not_retry_ambiguous_thread_start_timeout(
 
     assert response.status == 504
     assert attempts == 1
-    assert "attempt=1/3 stage=thread_start" in caplog.text
+    assert (
+        f"attempt=1/{bridge_service.TRANSCRIPTION_MAX_ATTEMPTS} stage=thread_start"
+        in caplog.text
+    )
     assert "reached its total deadline" not in caplog.text
 
 
@@ -3627,6 +3701,54 @@ async def test_synthesize_returns_best_effort_wav(
 
 
 @pytest.mark.asyncio
+async def test_synthesize_returns_requested_native_16khz_wav(
+    aiohttp_client: Any, bridge_app: web.Application
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _synthesis_payload()
+    payload.update({"sample_rate": 16_000, "channels": 1, "sample_width": 2})
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    assert response.headers["X-Audio-Sample-Rate"] == "16000"
+    with wave.open(BytesIO(await response.read()), "rb") as audio:
+        assert audio.getframerate() == 16_000
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+        assert audio.readframes(audio.getnframes()) == b"\x01\x00" * 320
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preference", "value", "expected_error"),
+    [
+        ("sample_rate", 22_050, "sample_rate"),
+        ("sample_rate", True, "sample_rate"),
+        ("channels", 2, "channels"),
+        ("sample_width", 1, "sample_width"),
+    ],
+)
+async def test_synthesize_rejects_unsupported_output_preferences(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    preference: str,
+    value: object,
+    expected_error: str,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _synthesis_payload()
+    payload[preference] = value
+
+    response = await client.post("/v1/synthesize", headers=AUTH, json=payload)
+
+    assert response.status == 400
+    assert expected_error in (await response.json())["error"]
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+
+@pytest.mark.asyncio
 async def test_synthesize_stream_yields_first_pcm_before_cleanup(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
@@ -3652,6 +3774,32 @@ async def test_synthesize_stream_yields_first_pcm_before_cleanup(
         "thread/delete",
         {"threadId": "thread-1"},
     ) in fake_rpc.calls
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_resamples_incrementally_to_16khz(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    payload = _synthesis_payload()
+    payload.update({"sample_rate": 16_000, "channels": 1, "sample_width": 2})
+
+    response = await client.post(
+        "/v1/synthesize/stream",
+        headers=AUTH,
+        json=payload,
+    )
+
+    assert response.status == 200
+    assert response.headers["X-Audio-Sample-Rate"] == "16000"
+    first_audio = await response.content.readexactly(44 + 640)
+    assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
+    complete_audio = first_audio + await response.read()
+    with wave.open(BytesIO(complete_audio), "rb") as audio:
+        assert audio.getframerate() == 16_000
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+        assert audio.readframes(audio.getnframes()) == b"\x01\x00" * 320
 
 
 @pytest.mark.asyncio

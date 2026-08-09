@@ -57,11 +57,13 @@
             "llm_hass_api": "Control Home Assistant",
             "model": "Model",
             "name": "Name",
-            "prompt": "Instructions"
+            "prompt": "Instructions",
+            "reasoning_effort": "Reasoning effort"
           },
           "data_description": {
             "llm_hass_api": "Select the Home Assistant LLM APIs whose exposed entities and tools this agent may use.",
-            "prompt": "Instructions supplied before the conversation. Templates are supported."
+            "prompt": "Instructions supplied before the conversation. Templates are supported.",
+            "reasoning_effort": "Use low for latency-sensitive voice commands; increase it only when harder reasoning produces a measured benefit."
           }
         }
       }

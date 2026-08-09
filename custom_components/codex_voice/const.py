@@ -14,6 +14,7 @@ PLATFORMS: Final = (Platform.CONVERSATION, Platform.STT, Platform.TTS)
 CONF_ACCESS_TOKEN: Final = "access_token"
 CONF_BRIDGE_URL: Final = "bridge_url"
 CONF_MODEL: Final = "model"
+CONF_REASONING_EFFORT: Final = "reasoning_effort"
 CONF_VOICE: Final = "voice"
 CONF_INSTRUCTIONS: Final = "instructions"
 
@@ -26,6 +27,7 @@ DEFAULT_CONVERSATION_NAME: Final = "Codex Voice"
 DEFAULT_STT_NAME: Final = "Codex Speech-to-Text"
 DEFAULT_TTS_NAME: Final = "Codex Text-to-Speech"
 DEFAULT_CONVERSATION_MODEL: Final = "gpt-5.6-sol"
+DEFAULT_CONVERSATION_REASONING_EFFORT: Final = "low"
 DEFAULT_VOICE: Final = "cove"
 DEFAULT_LLM_HASS_API: Final = ["assist"]
 
@@ -53,6 +55,15 @@ SUPPORTED_VOICES: Final = (
     "sol",
     "spruce",
     "vale",
+)
+
+SUPPORTED_REASONING_EFFORTS: Final = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
 )
 
 # The realtime speech models detect language automatically. Home Assistant still

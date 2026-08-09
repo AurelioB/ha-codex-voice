@@ -55,9 +55,11 @@ All routes, including `GET /health`, require
 - `GET /v1/transcribe/stream` WebSocket: a validated v1 start object, bounded
   binary PCM16 frames, and explicit `end`/`cancel` control. It returns one
   transcript result and lets bridge setup overlap Home Assistant capture.
-- `POST /v1/synthesize`: text, voice, and language; returns mono 24 kHz WAV.
+- `POST /v1/synthesize`: text, voice, language, and an optional supported
+  output tuple; returns mono 16-bit WAV at 16 or 24 kHz.
 - `POST /v1/synthesize/stream`: the same request contract, returned as a
-  progressively delivered mono 24 kHz PCM16 WAV stream.
+  progressively delivered mono PCM16 WAV stream at the requested supported
+  rate.
 - `POST /v1/speech-session/release`: idempotently release a private,
   unconsumed STT-to-TTS handoff ticket.
 - `GET /v1/realtime` WebSocket: full-duplex PCM16 `audio`, `text`, `speech`,
@@ -80,9 +82,12 @@ that spoken wording exactly matches the input.
 The component opens `/v1/transcribe/stream` before it reads Home Assistant's
 microphone iterator. Once the bridge validates the start object, it starts the
 Codex thread and realtime WebRTC handshake concurrently with capture. The
-bridge still waits for explicit capture EOF before normalizing and feeding the
-finite utterance. This overlaps setup without sending partially normalized
-audio or changing Home Assistant's finite STT semantics.
+bridge performs one bounded level calibration after it observes sustained
+speech, then normalizes and feeds subsequent audio while capture continues.
+Quiet or ambiguous captures remain buffered until explicit EOF. The complete
+raw capture is retained so a retry always starts in a fresh session with a
+whole-utterance normalization pass. This preserves Home Assistant's finite STT
+result while allowing remote recognition to overlap capture.
 
 The bundled component does not request STT-to-TTS session handoff. Live
 realtime v3 validation found that the remote session can begin assistant output

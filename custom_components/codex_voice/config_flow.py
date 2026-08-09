@@ -42,10 +42,12 @@ from .const import (
     CONF_BRIDGE_URL,
     CONF_INSTRUCTIONS,
     CONF_MODEL,
+    CONF_REASONING_EFFORT,
     CONF_VOICE,
     DEFAULT_BRIDGE_URL,
     DEFAULT_CONVERSATION_MODEL,
     DEFAULT_CONVERSATION_NAME,
+    DEFAULT_CONVERSATION_REASONING_EFFORT,
     DEFAULT_LLM_HASS_API,
     DEFAULT_STT_NAME,
     DEFAULT_TTS_NAME,
@@ -54,6 +56,7 @@ from .const import (
     SUBENTRY_TYPE_CONVERSATION,
     SUBENTRY_TYPE_STT,
     SUBENTRY_TYPE_TTS,
+    SUPPORTED_REASONING_EFFORTS,
     SUPPORTED_VOICES,
 )
 
@@ -80,6 +83,7 @@ def _default_subentries() -> list[ConfigSubentryData]:
             "unique_id": None,
             "data": {
                 CONF_MODEL: DEFAULT_CONVERSATION_MODEL,
+                CONF_REASONING_EFFORT: DEFAULT_CONVERSATION_REASONING_EFFORT,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
             },
@@ -332,6 +336,9 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
             fields.update(
                 {
                     vol.Required(CONF_MODEL): str,
+                    vol.Required(CONF_REASONING_EFFORT): SelectSelector(
+                        SelectSelectorConfig(options=list(SUPPORTED_REASONING_EFFORTS))
+                    ),
                     vol.Optional(CONF_PROMPT): TemplateSelector(),
                     vol.Optional(CONF_LLM_HASS_API): SelectSelector(
                         SelectSelectorConfig(options=hass_apis, multiple=True)
@@ -361,6 +368,7 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
             return {
                 CONF_NAME: DEFAULT_CONVERSATION_NAME,
                 CONF_MODEL: DEFAULT_CONVERSATION_MODEL,
+                CONF_REASONING_EFFORT: DEFAULT_CONVERSATION_REASONING_EFFORT,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
             }

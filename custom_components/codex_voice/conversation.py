@@ -24,7 +24,9 @@ from .api import (
 )
 from .const import (
     CONF_MODEL,
+    CONF_REASONING_EFFORT,
     DEFAULT_CONVERSATION_MODEL,
+    DEFAULT_CONVERSATION_REASONING_EFFORT,
     DOMAIN,
     SUBENTRY_TYPE_CONVERSATION,
 )
@@ -175,6 +177,10 @@ class CodexVoiceConversationEntity(
             "text": user_input.text,
             "language": user_input.language,
             "model": options.get(CONF_MODEL, DEFAULT_CONVERSATION_MODEL),
+            "effort": options.get(
+                CONF_REASONING_EFFORT,
+                DEFAULT_CONVERSATION_REASONING_EFFORT,
+            ),
             "instructions": _conversation_instructions(chat_log),
             "messages": _serialize_chat_log(chat_log),
             "tools": _serialize_tools(chat_log),
