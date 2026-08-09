@@ -5,15 +5,17 @@ from __future__ import annotations
 import array
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import json
 import logging
 import math
+import secrets
 import sys
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -57,6 +59,10 @@ TRANSCRIPTION_MAX_ATTEMPTS = 3
 TRANSCRIPTION_SESSION_TIMEOUT_SECONDS = 20.0
 TRANSCRIPTION_RESULT_TIMEOUT_SECONDS = 15.0
 TRANSCRIPTION_FRAGMENT_QUIET_SECONDS = 2.0
+TRANSCRIPTION_STREAM_START_TIMEOUT_SECONDS = 30.0
+TRANSCRIPTION_STREAM_CAPTURE_TIMEOUT_SECONDS = 70.0
+TRANSCRIPTION_STREAM_MAX_FRAME_BYTES = 256 * 1024
+TRANSCRIPTION_STREAM_MAX_RAW_BYTES = 16 * 1024 * 1024
 TRANSCRIPTION_TARGET_RMS = 0.05
 TRANSCRIPTION_TARGET_PEAK = 0.8
 TRANSCRIPTION_MAX_GAIN = 64.0
@@ -68,6 +74,13 @@ TRANSCRIPTION_TRIM_MIN_RMS = 0.015
 TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES = 3
 TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES = 5
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
+SPEECH_SESSION_HANDOFF_VERSION = 1
+SPEECH_SESSION_HANDOFF_TTL_SECONDS = 30.0
+SPEECH_SESSION_HANDOFF_SETTLE_CYCLES = 3
+# Realtime v3 can emit assistant output before finite STT completes, and later
+# PCM cannot be causally bound to appendSpeech. Keep ticket issuance disabled.
+SPEECH_SESSION_HANDOFF_ENABLED = False
+SPEECH_SESSION_CLEANUP_ADMISSION_TIMEOUT_SECONDS = 5.0
 
 
 class _TranscriptionAttemptTimeout(TimeoutError):
@@ -78,6 +91,14 @@ class _TranscriptionAttemptTimeout(TimeoutError):
 
 class _TranscriptionStartTimeout(TimeoutError):
     """A thread start timed out without returning an id that can be cleaned up."""
+
+
+class _TranscriptionStreamCancelled(Exception):
+    """The streaming client explicitly cancelled or disconnected."""
+
+
+class _TranscriptionStreamProtocolError(ProtocolError):
+    """A client-safe streaming protocol error."""
 
 
 def _codex_child_environment() -> dict[str, str]:
@@ -148,6 +169,86 @@ class _SynthesisCollectionTiming:
     ended_at: float | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class _PreparedTranscriptionAudio:
+    """Normalized finite audio plus privacy-safe numeric diagnostics."""
+
+    pcm: bytes
+    duration: float
+    input_duration: float
+    peak: float
+    rms: float
+    adaptive_gain: float
+
+
+@dataclass(slots=True)
+class _TranscriptionOverlapTiming:
+    """Monotonic markers for the first stream attempt's capture overlap."""
+
+    attempt_started_at: float | None = None
+    handshake_finished_at: float | None = None
+
+
+@dataclass(slots=True)
+class _SpeechHandoffBoundaryState:
+    """Content-private correlation for input-side v3 turn lifecycle events."""
+
+    input_turn_id: str | None = None
+    authoritative_input: str = field(default="", repr=False)
+    invalidated: bool = False
+
+
+@dataclass(slots=True)
+class _RetainedSpeechSession:
+    """Exactly-once ownership wrapper around a live realtime resource."""
+
+    session: RealtimeSession = field(repr=False)
+    thread_id: str = field(repr=False)
+    voice: str
+    language: str | None = None
+    boundary_state: _SpeechHandoffBoundaryState = field(
+        default_factory=_SpeechHandoffBoundaryState,
+        repr=False,
+    )
+    invalidated: bool = False
+    _close_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def start_close(self) -> asyncio.Task[None]:
+        """Start and return the one authoritative cleanup task."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close(), name="codex-speech-handoff-cleanup"
+            )
+        return self._close_task
+
+    async def close(self) -> None:
+        await asyncio.shield(self.start_close())
+
+    async def _close(self) -> None:
+        try:
+            await self.session.stop()
+        finally:
+            await _dispose_thread(self.session.rpc, self.thread_id)
+
+
+@dataclass(slots=True)
+class _SpeechSessionOffer:
+    """Digest-only, short-lived claim over a retained realtime session."""
+
+    token_digest: bytes = field(repr=False)
+    resource: _RetainedSpeechSession = field(repr=False)
+    voice: str
+    language: str | None
+    expires_at: float
+    watchdog: asyncio.Task[None] | None = field(default=None, repr=False)
+
+
+@dataclass(slots=True)
+class _TranscriptionAttemptOutcome:
+    transcript: str
+    retained_session: _RetainedSpeechSession | None = None
+
+
 class BridgeState:
     def __init__(
         self,
@@ -184,18 +285,234 @@ class BridgeState:
         self.peer_factory = peer_factory
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
+        self._speech_state_lock = asyncio.Lock()
+        self._speech_owner: object | None = None
         self._speech_session_active = False
+        self._speech_session_offer: _SpeechSessionOffer | None = None
+        self._speech_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._close_task: asyncio.Task[None] | None = None
 
-    @contextlib.contextmanager
-    def speech_session_lease(self) -> Iterator[None]:
-        """Fail fast when the single realtime speech channel is already in use."""
-        if self._speech_session_active:
-            raise BridgeBusyError("another speech session is already active")
-        self._speech_session_active = True
+    async def require_speech_session_available(self) -> None:
+        """Fail before reading a synthesis body when speech is truly active."""
+        async with self._speech_state_lock:
+            if self._speech_owner is not None:
+                raise BridgeBusyError("another speech session is already active")
+
+    @contextlib.asynccontextmanager
+    async def speech_session_lease(
+        self,
+        *,
+        handoff_token: object = None,
+        voice: str | None = None,
+        language: str | None = None,
+        has_instructions: bool = False,
+    ) -> AsyncIterator[_RetainedSpeechSession | None]:
+        """Claim, preempt, or cold-acquire the single realtime speech channel."""
+        owner = object()
+        offer: _SpeechSessionOffer | None = None
+        retained: _RetainedSpeechSession | None = None
+        cleanup_task: asyncio.Task[None] | None = None
+        cleanup_deadline = (
+            asyncio.get_running_loop().time()
+            + SPEECH_SESSION_CLEANUP_ADMISSION_TIMEOUT_SECONDS
+        )
+        while True:
+            pending_cleanup: tuple[asyncio.Task[None], ...] = ()
+            async with self._speech_state_lock:
+                if self._speech_owner is not None:
+                    raise BridgeBusyError("another speech session is already active")
+                if self._speech_cleanup_tasks:
+                    pending_cleanup = tuple(self._speech_cleanup_tasks)
+                else:
+                    self._speech_owner = owner
+                    self._refresh_speech_session_active()
+                    offer = self._speech_session_offer
+                    self._speech_session_offer = None
+                    if offer is not None:
+                        candidate = (
+                            handoff_token if isinstance(handoff_token, str) else ""
+                        )
+                        token_matches = hmac.compare_digest(
+                            offer.token_digest,
+                            _speech_handoff_token_digest(candidate),
+                        )
+                        compatible = (
+                            token_matches
+                            and time.monotonic() < offer.expires_at
+                            and not offer.resource.invalidated
+                            and voice == offer.voice
+                            and language == offer.language
+                            and not has_instructions
+                        )
+                        if compatible:
+                            retained = offer.resource
+                        else:
+                            cleanup_task = self._track_speech_cleanup(offer.resource)
+                    break
+            remaining = cleanup_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BridgeBusyError("speech session cleanup is still active")
+            try:
+                async with asyncio.timeout(remaining):
+                    await asyncio.gather(
+                        *(asyncio.shield(task) for task in pending_cleanup),
+                        return_exceptions=True,
+                    )
+            except TimeoutError as err:
+                raise BridgeBusyError("speech session cleanup is still active") from err
+
         try:
-            yield
+            if offer is not None:
+                await _cancel_speech_offer_watchdog(offer)
+                if retained is not None and (
+                    retained.invalidated or time.monotonic() >= offer.expires_at
+                ):
+                    cleanup_task = self._track_speech_cleanup(retained)
+                    retained = None
+                if retained is None:
+                    if cleanup_task is None:
+                        cleanup_task = self._track_speech_cleanup(offer.resource)
+                    await asyncio.shield(cleanup_task)
+                else:
+                    try:
+                        await _sanitize_speech_handoff_session(
+                            retained.session,
+                            retained.boundary_state,
+                        )
+                    except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                        retained.invalidated = True
+                        cleanup_task = self._track_speech_cleanup(retained)
+                        retained = None
+                        await asyncio.shield(cleanup_task)
+            yield retained
         finally:
-            self._speech_session_active = False
+            try:
+                if retained is not None:
+                    await self.close_speech_session_resource(retained)
+            finally:
+                async with self._speech_state_lock:
+                    if self._speech_owner is owner:
+                        self._speech_owner = None
+                    self._refresh_speech_session_active()
+
+    async def offer_speech_session(
+        self, resource: _RetainedSpeechSession
+    ) -> dict[str, Any]:
+        """Publish one digest-only, TTL-bound offer from the active STT owner."""
+        token = secrets.token_urlsafe(32)
+        offer = _SpeechSessionOffer(
+            token_digest=_speech_handoff_token_digest(token),
+            resource=resource,
+            voice=resource.voice,
+            language=resource.language,
+            expires_at=time.monotonic() + SPEECH_SESSION_HANDOFF_TTL_SECONDS,
+        )
+        replaced: _SpeechSessionOffer | None = None
+        replaced_cleanup: asyncio.Task[None] | None = None
+        async with self._speech_state_lock:
+            replaced = self._speech_session_offer
+            self._speech_session_offer = None
+            if replaced is not None:
+                replaced_cleanup = self._track_speech_cleanup(replaced.resource)
+        if replaced is not None:
+            await _cancel_speech_offer_watchdog(replaced)
+            assert replaced_cleanup is not None
+            await asyncio.shield(replaced_cleanup)
+        async with self._speech_state_lock:
+            self._speech_session_offer = offer
+            offer.watchdog = asyncio.create_task(
+                self._watch_speech_session_offer(offer),
+                name="codex-speech-handoff-watchdog",
+            )
+        return {
+            "version": SPEECH_SESSION_HANDOFF_VERSION,
+            "token": token,
+            "expires_in_ms": round(SPEECH_SESSION_HANDOFF_TTL_SECONDS * 1_000),
+            "voice": resource.voice,
+            "language": resource.language,
+        }
+
+    async def release_speech_session_offer(self, token: object) -> None:
+        """Idempotently release a matching or already-expired offer."""
+        offer: _SpeechSessionOffer | None = None
+        async with self._speech_state_lock:
+            current = self._speech_session_offer
+            if current is None:
+                return
+            candidate = token if isinstance(token, str) else ""
+            matches = hmac.compare_digest(
+                current.token_digest, _speech_handoff_token_digest(candidate)
+            )
+            if not matches and time.monotonic() < current.expires_at:
+                return
+            self._speech_session_offer = None
+            offer = current
+            cleanup_task = self._track_speech_cleanup(offer.resource)
+        await _cancel_speech_offer_watchdog(offer)
+        await asyncio.shield(cleanup_task)
+
+    async def _watch_speech_session_offer(self, offer: _SpeechSessionOffer) -> None:
+        try:
+            async with asyncio.timeout_at(offer.expires_at):
+                await _wait_for_speech_handoff_invalidation(
+                    offer.resource.session,
+                    offer.resource.boundary_state,
+                )
+        except asyncio.CancelledError:
+            raise
+        except (AppServerExited, BridgeError, TimeoutError, ValueError):
+            offer.resource.invalidated = True
+            await self._invalidate_speech_session_offer(offer)
+
+    async def _invalidate_speech_session_offer(
+        self, offer: _SpeechSessionOffer
+    ) -> None:
+        async with self._speech_state_lock:
+            if self._speech_session_offer is not offer:
+                return
+            self._speech_session_offer = None
+            cleanup_task = self._track_speech_cleanup(offer.resource)
+        await asyncio.shield(cleanup_task)
+
+    async def _close_speech_session_offer(self) -> None:
+        offer: _SpeechSessionOffer | None = None
+        cleanup_task: asyncio.Task[None] | None = None
+        async with self._speech_state_lock:
+            offer = self._speech_session_offer
+            self._speech_session_offer = None
+            if offer is not None:
+                cleanup_task = self._track_speech_cleanup(offer.resource)
+        if offer is not None:
+            await _cancel_speech_offer_watchdog(offer)
+            assert cleanup_task is not None
+            await asyncio.shield(cleanup_task)
+
+    async def close_speech_session_resource(
+        self, resource: _RetainedSpeechSession
+    ) -> None:
+        """Close a retained resource while keeping detached cleanup authoritative."""
+        await asyncio.shield(self._track_speech_cleanup(resource))
+
+    def _track_speech_cleanup(
+        self, resource: _RetainedSpeechSession
+    ) -> asyncio.Task[None]:
+        cleanup_task = resource.start_close()
+        if cleanup_task not in self._speech_cleanup_tasks:
+            self._speech_cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._speech_cleanup_finished)
+        self._refresh_speech_session_active()
+        return cleanup_task
+
+    def _speech_cleanup_finished(self, cleanup_task: asyncio.Task[None]) -> None:
+        self._speech_cleanup_tasks.discard(cleanup_task)
+        self._refresh_speech_session_active()
+        with contextlib.suppress(BaseException):
+            cleanup_task.exception()
+
+    def _refresh_speech_session_active(self) -> None:
+        self._speech_session_active = self._speech_owner is not None or bool(
+            self._speech_cleanup_tasks
+        )
 
     async def start_thread(
         self,
@@ -324,7 +641,23 @@ class BridgeState:
             await _dispose_thread(self.rpc, entry.thread_id)
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close(), name="codex-bridge-state-cleanup"
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         try:
+            await self._close_speech_session_offer()
+            while self._speech_cleanup_tasks:
+                await asyncio.gather(
+                    *(
+                        asyncio.shield(task)
+                        for task in tuple(self._speech_cleanup_tasks)
+                    ),
+                    return_exceptions=True,
+                )
             for entry in self._conversations.values():
                 entry.turn_state.retired = True
                 await _dispose_thread(self.rpc, entry.thread_id)
@@ -366,6 +699,483 @@ class BridgeState:
                 await _dispose_thread(self.rpc, entry.thread_id)
 
 
+def _speech_handoff_token_digest(token: str) -> bytes:
+    return hashlib.sha256(token.encode()).digest()
+
+
+async def _cancel_speech_offer_watchdog(offer: _SpeechSessionOffer) -> None:
+    watchdog = offer.watchdog
+    if watchdog is None or watchdog is asyncio.current_task():
+        return
+    if not watchdog.done():
+        watchdog.cancel()
+    await asyncio.gather(watchdog, return_exceptions=True)
+
+
+async def _sanitize_speech_handoff_session(
+    session: RealtimeSession,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
+    """Establish a quiet boundary between finite STT and retained TTS."""
+    session.discard_pending_input()
+    for _ in range(SPEECH_SESSION_HANDOFF_SETTLE_CYCLES):
+        _validate_speech_handoff_boundary_now(session, boundary_state)
+        await asyncio.sleep(0)
+
+
+def _validate_speech_handoff_boundary_now(
+    session: RealtimeSession,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
+    """Drain and validate every event already visible at a handoff boundary."""
+    audio_chunks = session.drain_audio_nowait()
+    if any(audio_chunks):
+        raise ProtocolError("retained speech session produced assistant audio")
+    for app_event in session.drain_app_events_nowait():
+        _validate_speech_handoff_app_event(app_event)
+    for data_event in session.drain_data_events_nowait():
+        _validate_speech_handoff_data_event(
+            data_event,
+            boundary_state=boundary_state,
+        )
+
+
+async def _wait_for_speech_handoff_invalidation(
+    session: RealtimeSession,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
+    """Drain benign late STT events and stop on any assistant-side activity."""
+    audio_task = asyncio.create_task(session.recv_audio())
+    event_task = asyncio.create_task(session.next_event())
+    data_task = asyncio.create_task(session.recv_data_event())
+    tasks = {audio_task, event_task, data_task}
+    try:
+        while True:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if audio_task in done:
+                if audio_task.result():
+                    raise ProtocolError(
+                        "retained speech session produced assistant audio"
+                    )
+                tasks.remove(audio_task)
+                audio_task = asyncio.create_task(session.recv_audio())
+                tasks.add(audio_task)
+            if event_task in done:
+                _validate_speech_handoff_app_event(event_task.result())
+                tasks.remove(event_task)
+                event_task = asyncio.create_task(session.next_event())
+                tasks.add(event_task)
+            if data_task in done:
+                _validate_speech_handoff_data_event(
+                    data_task.result(),
+                    boundary_state=boundary_state,
+                )
+                tasks.remove(data_task)
+                data_task = asyncio.create_task(session.recv_data_event())
+                tasks.add(data_task)
+    finally:
+        receivers = (
+            ("audio", audio_task),
+            ("app", event_task),
+            ("data", data_task),
+        )
+        for _, task in receivers:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(
+            *(task for _, task in receivers), return_exceptions=True
+        )
+        validation_error: BridgeError | TimeoutError | ValueError | None = None
+        for (source, _), result in zip(receivers, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, (BridgeError, TimeoutError, ValueError)):
+                if validation_error is None:
+                    validation_error = result
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            try:
+                _validate_speech_handoff_receive_result(
+                    source,
+                    result,
+                    boundary_state=boundary_state,
+                )
+            except (BridgeError, TimeoutError, ValueError) as err:
+                if validation_error is None:
+                    validation_error = err
+        if validation_error is not None:
+            raise validation_error
+
+
+def _validate_speech_handoff_receive_result(
+    source: str,
+    result: object,
+    *,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
+    """Validate a receiver result that won a handoff-watchdog cancellation race."""
+    if source == "audio":
+        if not isinstance(result, bytes):
+            raise ProtocolError(
+                "retained speech session received an invalid audio event"
+            )
+        if result:
+            raise ProtocolError("retained speech session produced assistant audio")
+        return
+    if source == "app":
+        if not isinstance(result, Mapping):
+            raise ProtocolError("retained speech session received an invalid app event")
+        _validate_speech_handoff_app_event(result)
+        return
+    if source == "data":
+        if not isinstance(result, (str, bytes)):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        _validate_speech_handoff_data_event(
+            result,
+            boundary_state=boundary_state,
+        )
+        return
+    raise RuntimeError("unknown retained speech receiver")
+
+
+def _validate_speech_handoff_app_event(event: Mapping[str, Any]) -> None:
+    _log_speech_handoff_event_shape("app", event, type_key="method")
+    method = event.get("method")
+    if method == "bridge/appServerExited":
+        raise AppServerExited("Codex app-server exited during retained speech session")
+    if method in {"thread/realtime/error", "thread/realtime/closed"}:
+        raise ProtocolError("retained speech session closed")
+    params = event.get("params")
+    if not isinstance(params, Mapping):
+        raise ProtocolError("retained speech session received an invalid app event")
+    if not isinstance(params.get("threadId"), str) or not params["threadId"]:
+        raise ProtocolError("retained speech session received an invalid app event")
+    if method == "thread/realtime/started":
+        if not isinstance(params.get("realtimeSessionId"), str) or not isinstance(
+            params.get("version"), str
+        ):
+            raise ProtocolError("retained speech session received an invalid app event")
+        return
+    if method == "thread/realtime/transcript/delta":
+        _validate_speech_handoff_input_roles(params, None, required=True)
+        if not isinstance(params.get("delta"), str):
+            raise ProtocolError("retained speech session received an invalid app event")
+        return
+    if method == "thread/realtime/transcript/done":
+        _validate_speech_handoff_input_roles(params, None, required=True)
+        if not isinstance(params.get("text"), str):
+            raise ProtocolError("retained speech session received an invalid app event")
+        return
+    if method == "thread/realtime/itemAdded":
+        item = params.get("item")
+        if not _is_valid_input_handoff_item(item):
+            raise ProtocolError("retained speech session produced assistant output")
+        _validate_speech_handoff_input_roles(params, item)
+        return
+    raise ProtocolError("retained speech session received an unknown app event")
+
+
+def _is_valid_input_handoff_item(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("type") != "handoff_request":
+        return False
+    transcript = value.get("input_transcript")
+    transcript_valid = isinstance(transcript, str) and bool(transcript.strip())
+    active = value.get("active_transcript")
+    active_valid = False
+    if "active_transcript" in value:
+        if not isinstance(active, list):
+            return False
+        if not all(
+            isinstance(entry, Mapping)
+            and isinstance(entry.get("role"), str)
+            and entry["role"].lower() in {"user", "input"}
+            and isinstance(entry.get("text"), str)
+            for entry in active
+        ):
+            return False
+        active_valid = bool(active)
+    return transcript_valid or active_valid
+
+
+def _validate_speech_handoff_data_event(
+    event: str | bytes,
+    *,
+    boundary_state: _SpeechHandoffBoundaryState | None = None,
+    known_input: str = "",
+) -> None:
+    if isinstance(event, bytes):
+        try:
+            event = event.decode()
+        except UnicodeDecodeError as err:
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            ) from err
+    try:
+        decoded = json.loads(event)
+    except (json.JSONDecodeError, TypeError) as err:
+        raise ProtocolError(
+            "retained speech session received an invalid data event"
+        ) from err
+    if not isinstance(decoded, Mapping):
+        raise ProtocolError("retained speech session received an invalid data event")
+    _log_speech_handoff_event_shape("data", decoded, type_key="type")
+    event_type = decoded.get("type")
+    if not isinstance(event_type, str) or not event_type:
+        raise ProtocolError("retained speech session received an invalid data event")
+    if event_type == "error" or event_type.startswith(
+        ("output_transcript.", "output_audio", "response.")
+    ):
+        raise ProtocolError("retained speech session produced assistant output")
+    if event_type in {"session.started", "session.updated"}:
+        if not isinstance(decoded.get("session"), Mapping):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        return
+    if event_type == "input_transcript.added":
+        item = decoded.get("item")
+        item_valid = (
+            isinstance(item, Mapping)
+            and item.get("type") == "input_transcript"
+            and isinstance(item.get("text"), str)
+        )
+        if not item_valid and not isinstance(decoded.get("text"), str):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        _validate_speech_handoff_input_roles(decoded, item)
+        return
+    if event_type == "delegation.created":
+        item = decoded.get("item")
+        if not isinstance(item, Mapping) or item.get("type") != "delegation":
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        target = item.get("target", decoded.get("target"))
+        content = item.get("content")
+        input_transcript = decoded.get("input_transcript")
+        content_valid = (
+            isinstance(content, list)
+            and bool(content)
+            and all(
+                isinstance(part, Mapping)
+                and part.get("type") == "input_text"
+                and isinstance(part.get("text"), str)
+                for part in content
+            )
+        )
+        if target != "client" or not (
+            content_valid or isinstance(input_transcript, str)
+        ):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        _validate_speech_handoff_input_roles(decoded, item)
+        return
+    if event_type == "turn.created":
+        turn = decoded.get("turn")
+        if not isinstance(turn, Mapping):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        _validate_speech_handoff_input_roles(decoded, turn, required=True)
+        turn_id = turn.get("id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        if boundary_state is not None:
+            boundary_state.input_turn_id = turn_id
+        return
+    if event_type == "turn.delta":
+        turn_id = decoded.get("turn_id")
+        delta = decoded.get("delta")
+        expected_input = known_input or (
+            boundary_state.authoritative_input if boundary_state is not None else ""
+        )
+        if (
+            boundary_state is None
+            or not isinstance(turn_id, str)
+            or not turn_id
+            or turn_id != boundary_state.input_turn_id
+            or not isinstance(delta, str)
+            or not delta
+            or not expected_input
+            or (delta not in expected_input and expected_input not in delta)
+        ):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        return
+    if event_type == "turn.done":
+        turn = decoded.get("turn")
+        if not isinstance(turn, Mapping):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        _validate_speech_handoff_input_roles(decoded, turn, required=True)
+        turn_id = turn.get("id", decoded.get("turn_id"))
+        if (
+            boundary_state is not None
+            and isinstance(turn_id, str)
+            and turn_id
+            and boundary_state.input_turn_id is not None
+            and turn_id != boundary_state.input_turn_id
+        ):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        return
+    raise ProtocolError("retained speech session received an unknown data event")
+
+
+def _validate_speech_handoff_input_roles(
+    event: Mapping[str, Any],
+    nested: object,
+    *,
+    required: bool = False,
+) -> None:
+    """Require every declared role at an STT handoff boundary to be input-side."""
+    roles: list[str] = []
+    for value in (event, nested):
+        if not isinstance(value, Mapping) or "role" not in value:
+            continue
+        role = value.get("role")
+        if not isinstance(role, str) or not role:
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        normalized = role.lower()
+        if normalized in {"assistant", "output"}:
+            raise ProtocolError("retained speech session produced assistant output")
+        if normalized not in {"user", "input"}:
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        roles.append(normalized)
+    if required and not roles:
+        raise ProtocolError("retained speech session received an invalid data event")
+
+
+def _log_speech_handoff_event_shape(
+    source: str,
+    event: Mapping[str, Any],
+    *,
+    type_key: str,
+) -> None:
+    """Emit opt-in structural diagnostics without content-bearing values."""
+    if not LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    known_keys = {
+        "active_transcript",
+        "content",
+        "delta",
+        "id",
+        "input_transcript",
+        "item",
+        "method",
+        "params",
+        "realtimeSessionId",
+        "role",
+        "session",
+        "target",
+        "text",
+        "threadId",
+        "turn",
+        "turnId",
+        "turn_id",
+        "type",
+        "version",
+    }
+    keys = ",".join(sorted(str(key) for key in event if key in known_keys)) or "none"
+
+    def value_shape(value: object) -> str:
+        if isinstance(value, Mapping):
+            return "object"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, str):
+            return "string"
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, (int, float)):
+            return "number"
+        return "other"
+
+    value_shapes = ",".join(
+        f"{key}:{value_shape(event[key])}" for key in sorted(known_keys) if key in event
+    )
+    raw_type = event.get(type_key)
+    event_type = (
+        raw_type
+        if isinstance(raw_type, str)
+        and len(raw_type) <= 64
+        and all(character.isalnum() or character in "._-/" for character in raw_type)
+        else "other"
+    )
+    roles: list[str] = []
+    nested_types: list[str] = []
+    content_flags: list[str] = []
+    for name, value in (
+        ("event", event),
+        ("params", event.get("params")),
+        ("item", event.get("item")),
+        ("turn", event.get("turn")),
+        ("delta", event.get("delta")),
+    ):
+        if isinstance(value, Mapping) and name != "event":
+            nested_raw_type = value.get("type")
+            nested_type = (
+                nested_raw_type
+                if isinstance(nested_raw_type, str)
+                and len(nested_raw_type) <= 64
+                and all(
+                    character.isalnum() or character in "._-/"
+                    for character in nested_raw_type
+                )
+                else "none"
+            )
+            nested_types.append(f"{name}:{nested_type}")
+        if isinstance(value, Mapping):
+            for content_key in ("delta", "input_transcript", "text"):
+                if content_key not in value:
+                    continue
+                content_value = value.get(content_key)
+                content_flags.append(
+                    f"{name}.{content_key}:"
+                    + (
+                        "nonempty"
+                        if isinstance(content_value, str) and bool(content_value)
+                        else "empty"
+                        if isinstance(content_value, str)
+                        else "nonstring"
+                    )
+                )
+        if not isinstance(value, Mapping) or "role" not in value:
+            continue
+        role = str(value.get("role", "")).lower()
+        roles.append(
+            role if role in {"user", "input", "assistant", "output"} else "other"
+        )
+    LOGGER.debug(
+        "Retained speech boundary event shape: source=%s event_type=%s "
+        "known_keys=%s value_shapes=%s nested_types=%s roles=%s "
+        "content_flags=%s",
+        source,
+        event_type,
+        keys,
+        value_shapes or "none",
+        ",".join(nested_types) or "none",
+        ",".join(roles) or "none",
+        ",".join(content_flags) or "none",
+    )
+
+
 def create_app(
     config: BridgeConfig,
     *,
@@ -383,8 +1193,10 @@ def create_app(
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/conversation", _conversation)
     app.router.add_post("/v1/transcribe", _transcribe)
+    app.router.add_get("/v1/transcribe/stream", _transcribe_stream)
     app.router.add_post("/v1/synthesize", _synthesize)
     app.router.add_post("/v1/synthesize/stream", _synthesize_stream)
+    app.router.add_post("/v1/speech-session/release", _release_speech_session)
     app.router.add_get("/v1/realtime", _realtime)
     app.cleanup_ctx.append(_app_server_lifecycle)
     return app
@@ -416,7 +1228,7 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
     except BridgeBusyError as exc:
         return web.json_response({"error": str(exc), "code": "busy"}, status=409)
     except (RpcError, AppServerExited) as exc:
-        LOGGER.warning("Codex app-server request failed: %s", exc)
+        LOGGER.warning("Codex app-server request failed")
         return web.json_response({"error": str(exc)}, status=503)
     except TimeoutError:
         return web.json_response({"error": "Codex operation timed out"}, status=504)
@@ -457,7 +1269,7 @@ async def _health(request: web.Request) -> web.Response:
 
 async def _transcribe(request: web.Request) -> web.Response:
     state: BridgeState = request.app[STATE_KEY]
-    with state.speech_session_lease():
+    async with state.speech_session_lease():
         return await _transcribe_admitted(request, state)
 
 
@@ -467,6 +1279,20 @@ async def _transcribe_admitted(
     payload = await _read_json(request)
     metadata_value = payload.get("metadata", {})
     metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+    language = payload.get("language", metadata.get("language"))
+    handoff_voice, handoff_language = _validate_speech_session_handoff(
+        payload.get("speech_session_handoff"), error_type=ProtocolError
+    )
+    retained_language = _normalize_speech_handoff_language(language)
+    if handoff_voice is not None and handoff_language != retained_language:
+        raise ProtocolError(
+            "speech_session_handoff language must match transcription language"
+        )
+    retained_voice = (
+        handoff_voice
+        if SPEECH_SESSION_HANDOFF_ENABLED and state.config.realtime_version == "v3"
+        else None
+    )
     raw = decode_base64_audio(payload.get("audio"))
     sample_rate = _positive_int(
         payload.get("sample_rate", metadata.get("sample_rate", 16_000)), "sample_rate"
@@ -486,64 +1312,50 @@ async def _transcribe_admitted(
         channels=channels,
     )
     pcm = pcm16_mono_24khz(pcm, actual_rate, actual_channels)
-    if not pcm:
-        raise ProtocolError("audio payload contains no samples")
-    input_duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
-    if input_duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
-        raise ProtocolError(
-            "audio must not exceed "
-            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
-        )
+    prepared_audio = _prepare_transcription_audio(pcm)
+    pcm = prepared_audio.pcm
 
-    language = payload.get("language", metadata.get("language"))
-    language_hint = (
-        f" The expected language is {language}."
-        if isinstance(language, str) and language
-        else ""
-    )
     prompt_value = payload.get("prompt")
-    vocabulary_hint = (
-        " Use this client-provided vocabulary/context hint when resolving "
-        f"ambiguous speech: {prompt_value[:2_000]}"
-        if isinstance(prompt_value, str) and prompt_value
-        else ""
-    )
-    transcription_prompt = (
-        "Transcribe the user's speech accurately. Do not answer it and do not speak."
-        + language_hint
-        + vocabulary_hint
+    transcription_prompt = _transcription_prompt(
+        language if isinstance(language, str) else None,
+        prompt_value if isinstance(prompt_value, str) else None,
     )
     total_timeout = min(
         state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
     )
-    peak, rms = _normalized_pcm16_levels(pcm)
-    pcm, adaptive_gain = _apply_transcription_gain(pcm, peak=peak, rms=rms)
-    pcm = _trim_transcription_silence(pcm)
-    duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
-    if duration < input_duration:
-        LOGGER.info(
-            "Trimmed leading transcription silence: "
-            "input_duration_seconds=%.3f trimmed_duration_seconds=%.3f "
-            "normalized_peak=%.4f normalized_rms=%.4f",
-            input_duration,
-            duration,
-            peak,
-            rms,
-        )
+    peak = prepared_audio.peak
+    rms = prepared_audio.rms
+    adaptive_gain = prepared_audio.adaptive_gain
+    duration = prepared_audio.duration
     transcript: str | None = None
+    retained_session: _RetainedSpeechSession | None = None
+    retained_promoted = False
     last_timeout: _TranscriptionAttemptTimeout | None = None
     current_attempt = 0
     try:
         async with asyncio.timeout(total_timeout):
             for current_attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
                 try:
-                    transcript = await _run_transcription_attempt(
-                        state,
-                        payload,
-                        pcm,
-                        duration,
-                        transcription_prompt,
-                    )
+                    if retained_voice is None:
+                        transcript = await _run_transcription_attempt(
+                            state,
+                            payload,
+                            pcm,
+                            duration,
+                            transcription_prompt,
+                        )
+                    else:
+                        outcome = await _run_transcription_attempt_with_handoff(
+                            state,
+                            payload,
+                            pcm,
+                            duration,
+                            transcription_prompt,
+                            retain_voice=retained_voice,
+                            retain_language=retained_language,
+                        )
+                        transcript = outcome.transcript
+                        retained_session = outcome.retained_session
                     break
                 except _TranscriptionAttemptTimeout as err:
                     last_timeout = err
@@ -588,10 +1400,515 @@ async def _transcribe_admitted(
         raise
     if transcript is None:
         raise TimeoutError from last_timeout
-    response: dict[str, Any] = {"text": transcript}
-    if isinstance(language, str) and language:
-        response["language"] = language
-    return web.json_response(response)
+    try:
+        response: dict[str, Any] = {"text": transcript}
+        if isinstance(language, str) and language:
+            response["language"] = language
+        if retained_session is not None:
+            response["speech_session_handoff"] = await state.offer_speech_session(
+                retained_session
+            )
+            retained_promoted = True
+        return web.json_response(response)
+    finally:
+        if retained_session is not None and not retained_promoted:
+            await state.close_speech_session_resource(retained_session)
+
+
+async def _transcribe_stream(request: web.Request) -> web.WebSocketResponse:
+    """Admit a finite streaming STT capture before upgrading the connection."""
+    state: BridgeState = request.app[STATE_KEY]
+    async with state.speech_session_lease():
+        # A WebSocket cannot change its HTTP status after prepare(). Keep managed
+        # subscription failures, like bearer and busy failures, at the HTTP layer.
+        state.require_subscription_auth()
+        return await _transcribe_stream_admitted(request, state)
+
+
+async def _transcribe_stream_admitted(
+    request: web.Request, state: BridgeState
+) -> web.WebSocketResponse:
+    websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
+    await websocket.prepare(request)
+    stream_started_at = time.monotonic()
+    capture_started_at: float | None = None
+    capture_ended_at: float | None = None
+    overlap_timing = _TranscriptionOverlapTiming()
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio] | None = None
+    transcription_task: asyncio.Task[_TranscriptionAttemptOutcome] | None = None
+    capture_task: asyncio.Task[bytes] | None = None
+    cancellation_task: asyncio.Task[None] | None = None
+    retained_promoted = False
+    try:
+        try:
+            first = await _receive_ws_json(
+                websocket, timeout=TRANSCRIPTION_STREAM_START_TIMEOUT_SECONDS
+            )
+        except ProtocolError as err:
+            raise _TranscriptionStreamProtocolError(str(err)) from None
+        except TimeoutError as err:
+            raise _TranscriptionStreamProtocolError(
+                "transcription start timed out"
+            ) from err
+        (
+            payload,
+            sample_rate,
+            language,
+            prompt,
+            handoff_voice,
+        ) = _validate_transcription_stream_start(first)
+        retained_voice = (
+            handoff_voice
+            if SPEECH_SESSION_HANDOFF_ENABLED and state.config.realtime_version == "v3"
+            else None
+        )
+        audio_ready = asyncio.get_running_loop().create_future()
+        transcription_task = asyncio.create_task(
+            _run_streaming_transcription(
+                state,
+                payload,
+                audio_ready,
+                _transcription_prompt(language, prompt),
+                overlap_timing,
+                retain_voice=retained_voice,
+                retain_language=_normalize_speech_handoff_language(language),
+            ),
+            name="codex-streaming-transcription",
+        )
+        await websocket.send_json({"type": "started", "protocol_version": 1})
+        capture_started_at = time.monotonic()
+        capture_task = asyncio.create_task(
+            _capture_transcription_stream(websocket, sample_rate),
+            name="codex-transcription-capture",
+        )
+
+        done, _ = await asyncio.wait(
+            {capture_task, transcription_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if capture_task not in done:
+            # Success is impossible before audio_ready is resolved. Retrieving the
+            # result here surfaces exhausted/ambiguous early setup failures promptly.
+            await transcription_task
+            raise ProtocolError(  # noqa: TRY301 - impossible worker result
+                "transcription completed before capture ended"
+            )
+
+        raw_pcm = await capture_task
+        capture_ended_at = time.monotonic()
+        try:
+            pcm = pcm16_mono_24khz(raw_pcm, sample_rate, 1)
+            prepared_audio = _prepare_transcription_audio(pcm)
+        except ProtocolError as err:
+            raise _TranscriptionStreamProtocolError(str(err)) from None
+        audio_ready.set_result(prepared_audio)
+        cancellation_task = asyncio.create_task(
+            _watch_transcription_stream_cancellation(websocket),
+            name="codex-transcription-cancellation",
+        )
+        done, _ = await asyncio.wait(
+            {transcription_task, cancellation_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancellation_task in done:
+            await cancellation_task
+        outcome = await transcription_task
+        result: dict[str, Any] = {"type": "result", "text": outcome.transcript}
+        if language:
+            result["language"] = language
+        if outcome.retained_session is not None:
+            try:
+                result["speech_session_handoff"] = await state.offer_speech_session(
+                    outcome.retained_session
+                )
+                retained_promoted = True
+            except BaseException:
+                await state.close_speech_session_resource(outcome.retained_session)
+                raise
+        await websocket.send_json(result)
+    except _TranscriptionStreamCancelled:
+        pass
+    except _TranscriptionStreamProtocolError as exc:
+        await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
+    except TimeoutError:
+        await _safe_ws_json(
+            websocket, {"type": "error", "error": "transcription timed out"}
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - wire errors must never expose internals
+        # App-server, WebRTC, and unexpected errors can contain private request
+        # material. The streaming wire contract deliberately returns no details.
+        await _safe_ws_json(
+            websocket, {"type": "error", "error": "transcription failed"}
+        )
+    finally:
+        if capture_ended_at is None and capture_started_at is not None:
+            capture_ended_at = time.monotonic()
+        for task in (capture_task, transcription_task, cancellation_task):
+            if task is not None and not task.done():
+                task.cancel()
+        if audio_ready is not None and not audio_ready.done():
+            audio_ready.cancel()
+        await asyncio.gather(
+            *(
+                task
+                for task in (capture_task, transcription_task, cancellation_task)
+                if task is not None
+            ),
+            return_exceptions=True,
+        )
+        if (
+            not retained_promoted
+            and transcription_task is not None
+            and transcription_task.done()
+            and not transcription_task.cancelled()
+        ):
+            with contextlib.suppress(Exception):
+                unfinished_outcome = transcription_task.result()
+                if unfinished_outcome.retained_session is not None:
+                    await state.close_speech_session_resource(
+                        unfinished_outcome.retained_session
+                    )
+        if not websocket.closed:
+            await websocket.close()
+        ended_at = time.monotonic()
+        capture_seconds = (
+            max(0.0, capture_ended_at - capture_started_at)
+            if capture_started_at is not None and capture_ended_at is not None
+            else 0.0
+        )
+        overlap_seconds = 0.0
+        if (
+            capture_started_at is not None
+            and capture_ended_at is not None
+            and overlap_timing.attempt_started_at is not None
+            and overlap_timing.handshake_finished_at is not None
+        ):
+            overlap_seconds = max(
+                0.0,
+                min(capture_ended_at, overlap_timing.handshake_finished_at)
+                - max(capture_started_at, overlap_timing.attempt_started_at),
+            )
+        post_capture_seconds = (
+            max(0.0, ended_at - capture_ended_at)
+            if capture_ended_at is not None
+            else 0.0
+        )
+        LOGGER.info(
+            "Realtime transcription stream timing: capture_seconds=%.3f "
+            "handshake_capture_overlap_seconds=%.3f "
+            "post_capture_seconds=%.3f total_seconds=%.3f",
+            capture_seconds,
+            overlap_seconds,
+            post_capture_seconds,
+            ended_at - stream_started_at,
+        )
+    return websocket
+
+
+def _validate_transcription_stream_start(
+    message: Mapping[str, Any],
+) -> tuple[dict[str, Any], int, str | None, str | None, str | None]:
+    """Validate and minimize the v1 stream start message."""
+    if message.get("type") != "start":
+        raise _TranscriptionStreamProtocolError(
+            "first transcription message must have type 'start'"
+        )
+    _require_stream_integer(message, "protocol_version", 1)
+    if message.get("format") != "pcm":
+        raise _TranscriptionStreamProtocolError("format must be 'pcm'")
+    if message.get("codec") != "pcm":
+        raise _TranscriptionStreamProtocolError("codec must be 'pcm'")
+    sample_rate = message.get("sample_rate")
+    if type(sample_rate) is not int or sample_rate not in {16_000, 48_000}:
+        raise _TranscriptionStreamProtocolError("sample_rate must be 16000 or 48000")
+    _require_stream_integer(message, "bit_rate", 16)
+    _require_stream_integer(message, "channels", 1)
+
+    language_value = message.get("language")
+    if "language" in message and not isinstance(language_value, str):
+        raise _TranscriptionStreamProtocolError("language must be a string")
+    prompt_value = message.get("prompt")
+    if "prompt" in message and not isinstance(prompt_value, str):
+        raise _TranscriptionStreamProtocolError("prompt must be a string")
+    language = language_value if isinstance(language_value, str) else None
+    prompt = prompt_value if isinstance(prompt_value, str) else None
+    handoff_voice, handoff_language = _validate_speech_session_handoff(
+        message.get("speech_session_handoff"),
+        error_type=_TranscriptionStreamProtocolError,
+    )
+    if handoff_voice is not None and handoff_language != (
+        _normalize_speech_handoff_language(language)
+    ):
+        raise _TranscriptionStreamProtocolError(
+            "speech_session_handoff language must match transcription language"
+        )
+    payload: dict[str, Any] = {}
+    if language:
+        payload["language"] = language
+    if prompt:
+        payload["prompt"] = prompt
+    return payload, sample_rate, language, prompt, handoff_voice
+
+
+def _validate_speech_session_handoff(
+    value: object,
+    *,
+    error_type: type[ProtocolError],
+) -> tuple[str | None, str | None]:
+    """Validate the shared finite-STT handoff request without retaining secrets."""
+    if value is None:
+        return None, None
+    if not isinstance(value, Mapping):
+        raise error_type("speech_session_handoff must be an object")
+    version = value.get("version")
+    if type(version) is not int or version != SPEECH_SESSION_HANDOFF_VERSION:
+        raise error_type(f"version must be {SPEECH_SESSION_HANDOFF_VERSION}")
+    voice_value = value.get("voice")
+    if not isinstance(voice_value, str) or not voice_value.strip():
+        raise error_type("speech_session_handoff voice must be a non-empty string")
+    voice = voice_value.strip().lower()
+    if len(voice) > 64:
+        raise error_type("speech_session_handoff voice is too long")
+    language_value = value.get("language")
+    language = _normalize_speech_handoff_language(language_value)
+    if language is None:
+        raise error_type(
+            "speech_session_handoff language must be a non-empty language tag"
+        )
+    return voice, language
+
+
+def _normalize_speech_handoff_language(value: object) -> str | None:
+    """Canonicalize a language tag identically on both sides of a handoff."""
+    if not isinstance(value, str):
+        return None
+    raw_parts = value.strip().replace("_", "-").split("-")
+    if not raw_parts or not raw_parts[0] or any(not part for part in raw_parts):
+        return None
+    normalized = [raw_parts[0].lower()]
+    normalized.extend(
+        part.upper() if len(part) == 2 and part.isalpha() else part
+        for part in raw_parts[1:]
+    )
+    return "-".join(normalized)
+
+
+def _require_stream_integer(
+    message: Mapping[str, Any], key: str, expected: int
+) -> None:
+    value = message.get(key)
+    if type(value) is not int or value != expected:
+        raise _TranscriptionStreamProtocolError(f"{key} must be {expected}")
+
+
+async def _capture_transcription_stream(
+    websocket: web.WebSocketResponse, sample_rate: int
+) -> bytes:
+    """Collect bounded PCM16LE frames until the client's explicit EOF."""
+    raw_pcm = bytearray()
+    duration_limit = int(MAX_TRANSCRIPTION_DURATION_SECONDS * sample_rate * 2)
+    try:
+        async with asyncio.timeout(TRANSCRIPTION_STREAM_CAPTURE_TIMEOUT_SECONDS):
+            while True:
+                message = await websocket.receive()
+                if message.type == WSMsgType.BINARY:
+                    chunk = bytes(message.data)
+                    if len(chunk) > TRANSCRIPTION_STREAM_MAX_FRAME_BYTES:
+                        raise _TranscriptionStreamProtocolError(
+                            "audio frame exceeds 256 KiB"
+                        )
+                    if len(chunk) % 2:
+                        raise _TranscriptionStreamProtocolError(
+                            "PCM16 audio frames must be sample-aligned"
+                        )
+                    next_size = len(raw_pcm) + len(chunk)
+                    if next_size > TRANSCRIPTION_STREAM_MAX_RAW_BYTES:
+                        raise _TranscriptionStreamProtocolError(
+                            "audio capture exceeds the size limit"
+                        )
+                    if next_size > duration_limit:
+                        raise _TranscriptionStreamProtocolError(
+                            "audio must not exceed "
+                            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds "
+                            "for transcription"
+                        )
+                    raw_pcm.extend(chunk)
+                    continue
+                if message.type == WSMsgType.TEXT:
+                    try:
+                        value = json.loads(message.data)
+                    except json.JSONDecodeError as err:
+                        raise _TranscriptionStreamProtocolError(
+                            "transcription control message must be valid JSON"
+                        ) from err
+                    if not isinstance(value, Mapping):
+                        raise _TranscriptionStreamProtocolError(
+                            "transcription control message must be a JSON object"
+                        )
+                    message_type = value.get("type")
+                    if message_type == "end":
+                        return bytes(raw_pcm)
+                    if message_type == "cancel":
+                        raise _TranscriptionStreamCancelled
+                    raise _TranscriptionStreamProtocolError(
+                        "expected binary audio, 'end', or 'cancel'"
+                    )
+                if message.type in {
+                    WSMsgType.CLOSE,
+                    WSMsgType.CLOSING,
+                    WSMsgType.CLOSED,
+                    WSMsgType.ERROR,
+                }:
+                    raise _TranscriptionStreamCancelled
+                if message.type in {WSMsgType.PING, WSMsgType.PONG}:
+                    continue
+                raise _TranscriptionStreamProtocolError(
+                    "unsupported transcription WebSocket message"
+                )
+    except TimeoutError as err:
+        raise _TranscriptionStreamProtocolError("audio capture timed out") from err
+
+
+async def _watch_transcription_stream_cancellation(
+    websocket: web.WebSocketResponse,
+) -> None:
+    """Observe cancellation and disconnects while Codex finishes after EOF."""
+    while True:
+        message = await websocket.receive()
+        if message.type == WSMsgType.TEXT:
+            try:
+                value = json.loads(message.data)
+            except json.JSONDecodeError as err:
+                raise _TranscriptionStreamProtocolError(
+                    "transcription control message must be valid JSON"
+                ) from err
+            if isinstance(value, Mapping) and value.get("type") == "cancel":
+                raise _TranscriptionStreamCancelled
+            raise _TranscriptionStreamProtocolError(
+                "only 'cancel' is accepted after transcription end"
+            )
+        if message.type in {
+            WSMsgType.CLOSE,
+            WSMsgType.CLOSING,
+            WSMsgType.CLOSED,
+            WSMsgType.ERROR,
+        }:
+            raise _TranscriptionStreamCancelled
+        if message.type in {WSMsgType.PING, WSMsgType.PONG}:
+            continue
+        raise _TranscriptionStreamProtocolError(
+            "only 'cancel' is accepted after transcription end"
+        )
+
+
+async def _run_streaming_transcription(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+    prompt: str,
+    overlap_timing: _TranscriptionOverlapTiming,
+    *,
+    retain_voice: str | None = None,
+    retain_language: str | None = None,
+) -> _TranscriptionAttemptOutcome:
+    """Run isolated attempts while capture resolves the shared audio future."""
+    total_timeout = min(
+        state.config.transcript_timeout, TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS
+    )
+    last_timeout: _TranscriptionAttemptTimeout | None = None
+    current_attempt = 0
+    loop = asyncio.get_running_loop()
+    try:
+        # POST's total deadline begins only after its complete body is available.
+        # Rescheduling here preserves that budget while still allowing setup to
+        # overlap microphone capture.
+        async with asyncio.timeout(None) as total_deadline:
+
+            def start_total_deadline(
+                completed_audio: asyncio.Future[_PreparedTranscriptionAudio],
+            ) -> None:
+                if not completed_audio.cancelled():
+                    total_deadline.reschedule(loop.time() + total_timeout)
+
+            audio_ready.add_done_callback(start_total_deadline)
+            try:
+                for current_attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
+                    try:
+                        return await _run_transcription_attempt_when_audio_ready(
+                            state,
+                            payload,
+                            audio_ready,
+                            prompt,
+                            overlap_timing=(
+                                overlap_timing if current_attempt == 1 else None
+                            ),
+                            retain_voice=retain_voice,
+                            retain_language=retain_language,
+                        )
+                    except _TranscriptionAttemptTimeout as err:
+                        last_timeout = err
+                        duration, peak, rms, adaptive_gain = (
+                            _stream_transcription_diagnostics(audio_ready)
+                        )
+                        LOGGER.warning(
+                            "Realtime transcription attempt timed out: attempt=%d/%d "
+                            "stage=%s normalized_duration_seconds=%.3f "
+                            "normalized_peak=%.4f normalized_rms=%.4f "
+                            "adaptive_gain=%.2f",
+                            current_attempt,
+                            TRANSCRIPTION_MAX_ATTEMPTS,
+                            err.stage,
+                            duration,
+                            peak,
+                            rms,
+                            adaptive_gain,
+                        )
+            finally:
+                audio_ready.remove_done_callback(start_total_deadline)
+    except _TranscriptionStartTimeout as err:
+        duration, peak, rms, adaptive_gain = _stream_transcription_diagnostics(
+            audio_ready
+        )
+        LOGGER.warning(
+            "Realtime transcription could not start: attempt=%d/%d "
+            "normalized_duration_seconds=%.3f normalized_peak=%.4f "
+            "normalized_rms=%.4f adaptive_gain=%.2f",
+            current_attempt,
+            TRANSCRIPTION_MAX_ATTEMPTS,
+            duration,
+            peak,
+            rms,
+            adaptive_gain,
+        )
+        raise TimeoutError from err
+    except TimeoutError:
+        duration, peak, rms, adaptive_gain = _stream_transcription_diagnostics(
+            audio_ready
+        )
+        LOGGER.warning(
+            "Realtime transcription reached its total deadline: attempt=%d/%d "
+            "normalized_duration_seconds=%.3f normalized_peak=%.4f "
+            "normalized_rms=%.4f adaptive_gain=%.2f",
+            current_attempt,
+            TRANSCRIPTION_MAX_ATTEMPTS,
+            duration,
+            peak,
+            rms,
+            adaptive_gain,
+        )
+        raise
+    raise TimeoutError from last_timeout
+
+
+def _stream_transcription_diagnostics(
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+) -> tuple[float, float, float, float]:
+    if not audio_ready.done() or audio_ready.cancelled():
+        return 0.0, 0.0, 0.0, 1.0
+    audio = audio_ready.result()
+    return audio.duration, audio.peak, audio.rms, audio.adaptive_gain
 
 
 async def _run_transcription_attempt(
@@ -602,7 +1919,72 @@ async def _run_transcription_attempt(
     prompt: str,
 ) -> str:
     """Run one disposable realtime transcription attempt."""
+    audio_ready = asyncio.get_running_loop().create_future()
+    audio_ready.set_result(
+        _PreparedTranscriptionAudio(
+            pcm=pcm,
+            duration=duration,
+            input_duration=duration,
+            peak=0.0,
+            rms=0.0,
+            adaptive_gain=1.0,
+        )
+    )
+    outcome = await _run_transcription_attempt_when_audio_ready(
+        state,
+        payload,
+        audio_ready,
+        prompt,
+    )
+    return outcome.transcript
+
+
+async def _run_transcription_attempt_with_handoff(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    pcm: bytes,
+    duration: float,
+    prompt: str,
+    *,
+    retain_voice: str,
+    retain_language: str | None,
+) -> _TranscriptionAttemptOutcome:
+    """Run one finite transcription attempt and retain a compatible v3 session."""
+    audio_ready = asyncio.get_running_loop().create_future()
+    audio_ready.set_result(
+        _PreparedTranscriptionAudio(
+            pcm=pcm,
+            duration=duration,
+            input_duration=duration,
+            peak=0.0,
+            rms=0.0,
+            adaptive_gain=1.0,
+        )
+    )
+    return await _run_transcription_attempt_when_audio_ready(
+        state,
+        payload,
+        audio_ready,
+        prompt,
+        retain_voice=retain_voice,
+        retain_language=retain_language,
+    )
+
+
+async def _run_transcription_attempt_when_audio_ready(
+    state: BridgeState,
+    payload: Mapping[str, Any],
+    audio_ready: asyncio.Future[_PreparedTranscriptionAudio],
+    prompt: str,
+    *,
+    overlap_timing: _TranscriptionOverlapTiming | None = None,
+    retain_voice: str | None = None,
+    retain_language: str | None = None,
+) -> _TranscriptionAttemptOutcome:
+    """Start a disposable session, then feed a normalized finite utterance."""
     attempt_started = time.monotonic()
+    if overlap_timing is not None and overlap_timing.attempt_started_at is None:
+        overlap_timing.attempt_started_at = attempt_started
     thread_start_seconds = 0.0
     realtime_handshake_seconds = 0.0
     transcript_wait_seconds = 0.0
@@ -626,6 +2008,7 @@ async def _run_transcription_attempt(
             thread_start_seconds = time.monotonic() - thread_start_started
 
         session: RealtimeSession | None = None
+        thread_owned = True
         timeout_stage = "handshake"
         try:
             session = RealtimeSession(
@@ -642,11 +2025,21 @@ async def _run_transcription_attempt(
             try:
                 await session.start(
                     prompt=prompt,
+                    voice=retain_voice,
                     include_startup_context=False,
                     client_managed_handoffs=True,
                 )
             finally:
                 realtime_handshake_seconds = time.monotonic() - handshake_started
+                if (
+                    overlap_timing is not None
+                    and overlap_timing.handshake_finished_at is None
+                ):
+                    overlap_timing.handshake_finished_at = time.monotonic()
+            timeout_stage = "audio_ready"
+            prepared_audio = await audio_ready
+            pcm = prepared_audio.pcm
+            duration = prepared_audio.duration
             timeout_stage = "input_drain"
             trailing_silence = silence_pcm16(state.config.silence_ms)
             feed_started = asyncio.get_running_loop().time()
@@ -660,23 +2053,60 @@ async def _run_transcription_attempt(
             )
             timeout_stage = "transcript"
             transcript_wait_started = time.monotonic()
+            handoff_boundary_state = (
+                _SpeechHandoffBoundaryState() if retain_voice is not None else None
+            )
             try:
                 # The remote recognizer can stop pulling the trailing silence once it
                 # has emitted a transcript, leaving the local track's drain marker
                 # unset. Transcript events are therefore the completion authority.
-                return await _wait_for_user_transcript(
-                    session,
-                    min(
-                        state.config.transcript_timeout,
-                        feed_duration + TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
-                    ),
-                    fragment_finalization_at=feed_started + duration,
+                transcript_timeout = min(
+                    state.config.transcript_timeout,
+                    feed_duration + TRANSCRIPTION_RESULT_TIMEOUT_SECONDS,
                 )
+                if retain_voice is None:
+                    transcript = await _wait_for_user_transcript(
+                        session,
+                        transcript_timeout,
+                        fragment_finalization_at=feed_started + duration,
+                    )
+                else:
+                    transcript = await _wait_for_user_transcript(
+                        session,
+                        transcript_timeout,
+                        fragment_finalization_at=feed_started + duration,
+                        strict_handoff_boundary=True,
+                        handoff_boundary_state=handoff_boundary_state,
+                    )
             finally:
                 transcript_wait_seconds = time.monotonic() - transcript_wait_started
                 if not drain_task.done():
                     drain_task.cancel()
                 await asyncio.gather(drain_task, return_exceptions=True)
+            retained_session: _RetainedSpeechSession | None = None
+            if (
+                retain_voice is not None
+                and handoff_boundary_state is not None
+                and not handoff_boundary_state.invalidated
+            ):
+                try:
+                    await _sanitize_speech_handoff_session(
+                        session,
+                        handoff_boundary_state,
+                    )
+                except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                    pass
+                else:
+                    retained_session = _RetainedSpeechSession(
+                        session=session,
+                        thread_id=thread_id,
+                        voice=retain_voice,
+                        language=retain_language,
+                        boundary_state=handoff_boundary_state,
+                    )
+                    session = None
+                    thread_owned = False
+            return _TranscriptionAttemptOutcome(transcript, retained_session)
         except TimeoutError as err:
             raise _TranscriptionAttemptTimeout(timeout_stage) from err
         finally:
@@ -690,11 +2120,12 @@ async def _run_transcription_attempt(
                             time.monotonic() - session_stop_started
                         )
             finally:
-                thread_delete_started = time.monotonic()
-                try:
-                    await _dispose_thread(state.rpc, thread_id)
-                finally:
-                    thread_delete_seconds = time.monotonic() - thread_delete_started
+                if thread_owned:
+                    thread_delete_started = time.monotonic()
+                    try:
+                        await _dispose_thread(state.rpc, thread_id)
+                    finally:
+                        thread_delete_seconds = time.monotonic() - thread_delete_started
     finally:
         LOGGER.info(
             "Realtime transcription attempt timing: thread_start_seconds=%.3f "
@@ -708,6 +2139,56 @@ async def _run_transcription_attempt(
             thread_delete_seconds,
             time.monotonic() - attempt_started,
         )
+
+
+def _prepare_transcription_audio(pcm: bytes) -> _PreparedTranscriptionAudio:
+    """Apply the finite-utterance normalization shared by both STT transports."""
+    if not pcm:
+        raise ProtocolError("audio payload contains no samples")
+    input_duration = len(pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if input_duration > MAX_TRANSCRIPTION_DURATION_SECONDS:
+        raise ProtocolError(
+            "audio must not exceed "
+            f"{MAX_TRANSCRIPTION_DURATION_SECONDS:g} seconds for transcription"
+        )
+
+    peak, rms = _normalized_pcm16_levels(pcm)
+    normalized_pcm, adaptive_gain = _apply_transcription_gain(pcm, peak=peak, rms=rms)
+    normalized_pcm = _trim_transcription_silence(normalized_pcm)
+    duration = len(normalized_pcm) / (REALTIME_SAMPLE_RATE * 2)
+    if duration < input_duration:
+        LOGGER.info(
+            "Trimmed leading transcription silence: "
+            "input_duration_seconds=%.3f trimmed_duration_seconds=%.3f "
+            "normalized_peak=%.4f normalized_rms=%.4f",
+            input_duration,
+            duration,
+            peak,
+            rms,
+        )
+    return _PreparedTranscriptionAudio(
+        pcm=normalized_pcm,
+        duration=duration,
+        input_duration=input_duration,
+        peak=peak,
+        rms=rms,
+        adaptive_gain=adaptive_gain,
+    )
+
+
+def _transcription_prompt(language: str | None, prompt: str | None) -> str:
+    language_hint = f" The expected language is {language}." if language else ""
+    vocabulary_hint = (
+        " Use this client-provided vocabulary/context hint when resolving "
+        f"ambiguous speech: {prompt[:2_000]}"
+        if prompt
+        else ""
+    )
+    return (
+        "Transcribe the user's speech accurately. Do not answer it and do not speak."
+        + language_hint
+        + vocabulary_hint
+    )
 
 
 def _normalized_pcm16_levels(pcm: bytes) -> tuple[float, float]:
@@ -849,21 +2330,56 @@ def _first_sustained_transcription_frame(
 
 
 async def _synthesize(request: web.Request) -> web.Response:
-    state: BridgeState = request.app[STATE_KEY]
-    with state.speech_session_lease():
-        return await _synthesize_admitted(request, state)
+    return await _synthesize_request(request)
 
 
 async def _synthesize_stream(request: web.Request) -> web.StreamResponse:
+    return await _synthesize_request(request, streaming=True)
+
+
+async def _synthesize_request(
+    request: web.Request, *, streaming: bool = False
+) -> web.StreamResponse:
     state: BridgeState = request.app[STATE_KEY]
-    with state.speech_session_lease():
-        return await _synthesize_admitted(request, state, streaming=True)
+    await state.require_speech_session_available()
+    payload = await _read_json(request)
+    voice_value = payload.get("voice")
+    voice = (
+        voice_value.lower() if isinstance(voice_value, str) and voice_value else None
+    )
+    language = _normalize_speech_handoff_language(payload.get("language"))
+    instructions_value = payload.get("instructions")
+    has_instructions = bool(isinstance(instructions_value, str) and instructions_value)
+    async with state.speech_session_lease(
+        handoff_token=payload.get("speech_session_handoff_token"),
+        voice=voice,
+        language=language,
+        has_instructions=has_instructions,
+    ) as retained_session:
+        return await _synthesize_admitted(
+            request,
+            state,
+            payload=payload,
+            retained_session=retained_session,
+            streaming=streaming,
+        )
+
+
+async def _release_speech_session(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    payload = await _read_json(request)
+    await state.release_speech_session_offer(
+        payload.get("speech_session_handoff_token", payload.get("token"))
+    )
+    return web.Response(status=204)
 
 
 async def _synthesize_admitted(
     request: web.Request,
     state: BridgeState,
     *,
+    payload: Mapping[str, Any],
+    retained_session: _RetainedSpeechSession | None = None,
     streaming: bool = False,
 ) -> web.StreamResponse:
     attempt_started = time.monotonic()
@@ -875,7 +2391,6 @@ async def _synthesize_admitted(
     session_stop_peer_close_seconds = 0.0
     thread_delete_seconds = 0.0
     collection_timing = _SynthesisCollectionTiming()
-    payload = await _read_json(request)
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         raise ProtocolError("text must be a non-empty string")
@@ -902,28 +2417,61 @@ async def _synthesize_admitted(
         stream_response.content_type = "audio/wav"
     stream_started = False
     pcm: bytes | None = None
+    synthesis_deadline = (
+        asyncio.get_running_loop().time() + state.config.synthesis_timeout
+    )
 
-    try:
-        thread_start_started = time.monotonic()
-        try:
-            thread_id = await state.start_thread(
-                payload,
-                base_instructions=(
-                    "Act only as a deterministic voice renderer. Remain silent until "
-                    "the client appends speakable text, then vocalize only that text. "
-                    "Never greet, acknowledge, answer, paraphrase, add or remove words, "
-                    "call tools, or inspect files."
+    async def write_pcm_chunk(chunk: bytes) -> None:
+        nonlocal stream_started
+        assert stream_response is not None
+        if not stream_started:
+            await stream_response.prepare(request)
+            stream_started = True
+            await stream_response.write(streaming_wav_header())
+        await stream_response.write(chunk)
+
+    async def run_session(
+        retained: _RetainedSpeechSession | None,
+    ) -> web.StreamResponse:
+        nonlocal append_text_rpc_seconds
+        nonlocal append_text_started_at
+        nonlocal audio_collection_seconds
+        nonlocal collection_timing
+        nonlocal pcm
+        nonlocal realtime_handshake_seconds
+        nonlocal session_stop_peer_close_seconds
+        nonlocal thread_delete_seconds
+        nonlocal thread_start_seconds
+
+        thread_id: str | None = None
+        session: RealtimeSession
+        if retained is None:
+            thread_start_started = time.monotonic()
+            try:
+                thread_id = await state.start_thread(
+                    payload,
+                    base_instructions=(
+                        "Act only as a deterministic voice renderer. Remain silent "
+                        "until the client appends speakable text, then vocalize only "
+                        "that text. Never greet, acknowledge, answer, paraphrase, add "
+                        "or remove words, call tools, or inspect files."
+                    ),
+                )
+            finally:
+                thread_start_seconds += time.monotonic() - thread_start_started
+            session = RealtimeSession(
+                state.rpc,
+                thread_id,
+                peer=state.peer_factory(),
+                version=state.config.realtime_version,
+                timeout=max(
+                    0.001,
+                    synthesis_deadline - asyncio.get_running_loop().time(),
                 ),
             )
-        finally:
-            thread_start_seconds = time.monotonic() - thread_start_started
-        session = RealtimeSession(
-            state.rpc,
-            thread_id,
-            peer=state.peer_factory(),
-            version=state.config.realtime_version,
-            timeout=state.config.synthesis_timeout,
-        )
+        else:
+            session = retained.session
+
         language = payload.get("language")
         language_hint = (
             f" Speak in {language}." if isinstance(language, str) and language else ""
@@ -935,45 +2483,53 @@ async def _synthesize_admitted(
             else ""
         )
         try:
-            handshake_started = time.monotonic()
-            try:
-                await session.start(
-                    prompt=(
-                        "Stay silent until a speakable item arrives. Render that item "
-                        "verbatim and naturally, without any preface or follow-up."
+            if retained is None:
+                handshake_started = time.monotonic()
+                try:
+                    await session.start(
+                        prompt=(
+                            "Stay silent until a speakable item arrives. Render that "
+                            "item verbatim and naturally, without any preface or "
+                            "follow-up."
+                        )
+                        + language_hint
+                        + voice_hint,
+                        voice=voice,
+                        include_startup_context=False,
+                        client_managed_handoffs=True,
                     )
-                    + language_hint
-                    + voice_hint,
-                    voice=voice,
-                    include_startup_context=False,
-                    client_managed_handoffs=True,
-                )
-            finally:
-                realtime_handshake_seconds = time.monotonic() - handshake_started
+                finally:
+                    realtime_handshake_seconds += time.monotonic() - handshake_started
             append_text_started_at = time.monotonic()
             try:
-                await session.append_text(
-                    "Vocalize only the following quoted data, with no acknowledgement "
-                    f"or extra words: {json.dumps(text, ensure_ascii=False)}",
-                    role="user",
-                )
+                if retained is None:
+                    await session.append_text(
+                        "Vocalize only the following quoted data, with no "
+                        "acknowledgement or extra words: "
+                        f"{json.dumps(text, ensure_ascii=False)}",
+                        role="user",
+                    )
+                else:
+                    _validate_speech_handoff_boundary_now(
+                        session,
+                        retained.boundary_state,
+                    )
+                    await session.append_speech(text)
+                    _validate_speech_handoff_boundary_now(
+                        session,
+                        retained.boundary_state,
+                    )
             finally:
-                append_text_rpc_seconds = time.monotonic() - append_text_started_at
-
-            async def write_pcm_chunk(chunk: bytes) -> None:
-                nonlocal stream_started
-                assert stream_response is not None
-                if not stream_started:
-                    await stream_response.prepare(request)
-                    await stream_response.write(streaming_wav_header())
-                    stream_started = True
-                await stream_response.write(chunk)
+                append_text_rpc_seconds += time.monotonic() - append_text_started_at
 
             collection_started = time.monotonic()
             try:
+                remaining = synthesis_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError
                 pcm = await _collect_speech_audio(
                     session,
-                    state.config.synthesis_timeout,
+                    remaining,
                     timing=collection_timing,
                     async_handle_chunk=write_pcm_chunk if streaming else None,
                 )
@@ -982,22 +2538,34 @@ async def _synthesize_admitted(
                         raise ProtocolError("realtime synthesis produced no audio")
                     await stream_response.write_eof()
             finally:
-                audio_collection_seconds = time.monotonic() - collection_started
+                audio_collection_seconds += time.monotonic() - collection_started
         finally:
-            try:
+            if retained is not None:
                 session_stop_started = time.monotonic()
                 try:
-                    await session.stop()
+                    await state.close_speech_session_resource(retained)
                 finally:
-                    session_stop_peer_close_seconds = (
+                    session_stop_peer_close_seconds += (
                         time.monotonic() - session_stop_started
                     )
-            finally:
-                thread_delete_started = time.monotonic()
+            else:
                 try:
-                    await _dispose_thread(state.rpc, thread_id)
+                    session_stop_started = time.monotonic()
+                    try:
+                        await session.stop()
+                    finally:
+                        session_stop_peer_close_seconds += (
+                            time.monotonic() - session_stop_started
+                        )
                 finally:
-                    thread_delete_seconds = time.monotonic() - thread_delete_started
+                    if thread_id is not None:
+                        thread_delete_started = time.monotonic()
+                        try:
+                            await _dispose_thread(state.rpc, thread_id)
+                        finally:
+                            thread_delete_seconds += (
+                                time.monotonic() - thread_delete_started
+                            )
         if stream_response is not None:
             return stream_response
         assert pcm is not None
@@ -1006,6 +2574,19 @@ async def _synthesize_admitted(
             content_type="audio/wav",
             headers=response_headers,
         )
+
+    try:
+        if retained_session is not None:
+            try:
+                return await run_session(retained_session)
+            except Exception:
+                if stream_started or collection_timing.first_audio_at is not None:
+                    raise
+                if asyncio.get_running_loop().time() >= synthesis_deadline:
+                    raise
+                collection_timing = _SynthesisCollectionTiming()
+                append_text_started_at = None
+        return await run_session(None)
     finally:
         collection_ended_at = collection_timing.ended_at
         append_to_first_audio_seconds = (
@@ -1416,7 +2997,7 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
 
 async def _realtime(request: web.Request) -> web.WebSocketResponse:
     state: BridgeState = request.app[STATE_KEY]
-    with state.speech_session_lease():
+    async with state.speech_session_lease():
         return await _realtime_admitted(request, state)
 
 
@@ -1632,6 +3213,8 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     timeout: float,
     *,
     fragment_finalization_at: float | None = None,
+    strict_handoff_boundary: bool = False,
+    handoff_boundary_state: _SpeechHandoffBoundaryState | None = None,
 ) -> str:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -1656,7 +3239,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                     fragment_ready_at = max(fragment_ready_at, fragment_finalization_at)
                 quiet_remaining = fragment_ready_at - now
                 if quiet_remaining <= 0:
-                    return transcript.strip()
+                    final_transcript = transcript.strip()
+                    _remember_speech_handoff_input(
+                        handoff_boundary_state,
+                        final_transcript,
+                    )
+                    return final_transcript
                 remaining = min(remaining, quiet_remaining)
             elif realtime_closed_at is not None:
                 close_remaining = TRANSCRIPTION_FRAGMENT_QUIET_SECONDS - (
@@ -1684,14 +3272,35 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                             fragment_ready_at, fragment_finalization_at
                         )
                     if now >= fragment_ready_at:
-                        return transcript.strip()
+                        final_transcript = transcript.strip()
+                        _remember_speech_handoff_input(
+                            handoff_boundary_state,
+                            final_transcript,
+                        )
+                        return final_transcript
                 if realtime_closed_at is not None:
                     raise TimeoutError(
                         "realtime session closed before transcription completed"
                     )
                 raise TimeoutError
-            if event_task in done:
+            # FIRST_COMPLETED can return while the sibling has completed in the
+            # same loop turn. Inspect both before accepting a terminal transcript
+            # so an unsafe simultaneous event cannot be discarded in ``finally``.
+            ready = set(done)
+            if event_task.done():
+                ready.add(event_task)
+            if data_task.done():
+                ready.add(data_task)
+            terminal_transcript: str | None = None
+            if event_task in ready:
                 event = event_task.result()
+                if strict_handoff_boundary:
+                    try:
+                        _validate_speech_handoff_app_event(event)
+                    except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                        if handoff_boundary_state is None:
+                            raise
+                        handoff_boundary_state.invalidated = True
                 method = event.get("method")
                 params = event.get("params", {})
                 if method == "bridge/appServerExited":
@@ -1727,15 +3336,15 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                         else "".join(deltas)
                     )
                     if transcript.strip():
-                        return transcript.strip()
+                        terminal_transcript = transcript.strip()
                 if method == "thread/realtime/itemAdded":
                     transcript = _realtime_item_user_transcript(params.get("item"))
                     if transcript:
-                        return transcript
+                        terminal_transcript = transcript
                 if method == "thread/realtime/closed":
                     realtime_closed_at = loop.time()
                 event_task = asyncio.create_task(session.next_event())
-            if data_task in done:
+            if data_task in ready:
                 data_event = data_task.result()
                 if isinstance(data_event, bytes):
                     data_event = data_event.decode(errors="replace")
@@ -1746,6 +3355,33 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 if not isinstance(decoded_event, Mapping):
                     decoded_event = {}
                 event_type = decoded_event.get("type")
+                if strict_handoff_boundary:
+                    known_input = _assembled_transcript(
+                        deltas, list(data_deltas.values())
+                    )
+                    if event_type == "turn.delta":
+                        delta = decoded_event.get("delta")
+                        LOGGER.debug(
+                            "Retained speech turn.delta relation: "
+                            "delta_is_string=%s matches_known_input=%s",
+                            isinstance(delta, str),
+                            bool(
+                                isinstance(delta, str)
+                                and delta
+                                and known_input
+                                and (delta in known_input or known_input in delta)
+                            ),
+                        )
+                    try:
+                        _validate_speech_handoff_data_event(
+                            data_event,
+                            boundary_state=handoff_boundary_state,
+                            known_input=known_input,
+                        )
+                    except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                        if handoff_boundary_state is None:
+                            raise
+                        handoff_boundary_state.invalidated = True
                 candidate = _data_channel_transcript(decoded_event)
                 if event_type == "input_transcript.added" and candidate:
                     item = decoded_event.get("item")
@@ -1758,18 +3394,36 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                     data_deltas[fragment_id] = candidate
                     last_fragment_at = loop.time()
                 elif candidate:
-                    return candidate
+                    terminal_transcript = candidate
                 elif event_type == "turn.done":
                     transcript = _assembled_transcript(
                         deltas, list(data_deltas.values())
                     )
                     if transcript:
-                        return transcript
+                        terminal_transcript = transcript
                 data_task = asyncio.create_task(session.recv_data_event())
+            if terminal_transcript:
+                _remember_speech_handoff_input(
+                    handoff_boundary_state,
+                    terminal_transcript,
+                )
+                return terminal_transcript
     finally:
         event_task.cancel()
         data_task.cancel()
         await asyncio.gather(event_task, data_task, return_exceptions=True)
+
+
+def _remember_speech_handoff_input(
+    boundary_state: _SpeechHandoffBoundaryState | None,
+    transcript: str,
+) -> None:
+    """Retain one bounded input transcript only for same-session validation."""
+    if boundary_state is None:
+        return
+    if not transcript or len(transcript) > 64_000:
+        raise ProtocolError("retained speech input transcript is invalid")
+    boundary_state.authoritative_input = transcript
 
 
 def _data_channel_transcript(event: Mapping[str, Any]) -> str:
@@ -1910,6 +3564,7 @@ async def _collect_speech_audio(
                 if idle >= (0.6 if transcript_done else 1.5):
                     break
                 continue
+            audio_preceded_ready_batch = received_audio
             if audio_task in done:
                 chunk = audio_task.result()
                 if chunk:
@@ -1930,10 +3585,15 @@ async def _collect_speech_audio(
                 method = event.get("method")
                 params = event.get("params", {})
                 role = str(params.get("role", "")).lower()
-                if method == "thread/realtime/transcript/done" and role in {
-                    "assistant",
-                    "output",
-                }:
+                if (
+                    method == "thread/realtime/transcript/done"
+                    and role
+                    in {
+                        "assistant",
+                        "output",
+                    }
+                    and audio_preceded_ready_batch
+                ):
                     transcript_done = True
                 elif method == "thread/realtime/error":
                     raise ProtocolError(
@@ -1953,7 +3613,10 @@ async def _collect_speech_audio(
                 except (json.JSONDecodeError, TypeError):  # fmt: skip
                     decoded_event = {}
                 event_type = decoded_event.get("type")
-                if event_type in {"turn.done", "output_audio_buffer.stopped"}:
+                if audio_preceded_ready_batch and event_type in {
+                    "turn.done",
+                    "output_audio_buffer.stopped",
+                }:
                     transcript_done = True
                     completion_at = loop.time()
                     if timing is not None:
@@ -2124,11 +3787,8 @@ async def _dispose_thread(rpc: Any, thread_id: str) -> None:
     """Delete a finished private thread, falling back to event unsubscribe."""
     try:
         await rpc.call("thread/delete", {"threadId": thread_id}, timeout=20)
-    except Exception:
-        LOGGER.warning(
-            "Could not delete finished Codex thread; falling back to unsubscribe",
-            exc_info=True,
-        )
+    except Exception:  # noqa: BLE001 - best-effort cleanup must not leak details
+        LOGGER.warning("Could not delete finished Codex thread; using fallback")
         await _unsubscribe_thread(rpc, thread_id)
 
 

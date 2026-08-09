@@ -5,6 +5,34 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-08
+
+### Added
+
+- Add observed-event boundary validation and a content-private live probe for
+  the dormant STT-to-TTS handoff experiment.
+- Document measured latency boundaries, ThirdReality tuning acceptance checks,
+  firmware backup and rollback, and the requirement to preserve TCP ADB on the
+  measured device.
+
+### Changed
+
+- Start the Codex thread and WebRTC handshake when streaming STT capture opens,
+  overlapping remote setup with the finite Home Assistant microphone capture.
+- Keep STT-to-TTS ticket issuance disabled in both the component and bridge
+  after live v3 validation observed assistant output before finite
+  transcription completed.
+
+### Fixed
+
+- Make retained-session expiry, replacement, cancellation, remote invalidation,
+  component unload, and successful consumption converge on bounded, exactly-once
+  session and thread cleanup.
+- Invalidate dormant reuse on observed assistant audio or output at checked
+  STT-to-TTS boundaries, including simultaneous receiver and claim races.
+- Preserve a valid STT transcript when unexpected assistant output invalidates
+  the reuse experiment, then close the unsafe session and use fresh TTS.
+
 ## [0.1.7] - 2026-08-08
 
 ### Added

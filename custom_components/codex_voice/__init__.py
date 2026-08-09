@@ -50,6 +50,7 @@ async def async_setup_entry(
         entry.data[CONF_BRIDGE_URL],
         entry.data[CONF_ACCESS_TOKEN],
     )
+    entry.async_on_unload(client.cancel_handoff_release_tasks)
     try:
         await client.async_health()
     except BridgeAuthenticationError as err:

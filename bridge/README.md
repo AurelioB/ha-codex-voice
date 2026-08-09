@@ -52,9 +52,14 @@ All routes, including `GET /health`, require
 - `POST /v1/transcribe`: up to 60 seconds of base64 PCM16/WAV plus audio
   metadata; returns JSON `{ "text": "..." }` under a bounded end-to-end
   deadline.
+- `GET /v1/transcribe/stream` WebSocket: a validated v1 start object, bounded
+  binary PCM16 frames, and explicit `end`/`cancel` control. It returns one
+  transcript result and lets bridge setup overlap Home Assistant capture.
 - `POST /v1/synthesize`: text, voice, and language; returns mono 24 kHz WAV.
 - `POST /v1/synthesize/stream`: the same request contract, returned as a
   progressively delivered mono 24 kHz PCM16 WAV stream.
+- `POST /v1/speech-session/release`: idempotently release a private,
+  unconsumed STT-to-TTS handoff ticket.
 - `GET /v1/realtime` WebSocket: full-duplex PCM16 `audio`, `text`, `speech`,
   transcripts, tool calls, and stop messages.
 
@@ -70,11 +75,80 @@ still provides best-effort conversational speech and returns the header
 `X-Codex-Synthesis-Mode: conversational-best-effort`; callers must not assume
 that spoken wording exactly matches the input.
 
+## Streaming STT and guarded session-handoff experiment
+
+The component opens `/v1/transcribe/stream` before it reads Home Assistant's
+microphone iterator. Once the bridge validates the start object, it starts the
+Codex thread and realtime WebRTC handshake concurrently with capture. The
+bridge still waits for explicit capture EOF before normalizing and feeding the
+finite utterance. This overlaps setup without sending partially normalized
+audio or changing Home Assistant's finite STT semantics.
+
+The bundled component does not request STT-to-TTS session handoff. Live
+realtime v3 validation found that the remote session can begin assistant output
+before finite STT completes, while the supported Frameless Bidi client protocol
+has no response-cancel message. The official Assist path therefore uses a
+fresh TTS session.
+
+The bridge retains the experimental wire schema and validation machinery for
+future protocol work, but the released build never retains the STT session or
+issues a ticket. A request containing the following field is validated and then
+takes the same isolated cold path; production clients should omit it.
+
+```json
+{
+  "speech_session_handoff": {
+    "version": 1,
+    "voice": "cove",
+    "language": "en-US"
+  }
+}
+```
+
+The dormant protocol defines a versioned random 256-bit ticket, its voice,
+normalized language, and `expires_in_ms: 30000`. The handoff language must
+normalize to the same tag as the outer transcription metadata. If a future
+causally safe implementation enables it, a compatible `/v1/synthesize` or
+`/v1/synthesize/stream` request may present the ticket once as
+`speech_session_handoff_token` with that same language. The bridge then uses
+`appendSpeech` on the sanitized STT session instead of creating a second
+thread and WebRTC session. Only one offer can be outstanding on the bridge's
+single speech lane.
+
+The released bridge does not reach ticket issuance. The dormant machinery
+stores only a ticket's SHA-256 digest and never logs the raw value. In that
+protocol, the bearer-authenticated request/response transport carries the
+ticket, and Home Assistant would bind it in memory to the exact bridge client,
+`ChatSession`, official pre-STT TTS preparation, voice, and language. Custom
+TTS instructions, another client/session, direct `tts.speak`, mismatch,
+expiry, remote output, or remote failure cannot implicitly claim it. An
+incompatible request closes the offer before taking the normal cold path. If
+an already-claimed reuse attempt fails before first PCM, synthesis may
+cold-start within its original deadline; it never restarts after PCM has been
+exposed to the caller.
+
+The release route accepts
+`{ "speech_session_handoff_token": "..." }` and returns `204` even when a
+matching offer has already expired or been cleaned. Expiry, explicit release,
+replacement, shutdown, cancellation, and successful consumption converge on
+the same exactly-once session stop and thread deletion. Tickets are bearer
+secrets despite their short lifetime and must stay out of URLs, logs, task
+names, and diagnostics.
+
+The bridge intentionally does not maintain an always-on remote prewarm. An
+idle WebRTC peer continues emitting silent RTP, would occupy the single speech
+lane, and has no documented quota-neutral lifetime. The supported optimization
+is capture overlap plus progressive TTS delivery. See
+[performance and ThirdReality tuning](../docs/performance.md) for live
+measurement scope and the prewarm rationale.
+
 Finite transcription does not append synthetic silence by default. Set
 `HA_CODEX_TRANSCRIBE_SILENCE_MS` only when an explicit nonzero compatibility
 tail is required. Successful STT and TTS attempts log numeric stage durations
 only; speech, transcripts, prompts, credentials, SDP, and remote identifiers
-are never included in those timing records.
+are never included in those timing records. Streaming STT also logs capture,
+handshake/capture overlap, post-capture, and total durations so deployments can
+verify overlap without recording content.
 
 Interactive approvals, permission requests, and unsupported server-initiated
 requests fail closed. Only explicitly declared dynamic Home Assistant tools are

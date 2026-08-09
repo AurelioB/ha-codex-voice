@@ -39,8 +39,13 @@ inside Home Assistant, so its user and Assist policies stay authoritative.
 ## Status
 
 - Milestone 1: standard Home Assistant Conversation, STT, and TTS entities.
+- Milestone 1 STT opens its authenticated bridge stream at capture start, so
+  thread and WebRTC setup can overlap the finite microphone capture.
 - Milestone 1 TTS progressively delivers realtime speech frames instead of
   waiting for the entire rendered response and remote cleanup.
+- Automatic STT-to-TTS session reuse is disabled: current realtime v3 sessions
+  can begin assistant output before finite STT completes, so the official Assist
+  flow uses a fresh, isolated TTS session.
 - Milestone 2: experimental realtime duplex-audio proxy with barge-in-ready
   session primitives.
 - Target Home Assistant version: 2026.8.0 or newer.
@@ -154,12 +159,42 @@ The standard TTS entity uses the authenticated
 through Home Assistant's TTS proxy as audio arrives; the finite
 `POST /v1/synthesize` route remains available for older clients and diagnostics.
 
+The standard STT entity opens the authenticated `/v1/transcribe/stream`
+WebSocket before consuming the microphone stream. Codex thread and WebRTC
+setup begin after the validated start message while Home Assistant continues
+capture. The normalized finite utterance is fed only after explicit capture
+EOF.
+
 The bridge converts that narrow WebSocket protocol to a genuine WebRTC peer:
 an active audio track carries media and the `oai-events` data channel carries
 control events. It sends the offer to Codex App Server and applies the returned
 answer. Subscription authentication has been verified with realtime v3 on
 Codex 0.146.0. App Server's raw realtime WebSocket route is deliberately not
 used because it requires API-key authentication in that release.
+
+## Performance
+
+Small live measurements on 2026-08-08 found that streaming TTS exposed first
+PCM 4.222 seconds before the equivalent finite bridge response in one probe,
+and overlapping a 2.0-second STT capture reduced one reference completion time
+from 11.709 seconds to a three-run median of 9.680 seconds. These are
+single-device diagnostic observations, not latency guarantees or directly
+comparable whole-room timings.
+
+Automatic STT-to-TTS session reuse is deliberately disabled in the bundled
+component. Live v3 validation observed genuine assistant output before the
+user transcript completed, and the tagged Frameless Bidi client protocol has
+no supported response-cancel message. Both the component and bridge therefore
+disable ticket issuance; a handoff-shaped diagnostic request is validated but
+takes the isolated cold path. The production Assist path always cold-starts TTS
+in a fresh thread and session.
+
+Always-on remote prewarming is not enabled: there is no provider hook before a
+wake word, an idle WebRTC peer still sends silent RTP, App Server does not
+document idle sessions as quota-neutral, and speculative sessions would occupy
+the single speech lane. See [performance and ThirdReality
+tuning](docs/performance.md) for measurement scope, handoff privacy and
+fallback behavior, safe device settings, and the firmware A/B procedure.
 
 ## Development
 
@@ -204,12 +239,17 @@ opt-in and must never print OAuth tokens or recorded audio.
   depends on hardware/firmware support for the bridge's authenticated PCM
   WebSocket protocol.
 - ThirdReality firmware 1.01.07 does not forward microphone audio until its
-  wake confirmation sound has completely finished. The bundled sound has a
-  short silent tail, so speech begun immediately after the audible tone can be
-  lost; wait about 0.3 seconds after the tone. Shortening that gap or raising
-  the device's hardware microphone gain requires a device-side configuration
-  or firmware change and cannot be controlled by this Home Assistant
-  integration.
+  wake confirmation sound has completely finished. Shortening the cue,
+  selecting aggressive finished-speaking detection, or raising hardware
+  microphone gain can reduce waits or improve recognition, but each is a
+  device-side change with explicit accuracy and clipping acceptance checks.
+- The official ThirdReality v1.2 firmware is a substantial Python-to-C++
+  rewrite and should be A/B tested with a verified backup and rollback path.
+  v1.2.1 also enables unauthenticated root ADB over TCP port 5555 and ships
+  password-authenticated root SSH with a documented default. Isolate and
+  harden both services, then verify the ports after reboot and updates. Prefer
+  a manually downloaded, SHA-256-verified image because the tagged built-in
+  updater disables TLS peer and hostname verification.
 
 ## License
 

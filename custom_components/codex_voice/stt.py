@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterable
-from typing import override
+from typing import Any, override
 
 from homeassistant.components import stt
 from homeassistant.const import CONF_PROMPT
@@ -12,8 +12,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import CodexVoiceConfigEntry
-from .api import BridgeAuthenticationError, BridgeError
-from .const import MAX_AUDIO_BYTES, SUBENTRY_TYPE_STT, SUPPORTED_LANGUAGES
+from .api import (
+    BridgeAuthenticationError,
+    BridgeError,
+    BridgeStreamingUnsupported,
+    _begin_speech_session_handoff,
+    _normalize_speech_language,
+    _revoke_pending_speech_session_handoff,
+)
+from .const import (
+    MAX_AUDIO_BYTES,
+    SUBENTRY_TYPE_STT,
+    SUPPORTED_LANGUAGES,
+)
 from .entity import CodexVoiceEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -86,40 +97,64 @@ class CodexVoiceSTTEntity(stt.SpeechToTextEntity, CodexVoiceEntity):
         metadata: stt.SpeechMetadata,
         stream: AsyncIterable[bytes],
     ) -> stt.SpeechResult:
-        """Collect bounded PCM and transcribe it through the bridge."""
-        audio = bytearray()
-        async for chunk in stream:
-            if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
-                _LOGGER.warning("Rejecting STT input larger than 16 MiB")
-                return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
-            audio.extend(chunk)
-
-        if not audio:
-            return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
-
+        """Stream bounded PCM to the bridge and return a standard STT result."""
+        language = _normalize_speech_language(metadata.language)
         bridge_metadata = {
-            "language": metadata.language,
+            "language": language,
             "codec": metadata.codec.value,
             "sample_rate": metadata.sample_rate.value,
             "bit_rate": metadata.bit_rate.value,
             "channels": metadata.channel.value,
         }
+        prompt = self.subentry.data.get(CONF_PROMPT)
+        client = self.entry.runtime_data
+        handoff = _begin_speech_session_handoff(
+            client,
+            language=language,
+        )
+        transcribe_kwargs: dict[str, Any] = {"prompt": prompt}
+        if handoff is not None:
+            transcribe_kwargs["speech_session_handoff"] = handoff
         try:
-            transcript = await self.entry.runtime_data.async_transcribe(
-                bytes(audio),
-                bridge_metadata,
-                prompt=self.subentry.data.get(CONF_PROMPT),
-            )
+            try:
+                transcript = await client.async_transcribe_stream(
+                    stream,
+                    bridge_metadata,
+                    **transcribe_kwargs,
+                )
+            except BridgeStreamingUnsupported:
+                audio = await _async_collect_audio(stream)
+                if audio is None:
+                    _LOGGER.warning("Rejecting STT input larger than 16 MiB")
+                    return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
+                if not audio:
+                    return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
+                transcript = await client.async_transcribe(
+                    audio,
+                    bridge_metadata,
+                    **transcribe_kwargs,
+                )
         except BridgeAuthenticationError:
             self.entry.async_start_reauth(self.hass)
             _LOGGER.error("The Codex Voice bridge requires reauthentication")
         except BridgeError:
-            _LOGGER.exception("Error transcribing speech with Codex Voice")
+            _LOGGER.error("Error transcribing speech with Codex Voice")
         else:
             if transcript.strip():
                 return stt.SpeechResult(
                     transcript,
                     stt.SpeechResultState.SUCCESS,
                 )
+            _revoke_pending_speech_session_handoff()
 
         return stt.SpeechResult(None, stt.SpeechResultState.ERROR)
+
+
+async def _async_collect_audio(stream: AsyncIterable[bytes]) -> bytes | None:
+    """Collect a legacy transcription request within the input-size bound."""
+    audio = bytearray()
+    async for chunk in stream:
+        if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
+            return None
+        audio.extend(chunk)
+    return bytes(audio)
