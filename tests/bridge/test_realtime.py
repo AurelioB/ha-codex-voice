@@ -95,6 +95,75 @@ class FakePeer:
         self.closed = True
 
 
+class ControlledStopRpc(SdpFirstRpc):
+    def __init__(
+        self,
+        *,
+        block_stop: bool = False,
+        stop_error: Exception | None = None,
+    ) -> None:
+        super().__init__()
+        self.block_stop = block_stop
+        self.stop_error = stop_error
+        self.stop_started = asyncio.Event()
+        self.release_stop = asyncio.Event()
+        self.stop_calls = 0
+        self.stop_cancelled = False
+        self.stop_timeouts: list[float | None] = []
+
+    async def call(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        if method != "thread/realtime/stop":
+            return await super().call(method, params, timeout=timeout)
+        self.calls.append((method, params))
+        self.stop_calls += 1
+        self.stop_timeouts.append(timeout)
+        self.stop_started.set()
+        try:
+            if self.stop_error is not None:
+                raise self.stop_error
+            if self.block_stop:
+                await self.release_stop.wait()
+        except asyncio.CancelledError:
+            self.stop_cancelled = True
+            raise
+        return {}
+
+
+class ControlledClosePeer(FakePeer):
+    def __init__(
+        self,
+        *,
+        block_close: bool = False,
+        close_error: Exception | None = None,
+    ) -> None:
+        super().__init__()
+        self.block_close = block_close
+        self.close_error = close_error
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+        self.close_calls = 0
+        self.close_cancelled = False
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        try:
+            if self.close_error is not None:
+                raise self.close_error
+            if self.block_close:
+                await self.release_close.wait()
+            self.closed = True
+        except asyncio.CancelledError:
+            self.close_cancelled = True
+            raise
+
+
 class BlockingDrainPeer(FakePeer):
     def __init__(self) -> None:
         super().__init__()
@@ -327,3 +396,128 @@ async def test_unmonitored_input_drain_preserves_app_server_events() -> None:
     await drain
     assert await asyncio.wait_for(session.next_event(), timeout=0.2) == event
     await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_bounds_hung_app_server_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc(block_stop=True)
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    await asyncio.wait_for(session.stop(), timeout=0.5)
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_timeouts == [pytest.approx(0.02)]
+    assert rpc.stop_cancelled is True
+    assert peer.closed is True
+    assert peer.close_cancelled is False
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stop_bounds_hung_peer_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc()
+    peer = ControlledClosePeer(block_close=True)
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    await asyncio.wait_for(session.stop(), timeout=0.5)
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_cancelled is False
+    assert peer.close_calls == 1
+    assert peer.close_cancelled is True
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stop_bounds_hung_rpc_and_peer_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc(block_stop=True)
+    peer = ControlledClosePeer(block_close=True)
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    await asyncio.wait_for(session.stop(), timeout=0.5)
+
+    assert rpc.stop_cancelled is True
+    assert peer.close_cancelled is True
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_error", "close_error"),
+    [
+        (RuntimeError("stop failed"), None),
+        (None, RuntimeError("close failed")),
+        (RuntimeError("stop failed"), RuntimeError("close failed")),
+    ],
+)
+async def test_stop_contains_cleanup_exceptions_and_closes_subscription(
+    stop_error: Exception | None,
+    close_error: Exception | None,
+) -> None:
+    rpc = ControlledStopRpc(stop_error=stop_error)
+    peer = ControlledClosePeer(close_error=close_error)
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stop_is_idempotent_for_concurrent_and_repeat_callers() -> None:
+    rpc = ControlledStopRpc(block_stop=True)
+    peer = ControlledClosePeer(block_close=True)
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    first = asyncio.create_task(session.stop())
+    second = asyncio.create_task(session.stop())
+    await asyncio.wait_for(rpc.stop_started.wait(), timeout=0.2)
+    await asyncio.wait_for(peer.close_started.wait(), timeout=0.2)
+    rpc.release_stop.set()
+    peer.release_close.set()
+
+    await asyncio.gather(first, second)
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_caller_does_not_abandon_shared_cleanup() -> None:
+    rpc = ControlledStopRpc(block_stop=True)
+    peer = ControlledClosePeer(block_close=True)
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+    caller = asyncio.create_task(session.stop())
+    await asyncio.wait_for(rpc.stop_started.wait(), timeout=0.2)
+    await asyncio.wait_for(peer.close_started.wait(), timeout=0.2)
+
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert peer.close_cancelled is True
+    assert rpc.stop_cancelled is True
+    assert rpc.subscription.closed is True

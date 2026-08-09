@@ -5,6 +5,49 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-09
+
+### Changed
+
+- Default newly created Conversation profiles to App Server's configurable
+  `priority` service tier, while preserving `standard` for existing profiles
+  that predate the option. Priority targets lower response latency and consumes
+  more subscription availability.
+- Align selectable reasoning efforts with the installed model catalog by
+  adding `ultra`, removing `none`, and safely mapping legacy unsupported values
+  to the latency-oriented `low` default.
+- Add an opt-in guarded live-STT fragment completion path. The safe default
+  remains 2 s because local WebRTC input drain is not remote recognition
+  completion. A measured deployment may explicitly select 0.5–2 s; the shorter
+  deadline is used only after successful input drain with a normalized,
+  unity-gain live feed and no handoff. Completion diagnostics remain numeric
+  and privacy-safe.
+- Calibrate streaming STT incrementally with a bounded 600 ms analysis window
+  and recognize speech-like quiet input without opening on digital silence,
+  steady noise, or isolated clicks. This prevents quiet ThirdReality captures
+  from being replayed only after EOF and removes the prior full-prefix rescan
+  cost as utterances grow.
+- Bound realtime-session shutdown to 5 s and private-thread disposal to one
+  separate 5 s wall-clock budget. Delete and legacy unsubscribe fallback now
+  share that budget, including a stalled App Server write, instead of adding a
+  nominal 30 s failure tail before a retry or error can return.
+- Pin a reversible, bytecode-guarded ThirdReality overlay for the tested v1.1.7
+  client. It lets Home Assistant prepare the pipeline during the 0.399592 s
+  wake cue without forwarding cue audio, and rejects stale callbacks after a
+  run ends, disconnects, is cancelled, or is replaced. Transactional rollback
+  and a bounded missing-EOF watchdog prevent mute, player, send, and cue
+  failures from wedging later wakes. The global mpv-cache experiment is not
+  included because its small observed difference was noisy and it also affected
+  sustained music playback. Device launch guidance also disables Python bytecode
+  writes so a permissive firmware umask cannot create a writable root import
+  artifact.
+
+### Fixed
+
+- Retain constrained `appendText` synthesis for the official Home Assistant
+  `tts.speak` path. A cold `appendSpeech` experiment timed out at 90.047 s with
+  HTTP 504 and is not enabled.
+
 ## [0.1.9] - 2026-08-08
 
 ### Added

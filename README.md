@@ -43,11 +43,17 @@ inside Home Assistant, so its user and Assist policies stay authoritative.
   thread and WebRTC setup can overlap the finite microphone capture.
 - Milestone 1 TTS progressively delivers realtime speech frames instead of
   waiting for the entire rendered response and remote cleanup.
+- Newly created Conversation profiles default to low reasoning effort and App
+  Server's configurable `priority` tier; upgraded profiles preserve standard
+  usage until reconfigured, and `standard` remains available when lower
+  subscription usage matters more than latency.
 - Automatic STT-to-TTS session reuse is disabled: current realtime v3 sessions
   can begin assistant output before finite STT completes, so the official Assist
   flow uses a fresh, isolated TTS session.
-- Milestone 2: experimental realtime duplex-audio proxy with barge-in-ready
-  session primitives.
+- Milestone 2 foundation: an experimental bridge-side realtime duplex-audio
+  proxy. A ThirdReality duplex client, playback interruption, acoustic echo
+  cancellation, and end-to-end barge-in are still pending; this transport is
+  not yet a user-facing realtime voice mode.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.146.0 or newer.
 
@@ -145,7 +151,8 @@ defense in depth.
 ## Realtime protocol
 
 `ws://BRIDGE/v1/realtime` accepts authenticated JSON messages from LAN
-clients:
+clients. This is a bridge protocol primitive, not a Home Assistant entity or a
+finished ThirdReality client:
 
 - `start`: create an audio-output Codex realtime session, selecting `model`,
   `voice`, and optional session `prompt`.
@@ -250,10 +257,12 @@ opt-in and must never print OAuth tokens or recorded audio.
   depends on hardware/firmware support for the bridge's authenticated PCM
   WebSocket protocol.
 - ThirdReality firmware 1.01.07 does not forward microphone audio until its
-  wake confirmation sound has completely finished. Shortening the cue,
-  selecting aggressive finished-speaking detection, or raising hardware
-  microphone gain can reduce waits or improve recognition, but each is a
-  device-side change with explicit accuracy and clipping acceptance checks.
+  wake confirmation sound has completely finished. The optional pinned overlay
+  can ask Home Assistant to prepare the pipeline during that cue while still
+  withholding microphone audio until EOF. Shortening the cue, applying the
+  overlay, selecting aggressive finished-speaking detection, or raising
+  hardware microphone gain are device-side changes with explicit accuracy,
+  compatibility, and clipping acceptance checks.
 - The official ThirdReality v1.2 firmware is a substantial Python-to-C++
   rewrite, but the target has one boot/system/recovery set rather than A/B
   slots. Do not flash the sole production speaker. Test only on a spare after

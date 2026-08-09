@@ -25,10 +25,14 @@ from .api import (
 from .const import (
     CONF_MODEL,
     CONF_REASONING_EFFORT,
+    CONF_SERVICE_TIER,
     DEFAULT_CONVERSATION_MODEL,
     DEFAULT_CONVERSATION_REASONING_EFFORT,
     DOMAIN,
+    LEGACY_CONVERSATION_SERVICE_TIER,
     SUBENTRY_TYPE_CONVERSATION,
+    SUPPORTED_REASONING_EFFORTS,
+    SUPPORTED_SERVICE_TIERS,
 )
 from .entity import CodexVoiceEntity
 
@@ -172,15 +176,26 @@ class CodexVoiceConversationEntity(
                     chat_log.delta_listener(chat_log, asdict(tool_result))
             return result
 
+        effort = options.get(
+            CONF_REASONING_EFFORT,
+            DEFAULT_CONVERSATION_REASONING_EFFORT,
+        )
+        if effort not in SUPPORTED_REASONING_EFFORTS:
+            effort = DEFAULT_CONVERSATION_REASONING_EFFORT
+        service_tier = options.get(
+            CONF_SERVICE_TIER,
+            LEGACY_CONVERSATION_SERVICE_TIER,
+        )
+        if service_tier not in SUPPORTED_SERVICE_TIERS:
+            service_tier = LEGACY_CONVERSATION_SERVICE_TIER
+
         start_payload = {
             "conversation_id": chat_log.conversation_id,
             "text": user_input.text,
             "language": user_input.language,
             "model": options.get(CONF_MODEL, DEFAULT_CONVERSATION_MODEL),
-            "effort": options.get(
-                CONF_REASONING_EFFORT,
-                DEFAULT_CONVERSATION_REASONING_EFFORT,
-            ),
+            "effort": effort,
+            "service_tier": service_tier,
             "instructions": _conversation_instructions(chat_log),
             "messages": _serialize_chat_log(chat_log),
             "tools": _serialize_tools(chat_log),

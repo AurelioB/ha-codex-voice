@@ -18,7 +18,9 @@ from custom_components.codex_voice.const import (
     CONF_ACCESS_TOKEN,
     CONF_BRIDGE_URL,
     CONF_REASONING_EFFORT,
+    CONF_SERVICE_TIER,
     DEFAULT_CONVERSATION_REASONING_EFFORT,
+    DEFAULT_CONVERSATION_SERVICE_TIER,
     DOMAIN,
 )
 
@@ -75,6 +77,9 @@ async def test_user_flow_creates_three_provider_subentries(
     assert result["subentries"][0]["data"][CONF_REASONING_EFFORT] == (
         DEFAULT_CONVERSATION_REASONING_EFFORT
     )
+    assert result["subentries"][0]["data"][CONF_SERVICE_TIER] == (
+        DEFAULT_CONVERSATION_SERVICE_TIER
+    )
 
 
 async def test_user_flow_reports_invalid_auth(hass: HomeAssistant) -> None:
@@ -98,6 +103,49 @@ async def test_user_flow_reports_invalid_auth(hass: HomeAssistant) -> None:
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_legacy_conversation_reconfigure_suggests_safe_supported_values(
+    hass: HomeAssistant,
+) -> None:
+    """A pre-tier profile opens with standard usage and a supported effort."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_BRIDGE_URL: "http://bridge.local:8787",
+            CONF_ACCESS_TOKEN: "bridge-token",
+        },
+        subentries_data=[
+            {
+                "data": {
+                    "model": "gpt-test",
+                    CONF_REASONING_EFFORT: "none",
+                },
+                "subentry_type": "conversation",
+                "title": "Legacy conversation",
+                "unique_id": None,
+            }
+        ],
+    )
+    entry.add_to_hass(hass)
+    subentry = next(iter(entry.subentries.values()))
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "conversation"),
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "subentry_id": subentry.subentry_id,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    suggestions = {
+        marker.schema: marker.description.get("suggested_value")
+        for marker in result["data_schema"].schema
+        if isinstance(marker.description, dict)
+    }
+    assert suggestions[CONF_REASONING_EFFORT] == (DEFAULT_CONVERSATION_REASONING_EFFORT)
+    assert suggestions[CONF_SERVICE_TIER] == "standard"
 
 
 async def test_duplicate_bridge_is_rejected(hass: HomeAssistant) -> None:

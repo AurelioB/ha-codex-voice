@@ -79,6 +79,7 @@ class BridgeConfig:
     synthesis_timeout: float = 90.0
     realtime_version: str = "v3"
     silence_ms: int = 0
+    live_fragment_quiet_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -91,6 +92,8 @@ class BridgeConfig:
             raise ValueError("codex_command must not be empty")
         if not self.permission_profile:
             raise ValueError("permission_profile must not be empty")
+        if not 0.5 <= self.live_fragment_quiet_seconds <= 2.0:
+            raise ValueError("live_fragment_quiet_seconds must be between 0.5 and 2.0")
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -124,4 +127,10 @@ class BridgeConfig:
             ),
             realtime_version=os.environ.get("HA_CODEX_REALTIME_VERSION", "v3"),
             silence_ms=int(os.environ.get("HA_CODEX_TRANSCRIBE_SILENCE_MS", "0")),
+            live_fragment_quiet_seconds=float(
+                os.environ.get(
+                    "HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS",
+                    "2.0",
+                )
+            ),
         )

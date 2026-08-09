@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections import deque
 from collections.abc import Mapping
@@ -14,6 +13,7 @@ from .errors import AppServerExited, ProtocolError
 from .webrtc import WebRtcPeer
 
 _EVENT_BACKLOG_LIMIT = 64
+_STOP_TIMEOUT_SECONDS = 5.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -65,6 +65,7 @@ class RealtimeSession:
         self._backlog: deque[dict[str, Any]] = deque(maxlen=_EVENT_BACKLOG_LIMIT)
         self._started = False
         self._closed = False
+        self._stop_waiter: asyncio.Future[None] | None = None
 
     async def start(
         self,
@@ -256,18 +257,75 @@ class RealtimeSession:
                 events.append(event)
 
     async def stop(self) -> None:
-        if self._closed:
+        if self._stop_waiter is not None:
+            await asyncio.shield(self._stop_waiter)
             return
         self._closed = True
-        if self._started:
-            with contextlib.suppress(Exception):
+        self._stop_waiter = asyncio.get_running_loop().create_future()
+        try:
+            await self._stop_once()
+        finally:
+            if not self._stop_waiter.done():
+                self._stop_waiter.set_result(None)
+
+    async def _stop_once(self) -> None:
+        cleanup_timeout = max(0.0, min(self.timeout, _STOP_TIMEOUT_SECONDS))
+        remote_stop_task: asyncio.Task[None] | None = None
+        peer_close_finished = False
+
+        async def stop_remote() -> None:
+            try:
                 await self.rpc.call(
                     "thread/realtime/stop",
                     {"threadId": self.thread_id},
-                    timeout=min(self.timeout, 10),
+                    timeout=cleanup_timeout,
                 )
-        await self.peer.close()
-        self.subscription.close()
+            except Exception as err:  # noqa: BLE001 - cleanup is best effort
+                LOGGER.warning(
+                    "Realtime cleanup step failed (app-server realtime stop): %s",
+                    err,
+                )
+
+        if self._started:
+            remote_stop_task = asyncio.create_task(
+                stop_remote(), name=f"codex-realtime-rpc-stop-{self.thread_id}"
+            )
+
+        try:
+            async with asyncio.timeout(cleanup_timeout):
+                if remote_stop_task is not None:
+                    # Let a healthy local RPC finish before close exposes the peer as
+                    # closed. If it blocks, peer teardown still proceeds concurrently.
+                    await asyncio.sleep(0)
+                try:
+                    await self.peer.close()
+                except Exception as err:  # noqa: BLE001 - cleanup is best effort
+                    LOGGER.warning(
+                        "Realtime cleanup step failed (WebRTC peer close): %s", err
+                    )
+                peer_close_finished = True
+                if remote_stop_task is not None:
+                    await remote_stop_task
+        except TimeoutError:
+            pending_names = []
+            if not peer_close_finished:
+                pending_names.append("WebRTC peer close")
+            if remote_stop_task is not None and not remote_stop_task.done():
+                pending_names.append("app-server realtime stop")
+            if pending_names:
+                LOGGER.warning(
+                    "Realtime cleanup timed out after %.1f seconds; cancelling %s",
+                    cleanup_timeout,
+                    ", ".join(pending_names),
+                )
+        finally:
+            if remote_stop_task is not None and not remote_stop_task.done():
+                remote_stop_task.cancel()
+            try:
+                if remote_stop_task is not None:
+                    await asyncio.gather(remote_stop_task, return_exceptions=True)
+            finally:
+                self.subscription.close()
 
     def _belongs_to_thread(self, event: Mapping[str, Any]) -> bool:
         params = event.get("params")
