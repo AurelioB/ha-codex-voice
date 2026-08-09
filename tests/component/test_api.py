@@ -278,6 +278,7 @@ async def test_conversation_normalizes_nested_temporal_values(
 
 async def test_conversation_rejects_unsupported_values_without_leaking_data(
     aiohttp_client: Any,
+    socket_enabled: None,
 ) -> None:
     """Unsupported values fail before connection with a data-safe error."""
     connection_attempted = False
