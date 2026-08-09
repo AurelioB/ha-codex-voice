@@ -461,7 +461,11 @@ def fake_rpc() -> FakeRpc:
 
 
 @pytest.fixture
-def bridge_app(fake_rpc: FakeRpc) -> web.Application:
+def bridge_app(
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> web.Application:
+    monkeypatch.setattr(bridge_service, "SPEECH_SESSION_HANDOFF_ENABLED", True)
     return create_app(
         BridgeConfig(bearer_token="test-token"),
         rpc=fake_rpc,
@@ -1975,6 +1979,59 @@ async def test_speech_session_handoff_reuses_exact_realtime_session(
 
 
 @pytest.mark.asyncio
+async def test_speech_session_handoff_is_disabled_by_default(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    """Released bridge requests always close STT and omit reuse tickets."""
+    app = create_app(
+        BridgeConfig(bearer_token="test-token"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+
+    transcription = await _request_speech_session_handoff(client)
+
+    assert transcription["text"] == "Turn on the kitchen"
+    assert "speech_session_handoff" not in transcription
+    assert app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_post_speech_session_handoff_is_disabled_by_default(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    """The finite transcription route cannot issue a reuse ticket either."""
+    app = create_app(
+        BridgeConfig(bearer_token="test-token"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    payload = _transcription_payload()
+    payload["language"] = "en-US"
+    payload["speech_session_handoff"] = {
+        "version": 1,
+        "voice": "cove",
+        "language": "en-US",
+    }
+
+    response = await client.post("/v1/transcribe", headers=AUTH, json=payload)
+
+    assert response.status == 200
+    transcription = await response.json()
+    assert transcription["text"] == "Turn on the kitchen"
+    assert "speech_session_handoff" not in transcription
+    assert app[bridge_service.STATE_KEY]._speech_session_offer is None
+    assert fake_rpc.peers[0].closed
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_post_transcription_handoff_reuses_exact_realtime_session(
     aiohttp_client: Any,
     bridge_app: web.Application,
@@ -2621,6 +2678,7 @@ async def test_speech_handoff_watchdog_rejects_mixed_active_transcript(
 @pytest.mark.parametrize(
     "event",
     [
+        {"type": "turn.created", "turn": {"role": "assistant"}},
         {"type": "turn.done", "turn": {"role": "assistant"}},
         {"type": "output_transcript.added", "text": "private-output"},
     ],
@@ -2688,11 +2746,93 @@ def test_speech_handoff_validators_accept_known_input_shapes() -> None:
     bridge_service._validate_speech_handoff_data_event(
         json.dumps(
             {
+                "type": "turn.created",
+                "turn": {"id": "input-turn", "role": "user"},
+            }
+        )
+    )
+    bridge_service._validate_speech_handoff_data_event(
+        json.dumps(
+            {
                 "type": "turn.done",
                 "turn": {"role": "user", "input_transcript": "private-input"},
             }
         )
     )
+
+
+def test_speech_handoff_data_validator_accepts_correlated_input_turn_delta() -> None:
+    boundary_state = bridge_service._SpeechHandoffBoundaryState()
+    bridge_service._validate_speech_handoff_data_event(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "input-turn", "role": "user"},
+            }
+        ),
+        boundary_state=boundary_state,
+    )
+    bridge_service._validate_speech_handoff_data_event(
+        json.dumps(
+            {
+                "type": "turn.delta",
+                "turn_id": "input-turn",
+                "delta": "known input",
+            }
+        ),
+        boundary_state=boundary_state,
+        known_input="the known input transcript",
+    )
+
+
+@pytest.mark.parametrize(
+    ("event", "known_input", "use_state"),
+    [
+        (
+            {
+                "type": "turn.delta",
+                "turn_id": "input-turn",
+                "delta": "known input",
+            },
+            "the known input transcript",
+            False,
+        ),
+        (
+            {
+                "type": "turn.delta",
+                "turn_id": "other-turn",
+                "delta": "known input",
+            },
+            "the known input transcript",
+            True,
+        ),
+        (
+            {
+                "type": "turn.delta",
+                "turn_id": "input-turn",
+                "delta": "assistant output",
+            },
+            "the known input transcript",
+            True,
+        ),
+    ],
+)
+def test_speech_handoff_data_validator_rejects_uncorrelated_turn_delta(
+    event: dict[str, Any],
+    known_input: str,
+    use_state: bool,
+) -> None:
+    boundary_state = (
+        bridge_service._SpeechHandoffBoundaryState(input_turn_id="input-turn")
+        if use_state
+        else None
+    )
+    with pytest.raises(ProtocolError):
+        bridge_service._validate_speech_handoff_data_event(
+            json.dumps(event),
+            boundary_state=boundary_state,
+            known_input=known_input,
+        )
 
 
 @pytest.mark.asyncio
@@ -3837,6 +3977,41 @@ async def test_handoff_transcription_rejects_simultaneous_assistant_data() -> No
             ),
             timeout=0.2,
         )
+
+
+@pytest.mark.asyncio
+async def test_handoff_transcription_preserves_stt_when_reuse_is_invalidated() -> None:
+    """Unsafe output disables reuse without discarding the valid STT result."""
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "text": "Turn on the kitchen.",
+            },
+        }
+    )
+    session.data.put_nowait(
+        json.dumps(
+            {"type": "turn.done", "turn": {"role": "assistant", "text": "unsafe"}}
+        )
+    )
+    boundary_state = bridge_service._SpeechHandoffBoundaryState()
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(
+            session,
+            1.0,
+            strict_handoff_boundary=True,
+            handoff_boundary_state=boundary_state,
+        ),
+        timeout=0.2,
+    )
+
+    assert transcript == "Turn on the kitchen."
+    assert boundary_state.invalidated
 
 
 @pytest.mark.asyncio

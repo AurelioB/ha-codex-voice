@@ -7,7 +7,7 @@ import io
 import logging
 import wave
 from collections.abc import AsyncGenerator, Mapping
-from typing import Any, override
+from typing import Any, Final, override
 
 from homeassistant.components.tts import (
     ATTR_PREFERRED_FORMAT,
@@ -46,6 +46,11 @@ from .const import (
 from .entity import CodexVoiceEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+# Frameless Bidi v3 currently begins assistant output before finite STT has
+# completed, and its supported client protocol has no response-cancel control.
+# Keep the private reuse machinery dormant until a quiet handoff can be proven.
+_AUTOMATIC_SPEECH_SESSION_HANDOFF_ENABLED: Final = False
 
 PARALLEL_UPDATES = 0
 
@@ -99,11 +104,13 @@ class CodexVoiceTTSEntity(TextToSpeechEntity, CodexVoiceEntity):
             ATTR_VOICE: voice,
             ATTR_PREFERRED_FORMAT: "wav",
         }
-        if not self.subentry.data.get(
-            CONF_INSTRUCTIONS
-        ) and _prepare_speech_session_handoff(
-            self.entry.runtime_data,
-            voice=voice,
+        if (
+            _AUTOMATIC_SPEECH_SESSION_HANDOFF_ENABLED
+            and not self.subentry.data.get(CONF_INSTRUCTIONS)
+            and _prepare_speech_session_handoff(
+                self.entry.runtime_data,
+                voice=voice,
+            )
         ):
             options[_SPEECH_SESSION_HANDOFF_OPTION] = (
                 _SPEECH_SESSION_HANDOFF_OPTION_VALUE

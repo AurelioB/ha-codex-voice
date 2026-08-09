@@ -77,6 +77,9 @@ SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
 SPEECH_SESSION_HANDOFF_VERSION = 1
 SPEECH_SESSION_HANDOFF_TTL_SECONDS = 30.0
 SPEECH_SESSION_HANDOFF_SETTLE_CYCLES = 3
+# Realtime v3 can emit assistant output before finite STT completes, and later
+# PCM cannot be causally bound to appendSpeech. Keep ticket issuance disabled.
+SPEECH_SESSION_HANDOFF_ENABLED = False
 SPEECH_SESSION_CLEANUP_ADMISSION_TIMEOUT_SECONDS = 5.0
 
 
@@ -187,6 +190,15 @@ class _TranscriptionOverlapTiming:
 
 
 @dataclass(slots=True)
+class _SpeechHandoffBoundaryState:
+    """Content-private correlation for input-side v3 turn lifecycle events."""
+
+    input_turn_id: str | None = None
+    authoritative_input: str = field(default="", repr=False)
+    invalidated: bool = False
+
+
+@dataclass(slots=True)
 class _RetainedSpeechSession:
     """Exactly-once ownership wrapper around a live realtime resource."""
 
@@ -194,6 +206,10 @@ class _RetainedSpeechSession:
     thread_id: str = field(repr=False)
     voice: str
     language: str | None = None
+    boundary_state: _SpeechHandoffBoundaryState = field(
+        default_factory=_SpeechHandoffBoundaryState,
+        repr=False,
+    )
     invalidated: bool = False
     _close_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
@@ -359,7 +375,10 @@ class BridgeState:
                     await asyncio.shield(cleanup_task)
                 else:
                     try:
-                        await _sanitize_speech_handoff_session(retained.session)
+                        await _sanitize_speech_handoff_session(
+                            retained.session,
+                            retained.boundary_state,
+                        )
                     except (AppServerExited, BridgeError, TimeoutError, ValueError):
                         retained.invalidated = True
                         cleanup_task = self._track_speech_cleanup(retained)
@@ -435,7 +454,10 @@ class BridgeState:
     async def _watch_speech_session_offer(self, offer: _SpeechSessionOffer) -> None:
         try:
             async with asyncio.timeout_at(offer.expires_at):
-                await _wait_for_speech_handoff_invalidation(offer.resource.session)
+                await _wait_for_speech_handoff_invalidation(
+                    offer.resource.session,
+                    offer.resource.boundary_state,
+                )
         except asyncio.CancelledError:
             raise
         except (AppServerExited, BridgeError, TimeoutError, ValueError):
@@ -690,15 +712,21 @@ async def _cancel_speech_offer_watchdog(offer: _SpeechSessionOffer) -> None:
     await asyncio.gather(watchdog, return_exceptions=True)
 
 
-async def _sanitize_speech_handoff_session(session: RealtimeSession) -> None:
+async def _sanitize_speech_handoff_session(
+    session: RealtimeSession,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
     """Establish a quiet boundary between finite STT and retained TTS."""
     session.discard_pending_input()
     for _ in range(SPEECH_SESSION_HANDOFF_SETTLE_CYCLES):
-        _validate_speech_handoff_boundary_now(session)
+        _validate_speech_handoff_boundary_now(session, boundary_state)
         await asyncio.sleep(0)
 
 
-def _validate_speech_handoff_boundary_now(session: RealtimeSession) -> None:
+def _validate_speech_handoff_boundary_now(
+    session: RealtimeSession,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
     """Drain and validate every event already visible at a handoff boundary."""
     audio_chunks = session.drain_audio_nowait()
     if any(audio_chunks):
@@ -706,11 +734,15 @@ def _validate_speech_handoff_boundary_now(session: RealtimeSession) -> None:
     for app_event in session.drain_app_events_nowait():
         _validate_speech_handoff_app_event(app_event)
     for data_event in session.drain_data_events_nowait():
-        _validate_speech_handoff_data_event(data_event)
+        _validate_speech_handoff_data_event(
+            data_event,
+            boundary_state=boundary_state,
+        )
 
 
 async def _wait_for_speech_handoff_invalidation(
     session: RealtimeSession,
+    boundary_state: _SpeechHandoffBoundaryState,
 ) -> None:
     """Drain benign late STT events and stop on any assistant-side activity."""
     audio_task = asyncio.create_task(session.recv_audio())
@@ -734,7 +766,10 @@ async def _wait_for_speech_handoff_invalidation(
                 event_task = asyncio.create_task(session.next_event())
                 tasks.add(event_task)
             if data_task in done:
-                _validate_speech_handoff_data_event(data_task.result())
+                _validate_speech_handoff_data_event(
+                    data_task.result(),
+                    boundary_state=boundary_state,
+                )
                 tasks.remove(data_task)
                 data_task = asyncio.create_task(session.recv_data_event())
                 tasks.add(data_task)
@@ -761,7 +796,11 @@ async def _wait_for_speech_handoff_invalidation(
             if isinstance(result, BaseException):
                 raise result
             try:
-                _validate_speech_handoff_receive_result(source, result)
+                _validate_speech_handoff_receive_result(
+                    source,
+                    result,
+                    boundary_state=boundary_state,
+                )
             except (BridgeError, TimeoutError, ValueError) as err:
                 if validation_error is None:
                     validation_error = err
@@ -769,7 +808,12 @@ async def _wait_for_speech_handoff_invalidation(
             raise validation_error
 
 
-def _validate_speech_handoff_receive_result(source: str, result: object) -> None:
+def _validate_speech_handoff_receive_result(
+    source: str,
+    result: object,
+    *,
+    boundary_state: _SpeechHandoffBoundaryState,
+) -> None:
     """Validate a receiver result that won a handoff-watchdog cancellation race."""
     if source == "audio":
         if not isinstance(result, bytes):
@@ -789,7 +833,10 @@ def _validate_speech_handoff_receive_result(source: str, result: object) -> None
             raise ProtocolError(
                 "retained speech session received an invalid data event"
             )
-        _validate_speech_handoff_data_event(result)
+        _validate_speech_handoff_data_event(
+            result,
+            boundary_state=boundary_state,
+        )
         return
     raise RuntimeError("unknown retained speech receiver")
 
@@ -853,7 +900,12 @@ def _is_valid_input_handoff_item(value: object) -> bool:
     return transcript_valid or active_valid
 
 
-def _validate_speech_handoff_data_event(event: str | bytes) -> None:
+def _validate_speech_handoff_data_event(
+    event: str | bytes,
+    *,
+    boundary_state: _SpeechHandoffBoundaryState | None = None,
+    known_input: str = "",
+) -> None:
     if isinstance(event, bytes):
         try:
             event = event.decode()
@@ -923,6 +975,41 @@ def _validate_speech_handoff_data_event(event: str | bytes) -> None:
             )
         _validate_speech_handoff_input_roles(decoded, item)
         return
+    if event_type == "turn.created":
+        turn = decoded.get("turn")
+        if not isinstance(turn, Mapping):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        _validate_speech_handoff_input_roles(decoded, turn, required=True)
+        turn_id = turn.get("id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        if boundary_state is not None:
+            boundary_state.input_turn_id = turn_id
+        return
+    if event_type == "turn.delta":
+        turn_id = decoded.get("turn_id")
+        delta = decoded.get("delta")
+        expected_input = known_input or (
+            boundary_state.authoritative_input if boundary_state is not None else ""
+        )
+        if (
+            boundary_state is None
+            or not isinstance(turn_id, str)
+            or not turn_id
+            or turn_id != boundary_state.input_turn_id
+            or not isinstance(delta, str)
+            or not delta
+            or not expected_input
+            or (delta not in expected_input and expected_input not in delta)
+        ):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
+        return
     if event_type == "turn.done":
         turn = decoded.get("turn")
         if not isinstance(turn, Mapping):
@@ -930,6 +1017,17 @@ def _validate_speech_handoff_data_event(event: str | bytes) -> None:
                 "retained speech session received an invalid data event"
             )
         _validate_speech_handoff_input_roles(decoded, turn, required=True)
+        turn_id = turn.get("id", decoded.get("turn_id"))
+        if (
+            boundary_state is not None
+            and isinstance(turn_id, str)
+            and turn_id
+            and boundary_state.input_turn_id is not None
+            and turn_id != boundary_state.input_turn_id
+        ):
+            raise ProtocolError(
+                "retained speech session received an invalid data event"
+            )
         return
     raise ProtocolError("retained speech session received an unknown data event")
 
@@ -975,6 +1073,7 @@ def _log_speech_handoff_event_shape(
         "active_transcript",
         "content",
         "delta",
+        "id",
         "input_transcript",
         "item",
         "method",
@@ -986,10 +1085,31 @@ def _log_speech_handoff_event_shape(
         "text",
         "threadId",
         "turn",
+        "turnId",
+        "turn_id",
         "type",
         "version",
     }
     keys = ",".join(sorted(str(key) for key in event if key in known_keys)) or "none"
+
+    def value_shape(value: object) -> str:
+        if isinstance(value, Mapping):
+            return "object"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, str):
+            return "string"
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, (int, float)):
+            return "number"
+        return "other"
+
+    value_shapes = ",".join(
+        f"{key}:{value_shape(event[key])}" for key in sorted(known_keys) if key in event
+    )
     raw_type = event.get(type_key)
     event_type = (
         raw_type
@@ -999,12 +1119,43 @@ def _log_speech_handoff_event_shape(
         else "other"
     )
     roles: list[str] = []
-    for value in (
-        event,
-        event.get("params"),
-        event.get("item"),
-        event.get("turn"),
+    nested_types: list[str] = []
+    content_flags: list[str] = []
+    for name, value in (
+        ("event", event),
+        ("params", event.get("params")),
+        ("item", event.get("item")),
+        ("turn", event.get("turn")),
+        ("delta", event.get("delta")),
     ):
+        if isinstance(value, Mapping) and name != "event":
+            nested_raw_type = value.get("type")
+            nested_type = (
+                nested_raw_type
+                if isinstance(nested_raw_type, str)
+                and len(nested_raw_type) <= 64
+                and all(
+                    character.isalnum() or character in "._-/"
+                    for character in nested_raw_type
+                )
+                else "none"
+            )
+            nested_types.append(f"{name}:{nested_type}")
+        if isinstance(value, Mapping):
+            for content_key in ("delta", "input_transcript", "text"):
+                if content_key not in value:
+                    continue
+                content_value = value.get(content_key)
+                content_flags.append(
+                    f"{name}.{content_key}:"
+                    + (
+                        "nonempty"
+                        if isinstance(content_value, str) and bool(content_value)
+                        else "empty"
+                        if isinstance(content_value, str)
+                        else "nonstring"
+                    )
+                )
         if not isinstance(value, Mapping) or "role" not in value:
             continue
         role = str(value.get("role", "")).lower()
@@ -1013,11 +1164,15 @@ def _log_speech_handoff_event_shape(
         )
     LOGGER.debug(
         "Retained speech boundary event shape: source=%s event_type=%s "
-        "known_keys=%s roles=%s",
+        "known_keys=%s value_shapes=%s nested_types=%s roles=%s "
+        "content_flags=%s",
         source,
         event_type,
         keys,
+        value_shapes or "none",
+        ",".join(nested_types) or "none",
         ",".join(roles) or "none",
+        ",".join(content_flags) or "none",
     )
 
 
@@ -1133,7 +1288,11 @@ async def _transcribe_admitted(
         raise ProtocolError(
             "speech_session_handoff language must match transcription language"
         )
-    retained_voice = handoff_voice if state.config.realtime_version == "v3" else None
+    retained_voice = (
+        handoff_voice
+        if SPEECH_SESSION_HANDOFF_ENABLED and state.config.realtime_version == "v3"
+        else None
+    )
     raw = decode_base64_audio(payload.get("audio"))
     sample_rate = _positive_int(
         payload.get("sample_rate", metadata.get("sample_rate", 16_000)), "sample_rate"
@@ -1299,7 +1458,9 @@ async def _transcribe_stream_admitted(
             handoff_voice,
         ) = _validate_transcription_stream_start(first)
         retained_voice = (
-            handoff_voice if state.config.realtime_version == "v3" else None
+            handoff_voice
+            if SPEECH_SESSION_HANDOFF_ENABLED and state.config.realtime_version == "v3"
+            else None
         )
         audio_ready = asyncio.get_running_loop().create_future()
         transcription_task = asyncio.create_task(
@@ -1892,6 +2053,9 @@ async def _run_transcription_attempt_when_audio_ready(
             )
             timeout_stage = "transcript"
             transcript_wait_started = time.monotonic()
+            handoff_boundary_state = (
+                _SpeechHandoffBoundaryState() if retain_voice is not None else None
+            )
             try:
                 # The remote recognizer can stop pulling the trailing silence once it
                 # has emitted a transcript, leaving the local track's drain marker
@@ -1912,6 +2076,7 @@ async def _run_transcription_attempt_when_audio_ready(
                         transcript_timeout,
                         fragment_finalization_at=feed_started + duration,
                         strict_handoff_boundary=True,
+                        handoff_boundary_state=handoff_boundary_state,
                     )
             finally:
                 transcript_wait_seconds = time.monotonic() - transcript_wait_started
@@ -1919,9 +2084,16 @@ async def _run_transcription_attempt_when_audio_ready(
                     drain_task.cancel()
                 await asyncio.gather(drain_task, return_exceptions=True)
             retained_session: _RetainedSpeechSession | None = None
-            if retain_voice is not None:
+            if (
+                retain_voice is not None
+                and handoff_boundary_state is not None
+                and not handoff_boundary_state.invalidated
+            ):
                 try:
-                    await _sanitize_speech_handoff_session(session)
+                    await _sanitize_speech_handoff_session(
+                        session,
+                        handoff_boundary_state,
+                    )
                 except (AppServerExited, BridgeError, TimeoutError, ValueError):
                     pass
                 else:
@@ -1930,6 +2102,7 @@ async def _run_transcription_attempt_when_audio_ready(
                         thread_id=thread_id,
                         voice=retain_voice,
                         language=retain_language,
+                        boundary_state=handoff_boundary_state,
                     )
                     session = None
                     thread_owned = False
@@ -2337,9 +2510,15 @@ async def _synthesize_admitted(
                         role="user",
                     )
                 else:
-                    _validate_speech_handoff_boundary_now(session)
+                    _validate_speech_handoff_boundary_now(
+                        session,
+                        retained.boundary_state,
+                    )
                     await session.append_speech(text)
-                    _validate_speech_handoff_boundary_now(session)
+                    _validate_speech_handoff_boundary_now(
+                        session,
+                        retained.boundary_state,
+                    )
             finally:
                 append_text_rpc_seconds += time.monotonic() - append_text_started_at
 
@@ -3035,6 +3214,7 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     *,
     fragment_finalization_at: float | None = None,
     strict_handoff_boundary: bool = False,
+    handoff_boundary_state: _SpeechHandoffBoundaryState | None = None,
 ) -> str:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -3059,7 +3239,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                     fragment_ready_at = max(fragment_ready_at, fragment_finalization_at)
                 quiet_remaining = fragment_ready_at - now
                 if quiet_remaining <= 0:
-                    return transcript.strip()
+                    final_transcript = transcript.strip()
+                    _remember_speech_handoff_input(
+                        handoff_boundary_state,
+                        final_transcript,
+                    )
+                    return final_transcript
                 remaining = min(remaining, quiet_remaining)
             elif realtime_closed_at is not None:
                 close_remaining = TRANSCRIPTION_FRAGMENT_QUIET_SECONDS - (
@@ -3087,7 +3272,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                             fragment_ready_at, fragment_finalization_at
                         )
                     if now >= fragment_ready_at:
-                        return transcript.strip()
+                        final_transcript = transcript.strip()
+                        _remember_speech_handoff_input(
+                            handoff_boundary_state,
+                            final_transcript,
+                        )
+                        return final_transcript
                 if realtime_closed_at is not None:
                     raise TimeoutError(
                         "realtime session closed before transcription completed"
@@ -3105,7 +3295,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
             if event_task in ready:
                 event = event_task.result()
                 if strict_handoff_boundary:
-                    _validate_speech_handoff_app_event(event)
+                    try:
+                        _validate_speech_handoff_app_event(event)
+                    except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                        if handoff_boundary_state is None:
+                            raise
+                        handoff_boundary_state.invalidated = True
                 method = event.get("method")
                 params = event.get("params", {})
                 if method == "bridge/appServerExited":
@@ -3151,8 +3346,6 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 event_task = asyncio.create_task(session.next_event())
             if data_task in ready:
                 data_event = data_task.result()
-                if strict_handoff_boundary:
-                    _validate_speech_handoff_data_event(data_event)
                 if isinstance(data_event, bytes):
                     data_event = data_event.decode(errors="replace")
                 try:
@@ -3162,6 +3355,33 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 if not isinstance(decoded_event, Mapping):
                     decoded_event = {}
                 event_type = decoded_event.get("type")
+                if strict_handoff_boundary:
+                    known_input = _assembled_transcript(
+                        deltas, list(data_deltas.values())
+                    )
+                    if event_type == "turn.delta":
+                        delta = decoded_event.get("delta")
+                        LOGGER.debug(
+                            "Retained speech turn.delta relation: "
+                            "delta_is_string=%s matches_known_input=%s",
+                            isinstance(delta, str),
+                            bool(
+                                isinstance(delta, str)
+                                and delta
+                                and known_input
+                                and (delta in known_input or known_input in delta)
+                            ),
+                        )
+                    try:
+                        _validate_speech_handoff_data_event(
+                            data_event,
+                            boundary_state=handoff_boundary_state,
+                            known_input=known_input,
+                        )
+                    except (AppServerExited, BridgeError, TimeoutError, ValueError):
+                        if handoff_boundary_state is None:
+                            raise
+                        handoff_boundary_state.invalidated = True
                 candidate = _data_channel_transcript(decoded_event)
                 if event_type == "input_transcript.added" and candidate:
                     item = decoded_event.get("item")
@@ -3183,11 +3403,27 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                         terminal_transcript = transcript
                 data_task = asyncio.create_task(session.recv_data_event())
             if terminal_transcript:
+                _remember_speech_handoff_input(
+                    handoff_boundary_state,
+                    terminal_transcript,
+                )
                 return terminal_transcript
     finally:
         event_task.cancel()
         data_task.cancel()
         await asyncio.gather(event_task, data_task, return_exceptions=True)
+
+
+def _remember_speech_handoff_input(
+    boundary_state: _SpeechHandoffBoundaryState | None,
+    transcript: str,
+) -> None:
+    """Retain one bounded input transcript only for same-session validation."""
+    if boundary_state is None:
+        return
+    if not transcript or len(transcript) > 64_000:
+        raise ProtocolError("retained speech input transcript is invalid")
+    boundary_state.authoritative_input = transcript
 
 
 def _data_channel_transcript(event: Mapping[str, Any]) -> str:

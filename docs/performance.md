@@ -14,7 +14,7 @@ The standard Assist path remains turn-based:
 wake cue -> capture -> STT -> Conversation -> TTS -> speaker playback
 ```
 
-Three optimizations shorten different parts of that path:
+Two enabled optimizations shorten different parts of that path:
 
 1. Streaming STT sends microphone frames to the bridge while Home Assistant is
    still capturing. The bridge starts the Codex thread and WebRTC handshake as
@@ -25,9 +25,11 @@ Three optimizations shorten different parts of that path:
 2. Streaming TTS returns an EOF-terminated PCM16 WAV stream as realtime speech
    frames arrive. Home Assistant can begin serving audio without waiting for
    the complete rendered response and remote cleanup.
-3. An eligible Assist turn can hand its successful STT realtime v3 session to
-   the TTS result stream that the official pipeline prepared before STT. This
-   avoids a second thread start and WebRTC handshake for that turn.
+
+Automatic STT-to-TTS session reuse is not enabled. Live validation found that
+the realtime v3 session can start genuine assistant output before the user
+transcript completes, and the supported tagged Frameless Bidi outbound protocol
+does not define a response-cancel message.
 
 These paths preserve the finite Home Assistant provider contracts. They do not
 turn the standard Assist pipeline into a full-duplex or barge-in session.
@@ -96,30 +98,28 @@ probe did not continuously drain and verify a quiet realtime stream before
 `appendSpeech`, so that frame cannot be causally attributed to the speech
 request and is not a warm-TTS latency measurement.
 
-A retained-session latency result remains pending a controlled quiet-boundary
-A/B probe. That probe must use one continuous reader, reject any audio or
-assistant/output event during at least two seconds of pre-append quiet, require
-the first audio to follow the acknowledged append, and confirm a randomized
-non-sensitive canary in memory without logging its text or audio. It should run
-matched no-append controls and repeated treatment/control trials. Because
-realtime v3 output has no turn identifier, timing alone is not causal evidence.
-A complete physical Assist A/B measurement must then include Conversation,
-Home Assistant proxying, speaker buffering, and playback.
+A later causal probe observed non-empty assistant transcript and output events
+before the user transcript completed. The bridge rejected that session for
+reuse while still returning the valid STT result. Codex 0.146.0's tagged
+[Frameless Bidi outbound message
+definitions](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs#L42-L84)
+include session close and context/delegation appends but no response-cancel
+control. There is therefore no retained-session latency claim, and automatic
+handoff remains disabled. A future implementation must first expose a supported
+cancel-or-transcription-only protocol and prove a quiet causal boundary before
+running a physical A/B.
 
 ## One-time STT-to-TTS session handoff
 
-Handoff is an opt-in wire path between this Home Assistant component and its
-bridge. The bundled component requests it automatically only when the official
-Assist pipeline has prepared this integration's TTS result stream before its
-STT call in the same `ChatSession`; there is currently no per-pipeline UI
-toggle. Configured custom TTS instructions skip preparation. A successful
-streaming STT request may retain its otherwise disposable realtime v3 session
-and return a random 256-bit one-time ticket. The component makes that ticket
-available only through the exact same bridge client and the private marker
-carried by that prepared TTS result.
+Handoff is a dormant diagnostic wire path in the bridge. The bundled Home
+Assistant component never prepares or requests it, and the released bridge
+never retains STT or issues a ticket. Standard Assist STT and TTS therefore
+always use separate realtime threads and sessions. The parser and ownership
+machinery remain covered for future protocol work.
 
-Home Assistant reads an entity's default options before it merges an Assist
-pipeline's voice override. Preparation therefore reserves the TTS subentry's
+If a future supported implementation enables the path, Home Assistant reads an
+entity's default options before it merges an Assist pipeline's voice override.
+Preparation therefore reserves the TTS subentry's
 default voice. If a pipeline overrides it with another supported voice, the
 later exact-voice check safely rejects reuse and takes the cold path; warm reuse
 for per-pipeline voice overrides is not currently supported.
@@ -160,11 +160,8 @@ If reuse fails before any PCM has been returned, synthesis may cold-start once
 within the original deadline; after the first PCM, it fails instead of risking
 duplicate speech.
 
-Privacy-wise, an eligible TTS request intentionally reuses the remote thread
-that just processed the same Assist utterance. It is never shared by tokenless
-or merely adjacent callers. A deployment that requires a new remote context
-for every STT and TTS operation must use a client/build that omits the handoff
-request; direct calls already do so.
+The released component omits the handoff request, so every STT and TTS operation
+has a new remote context. Direct calls do the same.
 
 ## Why remote prewarming is not enabled
 

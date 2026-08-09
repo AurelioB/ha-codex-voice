@@ -44,13 +44,12 @@ copied into Home Assistant or the repository.
 Threads start with `ephemeral: false`, but their persistence is confined to the
 temporary profile. This is intentional: App Server cannot apply
 `thread/delete` to an ephemeral thread. The bridge deletes one-shot STT, TTS,
-and realtime threads as soon as their session ends. The only bounded exception
-is an explicitly requested STT-to-TTS handoff, whose same thread and session
-may remain alive for up to 30 seconds before one compatible TTS claim. It is
-then deleted like any other one-shot thread. Cached Conversation threads are
-deleted when retired, evicted, or the bridge closes. Deletion unloads the
-thread immediately instead of retaining it for App Server's idle-unload
-period.
+and realtime threads as soon as their session ends. The bundled Home Assistant
+component does not retain STT sessions for TTS, and the released bridge never
+issues a handoff ticket. Dormant validation and ownership machinery remains for
+future protocol work. Cached Conversation threads are deleted when retired,
+evicted, or the bridge closes. Deletion unloads the thread immediately instead
+of retaining it for App Server's idle-unload period.
 
 ## Subscription audio adapter
 
@@ -63,8 +62,7 @@ The bridge therefore creates short-lived realtime-conversation sessions:
    transport.
 3. Apply the answer returned by App Server.
 4. Send or receive RTP audio and observe transcript events.
-5. Stop and dispose of the session on success, timeout, cancellation, or error,
-   or transfer a successful STT resource into the bounded one-time TTS offer.
+5. Stop and dispose of the session on success, timeout, cancellation, or error.
 
 The active outbound track is required even for synthesis: a transceiver-only
 offer negotiates successfully but the subscription service does not deliver
@@ -87,55 +85,46 @@ PCM frames. The completed capture is normalized and released to that task only
 after explicit EOF. This overlaps remote setup with capture while preserving a
 finite, whole-utterance recognition boundary.
 
-The normal lifecycle still creates a fresh realtime resource per speech
-operation. When the official Assist pipeline prepares this integration's TTS
-result stream before running its STT entity in the same `ChatSession`, the
-bundled component explicitly asks the bridge to retain its successful realtime
-v3 resource for that prepared voice and language. This is automatic in the
-current component and has no per-pipeline UI toggle; an active chat session
-without that private preparation marker is not eligible. Configured custom TTS
-instructions also disable preparation because retained sessions cannot safely
-change that profile.
+The production lifecycle creates a fresh realtime resource per speech
+operation. Automatic reuse is disabled because live v3 sessions emitted
+assistant output before finite STT completion and the supported Frameless Bidi
+outbound protocol has no response-cancel control. This keeps the official Home
+Assistant provider flow isolated and deterministic.
 
 ```text
 STT active
-  -> no handoff / failure -> stop session -> delete thread
-  -> handoff offered (one ticket, 30 s)
-       -> compatible claim -> sanitize -> appendSpeech -> stop/delete
-       -> expiry, mismatch, release, or remote activity -> stop/delete
+  -> transcript result -> stop session -> delete thread
+  -> TTS -> start fresh session -> stream speech -> stop/delete
 ```
 
-The ticket has 256 random bits and is single-use. The bridge stores its SHA-256
-digest; outside the authenticated request/response transport, the raw value
-remains only in the component's private in-memory context. The component binds
-it to the exact bridge client, exact Home Assistant `ChatSession` object,
-pre-STT TTS preparation, voice, and normalized language. The bridge
-independently requires a matching ticket digest, unexpired offer, compatible
-voice and language, no custom TTS instructions, and a quiet retained session.
-It drains pending STT input and events, and a watchdog invalidates unexpected
-assistant output, audio, closure, or App Server failure.
+The dormant diagnostic handoff protocol uses a 256-bit single-use ticket. Its
+design stores only a SHA-256 digest in the bridge; outside the authenticated
+request/response transport, the raw value would remain in the component's
+private in-memory context. The component-side design binds it to the exact
+bridge client, Home Assistant `ChatSession` object, pre-STT TTS preparation,
+voice, and normalized language. The bridge-side design also requires a matching
+ticket digest, unexpired offer, compatible voice and language, no custom TTS
+instructions, and an observed quiet boundary.
 
-This makes reuse explicit rather than interpreting “the next TTS request” as
-ownership. Calls without the marker preserved in the pipeline's prepared TTS
+This would make reuse explicit rather than interpreting “the next TTS request”
+as ownership. Calls without the marker preserved in the pipeline's prepared TTS
 result—including ordinary direct `tts.speak` service calls, even in the same
 chat session—take a fresh session. A mismatched or expired offer is cleaned
 before the new cold session starts. If claimed reuse fails before the first PCM
 leaves the bridge, synthesis can try the cold path within the original
 deadline; it cannot restart after first PCM without risking duplicate speech.
 
-The retained thread has already received the user's STT audio and will receive
-the same turn's TTS text. Deployments that require separate remote contexts for
-those operations must use a client/build that omits the private handoff
-request. Tickets are bearer secrets and are excluded from logs and diagnostics.
+The bundled component omits the private request, so STT and TTS always use
+separate remote contexts. Diagnostic tickets remain bearer secrets and are
+excluded from logs and diagnostics.
 
 The bridge does not prewarm a remote session before a future wake word. A
 custom STT provider has no reliable Home Assistant callback before wake
 detection, an idle peer continues sending paced silent RTP, and a speculative
 session would occupy the single subscription speech lane without a documented
 quota-neutral idle lifetime. Current latency work is therefore limited to
-capture overlap, progressive TTS delivery, and explicitly correlated
-STT-to-TTS reuse. See [performance and ThirdReality tuning](performance.md) for
-the live measurements and acceptance criteria.
+capture overlap and progressive TTS delivery. See [performance and ThirdReality
+tuning](performance.md) for the live measurements and acceptance criteria.
 
 ## Realtime client mode
 

@@ -19,6 +19,7 @@ from homeassistant.helpers import chat_session
 
 from custom_components.codex_voice import CodexVoiceConfigEntry
 from custom_components.codex_voice import api as api_module
+from custom_components.codex_voice import tts as tts_module
 from custom_components.codex_voice.api import (
     BridgeAudio,
     BridgeAuthenticationError,
@@ -204,8 +205,15 @@ async def test_tts_consumes_same_session_handoff_exactly_once() -> None:
     }
 
 
-async def test_pipeline_background_tts_inherits_exact_chat_session() -> None:
+async def test_pipeline_background_tts_inherits_exact_chat_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """HA's TTS background task keeps the pipeline context after its parent moves on."""
+    monkeypatch.setattr(
+        tts_module,
+        "_AUTOMATIC_SPEECH_SESSION_HANDOFF_ENABLED",
+        True,
+    )
     synthesize = AsyncMock(
         return_value=BridgeAudio(data=b"\x00\x01", audio_format="pcm")
     )
@@ -303,8 +311,15 @@ async def test_direct_tts_without_chat_session_cannot_steal_handoff() -> None:
     )
 
 
-async def test_direct_tts_in_same_session_after_stt_cannot_steal_handoff() -> None:
+async def test_direct_tts_in_same_session_after_stt_cannot_steal_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Only HA's saved pre-STT options can claim after transcription finishes."""
+    monkeypatch.setattr(
+        tts_module,
+        "_AUTOMATIC_SPEECH_SESSION_HANDOFF_ENABLED",
+        True,
+    )
     synthesize = AsyncMock(
         return_value=BridgeAudio(data=b"\x00\x01", audio_format="pcm")
     )
@@ -583,6 +598,7 @@ async def test_tts_streams_bridge_audio_and_merges_options() -> None:
     assert entity.supported_options is not None
     assert ATTR_PREFERRED_FORMAT not in entity.supported_options
     assert api_module._SPEECH_SESSION_HANDOFF_OPTION not in entity.supported_options
+    assert api_module._SPEECH_SESSION_HANDOFF_OPTION not in entity.default_options
     assert entity.default_options[ATTR_PREFERRED_FORMAT] == "wav"
     assert response.extension == "wav"
     first_chunk = await anext(response.data_gen)

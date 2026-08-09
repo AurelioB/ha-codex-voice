@@ -75,7 +75,7 @@ still provides best-effort conversational speech and returns the header
 `X-Codex-Synthesis-Mode: conversational-best-effort`; callers must not assume
 that spoken wording exactly matches the input.
 
-## Streaming STT and one-time session handoff
+## Streaming STT and guarded session-handoff experiment
 
 The component opens `/v1/transcribe/stream` before it reads Home Assistant's
 microphone iterator. Once the bridge validates the start object, it starts the
@@ -84,10 +84,16 @@ bridge still waits for explicit capture EOF before normalizing and feeding the
 finite utterance. This overlaps setup without sending partially normalized
 audio or changing Home Assistant's finite STT semantics.
 
-The stream start object may opt into the private handoff protocol with the
-following field. The bundled component adds it only when the official Assist
-pipeline prepared its TTS result before STT in the same `ChatSession`; other
-clients can omit it.
+The bundled component does not request STT-to-TTS session handoff. Live
+realtime v3 validation found that the remote session can begin assistant output
+before finite STT completes, while the supported Frameless Bidi client protocol
+has no response-cancel message. The official Assist path therefore uses a
+fresh TTS session.
+
+The bridge retains the experimental wire schema and validation machinery for
+future protocol work, but the released build never retains the STT session or
+issues a ticket. A request containing the following field is validated and then
+takes the same isolated cold path; production clients should omit it.
 
 ```json
 {
@@ -99,19 +105,20 @@ clients can omit it.
 }
 ```
 
-On eligible realtime v3 success, the result additionally contains a versioned
-random 256-bit ticket, its voice, normalized language, and `expires_in_ms:
-30000`. The handoff language must normalize to the same tag as the outer
-transcription metadata. A compatible `/v1/synthesize` or
+The dormant protocol defines a versioned random 256-bit ticket, its voice,
+normalized language, and `expires_in_ms: 30000`. The handoff language must
+normalize to the same tag as the outer transcription metadata. If a future
+causally safe implementation enables it, a compatible `/v1/synthesize` or
 `/v1/synthesize/stream` request may present the ticket once as
 `speech_session_handoff_token` with that same language. The bridge then uses
 `appendSpeech` on the sanitized STT session instead of creating a second
 thread and WebRTC session. Only one offer can be outstanding on the bridge's
 single speech lane.
 
-The bridge stores only the ticket's SHA-256 digest and never logs the raw
-value. The bearer-authenticated request/response transport carries the ticket;
-Home Assistant otherwise binds it in memory to the exact bridge client,
+The released bridge does not reach ticket issuance. The dormant machinery
+stores only a ticket's SHA-256 digest and never logs the raw value. In that
+protocol, the bearer-authenticated request/response transport carries the
+ticket, and Home Assistant would bind it in memory to the exact bridge client,
 `ChatSession`, official pre-STT TTS preparation, voice, and language. Custom
 TTS instructions, another client/session, direct `tts.speak`, mismatch,
 expiry, remote output, or remote failure cannot implicitly claim it. An
@@ -131,7 +138,7 @@ names, and diagnostics.
 The bridge intentionally does not maintain an always-on remote prewarm. An
 idle WebRTC peer continues emitting silent RTP, would occupy the single speech
 lane, and has no documented quota-neutral lifetime. The supported optimization
-is capture overlap plus the explicitly correlated one-turn handoff. See
+is capture overlap plus progressive TTS delivery. See
 [performance and ThirdReality tuning](../docs/performance.md) for live
 measurement scope and the prewarm rationale.
 

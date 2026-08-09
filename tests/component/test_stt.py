@@ -18,6 +18,7 @@ from homeassistant.helpers import chat_session
 from custom_components.codex_voice import CodexVoiceConfigEntry
 from custom_components.codex_voice import api as api_module
 from custom_components.codex_voice import stt as stt_module
+from custom_components.codex_voice import tts as tts_module
 from custom_components.codex_voice.api import (
     BridgeAuthenticationError,
     BridgeBusyError,
@@ -117,8 +118,15 @@ async def test_stt_forwards_stream_and_metadata() -> None:
     finite_transcribe.assert_not_awaited()
 
 
-async def test_stt_opts_in_only_after_pipeline_tts_preparation() -> None:
+async def test_stt_opts_in_only_after_pipeline_tts_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """HA's pre-STT TTS options bind one normalized private handoff request."""
+    monkeypatch.setattr(
+        tts_module,
+        "_AUTOMATIC_SPEECH_SESSION_HANDOFF_ENABLED",
+        True,
+    )
     stream_transcribe = AsyncMock(return_value="Active transcript")
     client = SimpleNamespace(
         async_transcribe_stream=stream_transcribe,
@@ -186,6 +194,38 @@ async def test_stt_active_session_without_pipeline_preparation_stays_cold() -> N
     finally:
         chat_session.current_session.reset(session_context)
 
+    assert result.result is stt.SpeechResultState.SUCCESS
+    assert stream_transcribe.await_args is not None
+    assert "speech_session_handoff" not in stream_transcribe.await_args.kwargs
+
+
+async def test_pipeline_tts_options_leave_handoff_disabled_by_default() -> None:
+    """An eligible Assist context still uses isolated STT and TTS sessions."""
+    stream_transcribe = AsyncMock(return_value="Cold transcript")
+    client = SimpleNamespace(
+        async_transcribe_stream=stream_transcribe,
+        async_transcribe=AsyncMock(),
+    )
+    tts_subentry = ConfigSubentry(
+        data=MappingProxyType({CONF_VOICE: "ember"}),
+        subentry_type="tts",
+        title="Test TTS",
+        unique_id=None,
+    )
+    tts_entity = CodexVoiceTTSEntity(_make_entry(client), tts_subentry)
+    stt_entity = _make_entity(client)
+    session_context = chat_session.current_session.set(
+        chat_session.ChatSession("assist-session")
+    )
+    try:
+        pipeline_options = dict(tts_entity.default_options)
+        result = await stt_entity.async_process_audio_stream(
+            _metadata(), _audio_stream(b"\x00\x01")
+        )
+    finally:
+        chat_session.current_session.reset(session_context)
+
+    assert api_module._SPEECH_SESSION_HANDOFF_OPTION not in pipeline_options
     assert result.result is stt.SpeechResultState.SUCCESS
     assert stream_transcribe.await_args is not None
     assert "speech_session_handoff" not in stream_transcribe.await_args.kwargs

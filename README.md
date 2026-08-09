@@ -43,9 +43,9 @@ inside Home Assistant, so its user and Assist policies stay authoritative.
   thread and WebRTC setup can overlap the finite microphone capture.
 - Milestone 1 TTS progressively delivers realtime speech frames instead of
   waiting for the entire rendered response and remote cleanup.
-- Eligible realtime v3 turns in the official STT-to-TTS Assist pipeline
-  privately hand the successful STT session to its prepared TTS result stream
-  with a one-use, 30-second ticket.
+- Automatic STT-to-TTS session reuse is disabled: current realtime v3 sessions
+  can begin assistant output before finite STT completes, so the official Assist
+  flow uses a fresh, isolated TTS session.
 - Milestone 2: experimental realtime duplex-audio proxy with barge-in-ready
   session primitives.
 - Target Home Assistant version: 2026.8.0 or newer.
@@ -181,15 +181,13 @@ from 11.709 seconds to a three-run median of 9.680 seconds. These are
 single-device diagnostic observations, not latency guarantees or directly
 comparable whole-room timings.
 
-An eligible Assist pipeline turn can avoid the second realtime handshake by
-privately retaining its successful STT session for TTS. The ticket is
-single-use, bound by the component to the exact Home Assistant chat session,
-bridge client, pre-STT TTS preparation, voice, and normalized language, and
-expires after 30 seconds. Mismatch, expiry, unexpected remote output, or reuse
-failure before first PCM closes the retained resource and uses the normal cold
-path when it is still safe to do so. An active chat session alone is not
-enough: direct `tts.speak` calls do not carry the private pipeline marker and
-cannot inherit the session.
+Automatic STT-to-TTS session reuse is deliberately disabled in the bundled
+component. Live v3 validation observed genuine assistant output before the
+user transcript completed, and the tagged Frameless Bidi client protocol has
+no supported response-cancel message. Both the component and bridge therefore
+disable ticket issuance; a handoff-shaped diagnostic request is validated but
+takes the isolated cold path. The production Assist path always cold-starts TTS
+in a fresh thread and session.
 
 Always-on remote prewarming is not enabled: there is no provider hook before a
 wake word, an idle WebRTC peer still sends silent RTP, App Server does not
