@@ -43,20 +43,24 @@ from .const import (
     CONF_INSTRUCTIONS,
     CONF_MODEL,
     CONF_REASONING_EFFORT,
+    CONF_SERVICE_TIER,
     CONF_VOICE,
     DEFAULT_BRIDGE_URL,
     DEFAULT_CONVERSATION_MODEL,
     DEFAULT_CONVERSATION_NAME,
     DEFAULT_CONVERSATION_REASONING_EFFORT,
+    DEFAULT_CONVERSATION_SERVICE_TIER,
     DEFAULT_LLM_HASS_API,
     DEFAULT_STT_NAME,
     DEFAULT_TTS_NAME,
     DEFAULT_VOICE,
     DOMAIN,
+    LEGACY_CONVERSATION_SERVICE_TIER,
     SUBENTRY_TYPE_CONVERSATION,
     SUBENTRY_TYPE_STT,
     SUBENTRY_TYPE_TTS,
     SUPPORTED_REASONING_EFFORTS,
+    SUPPORTED_SERVICE_TIERS,
     SUPPORTED_VOICES,
 )
 
@@ -84,6 +88,7 @@ def _default_subentries() -> list[ConfigSubentryData]:
             "data": {
                 CONF_MODEL: DEFAULT_CONVERSATION_MODEL,
                 CONF_REASONING_EFFORT: DEFAULT_CONVERSATION_REASONING_EFFORT,
+                CONF_SERVICE_TIER: DEFAULT_CONVERSATION_SERVICE_TIER,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
             },
@@ -298,6 +303,21 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
     ) -> SubentryFlowResult:
         """Start reconfiguring a profile."""
         self._values = dict(self._get_reconfigure_subentry().data)
+        if self._subentry_type == SUBENTRY_TYPE_CONVERSATION:
+            # Preserve the usage behavior of profiles created before service
+            # tiers were configurable. New profiles explicitly store priority.
+            self._values.setdefault(
+                CONF_SERVICE_TIER,
+                LEGACY_CONVERSATION_SERVICE_TIER,
+            )
+            if self._values.get(CONF_REASONING_EFFORT) not in (
+                SUPPORTED_REASONING_EFFORTS
+            ):
+                self._values[CONF_REASONING_EFFORT] = (
+                    DEFAULT_CONVERSATION_REASONING_EFFORT
+                )
+            if self._values.get(CONF_SERVICE_TIER) not in SUPPORTED_SERVICE_TIERS:
+                self._values[CONF_SERVICE_TIER] = LEGACY_CONVERSATION_SERVICE_TIER
         return await self.async_step_init(user_input)
 
     async def async_step_init(
@@ -339,6 +359,9 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
                     vol.Required(CONF_REASONING_EFFORT): SelectSelector(
                         SelectSelectorConfig(options=list(SUPPORTED_REASONING_EFFORTS))
                     ),
+                    vol.Required(CONF_SERVICE_TIER): SelectSelector(
+                        SelectSelectorConfig(options=list(SUPPORTED_SERVICE_TIERS))
+                    ),
                     vol.Optional(CONF_PROMPT): TemplateSelector(),
                     vol.Optional(CONF_LLM_HASS_API): SelectSelector(
                         SelectSelectorConfig(options=hass_apis, multiple=True)
@@ -369,6 +392,7 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
                 CONF_NAME: DEFAULT_CONVERSATION_NAME,
                 CONF_MODEL: DEFAULT_CONVERSATION_MODEL,
                 CONF_REASONING_EFFORT: DEFAULT_CONVERSATION_REASONING_EFFORT,
+                CONF_SERVICE_TIER: DEFAULT_CONVERSATION_SERVICE_TIER,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
             }
