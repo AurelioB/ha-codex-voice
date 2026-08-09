@@ -14,7 +14,7 @@ import secrets
 import sys
 import tempfile
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -55,6 +55,7 @@ CONVERSATION_TTL = 60 * 60
 MAX_HISTORY_CONTEXT_CHARS = 16_000
 MAX_EARLY_TURN_EVENTS = 64
 DEFAULT_CONVERSATION_EFFORT = "low"
+SUPPORTED_CONVERSATION_SERVICE_TIERS = frozenset({"standard", "priority"})
 MAX_SYNTHESIS_TEXT_CHARS = 8_000
 MAX_TRANSCRIPTION_DURATION_SECONDS = 60.0
 TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
@@ -78,6 +79,13 @@ TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES = 3
 TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES = 5
 TRANSCRIPTION_STREAM_ACTIVATION_RMS = 0.01
 TRANSCRIPTION_STREAM_GAIN_PROBE_MS = 200
+TRANSCRIPTION_STREAM_QUIET_CALIBRATION_MS = 600
+TRANSCRIPTION_STREAM_QUIET_MIN_FRAME_RMS = 0.001
+TRANSCRIPTION_STREAM_QUIET_MIN_PEAK = 0.008
+TRANSCRIPTION_STREAM_QUIET_MIN_RMS = 0.0005
+TRANSCRIPTION_STREAM_QUIET_MIN_CREST_FACTOR = 3.0
+TRANSCRIPTION_STREAM_QUIET_NOISE_RATIO = 2.0
+TRANSCRIPTION_STREAM_QUIET_NOISE_MARGIN = 0.0005
 SYNTHESIS_TAIL_GRACE_SECONDS = 0.75
 SPEECH_SESSION_HANDOFF_VERSION = 1
 SPEECH_SESSION_HANDOFF_TTL_SECONDS = 30.0
@@ -86,6 +94,8 @@ SPEECH_SESSION_HANDOFF_SETTLE_CYCLES = 3
 # PCM cannot be causally bound to appendSpeech. Keep ticket issuance disabled.
 SPEECH_SESSION_HANDOFF_ENABLED = False
 SPEECH_SESSION_CLEANUP_ADMISSION_TIMEOUT_SECONDS = 5.0
+THREAD_DISPOSAL_TOTAL_TIMEOUT_SECONDS = 5.0
+THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS = 4.0
 
 
 class _TranscriptionAttemptTimeout(TimeoutError):
@@ -205,12 +215,175 @@ class _LiveTranscriptionInput:
     )
 
 
+@dataclass(slots=True, frozen=True)
+class _TranscriptionCalibrationFrame:
+    """One PCM frame's integer levels for bounded streaming calibration."""
+
+    peak: int
+    square_sum: int
+    sample_count: int
+
+    @property
+    def rms(self) -> float:
+        return math.sqrt(self.square_sum / self.sample_count) / 32_768.0
+
+
+@dataclass(slots=True, frozen=True)
+class _StreamingTranscriptionCalibration:
+    """Gain and onset selected by the incremental stream calibrator."""
+
+    gain: float
+    onset_frame: int
+
+
+class _StreamingTranscriptionCalibrator:
+    """Analyze each PCM frame once and retain only a short rolling window."""
+
+    def __init__(self) -> None:
+        self._frame_samples = (
+            REALTIME_SAMPLE_RATE * TRANSCRIPTION_TRIM_FRAME_MS // 1_000
+        )
+        self._frame_bytes = self._frame_samples * 2
+        self._partial_frame = bytearray()
+        self._activation_window: deque[tuple[int, _TranscriptionCalibrationFrame]] = (
+            deque(maxlen=TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES)
+        )
+        self._loud_probe: list[_TranscriptionCalibrationFrame] | None = None
+        self._loud_onset_frame: int | None = None
+        quiet_frames = max(
+            TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES,
+            TRANSCRIPTION_STREAM_QUIET_CALIBRATION_MS // TRANSCRIPTION_TRIM_FRAME_MS,
+        )
+        self._quiet_frames: deque[_TranscriptionCalibrationFrame] = deque(
+            maxlen=quiet_frames
+        )
+        self.frame_count = 0
+        self.analyzed_samples = 0
+
+    @property
+    def retained_frame_count(self) -> int:
+        """Return bounded analysis state size for diagnostics and tests."""
+        return len(self._quiet_frames)
+
+    @property
+    def partial_frame_bytes(self) -> int:
+        return len(self._partial_frame)
+
+    @property
+    def frame_bytes(self) -> int:
+        return self._frame_bytes
+
+    def feed(self, pcm: bytes) -> _StreamingTranscriptionCalibration | None:
+        """Return a calibrated gain once loud or quiet speech is established."""
+        if not pcm:
+            return None
+        self._partial_frame.extend(pcm)
+        complete_bytes = (
+            len(self._partial_frame) // self._frame_bytes * self._frame_bytes
+        )
+        for offset in range(0, complete_bytes, self._frame_bytes):
+            frame = array.array("h")
+            frame.frombytes(self._partial_frame[offset : offset + self._frame_bytes])
+            if sys.byteorder != "little":
+                frame.byteswap()
+            calibration_frame = _TranscriptionCalibrationFrame(
+                peak=max(abs(sample) for sample in frame),
+                square_sum=sum(sample * sample for sample in frame),
+                sample_count=len(frame),
+            )
+            self.analyzed_samples += len(frame)
+            calibration = self._feed_frame(calibration_frame)
+            if calibration is not None:
+                self._partial_frame.clear()
+                return calibration
+        if complete_bytes:
+            del self._partial_frame[:complete_bytes]
+        return None
+
+    def _feed_frame(
+        self, frame: _TranscriptionCalibrationFrame
+    ) -> _StreamingTranscriptionCalibration | None:
+        frame_index = self.frame_count
+        self.frame_count += 1
+        self._quiet_frames.append(frame)
+
+        if self._loud_probe is None:
+            self._activation_window.append((frame_index, frame))
+            active = [
+                value.rms >= TRANSCRIPTION_STREAM_ACTIVATION_RMS
+                for _, value in self._activation_window
+            ]
+            if sum(active) >= TRANSCRIPTION_TRIM_MIN_ACTIVE_FRAMES:
+                onset_offset = active.index(True)
+                onset_index = self._activation_window[onset_offset][0]
+                self._loud_onset_frame = onset_index
+                self._loud_probe = [
+                    value
+                    for index, value in self._activation_window
+                    if index >= onset_index
+                ]
+        else:
+            self._loud_probe.append(frame)
+
+        probe_frames = max(
+            TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES,
+            TRANSCRIPTION_STREAM_GAIN_PROBE_MS // TRANSCRIPTION_TRIM_FRAME_MS,
+        )
+        if self._loud_probe is not None and len(self._loud_probe) >= probe_frames:
+            assert self._loud_onset_frame is not None
+            return _StreamingTranscriptionCalibration(
+                gain=_transcription_gain_for_calibration_frames(
+                    self._loud_probe[:probe_frames]
+                ),
+                onset_frame=self._loud_onset_frame,
+            )
+        return self._quiet_speech_calibration(probe_frames)
+
+    def _quiet_speech_calibration(
+        self, probe_frames: int
+    ) -> _StreamingTranscriptionCalibration | None:
+        """Recognize quiet speech without opening on silence or steady noise."""
+        if len(self._quiet_frames) < self._quiet_frames.maxlen:
+            return None
+        frames = list(self._quiet_frames)
+        levels = [frame.rms for frame in frames]
+        sorted_levels = sorted(levels)
+        noise_floor = sorted_levels[len(sorted_levels) // 5]
+        active_threshold = max(
+            TRANSCRIPTION_STREAM_QUIET_MIN_FRAME_RMS,
+            noise_floor * TRANSCRIPTION_STREAM_QUIET_NOISE_RATIO,
+            noise_floor + TRANSCRIPTION_STREAM_QUIET_NOISE_MARGIN,
+        )
+        onset_frame = _first_sustained_transcription_frame(
+            levels,
+            active_threshold,
+        )
+        if onset_frame is None or len(frames) < onset_frame + probe_frames:
+            return None
+        probe = frames[onset_frame : onset_frame + probe_frames]
+        peak, rms = _normalized_calibration_frame_levels(probe)
+        if (
+            peak < TRANSCRIPTION_STREAM_QUIET_MIN_PEAK
+            or rms < TRANSCRIPTION_STREAM_QUIET_MIN_RMS
+            or peak / rms < TRANSCRIPTION_STREAM_QUIET_MIN_CREST_FACTOR
+        ):
+            return None
+        window_start_frame = self.frame_count - len(frames)
+        return _StreamingTranscriptionCalibration(
+            gain=_transcription_gain_for_levels(peak, rms),
+            onset_frame=window_start_frame + onset_frame,
+        )
+
+
 class _StreamingTranscriptionNormalizer:
     """Calibrate once on sustained speech, then apply a bounded streaming gain."""
 
     def __init__(self) -> None:
         self._pending = bytearray()
+        self._pending_start_byte = 0
+        self._calibrator = _StreamingTranscriptionCalibrator()
         self.gain: float | None = None
+        self.ever_gain_assisted = False
         self.output_bytes = 0
 
     def feed(self, pcm: bytes) -> bytes:
@@ -218,19 +391,50 @@ class _StreamingTranscriptionNormalizer:
             return b""
         if self.gain is None:
             self._pending.extend(pcm)
-            gain = _streaming_transcription_gain(bytes(self._pending))
-            if gain is None:
+            calibration = self._calibrator.feed(pcm)
+            if calibration is None:
+                self._bound_pending_preroll()
                 return b""
-            self.gain = gain
-            output = _apply_pcm16_gain(bytes(self._pending), gain)
+            self.gain = calibration.gain
+            self.ever_gain_assisted = self.gain > 1.0
+            frame_bytes = self._calibrator.frame_bytes
+            preroll_bytes = (
+                REALTIME_SAMPLE_RATE * TRANSCRIPTION_TRIM_PREROLL_MS // 1_000 * 2
+            )
+            output_start = max(
+                0,
+                calibration.onset_frame * frame_bytes - preroll_bytes,
+            )
+            discard = max(0, output_start - self._pending_start_byte)
+            if discard:
+                del self._pending[:discard]
+                self._pending_start_byte += discard
+            output = _apply_pcm16_gain(bytes(self._pending), self.gain)
             self._pending.clear()
         else:
             peak, _ = _normalized_pcm16_levels(pcm)
             if peak > 0:
-                self.gain = min(self.gain, TRANSCRIPTION_TARGET_PEAK / peak)
+                self.gain = max(
+                    1.0,
+                    min(self.gain, TRANSCRIPTION_TARGET_PEAK / peak),
+                )
             output = _apply_pcm16_gain(pcm, self.gain)
         self.output_bytes += len(output)
         return output
+
+    def _bound_pending_preroll(self) -> None:
+        max_pending_ms = (
+            TRANSCRIPTION_STREAM_QUIET_CALIBRATION_MS + TRANSCRIPTION_TRIM_PREROLL_MS
+        )
+        max_pending_bytes = REALTIME_SAMPLE_RATE * max_pending_ms // 1_000 * 2
+        discard = max(0, len(self._pending) - max_pending_bytes)
+        if discard:
+            # Discard only complete analysis frames. This keeps the retained
+            # prefix aligned with ``onset_frame`` even when resampling leaves a
+            # partial frame at the end of a feed call.
+            discard -= discard % self._calibrator.frame_bytes
+            del self._pending[:discard]
+            self._pending_start_byte += discard
 
     @property
     def active(self) -> bool:
@@ -568,6 +772,7 @@ class BridgeState:
         *,
         tools: object | None = None,
         base_instructions: str | None = None,
+        service_tier: str | None = None,
     ) -> str:
         self.require_subscription_auth()
         params: dict[str, Any] = {
@@ -592,6 +797,8 @@ class BridgeState:
             value = payload.get(source)
             if isinstance(value, str) and value:
                 params[target] = value
+        if service_tier is not None:
+            params["serviceTier"] = _app_server_service_tier(service_tier)
         dynamic_tools = normalize_dynamic_tools(
             tools if tools is not None else payload.get("tools")
         )
@@ -627,10 +834,19 @@ class BridgeState:
         thread_payload = dict(payload)
         thread_payload.pop("instructions", None)
         thread_payload.pop("developer_instructions", None)
+        service_tier: str | None = None
+        if "service_tier" in payload:
+            service_tier_value = payload.get("service_tier")
+            _app_server_service_tier(service_tier_value)
+            assert isinstance(service_tier_value, str)
+            service_tier = service_tier_value
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id:
             return (
-                await self.start_thread(thread_payload),
+                await self.start_thread(
+                    thread_payload,
+                    service_tier=service_tier,
+                ),
                 False,
                 True,
                 _ConversationTurnState(),
@@ -660,7 +876,11 @@ class BridgeState:
                 raise ProtocolError(
                     "conversation cache is busy; retry after an active turn finishes"
                 )
-            thread_id = await self.start_thread(thread_payload, tools=tools)
+            thread_id = await self.start_thread(
+                thread_payload,
+                tools=tools,
+                service_tier=service_tier,
+            )
             entry = _ConversationEntry(
                 thread_id=thread_id, tools_fingerprint=fingerprint
             )
@@ -2009,6 +2229,7 @@ async def _run_live_transcription_attempt(
     live_feed = False
     live_gain = 1.0
     feed_backlog_seconds = 0.0
+    completion_diagnostics: dict[str, float | str] = {}
     try:
         thread_start_started = time.monotonic()
         try:
@@ -2097,6 +2318,16 @@ async def _run_live_transcription_attempt(
                     monitor_app_server_exit=False,
                 )
             )
+            live_fragment_quiet_seconds = (
+                state.config.live_fragment_quiet_seconds
+                if state.config.live_fragment_quiet_seconds
+                < TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                and normalizer.active
+                and live_gain == 1.0
+                and not normalizer.ever_gain_assisted
+                and retain_voice is None
+                else None
+            )
             timeout_stage = "transcript"
             transcript_wait_started = time.monotonic()
             handoff_boundary_state = (
@@ -2113,6 +2344,9 @@ async def _run_live_transcription_attempt(
                     fragment_finalization_at=feed_started + duration,
                     strict_handoff_boundary=retain_voice is not None,
                     handoff_boundary_state=handoff_boundary_state,
+                    input_drain_task=drain_task,
+                    live_fragment_quiet_seconds=live_fragment_quiet_seconds,
+                    completion_diagnostics=completion_diagnostics,
                 )
             finally:
                 transcript_wait_seconds = time.monotonic() - transcript_wait_started
@@ -2166,10 +2400,17 @@ async def _run_live_transcription_attempt(
     finally:
         LOGGER.info(
             "Realtime live transcription timing: live_feed=%s live_gain=%.2f "
-            "feed_backlog_seconds=%.3f",
+            "feed_backlog_seconds=%.3f completion_reason=%s "
+            "drain_to_result_seconds=%s",
             live_feed,
             live_gain,
             feed_backlog_seconds,
+            completion_diagnostics.get("reason", "unknown"),
+            (
+                f"{completion_diagnostics['drain_to_result_seconds']:.3f}"
+                if "drain_to_result_seconds" in completion_diagnostics
+                else "unknown"
+            ),
         )
         LOGGER.info(
             "Realtime transcription attempt timing: thread_start_seconds=%.3f "
@@ -2522,40 +2763,20 @@ def _apply_pcm16_gain(pcm: bytes, gain: float) -> bytes:
     return samples.tobytes()
 
 
-def _streaming_transcription_gain(pcm: bytes) -> float | None:
-    """Return a gain only after a sustained speech-like calibration window."""
-    if not pcm or len(pcm) % 2:
-        return None
-    samples = array.array("h")
-    samples.frombytes(pcm)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    frame_samples = REALTIME_SAMPLE_RATE * TRANSCRIPTION_TRIM_FRAME_MS // 1_000
-    frame_levels: list[float] = []
-    scale = 32_768.0
-    for frame_start in range(0, len(samples), frame_samples):
-        frame = samples[frame_start : frame_start + frame_samples]
-        if len(frame) < frame_samples:
-            break
-        square_sum = sum(sample * sample for sample in frame)
-        frame_levels.append(math.sqrt(square_sum / len(frame)) / scale)
-    onset_frame = _first_sustained_transcription_frame(
-        frame_levels,
-        TRANSCRIPTION_STREAM_ACTIVATION_RMS,
-    )
-    if onset_frame is None:
-        return None
-    probe_frames = max(
-        TRANSCRIPTION_TRIM_ACTIVE_WINDOW_FRAMES,
-        TRANSCRIPTION_STREAM_GAIN_PROBE_MS // TRANSCRIPTION_TRIM_FRAME_MS,
-    )
-    if len(frame_levels) < onset_frame + probe_frames:
-        return None
-    probe_start = onset_frame * frame_samples
-    probe_end = (onset_frame + probe_frames) * frame_samples
-    probe = samples[probe_start:probe_end]
-    peak = max(abs(sample) for sample in probe) / scale
-    rms = math.sqrt(sum(sample * sample for sample in probe) / len(probe)) / scale
+def _normalized_calibration_frame_levels(
+    frames: list[_TranscriptionCalibrationFrame],
+) -> tuple[float, float]:
+    """Combine already-inspected frame levels without rescanning PCM samples."""
+    peak = max(frame.peak for frame in frames) / 32_768.0
+    square_sum = sum(frame.square_sum for frame in frames)
+    sample_count = sum(frame.sample_count for frame in frames)
+    return peak, math.sqrt(square_sum / sample_count) / 32_768.0
+
+
+def _transcription_gain_for_calibration_frames(
+    frames: list[_TranscriptionCalibrationFrame],
+) -> float:
+    peak, rms = _normalized_calibration_frame_levels(frames)
     return _transcription_gain_for_levels(peak, rms)
 
 
@@ -3118,6 +3339,12 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                     effort = start_payload.get("effort", DEFAULT_CONVERSATION_EFFORT)
                     if isinstance(effort, str) and effort:
                         turn_params["effort"] = effort
+                    if "service_tier" in start_payload:
+                        # App Server uses null to clear a tier previously selected
+                        # on a reused thread. Omission would leave it unchanged.
+                        turn_params["serviceTier"] = _app_server_service_tier(
+                            start_payload.get("service_tier")
+                        )
                     instructions = start_payload.get("instructions")
                     additional_context: dict[str, dict[str, str]] = {}
                     if isinstance(instructions, str) and instructions:
@@ -3570,6 +3797,9 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     fragment_finalization_at: float | None = None,
     strict_handoff_boundary: bool = False,
     handoff_boundary_state: _SpeechHandoffBoundaryState | None = None,
+    input_drain_task: asyncio.Task[Any] | None = None,
+    live_fragment_quiet_seconds: float | None = None,
+    completion_diagnostics: dict[str, float | str] | None = None,
 ) -> str:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -3577,6 +3807,8 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     data_deltas: OrderedDict[str, str] = OrderedDict()
     last_fragment_at: float | None = None
     realtime_closed_at: float | None = None
+    drained_at: float | None = None
+    drain_observed = input_drain_task is None
     event_task = asyncio.create_task(session.next_event())
     data_task = asyncio.create_task(session.recv_data_event())
     try:
@@ -3587,11 +3819,23 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 raise TimeoutError
             transcript = _assembled_transcript(deltas, list(data_deltas.values()))
             if transcript and last_fragment_at is not None:
-                fragment_ready_at = last_fragment_at + (
-                    TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                use_live_guard = (
+                    live_fragment_quiet_seconds is not None and drained_at is not None
                 )
-                if fragment_finalization_at is not None:
+                quiet_seconds = (
+                    live_fragment_quiet_seconds
+                    if use_live_guard
+                    else TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                )
+                assert quiet_seconds is not None
+                fragment_ready_at = last_fragment_at + quiet_seconds
+                if fragment_finalization_at is not None and not use_live_guard:
                     fragment_ready_at = max(fragment_ready_at, fragment_finalization_at)
+                if use_live_guard:
+                    assert drained_at is not None
+                    fragment_ready_at = max(
+                        fragment_ready_at, drained_at + quiet_seconds
+                    )
                 quiet_remaining = fragment_ready_at - now
                 if quiet_remaining <= 0:
                     final_transcript = transcript.strip()
@@ -3599,6 +3843,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                         handoff_boundary_state,
                         final_transcript,
                     )
+                    if completion_diagnostics is not None:
+                        completion_diagnostics["reason"] = "fragment_quiet"
+                        if drained_at is not None:
+                            completion_diagnostics["drain_to_result_seconds"] = (
+                                loop.time() - drained_at
+                            )
                     return final_transcript
                 remaining = min(remaining, quiet_remaining)
             elif realtime_closed_at is not None:
@@ -3610,8 +3860,11 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                         "realtime session closed before transcription completed"
                     )
                 remaining = min(remaining, close_remaining)
+            wait_tasks: set[asyncio.Task[Any]] = {event_task, data_task}
+            if input_drain_task is not None and not drain_observed:
+                wait_tasks.add(input_drain_task)
             done, _ = await asyncio.wait(
-                {event_task, data_task},
+                wait_tasks,
                 timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -3619,12 +3872,25 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 now = loop.time()
                 transcript = _assembled_transcript(deltas, list(data_deltas.values()))
                 if transcript and last_fragment_at is not None:
-                    fragment_ready_at = last_fragment_at + (
-                        TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                    use_live_guard = (
+                        live_fragment_quiet_seconds is not None
+                        and drained_at is not None
                     )
-                    if fragment_finalization_at is not None:
+                    quiet_seconds = (
+                        live_fragment_quiet_seconds
+                        if use_live_guard
+                        else TRANSCRIPTION_FRAGMENT_QUIET_SECONDS
+                    )
+                    assert quiet_seconds is not None
+                    fragment_ready_at = last_fragment_at + quiet_seconds
+                    if fragment_finalization_at is not None and not use_live_guard:
                         fragment_ready_at = max(
                             fragment_ready_at, fragment_finalization_at
+                        )
+                    if use_live_guard:
+                        assert drained_at is not None
+                        fragment_ready_at = max(
+                            fragment_ready_at, drained_at + quiet_seconds
                         )
                     if now >= fragment_ready_at:
                         final_transcript = transcript.strip()
@@ -3632,6 +3898,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                             handoff_boundary_state,
                             final_transcript,
                         )
+                        if completion_diagnostics is not None:
+                            completion_diagnostics["reason"] = "fragment_quiet"
+                            if drained_at is not None:
+                                completion_diagnostics["drain_to_result_seconds"] = (
+                                    loop.time() - drained_at
+                                )
                         return final_transcript
                 if realtime_closed_at is not None:
                     raise TimeoutError(
@@ -3646,6 +3918,23 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 ready.add(event_task)
             if data_task.done():
                 ready.add(data_task)
+            if (
+                input_drain_task is not None
+                and not drain_observed
+                and input_drain_task.done()
+            ):
+                ready.add(input_drain_task)
+            if (
+                input_drain_task is not None
+                and not drain_observed
+                and input_drain_task in ready
+            ):
+                drain_observed = True
+                if (
+                    not input_drain_task.cancelled()
+                    and input_drain_task.exception() is None
+                ):
+                    drained_at = loop.time()
             terminal_transcript: str | None = None
             if event_task in ready:
                 event = event_task.result()
@@ -3762,6 +4051,12 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                     handoff_boundary_state,
                     terminal_transcript,
                 )
+                if completion_diagnostics is not None:
+                    completion_diagnostics["reason"] = "terminal_event"
+                    if drained_at is not None:
+                        completion_diagnostics["drain_to_result_seconds"] = (
+                            loop.time() - drained_at
+                        )
                 return terminal_transcript
     finally:
         event_task.cancel()
@@ -4099,9 +4394,9 @@ async def _safe_ws_json(
         await websocket.send_json(dict(value))
 
 
-async def _unsubscribe_thread(rpc: Any, thread_id: str) -> None:
+async def _unsubscribe_thread(rpc: Any, thread_id: str, *, timeout: float) -> None:
     with contextlib.suppress(Exception):
-        await rpc.call("thread/unsubscribe", {"threadId": thread_id}, timeout=10)
+        await rpc.call("thread/unsubscribe", {"threadId": thread_id}, timeout=timeout)
 
 
 def _turn_state_busy(turn_state: _ConversationTurnState) -> bool:
@@ -4111,6 +4406,15 @@ def _turn_state_busy(turn_state: _ConversationTurnState) -> bool:
         or turn_state.owner is not None
         or turn_state.turn_lock.locked()
     )
+
+
+def _app_server_service_tier(value: object) -> str | None:
+    """Validate the public tier name and map standard to App Server's reset."""
+    if not isinstance(value, str) or value not in (
+        SUPPORTED_CONVERSATION_SERVICE_TIERS
+    ):
+        raise ProtocolError("service_tier must be standard or priority")
+    return "priority" if value == "priority" else None
 
 
 def _validate_started_thread(
@@ -4139,12 +4443,31 @@ def _validate_started_thread(
 
 
 async def _dispose_thread(rpc: Any, thread_id: str) -> None:
-    """Delete a finished private thread, falling back to event unsubscribe."""
+    """Delete a private thread within one deadline, then unsubscribe if needed."""
+    loop = asyncio.get_running_loop()
+    disposal_deadline = loop.time() + THREAD_DISPOSAL_TOTAL_TIMEOUT_SECONDS
+    delete_deadline = min(
+        disposal_deadline,
+        loop.time() + THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS,
+    )
     try:
-        await rpc.call("thread/delete", {"threadId": thread_id}, timeout=20)
-    except Exception:  # noqa: BLE001 - best-effort cleanup must not leak details
-        LOGGER.warning("Could not delete finished Codex thread; using fallback")
-        await _unsubscribe_thread(rpc, thread_id)
+        async with asyncio.timeout_at(disposal_deadline):
+            try:
+                async with asyncio.timeout_at(delete_deadline):
+                    await rpc.call(
+                        "thread/delete",
+                        {"threadId": thread_id},
+                        timeout=max(0.0, delete_deadline - loop.time()),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - cleanup must not leak details
+                LOGGER.warning("Could not delete finished Codex thread; using fallback")
+                remaining = max(0.0, disposal_deadline - loop.time())
+                if remaining:
+                    await _unsubscribe_thread(rpc, thread_id, timeout=remaining)
+    except TimeoutError:
+        LOGGER.warning("Timed out disposing finished Codex thread")
 
 
 def _positive_int(value: object, name: str) -> int:

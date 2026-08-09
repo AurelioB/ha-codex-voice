@@ -48,6 +48,25 @@ def _transcription_stream_start(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def _quiet_speech_pcm(sample_rate: int, *, ambient_level: int = 0) -> bytes:
+    """Build low-RMS, high-crest PCM matching the measured device envelope."""
+    frame_samples = sample_rate * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS // 1_000
+    samples = array(
+        "h",
+        (
+            ambient_level if index % 2 else -ambient_level
+            for index in range(10 * frame_samples)
+        ),
+    )
+    for frame_index in range(21):
+        for sample_index in range(frame_samples):
+            if sample_index % 32:
+                samples.append(0)
+            else:
+                samples.append(680 if (sample_index // 32 + frame_index) % 2 else -680)
+    return samples.tobytes()
+
+
 async def _request_speech_session_handoff(
     client: Any, *, voice: str = "cove", language: str = "en-US"
 ) -> dict[str, Any]:
@@ -493,6 +512,42 @@ def test_transcription_silence_supports_explicit_nonzero_overrides(
     assert BridgeConfig.from_env().silence_ms == 750
 
 
+def test_live_fragment_guard_defaults_to_full_safety_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv(
+        "HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS",
+        raising=False,
+    )
+
+    assert BridgeConfig(bearer_token="test-token").live_fragment_quiet_seconds == 2.0
+    assert BridgeConfig.from_env().live_fragment_quiet_seconds == 2.0
+
+
+def test_live_fragment_guard_supports_explicit_measured_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.setenv(
+        "HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS",
+        "0.5",
+    )
+
+    assert BridgeConfig.from_env().live_fragment_quiet_seconds == 0.5
+
+
+@pytest.mark.parametrize("value", [0.49, 2.01])
+def test_live_fragment_guard_rejects_unsafe_or_misleading_values(
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match=r"between 0\.5 and 2\.0"):
+        BridgeConfig(
+            bearer_token="test-token",
+            live_fragment_quiet_seconds=value,
+        )
+
+
 def test_codex_child_environment_excludes_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -538,6 +593,176 @@ def test_adaptive_transcription_gain_leaves_silence_unchanged() -> None:
 
     assert amplified == source
     assert gain == 1.0
+
+
+def test_quiet_streaming_calibration_keeps_preroll() -> None:
+    source = _quiet_speech_pcm(bridge_service.REALTIME_SAMPLE_RATE)
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+
+    output = normalizer.feed(source)
+
+    assert normalizer.active
+    assert normalizer.gain is not None and normalizer.gain > 1.0
+    assert len(output) == len(source)
+    assert output == bridge_service._apply_pcm16_gain(source, normalizer.gain)
+    preroll_bytes = (
+        10
+        * bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 1_000
+        * 2
+    )
+    assert output[:preroll_bytes] == b"\x00" * preroll_bytes
+
+
+def test_quiet_streaming_calibration_preserves_chunk_boundaries() -> None:
+    source = _quiet_speech_pcm(bridge_service.REALTIME_SAMPLE_RATE)
+    one_shot = bridge_service._StreamingTranscriptionNormalizer()
+    expected = one_shot.feed(source)
+    chunked = bridge_service._StreamingTranscriptionNormalizer()
+    output = bytearray()
+
+    for offset in range(0, len(source), 722):
+        output.extend(chunked.feed(source[offset : offset + 722]))
+
+    assert chunked.active
+    assert chunked.gain == one_shot.gain
+    assert bytes(output) == expected
+    assert len(output) % 2 == 0
+
+
+def test_quiet_streaming_calibration_keeps_only_bounded_onset_preroll() -> None:
+    leading_silence = b"\x00\x00" * (2 * bridge_service.REALTIME_SAMPLE_RATE)
+    source = leading_silence + _quiet_speech_pcm(bridge_service.REALTIME_SAMPLE_RATE)
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    output = bytearray()
+
+    for offset in range(0, len(source), 722):
+        output.extend(normalizer.feed(source[offset : offset + 722]))
+    samples = array("h")
+    samples.frombytes(output)
+    first_speech_sample = next(
+        index for index, sample in enumerate(samples) if sample != 0
+    )
+
+    assert normalizer.active
+    assert first_speech_sample / bridge_service.REALTIME_SAMPLE_RATE == pytest.approx(
+        bridge_service.TRANSCRIPTION_TRIM_PREROLL_MS / 1_000
+    )
+    assert len(output) < len(source) / 2
+
+
+def test_streaming_transcription_normal_speech_keeps_existing_activation() -> None:
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    frame_samples = (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 1_000
+    )
+    frame = array("h", [8_192, -8_192]) * (frame_samples // 2)
+    source = frame.tobytes() * 10
+
+    assert normalizer.feed(source[: -len(frame.tobytes())]) == b""
+    output = normalizer.feed(frame.tobytes())
+
+    assert output == source
+    assert normalizer.gain == 1.0
+
+
+def test_streaming_transcription_digital_silence_never_activates() -> None:
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    frame_bytes = (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 1_000
+        * 2
+    )
+
+    for _ in range(100):
+        assert normalizer.feed(b"\x00" * frame_bytes) == b""
+
+    assert not normalizer.active
+
+
+def test_stationary_high_crest_noise_does_not_activate_stream() -> None:
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    frame_samples = (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 1_000
+    )
+    noise = array(
+        "h",
+        (680 if index % 32 == 0 else 0 for index in range(frame_samples)),
+    ).tobytes()
+
+    for _ in range(100):
+        assert normalizer.feed(noise) == b""
+
+    assert not normalizer.active
+
+
+def test_streaming_transcription_isolated_quiet_click_never_activates() -> None:
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    frame_samples = (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 1_000
+    )
+    silence = b"\x00\x00" * frame_samples
+    click = array("h", [0]) * frame_samples
+    click[0] = 680
+
+    for frame_index in range(100):
+        frame = click.tobytes() if frame_index == 40 else silence
+        assert normalizer.feed(frame) == b""
+
+    assert not normalizer.active
+
+
+def test_streaming_transcription_calibration_is_incremental_and_bounded() -> None:
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    frame_samples = (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+        // 1_000
+    )
+    frames = 15_000 // bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+    digital_silence = b"\x00\x00" * frame_samples
+
+    for _ in range(frames):
+        assert normalizer.feed(digital_silence) == b""
+
+    calibrator = normalizer._calibrator
+    assert calibrator.analyzed_samples == frames * frame_samples
+    assert calibrator.frame_count == frames
+    assert calibrator.retained_frame_count == (
+        bridge_service.TRANSCRIPTION_STREAM_QUIET_CALIBRATION_MS
+        // bridge_service.TRANSCRIPTION_TRIM_FRAME_MS
+    )
+    assert calibrator.partial_frame_bytes == 0
+    assert len(normalizer._pending) == (
+        bridge_service.REALTIME_SAMPLE_RATE
+        * (
+            bridge_service.TRANSCRIPTION_STREAM_QUIET_CALIBRATION_MS
+            + bridge_service.TRANSCRIPTION_TRIM_PREROLL_MS
+        )
+        // 1_000
+        * 2
+    )
+
+
+def test_streaming_transcription_remembers_gain_assisted_activation() -> None:
+    normalizer = bridge_service._StreamingTranscriptionNormalizer()
+    assert normalizer.feed(_quiet_speech_pcm(bridge_service.REALTIME_SAMPLE_RATE))
+    assert normalizer.gain is not None and normalizer.gain > 1.0
+
+    loud = array("h", [30_000, -30_000] * 240).tobytes()
+    output = normalizer.feed(loud)
+
+    assert output == loud
+    assert normalizer.gain == 1.0
+    assert normalizer.ever_gain_assisted
 
 
 def test_transcription_silence_trim_keeps_preroll_before_synthetic_speech() -> None:
@@ -822,6 +1047,147 @@ async def test_thread_delete_falls_back_to_unsubscribe(fake_rpc: FakeRpc) -> Non
 
 
 @pytest.mark.asyncio
+async def test_thread_disposal_bounds_hung_delete_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delete and fallback share one hard wall-clock budget."""
+    monkeypatch.setattr(bridge_service, "THREAD_DISPOSAL_TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(bridge_service, "THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS", 0.04)
+
+    class HungCleanupRpc:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float | None]] = []
+
+        async def call(
+            self,
+            method: str,
+            params: Mapping[str, Any] | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            del params
+            self.calls.append((method, timeout))
+            await asyncio.Event().wait()
+            return {}
+
+    rpc = HungCleanupRpc()
+    started = time.monotonic()
+    await bridge_service._dispose_thread(rpc, "thread-1")
+    elapsed = time.monotonic() - started
+
+    assert [method for method, _ in rpc.calls] == [
+        "thread/delete",
+        "thread/unsubscribe",
+    ]
+    assert rpc.calls[0][1] == pytest.approx(0.04, abs=0.005)
+    assert 0 < (rpc.calls[1][1] or 0) <= 0.02
+    assert 0.04 <= elapsed < 0.25
+
+
+@pytest.mark.asyncio
+async def test_thread_disposal_interrupts_call_that_ignores_rpc_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local delete deadline covers a transport stalled before RPC waits."""
+    monkeypatch.setattr(bridge_service, "THREAD_DISPOSAL_TOTAL_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(bridge_service, "THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS", 0.02)
+
+    class StalledDeleteRpc:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float | None]] = []
+
+        async def call(
+            self,
+            method: str,
+            params: Mapping[str, Any] | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            del params
+            self.calls.append((method, timeout))
+            if method == "thread/delete":
+                await asyncio.Event().wait()
+            return {}
+
+    rpc = StalledDeleteRpc()
+    started = time.monotonic()
+    await bridge_service._dispose_thread(rpc, "thread-1")
+    elapsed = time.monotonic() - started
+
+    assert [method for method, _ in rpc.calls] == [
+        "thread/delete",
+        "thread/unsubscribe",
+    ]
+    assert elapsed < 0.15
+
+
+@pytest.mark.asyncio
+async def test_thread_disposal_propagates_cancellation_during_delete() -> None:
+    """Caller cancellation does not get mistaken for a delete failure."""
+    delete_started = asyncio.Event()
+
+    class BlockingDeleteRpc:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def call(
+            self,
+            method: str,
+            params: Mapping[str, Any] | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            del params, timeout
+            self.calls.append(method)
+            delete_started.set()
+            await asyncio.Event().wait()
+            return {}
+
+    rpc = BlockingDeleteRpc()
+    disposal = asyncio.create_task(bridge_service._dispose_thread(rpc, "thread-1"))
+    await delete_started.wait()
+    disposal.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await disposal
+    assert rpc.calls == ["thread/delete"]
+
+
+@pytest.mark.asyncio
+async def test_thread_disposal_propagates_cancellation_during_fallback() -> None:
+    """Caller cancellation also interrupts an in-flight unsubscribe fallback."""
+    fallback_started = asyncio.Event()
+
+    class BlockingFallbackRpc:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def call(
+            self,
+            method: str,
+            params: Mapping[str, Any] | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            del params, timeout
+            self.calls.append(method)
+            if method == "thread/delete":
+                raise RuntimeError("delete unavailable")
+            fallback_started.set()
+            await asyncio.Event().wait()
+            return {}
+
+    rpc = BlockingFallbackRpc()
+    disposal = asyncio.create_task(bridge_service._dispose_thread(rpc, "thread-1"))
+    await fallback_started.wait()
+    disposal.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await disposal
+    assert rpc.calls == ["thread/delete", "thread/unsubscribe"]
+
+
+@pytest.mark.asyncio
 async def test_health_requires_bearer_and_reports_ready(
     aiohttp_client: Any, bridge_app: web.Application
 ) -> None:
@@ -873,6 +1239,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
         "type": "start",
         "conversation_id": "conversation-1",
         "effort": "low",
+        "service_tier": "priority",
         "instructions": "Current Home Assistant context: morning",
         "messages": [
             {"role": "user", "content": "Remember the kitchen"},
@@ -933,6 +1300,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
         == "deny"
     )
     assert starts[0]["approvalPolicy"] == "never"
+    assert starts[0]["serviceTier"] == "priority"
     assert "developerInstructions" not in starts[0]
     assert Path(starts[0]["cwd"]).name.startswith("ha-codex-voice-")
     assert starts[0]["dynamicTools"][0]["inputSchema"]["type"] == "object"
@@ -942,6 +1310,7 @@ async def test_conversation_contract_tools_and_thread_reuse(
         "And the dining room",
     ]
     assert [turn["effort"] for turn in turns] == ["low", "low"]
+    assert [turn["serviceTier"] for turn in turns] == ["priority", "priority"]
     assert (
         turns[0]["additionalContext"]["home_assistant_instructions"]["value"]
         == "Current Home Assistant context: morning"
@@ -964,6 +1333,103 @@ async def test_conversation_contract_tools_and_thread_reuse(
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_conversation_standard_service_tier_clears_reused_thread_override(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    fake_rpc.emit_tool_once = False
+    client = await aiohttp_client(bridge_app)
+    first = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await first.send_json(
+        {
+            "type": "start",
+            "conversation_id": "standard-tier",
+            "service_tier": "priority",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [],
+        }
+    )
+    assert (await first.receive_json())["type"] == "started"
+    assert (await first.receive_json())["type"] == "delta"
+    assert (await first.receive_json())["type"] == "done"
+    await first.close()
+
+    second = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await second.send_json(
+        {
+            "type": "start",
+            "conversation_id": "standard-tier",
+            "service_tier": "standard",
+            "messages": [{"role": "user", "content": "Hello again"}],
+            "tools": [],
+        }
+    )
+    assert (await second.receive_json())["type"] == "started"
+    assert (await second.receive_json())["type"] == "delta"
+    assert (await second.receive_json())["type"] == "done"
+    await second.close()
+
+    thread_starts = [
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    ]
+    assert len(thread_starts) == 1
+    assert thread_starts[0]["serviceTier"] == "priority"
+    turns = [params for method, params in fake_rpc.calls if method == "turn/start"]
+    assert [turn["serviceTier"] for turn in turns] == ["priority", None]
+
+
+@pytest.mark.asyncio
+async def test_conversation_rejects_unknown_service_tier_before_turn_start(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    fake_rpc.emit_tool_once = False
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await websocket.send_json(
+        {
+            "type": "start",
+            "conversation_id": "invalid-tier",
+            "service_tier": "private-fast-lane",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [],
+        }
+    )
+
+    error = await websocket.receive_json()
+    assert error == {
+        "type": "error",
+        "error": "service_tier must be standard or priority",
+    }
+    await websocket.close()
+
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+    assert not any(method == "turn/start" for method, _ in fake_rpc.calls)
+
+
+@pytest.mark.asyncio
+async def test_conversation_rejects_non_string_service_tier_before_thread_start(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/conversation", headers=AUTH)
+    await websocket.send_json(
+        {
+            "type": "start",
+            "service_tier": ["priority"],
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [],
+        }
+    )
+
+    assert await websocket.receive_json() == {
+        "type": "error",
+        "error": "service_tier must be standard or priority",
+    }
+    await websocket.close()
+
+    assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
 
 
 @pytest.mark.asyncio
@@ -1518,7 +1984,41 @@ async def test_transcription_stream_feeds_confident_speech_before_eof(
 
 
 @pytest.mark.asyncio
-async def test_transcription_stream_quiet_audio_keeps_normalized_eof_fallback(
+async def test_transcription_stream_feeds_quiet_speech_before_eof(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = _quiet_speech_pcm(16_000, ambient_level=20)
+    peak, rms = bridge_service._normalized_pcm16_levels(source)
+    assert peak == pytest.approx(0.0208, abs=0.0001)
+    assert rms < bridge_service.TRANSCRIPTION_STREAM_ACTIVATION_RMS
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/transcribe/stream", headers=AUTH)
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await websocket.send_json(_transcription_stream_start())
+        assert (await websocket.receive_json())["type"] == "started"
+        await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+        await websocket.send_bytes(source)
+        for _ in range(100):
+            if fake_rpc.peers[-1].fed:
+                break
+            await asyncio.sleep(0)
+
+        fed_before_eof = bytes(fake_rpc.peers[-1].fed)
+        assert fed_before_eof
+        assert not websocket.closed
+        await websocket.send_json({"type": "end"})
+        assert (await websocket.receive_json(timeout=1))["type"] == "result"
+        await websocket.receive(timeout=1)
+
+    assert "Realtime live transcription timing: live_feed=True" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transcription_stream_stationary_quiet_noise_keeps_eof_fallback(
     aiohttp_client: Any,
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
@@ -2591,6 +3091,7 @@ async def test_speech_session_handoff_watchdog_invalidates_assistant_audio(
         if (
             bridge_app[bridge_service.STATE_KEY]._speech_session_offer is None
             and fake_rpc.peers[0].closed
+            and sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
         ):
             break
         await asyncio.sleep(0)
@@ -2730,7 +3231,11 @@ async def test_speech_handoff_watchdog_rejects_mixed_active_transcript(
         }
     )
     for _ in range(100):
-        if state._speech_session_offer is None and fake_rpc.peers[0].closed:
+        if (
+            state._speech_session_offer is None
+            and fake_rpc.peers[0].closed
+            and sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+        ):
             break
         await asyncio.sleep(0)
 
@@ -3770,6 +4275,13 @@ async def test_synthesize_stream_yields_first_pcm_before_cleanup(
         assert audio.getnchannels() == 1
         assert audio.getnframes() == 0xFFFFFFFF // 2
         assert audio.readframes(audio.getnframes()) == b"\x01\x00" * 480
+    for _ in range(100):
+        if (
+            "thread/delete",
+            {"threadId": "thread-1"},
+        ) in fake_rpc.calls:
+            break
+        await asyncio.sleep(0)
     assert (
         "thread/delete",
         {"threadId": "thread-1"},
@@ -4253,6 +4765,296 @@ async def test_transcription_finalizes_nested_v3_fragments_after_quiet_period(
     )
 
     assert transcript == "The front door is locked."
+
+
+@pytest.mark.asyncio
+async def test_transcription_uses_fast_guard_after_successful_input_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep a deliberately wide gap between the standard and live guards so
+    # scheduler jitter cannot make this assertion flaky in CI.
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.16)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "one",
+                    "type": "input_transcript",
+                    "text": "Open the blinds.",
+                },
+            }
+        )
+    )
+    drain = asyncio.create_task(asyncio.sleep(0))
+    diagnostics: dict[str, float | str] = {}
+    started = asyncio.get_running_loop().time()
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(
+            session,
+            1.0,
+            input_drain_task=drain,
+            live_fragment_quiet_seconds=0.03,
+            completion_diagnostics=diagnostics,
+        ),
+        timeout=0.5,
+    )
+
+    assert transcript == "Open the blinds."
+    assert asyncio.get_running_loop().time() - started < 0.13
+    assert diagnostics["reason"] == "fragment_quiet"
+    assert isinstance(diagnostics["drain_to_result_seconds"], float)
+
+
+@pytest.mark.asyncio
+async def test_transcription_fast_guard_overrides_fragment_finalization_after_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed input drain permits the short guard even past audio-end."""
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.20)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "one",
+                    "type": "input_transcript",
+                    "text": "Open the blinds.",
+                },
+            }
+        )
+    )
+    drain = asyncio.create_task(asyncio.sleep(0))
+    # Leave ample room for a loaded CI runner while keeping this well beyond
+    # the fast guard and standard guard.
+    finalization_at = asyncio.get_running_loop().time() + 0.40
+    started = asyncio.get_running_loop().time()
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(
+            session,
+            1.0,
+            fragment_finalization_at=finalization_at,
+            input_drain_task=drain,
+            live_fragment_quiet_seconds=0.03,
+        ),
+        timeout=0.8,
+    )
+
+    assert transcript == "Open the blinds."
+    assert asyncio.get_running_loop().time() - started < 0.25
+
+
+@pytest.mark.asyncio
+async def test_transcription_without_fast_fallback_honors_fragment_finalization_after_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callers opting out of the live fallback retain the standard guard."""
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.16)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "one",
+                    "type": "input_transcript",
+                    "text": "Open the blinds.",
+                },
+            }
+        )
+    )
+    drain = asyncio.create_task(asyncio.sleep(0))
+    finalization_at = asyncio.get_running_loop().time() + 0.05
+    started = asyncio.get_running_loop().time()
+
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(
+            session,
+            1.0,
+            fragment_finalization_at=finalization_at,
+            input_drain_task=drain,
+        ),
+        timeout=0.5,
+    )
+
+    assert transcript == "Open the blinds."
+    assert asyncio.get_running_loop().time() - started >= 0.12
+
+
+@pytest.mark.asyncio
+async def test_transcription_pending_input_drain_keeps_standard_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.16)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "one",
+                    "type": "input_transcript",
+                    "text": "Open the blinds.",
+                },
+            }
+        )
+    )
+    gate = asyncio.Event()
+    drain = asyncio.create_task(gate.wait())
+    diagnostics: dict[str, float | str] = {}
+    started = asyncio.get_running_loop().time()
+    try:
+        transcript = await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session,
+                1.0,
+                input_drain_task=drain,
+                live_fragment_quiet_seconds=0.03,
+                completion_diagnostics=diagnostics,
+            ),
+            timeout=0.5,
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        assert transcript == "Open the blinds."
+        assert elapsed >= 0.12
+        assert not drain.cancelled()
+        assert not drain.done()
+        assert diagnostics["reason"] == "fragment_quiet"
+        assert "drain_to_result_seconds" not in diagnostics
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_transcription_failed_input_drain_keeps_standard_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.16)
+    session = FakeCollectorSession()
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "one",
+                    "type": "input_transcript",
+                    "text": "Open the blinds.",
+                },
+            }
+        )
+    )
+
+    async def fail_drain() -> None:
+        raise RuntimeError("drain failed")
+
+    drain = asyncio.create_task(fail_drain())
+    diagnostics: dict[str, float | str] = {}
+    started = asyncio.get_running_loop().time()
+    transcript = await asyncio.wait_for(
+        bridge_service._wait_for_user_transcript(
+            session,
+            1.0,
+            input_drain_task=drain,
+            live_fragment_quiet_seconds=0.03,
+            completion_diagnostics=diagnostics,
+        ),
+        timeout=0.5,
+    )
+
+    assert transcript == "Open the blinds."
+    assert asyncio.get_running_loop().time() - started >= 0.12
+    assert drain.done() and not drain.cancelled()
+    assert diagnostics["reason"] == "fragment_quiet"
+    assert "drain_to_result_seconds" not in diagnostics
+
+
+@pytest.mark.asyncio
+async def test_transcription_late_fragment_resets_fast_guard_and_combines_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_service, "TRANSCRIPTION_FRAGMENT_QUIET_SECONDS", 0.08)
+    session = FakeCollectorSession()
+    drain = asyncio.create_task(asyncio.sleep(0))
+    session.data.put_nowait(
+        json.dumps(
+            {
+                "type": "input_transcript.added",
+                "item": {
+                    "id": "one",
+                    "type": "input_transcript",
+                    "text": "Open ",
+                },
+            }
+        )
+    )
+
+    async def add_late_fragment() -> None:
+        await asyncio.sleep(0.012)
+        session.data.put_nowait(
+            json.dumps(
+                {
+                    "type": "input_transcript.added",
+                    "item": {
+                        "id": "two",
+                        "type": "input_transcript",
+                        "text": "the blinds.",
+                    },
+                }
+            )
+        )
+
+    late = asyncio.create_task(add_late_fragment())
+    try:
+        transcript = await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session,
+                1.0,
+                input_drain_task=drain,
+                live_fragment_quiet_seconds=0.02,
+            ),
+            timeout=0.3,
+        )
+    finally:
+        await late
+    assert transcript == "Open the blinds."
+
+
+@pytest.mark.asyncio
+async def test_transcription_terminal_ignores_pending_drain() -> None:
+    session = FakeCollectorSession()
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {"role": "user", "text": "Open the blinds."},
+        }
+    )
+    gate = asyncio.Event()
+    drain = asyncio.create_task(gate.wait())
+    diagnostics: dict[str, float | str] = {}
+    try:
+        transcript = await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session,
+                1.0,
+                input_drain_task=drain,
+                live_fragment_quiet_seconds=0.03,
+                completion_diagnostics=diagnostics,
+            ),
+            timeout=0.1,
+        )
+        assert transcript == "Open the blinds."
+        assert not drain.done()
+        assert not drain.cancelled()
+        assert diagnostics["reason"] == "terminal_event"
+        assert "drain_to_result_seconds" not in diagnostics
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, return_exceptions=True)
 
 
 @pytest.mark.asyncio
