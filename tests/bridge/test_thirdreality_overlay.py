@@ -16,12 +16,17 @@ _BASE_WAKEUP_HASH = "9fc5d4920ced216444adf048f0733929a3261ae47a76ed5fa2bed8061cc
 _BASE_FINISH_HASH = "a1544719b6fac5cff4388a5c10f0674cd295fb98c3c86e799993db1cbee2080d"
 _TR_WAKEUP_HASH = "4aff556b90696a3b425978641a48022021b9ffd13f4176c6bed93963577df424"
 _TR_LED_FIRE_HASH = "bd6ddee49d623fff2224b5ec0dfb302075d0be9ce3c245f6cf1cf993478f9efc"
+_BASE_HANDLE_AUDIO_HASH = (
+    "ecc9e6112426a14c798736e18244af1cea526ec072882e4d95c622106a06a41d"
+)
+_BASE_STOP_HASH = "b249e6254095ee6c19fa26795eeb424b762972adf52ba931b2a04ae3985c80ea"
 _KNOWN_HASHES = (
     _BASE_WAKEUP_HASH,
     _BASE_FINISH_HASH,
     _TR_WAKEUP_HASH,
     _TR_LED_FIRE_HASH,
 )
+_REALTIME_HASHES = (*_KNOWN_HASHES, _BASE_HANDLE_AUDIO_HASH, _BASE_STOP_HASH)
 _OVERLAY_PATH = (
     Path(__file__).resolve().parents[2]
     / "device"
@@ -58,11 +63,14 @@ class _FakeProtocol:
     def __init__(self) -> None:
         self.events: list[str] = []
         self.audio: list[bytes] = []
+        self.requests: list[str] = []
         self.state = SimpleNamespace(
             connected=True,
             muted=False,
             tts_player=_FakePlayer(self.events),
             wakeup_sound=object(),
+            active_wake_words={"okay_nabu"},
+            stop_word=SimpleNamespace(id="stop"),
         )
         self._timer_finished = False
         self._pipeline_active = False
@@ -101,10 +109,10 @@ class _FakeProtocol:
             self.events.append("cancel")
             return
         assert self._is_streaming_audio
-        assert message.values == {
-            "start": True,
-            "wake_word_phrase": "okay nabu",
-        }
+        assert message.values.get("start") is True
+        phrase = message.values.get("wake_word_phrase")
+        assert isinstance(phrase, str)
+        self.requests.append(phrase)
         self.events.append("request")
         if self.fail_send:
             raise RuntimeError("private send failure")
@@ -127,6 +135,20 @@ class _FakeProtocol:
             return
         self.send_messages([_FakeAudio(data=audio_chunk)])
 
+    def stop(self) -> None:
+        self.state.active_wake_words.discard(self.state.stop_word.id)
+        self._pipeline_active = False
+        if self._timer_finished:
+            self._timer_finished = False
+            self.unduck()
+            self.state.tts_player.stop()
+            return
+        self.state.tts_player.stop()
+        self._tts_finished()
+
+    def _tts_finished(self) -> None:
+        self.events.append("tts-finished")
+
 
 class _FakeTRProtocol(_FakeProtocol):
     def wakeup(self, wake_word: Any) -> None:
@@ -142,6 +164,8 @@ def _vendor_led_fire(_state: str, _to_idle: bool = False) -> None:
 
 _VENDOR_BASE_WAKEUP = _FakeProtocol.wakeup
 _VENDOR_BASE_FINISH = _FakeProtocol._on_wakeup_sound_finished
+_VENDOR_BASE_HANDLE_AUDIO = _FakeProtocol.handle_audio
+_VENDOR_BASE_STOP = _FakeProtocol.stop
 _VENDOR_TR_WAKEUP = _FakeTRProtocol.wakeup
 
 
@@ -152,10 +176,13 @@ def load_overlay(
     loaded_modules: list[ModuleType] = []
 
     def load(
-        hashes: tuple[str, str, str, str] = _KNOWN_HASHES,
+        hashes: tuple[str, ...] = _KNOWN_HASHES,
+        realtime_support: ModuleType | None = None,
     ) -> tuple[type[_FakeTRProtocol], ModuleType, ModuleType]:
         _FakeProtocol.wakeup = _VENDOR_BASE_WAKEUP
         _FakeProtocol._on_wakeup_sound_finished = _VENDOR_BASE_FINISH
+        _FakeProtocol.handle_audio = _VENDOR_BASE_HANDLE_AUDIO
+        _FakeProtocol.stop = _VENDOR_BASE_STOP
         _FakeTRProtocol.wakeup = _VENDOR_TR_WAKEUP
 
         aioesphomeapi = ModuleType("aioesphomeapi")
@@ -192,6 +219,10 @@ def load_overlay(
         )
         monkeypatch.setitem(sys.modules, "thirdreality", thirdreality)
         monkeypatch.setitem(sys.modules, "thirdreality.satellite", tr_satellite)
+        if realtime_support is None:
+            monkeypatch.delitem(sys.modules, "realtime_client", raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, "realtime_client", realtime_support)
 
         values = iter(hashes)
 
@@ -225,11 +256,596 @@ def load_overlay(
         module._shutdown_led_worker()
     _FakeProtocol.wakeup = _VENDOR_BASE_WAKEUP
     _FakeProtocol._on_wakeup_sound_finished = _VENDOR_BASE_FINISH
+    _FakeProtocol.handle_audio = _VENDOR_BASE_HANDLE_AUDIO
+    _FakeProtocol.stop = _VENDOR_BASE_STOP
     _FakeTRProtocol.wakeup = _VENDOR_TR_WAKEUP
 
 
-def _wake(instance: _FakeProtocol) -> None:
-    instance.wakeup(SimpleNamespace(wake_word="okay nabu"))
+def _wake(instance: _FakeProtocol, phrase: str = "okay nabu") -> None:
+    instance.wakeup(SimpleNamespace(wake_word=phrase))
+
+
+def _pcm_frame(marker: int, *, samples: int = 4) -> bytes:
+    """Return one distinct, aligned PCM16 test frame."""
+    return bytes((marker, 0)) * samples
+
+
+def _fake_realtime_support(
+    *,
+    fallback_buffer_bytes: int = 64 * 1024,
+    input_queue_bytes: int = 64 * 1024,
+    constructor_error: Exception | None = None,
+    start_error: Exception | None = None,
+    start_entered: threading.Event | None = None,
+    start_release: threading.Event | None = None,
+    submit_entered: threading.Event | None = None,
+    submit_release: threading.Event | None = None,
+) -> ModuleType:
+    support = ModuleType("realtime_client")
+    config = SimpleNamespace(
+        wake_phrase="okay computer",
+        fallback_buffer_bytes=fallback_buffer_bytes,
+        input_queue_bytes=input_queue_bytes,
+    )
+    sessions: list[Any] = []
+
+    class ConfigError(ValueError):
+        pass
+
+    class SubmitResult:
+        ACCEPTED = object()
+        GATED = object()
+        FULL = object()
+        CLOSED = object()
+        INVALID = object()
+
+    class RealtimeSession:
+        def __init__(self, received_config: object) -> None:
+            assert received_config is config
+            if constructor_error is not None:
+                raise constructor_error
+            self.ready = False
+            self.failed_before_ready = False
+            self.terminal = False
+            self.submit_result = SubmitResult.ACCEPTED
+            self.started = 0
+            self.stopped = 0
+            self.interrupted = 0
+            self.audio: list[bytes] = []
+            sessions.append(self)
+
+        def start(self) -> None:
+            self.started += 1
+            if start_entered is not None:
+                start_entered.set()
+            if start_release is not None and not start_release.wait(2):
+                raise RuntimeError("test start barrier timed out")
+            if start_error is not None:
+                raise start_error
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def interrupt(self) -> None:
+            self.interrupted += 1
+
+        def submit_audio(self, value: bytes) -> object:
+            if len(value) % 2:
+                return SubmitResult.INVALID
+            if submit_entered is not None:
+                submit_entered.set()
+            if submit_release is not None and not submit_release.wait(2):
+                raise RuntimeError("test submit barrier timed out")
+            self.audio.append(value)
+            return self.submit_result
+
+    support.ConfigError = ConfigError  # type: ignore[attr-defined]
+    support.SubmitResult = SubmitResult  # type: ignore[attr-defined]
+    support.RealtimeSession = RealtimeSession  # type: ignore[attr-defined]
+    support.load_config = lambda: config  # type: ignore[attr-defined]
+    support.normalize_wake_phrase = (  # type: ignore[attr-defined]
+        lambda phrase: " ".join(phrase.casefold().split())
+    )
+    support.shutdown_all_sessions = lambda: None  # type: ignore[attr-defined]
+    support.sessions = sessions  # type: ignore[attr-defined]
+    return support
+
+
+def test_realtime_wake_claims_mic_without_starting_home_assistant(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "  OKAY   Computer ")
+
+    assert module._REALTIME_PATCH_ACTIVE
+    assert len(support.sessions) == 1  # type: ignore[attr-defined]
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.started == 1
+    assert instance.events == ["duck"]
+    assert not instance.requests
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+    assert "stop" in instance.state.active_wake_words
+
+    instance.handle_audio(b"\x01\x00" * 8)
+    assert session.audio == [b"\x01\x00" * 8]
+    assert not instance.audio
+
+
+def test_realtime_wake_prepends_only_bounded_idle_preroll(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    idle_frames = [_pcm_frame(index, samples=1_024) for index in range(1, 9)]
+    post_wake = _pcm_frame(9)
+
+    for frame in idle_frames:
+        instance.handle_audio(frame)
+    _wake(instance, "okay computer")
+    instance.handle_audio(post_wake)
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert module._REALTIME_PREROLL_MAX_BYTES == 12 * 1024
+    assert session.audio == [*idle_frames[-6:], post_wake]
+    assert list(instance._codex_realtime_owner.fallback_audio) == [
+        *idle_frames[-6:],
+        post_wake,
+    ]
+    assert not instance.audio
+
+
+def test_normal_wake_discards_direct_preroll(load_overlay: Any) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    instance.handle_audio(_pcm_frame(1))
+    _wake(instance, "okay nabu")
+    post_wake = _pcm_frame(2)
+    instance.handle_audio(post_wake)
+
+    assert not support.sessions  # type: ignore[attr-defined]
+    assert instance.audio == [post_wake]
+    assert instance._codex_realtime_preroll is None
+
+
+def test_normal_wake_preempts_realtime_then_starts_official_assist(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    _wake(instance, "okay nabu")
+
+    assert session.interrupted == 1
+    assert getattr(instance, "_codex_realtime_owner", None) is None
+    assert instance.requests == ["okay nabu"]
+    assert instance.events == ["duck", "unduck", "request", "duck"]
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+    assert "stop" not in instance.state.active_wake_words
+
+
+def test_realtime_start_exception_falls_back_on_same_wake_call(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(start_error=OSError("bridge unavailable"))
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "okay computer")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.started == 1
+    assert session.stopped == 1
+    assert instance.requests == ["okay computer"]
+    assert instance.events == ["request", "duck"]
+    assert instance._codex_realtime_owner is None
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+    assert "stop" not in instance.state.active_wake_words
+
+
+def test_realtime_start_exception_replays_idle_preroll_once(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(start_error=OSError("bridge unavailable"))
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    preroll = [_pcm_frame(1), _pcm_frame(2)]
+
+    for chunk in preroll:
+        instance.handle_audio(chunk)
+    _wake(instance, "okay computer")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.started == 1
+    assert session.stopped == 1
+    assert session.audio == []
+    assert instance.audio == preroll
+    assert instance.requests == ["okay computer"]
+    assert instance._codex_realtime_owner is None
+
+
+def test_realtime_constructor_exception_preserves_vendor_state_and_preroll(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        constructor_error=OSError("client construction failed")
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    preroll = [_pcm_frame(1), _pcm_frame(2)]
+
+    for chunk in preroll:
+        instance.handle_audio(chunk)
+    _wake(instance, "okay computer")
+
+    assert not support.sessions  # type: ignore[attr-defined]
+    assert instance.requests == ["okay computer"]
+    assert instance.audio == preroll
+    assert "stop" not in instance.state.active_wake_words
+    assert getattr(instance, "_codex_realtime_owner", None) is None
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+
+
+def test_partial_direct_duck_failure_is_undone_before_ha_fallback(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    preroll = _pcm_frame(1)
+    instance.handle_audio(preroll)
+    duck_calls = 0
+
+    def duck_once_then_succeed() -> None:
+        nonlocal duck_calls
+        duck_calls += 1
+        instance.events.append("duck")
+        if duck_calls == 1:
+            raise RuntimeError("partial duck failure")
+
+    instance.duck = duck_once_then_succeed
+    _wake(instance, "okay computer")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.stopped == 1
+    assert instance.events == ["duck", "unduck", "request", "duck", "audio"]
+    assert instance.audio == [preroll]
+    assert instance._codex_realtime_owner is None
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+
+
+def test_small_legal_queues_reserve_live_headroom_instead_of_seeding_preroll(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        fallback_buffer_bytes=16 * 1024,
+        input_queue_bytes=32 * 1024,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    idle_frames = [_pcm_frame(index, samples=1_024) for index in range(1, 7)]
+
+    for frame in idle_frames:
+        instance.handle_audio(frame)
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+
+    assert session.audio == []
+    assert instance._codex_realtime_owner.fallback_bytes == 0
+    assert instance._codex_realtime_owner is not None
+
+
+def test_pre_ready_failure_replays_bounded_pcm_to_home_assistant_in_order(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(fallback_buffer_bytes=4)
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+
+    instance.handle_audio(b"\x01\x00\x02\x00")
+    # Overflow is detected on the vendor mic thread. The current block is not
+    # submitted direct and is replayed after the buffered block into HA.
+    instance.handle_audio(b"\x03\x00")
+
+    assert session.audio == [b"\x01\x00\x02\x00"]
+    assert session.stopped == 1
+    assert instance.requests == ["okay computer"]
+    assert instance.audio == [b"\x01\x00\x02\x00", b"\x03\x00"]
+    assert instance.events == [
+        "duck",
+        "unduck",
+        "request",
+        "duck",
+        "audio",
+        "audio",
+    ]
+    assert instance._codex_realtime_owner is None
+
+
+def test_async_start_failure_replays_current_frame_and_marks_normal_owner(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    instance.handle_audio(b"\x01\x00")
+    session.failed_before_ready = True
+    session.terminal = True
+
+    instance.handle_audio(b"\x02\x00")
+
+    assert session.stopped == 1
+    assert instance.audio == [b"\x01\x00", b"\x02\x00"]
+    assert instance.requests == ["okay computer"]
+    assert instance._codex_realtime_owner is None
+
+
+def test_async_start_failure_replays_preroll_and_live_audio_once(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    preroll = [_pcm_frame(1), _pcm_frame(2)]
+
+    for chunk in preroll:
+        instance.handle_audio(chunk)
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    live = _pcm_frame(3)
+    trailing = _pcm_frame(4)
+    instance.handle_audio(live)
+    session.failed_before_ready = True
+    session.terminal = True
+    instance.handle_audio(trailing)
+
+    assert session.audio == [*preroll, live]
+    assert session.stopped == 1
+    assert instance.audio == [*preroll, live, trailing]
+    assert instance.requests == ["okay computer"]
+    assert instance._codex_realtime_owner is None
+
+
+@pytest.mark.parametrize("invalid_state", ["muted", "disconnected"])
+def test_invalid_idle_state_clears_realtime_preroll(
+    load_overlay: Any,
+    invalid_state: str,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    instance.handle_audio(_pcm_frame(1))
+    if invalid_state == "muted":
+        instance.state.muted = True
+    else:
+        instance.state.connected = False
+
+    instance.handle_audio(_pcm_frame(2))
+    instance.state.muted = False
+    instance.state.connected = True
+    _wake(instance, "okay computer")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.audio == []
+
+
+def test_ownerless_stop_clears_idle_preroll(load_overlay: Any) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    instance.handle_audio(_pcm_frame(1))
+
+    instance.stop()
+    _wake(instance, "okay computer")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.audio == []
+    assert instance._codex_realtime_preroll is None
+
+
+@pytest.mark.parametrize("stop_word_preexisting", [False, True])
+def test_stop_requested_during_start_cannot_leave_an_orphan_session(
+    load_overlay: Any,
+    stop_word_preexisting: bool,
+) -> None:
+    start_entered = threading.Event()
+    start_release = threading.Event()
+    stop_completed = threading.Event()
+    support = _fake_realtime_support(
+        start_entered=start_entered,
+        start_release=start_release,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    if stop_word_preexisting:
+        instance.state.active_wake_words.add("stop")
+
+    wake_thread = threading.Thread(
+        target=_wake,
+        args=(instance, "okay computer"),
+    )
+    wake_thread.start()
+    assert start_entered.wait(1)
+    stop_thread = threading.Thread(
+        target=lambda: (instance.stop(), stop_completed.set()),
+    )
+    stop_thread.start()
+    assert not stop_completed.wait(0.05)
+    start_release.set()
+    wake_thread.join(1)
+    stop_thread.join(1)
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert not wake_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert stop_completed.is_set()
+    assert session.started == 1
+    assert session.interrupted == 1
+    assert instance._codex_realtime_owner is None
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+    assert not instance.requests
+    assert ("stop" in instance.state.active_wake_words) is stop_word_preexisting
+
+
+def test_stop_requested_during_submit_cannot_resurrect_ha_fallback(
+    load_overlay: Any,
+) -> None:
+    submit_entered = threading.Event()
+    submit_release = threading.Event()
+    stop_completed = threading.Event()
+    support = _fake_realtime_support(
+        submit_entered=submit_entered,
+        submit_release=submit_release,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    session.submit_result = support.SubmitResult.FULL  # type: ignore[attr-defined]
+
+    audio_thread = threading.Thread(
+        target=instance.handle_audio,
+        args=(_pcm_frame(1),),
+    )
+    audio_thread.start()
+    assert submit_entered.wait(1)
+    stop_thread = threading.Thread(
+        target=lambda: (instance.stop(), stop_completed.set()),
+    )
+    stop_thread.start()
+    assert not stop_completed.wait(0.05)
+    submit_release.set()
+    audio_thread.join(1)
+    stop_thread.join(1)
+
+    assert not audio_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert stop_completed.is_set()
+    assert session.interrupted == 1
+    assert session.stopped == 0
+    assert instance._codex_realtime_owner is None
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+    assert not instance.requests
+
+
+def test_stop_during_fallback_handoff_explicitly_cancels_ha_start(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff_entered = threading.Event()
+    handoff_release = threading.Event()
+    stop_completed = threading.Event()
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    session.failed_before_ready = True
+    original_fast_wakeup = module._fast_wakeup
+
+    def blocked_fast_wakeup(protocol_instance: Any, wake_word: Any) -> None:
+        handoff_entered.set()
+        assert handoff_release.wait(2)
+        original_fast_wakeup(protocol_instance, wake_word)
+
+    monkeypatch.setattr(module, "_fast_wakeup", blocked_fast_wakeup)
+    audio_thread = threading.Thread(
+        target=instance.handle_audio,
+        args=(_pcm_frame(1),),
+    )
+    audio_thread.start()
+    assert handoff_entered.wait(1)
+    stop_thread = threading.Thread(
+        target=lambda: (instance.stop(), stop_completed.set()),
+    )
+    stop_thread.start()
+    assert not stop_completed.wait(0.05)
+    handoff_release.set()
+    audio_thread.join(1)
+    stop_thread.join(1)
+
+    assert not audio_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert stop_completed.is_set()
+    assert session.stopped == 1
+    assert instance.requests == ["okay computer"]
+    assert instance.events.count("cancel") == 1
+    assert instance._codex_realtime_owner is None
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+
+
+@pytest.mark.parametrize("stop_word_preexisting", [False, True])
+def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
+    load_overlay: Any,
+    stop_word_preexisting: bool,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    if stop_word_preexisting:
+        instance.state.active_wake_words.add("stop")
+    _wake(instance, "okay computer")
+    owner = instance._codex_realtime_owner
+    session = support.sessions[0]  # type: ignore[attr-defined]
+
+    instance.stop()
+    module._detach_realtime_owner(instance, owner, unduck=True)
+
+    assert session.interrupted == 1
+    assert instance._codex_realtime_owner is None
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+    assert instance.events.count("unduck") == 1
+    assert ("stop" in instance.state.active_wake_words) is stop_word_preexisting
+
+
+def test_realtime_opcode_mismatch_keeps_latency_patch_and_normal_audio_path(
+    load_overlay: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    support = _fake_realtime_support()
+    hashes = list(_REALTIME_HASHES)
+    hashes[4] = "unknown"
+
+    with caplog.at_level(logging.WARNING):
+        protocol, module, tr_satellite = load_overlay(tuple(hashes), support)
+
+    assert module._REALTIME_PATCH_ACTIVE is False
+    assert _FakeProtocol.handle_audio is _VENDOR_BASE_HANDLE_AUDIO
+    assert _FakeProtocol.stop is _VENDOR_BASE_STOP
+    assert _FakeTRProtocol.wakeup is module._fast_thirdreality_wakeup
+    assert tr_satellite._led_fire is module._nonblocking_led_fire  # type: ignore[attr-defined]
+    assert (
+        "Skipping ThirdReality realtime client: unrecognized vendor bytecode"
+        in caplog.messages
+    )
+
+    instance = protocol()
+    _wake(instance, "okay computer")
+    instance.handle_audio(b"normal")
+    assert instance.requests == ["okay computer"]
+    assert instance.audio == [b"normal"]
+    assert not support.sessions  # type: ignore[attr-defined]
 
 
 def test_wake_fast_path_streams_immediately_without_cue_or_watchdog(

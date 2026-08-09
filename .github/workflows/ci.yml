@@ -51,6 +51,6 @@ jobs:
       - name: Install standalone bridge test dependencies
         run: python -m pip install -r bridge/requirements-dev.txt
       - name: Compile bridge with the minimum Python version
-        run: python -m compileall -q bridge scripts
+        run: python -m compileall -q bridge device/thirdreality scripts
       - name: Test bridge with the minimum Python version
         run: python -m pytest -p no:homeassistant tests/bridge
