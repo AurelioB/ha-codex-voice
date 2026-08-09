@@ -27,8 +27,10 @@ Several enabled optimizations shorten different parts of that path:
    the complete rendered response and remote cleanup.
 3. Speech peers use an explicit empty ICE-server list for this local
    subscription-backed path, avoiding the default public STUN probe. Voice
-   conversation turns default to low reasoning effort to favor response
-   latency.
+   newly created Conversation profiles default to low reasoning effort and App
+   Server's `priority` service tier to favor response latency. Existing
+   profiles preserve standard usage until reconfigured, and users can select
+   `standard` to reduce subscription usage.
 
 Automatic STT-to-TTS session reuse is not enabled. Live validation found that
 the realtime v3 session can start genuine assistant output before the user
@@ -88,6 +90,26 @@ audio traversed the device's physical output/input path, but it is still a
 controlled self-acoustic test rather than a substitute for near-, normal-, and
 far-field human trials in the deployment room.
 
+### Wake-pipeline overlap overlay
+
+The pinned v1.1.7 Python client normally waits for the confirmation cue to end
+before it asks Home Assistant to start Assist. The reversible device overlay
+instead sends that request immediately after wake detection, allowing Home
+Assistant to prepare the pipeline during the measured 0.399592 s shortened
+cue. It deliberately leaves microphone forwarding disabled until the cue's EOF
+callback, so the device does not send its own confirmation sound as speech on
+hardware without active acoustic echo cancellation.
+
+The override is guarded by SHA-256 hashes of both installed vendor code objects
+and skips itself if either changes. An isolated player test verified request
+ordering and that no microphone audio is forwarded before cue EOF. Transactional
+rollback and a two-second missing-EOF watchdog prevent mute, disconnect, player
+replacement, or setup failure from leaving a phantom active pipeline that
+blocks later wakes. A single low-volume acoustic comparison was inconclusive
+because wake-detection jitter was larger than this sub-second boundary; the
+optimization therefore has no claimed fixed end-to-end saving. See the device
+overlay README for deployment and rollback checks.
+
 ### Streaming TTS probe
 
 One v0.1.7 live bridge probe of the same synthesis request measured:
@@ -134,6 +156,57 @@ ready and saved 3.381 s overall. It completed without a retry or pipeline
 error. This is one controlled self-acoustic A/B, not a latency guarantee or a
 replacement for human near-, normal-, and far-field trials.
 
+### Guarded live-fragment completion
+
+The live path has a deliberately narrow, operator-controlled fast-completion
+guard. The public default remains the 2 s quiet-fragment window because local
+WebRTC input drain does not prove remote recognition completion. A measured
+deployment can explicitly choose 0.5–2 s with
+`HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS`. A value below 2 s is used
+only after input drain completed successfully, the live feed was normalized at
+unity gain, and no handoff is in progress. Gain-assisted, quiet or ambiguous
+captures, failed drains, retries, and handoff-shaped requests keep the 2 s
+fallback.
+
+Live activation itself uses a one-pass, bounded calibrator. It retains at most
+600 ms of per-frame analysis plus the 320 ms audio preroll, keeps the original
+utterance separately for an exact cold retry, and adds a speech-like quiet path
+for the low microphone levels observed on the ThirdReality unit. Digital
+silence, stationary noise, high-crest isolated clicks, and other ambiguous
+input remain buffered until EOF. In a synthetic 15-second quiet-utterance
+benchmark, analysis CPU time fell from about 4.7 s with repeated full-prefix
+rescans to 0.017 s with 30 retained analysis frames. This is a host benchmark;
+physical latency is recorded separately after deployment.
+
+Realtime stop and private-thread disposal are also bounded independently at
+five seconds each. Thread deletion receives four seconds and the legacy
+unsubscribe fallback can use only the remainder of the shared disposal
+deadline. The outer deadline includes time waiting to write the App Server RPC,
+so a failed speech attempt cannot silently append the previous nominal 20 s
+delete plus 10 s fallback tail before retrying or returning an error.
+
+On the measured deployment after explicitly selecting the shorter guard, the
+same short acoustic canary's Home Assistant
+`listening`-to-`processing` interval was 7.161 s at the prior setting, 5.928 s
+with a 0.75 s guard, and 5.666 s with the 0.5 s guard. The transcript remained
+`Say the word ready ready`. A separate long multi-fragment canary completed in
+7.090 s with the full words `amber violet juniper`. These are single controlled
+runs, not service-level guarantees or evidence that every accent, pause, name,
+or network condition is safe at 0.5 s. Logs expose only completion reason,
+drain-to-result, and numeric stage timings; speech and transcript content are
+not recorded. Return the setting to 2 s if late words are ever omitted.
+
+### Priority conversation service tier
+
+New Conversation profiles default to App Server's `priority` tier and expose
+`standard` as a configurable alternative. Existing profiles without a stored
+tier remain on standard until the user explicitly reconfigures them. The
+installed Codex model catalog describes priority as a faster mode with
+increased usage. In one paired direct turn, standard produced first text at
+2.271 s and finished at 2.481 s; priority produced first text at 2.091 s and
+finished at 2.234 s. This single pair proves that both settings work through
+the bridge, not a repeatable latency saving.
+
 ### Native TTS output format
 
 The component advertises mono 16-bit WAV at 16 and 24 kHz and forwards Home
@@ -142,6 +215,13 @@ resamples its 24 kHz realtime output when 16 kHz is requested, without waiting
 for the full response. This removes a format mismatch at the provider boundary;
 downstream Home Assistant or media-player conversion and buffering can still
 add latency.
+
+### Cold synthesis experiment rejected
+
+The bridge retains constrained `appendText` for the official Home Assistant
+`tts.speak` contract. Replacing that cold turn with `appendSpeech` was tested
+against the same path and produced a 90.047 s request ending in HTTP 504, so it
+is not a latency optimization and remains disabled.
 
 ### Retained-session exploratory probe
 
@@ -273,8 +353,11 @@ transcript is not a performance improvement.
 
 ### Microphone gain
 
-On the measured device, a ThirdReality microphone-gain setting of 50 mapped to
-an ALSA PDM level of 24/48; the factory 30% setting mapped to 14/48. The higher
+On the measured device, a stored ThirdReality microphone-gain setting of 50 was
+observed at ALSA PDM 24/48 in an earlier snapshot and 34/48 in the current
+v1.1.7 runtime; the factory 30% setting had mapped to 14/48. Treat the stored
+percentage as a device preference, not a stable linear ALSA mapping, and verify
+the effective runtime control after each firmware or service change. The higher
 setting is an acceptance candidate, not a universal recommendation. Room
 acoustics and individual hardware vary.
 

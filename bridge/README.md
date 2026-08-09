@@ -34,6 +34,14 @@ variables. Startup and every new thread fail closed unless that profile is
 available and active. Startup also audits App Server's effective configuration
 layers and rejects any configured MCP server.
 
+Finite STT keeps a two-second fragment-quiet fallback by default. A deployment
+that has passed short, long, paused, number, and name transcription trials may
+set `HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS` between `0.5` and `2.0`.
+Values below `2.0` are an explicit accuracy/latency tradeoff: local WebRTC input
+drain does not prove that remote recognition has emitted its final fragment.
+The shorter value is still gated on successful drain, a calibrated unity-gain
+live feed, and no retained-session handoff.
+
 If `CODEX_APP_SERVER_COMMAND` is overridden, it must enable the experimental
 `realtime_conversation` feature. The bridge still injects and verifies the
 profile selected by `HA_CODEX_PERMISSION_PROFILE` (default
@@ -48,7 +56,9 @@ All routes, including `GET /health`, require
 - `GET /health`
 - `GET /v1/conversation` WebSocket: `start`, streamed `delta`, `tool_call`,
   `tool_result`, and `done` messages. Stable Home Assistant `conversation_id`
-  values reuse a bounded in-memory Codex thread for multi-turn context.
+  values reuse a bounded in-memory Codex thread for multi-turn context. A
+  start may select `service_tier` as `standard` or `priority`; priority targets
+  lower latency while increasing subscription usage.
 - `POST /v1/transcribe`: up to 60 seconds of base64 PCM16/WAV plus audio
   metadata; returns JSON `{ "text": "..." }` under a bounded end-to-end
   deadline.
@@ -75,7 +85,10 @@ The subscription realtime voice is conversational, not a verbatim
 text-to-speech API. `/v1/synthesize` sends a tightly constrained text turn but
 still provides best-effort conversational speech and returns the header
 `X-Codex-Synthesis-Mode: conversational-best-effort`; callers must not assume
-that spoken wording exactly matches the input.
+that spoken wording exactly matches the input. A cold `appendSpeech` variant
+was also tested through the official Home Assistant `tts.speak` path and
+timed out at 90.047 s with HTTP 504; the constrained `appendText` turn remains
+the supported implementation.
 
 ## Streaming STT and guarded session-handoff experiment
 
