@@ -89,6 +89,7 @@ SUPPORTED_LANGUAGES: Final = (
     "en-GB",
     "en-US",
     "es-ES",
+    "es-MX",
     "et-EE",
     "fa-IR",
     "fi-FI",
