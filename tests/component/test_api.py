@@ -7,6 +7,7 @@ import base64
 import io
 import wave
 from collections.abc import AsyncGenerator
+from datetime import UTC, date, datetime, time
 from typing import Any, cast
 
 import pytest
@@ -177,6 +178,140 @@ async def test_conversation_stream_and_tool_result(
         "result": {"success": True},
         "success": True,
     }
+
+
+async def test_conversation_normalizes_nested_temporal_values(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Home Assistant temporal values use its canonical JSON representation."""
+    received: dict[str, Any] = {}
+
+    async def conversation(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        received["start"] = await websocket.receive_json()
+        await websocket.send_json(
+            {
+                "type": "tool_call",
+                "call_id": "call-1",
+                "name": "GetSchedule",
+                "arguments": {},
+            }
+        )
+        received["tool_result"] = await websocket.receive_json()
+        await websocket.send_json({"type": "done"})
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/v1/conversation", conversation)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    async def handle_delta(_delta: str) -> None:
+        pass
+
+    async def handle_tool(_tool_call: BridgeToolCall) -> dict[str, Any]:
+        return {
+            "schedule": {
+                "day": date(2026, 8, 9),
+                "starts_at": time(7, 5, 3, 123456),
+                "updated_at": datetime(
+                    2026,
+                    8,
+                    9,
+                    12,
+                    30,
+                    tzinfo=UTC,
+                ),
+            }
+        }
+
+    await client.async_converse(
+        {
+            "messages": [
+                {
+                    "role": "tool",
+                    "result": {
+                        "speech_slots": {
+                            "alarm": time(6, 45),
+                            "date": date(2026, 8, 10),
+                        },
+                        "preserved": [None, True, 42, 1.5, "ready"],
+                    },
+                }
+            ]
+        },
+        async_handle_delta=handle_delta,
+        async_handle_tool=handle_tool,
+    )
+
+    assert received["start"] == {
+        "type": "start",
+        "messages": [
+            {
+                "role": "tool",
+                "result": {
+                    "speech_slots": {
+                        "alarm": "06:45:00",
+                        "date": "2026-08-10",
+                    },
+                    "preserved": [None, True, 42, 1.5, "ready"],
+                },
+            }
+        ],
+    }
+    assert received["tool_result"] == {
+        "type": "tool_result",
+        "request_id": None,
+        "call_id": "call-1",
+        "result": {
+            "schedule": {
+                "day": "2026-08-09",
+                "starts_at": "07:05:03.123456",
+                "updated_at": "2026-08-09T12:30:00+00:00",
+            }
+        },
+        "success": True,
+    }
+
+
+async def test_conversation_rejects_unsupported_values_without_leaking_data(
+    aiohttp_client: Any,
+) -> None:
+    """Unsupported values fail before connection with a data-safe error."""
+    connection_attempted = False
+
+    async def conversation(request: web.Request) -> web.WebSocketResponse:
+        nonlocal connection_attempted
+        connection_attempted = True
+        return web.WebSocketResponse()
+
+    app = web.Application()
+    app.router.add_get("/v1/conversation", conversation)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(test_client.session, str(test_client.make_url("")), "token")
+
+    class UnsupportedValue:
+        def __repr__(self) -> str:
+            return "private-automation-secret"
+
+    async def handle_delta(_delta: str) -> None:
+        pass
+
+    async def handle_tool(_tool_call: BridgeToolCall) -> dict[str, Any]:
+        return {}
+
+    with pytest.raises(BridgeProtocolError) as err:
+        await client.async_converse(
+            {"messages": [{"content": UnsupportedValue()}]},
+            async_handle_delta=handle_delta,
+            async_handle_tool=handle_tool,
+        )
+
+    assert str(err.value) == "Conversation payload contains unsupported JSON values"
+    assert "private-automation-secret" not in str(err.value)
+    assert not connection_attempted
 
 
 async def test_transcribe_sends_base64_pcm(
