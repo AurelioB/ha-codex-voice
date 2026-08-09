@@ -66,6 +66,7 @@ class BridgeConfig:
     """Configuration shared by the HTTP service and Codex child process."""
 
     bearer_token: str
+    realtime_device_token: str | None = None
     host: str = "127.0.0.1"
     port: int = 8787
     codex_command: tuple[str, ...] = field(
@@ -84,6 +85,11 @@ class BridgeConfig:
     def __post_init__(self) -> None:
         if not self.bearer_token:
             raise ValueError("bearer_token must not be empty")
+        if self.realtime_device_token is not None:
+            if not self.realtime_device_token:
+                raise ValueError("realtime_device_token must not be empty")
+            if self.realtime_device_token == self.bearer_token:
+                raise ValueError("realtime_device_token must differ from bearer_token")
         if not 0 < self.port < 65_536:
             raise ValueError("port must be between 1 and 65535")
         if self.realtime_version not in {"v1", "v3"}:
@@ -110,6 +116,9 @@ class BridgeConfig:
         )
         return cls(
             bearer_token=token,
+            realtime_device_token=(
+                os.environ.get("HA_CODEX_REALTIME_DEVICE_TOKEN") or None
+            ),
             host=os.environ.get("HA_CODEX_BRIDGE_HOST", "127.0.0.1"),
             port=int(os.environ.get("HA_CODEX_BRIDGE_PORT", "8787")),
             codex_command=command,

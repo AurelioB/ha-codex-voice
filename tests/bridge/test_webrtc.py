@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from fractions import Fraction
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from bridge import webrtc
 from bridge.errors import ProtocolError
 from bridge.webrtc import RTP_FRAME_SAMPLES, RTP_SAMPLE_RATE, PcmAudioTrack, WebRtcPeer
+
+
+def _queue_only_peer(*, audio_queue_size: int = 1) -> WebRtcPeer:
+    peer = object.__new__(WebRtcPeer)
+    peer.audio = asyncio.Queue(maxsize=audio_queue_size)
+    peer.data_events = asyncio.Queue(maxsize=1)
+    peer.closed = False
+    peer._transport_failed = asyncio.Event()
+    peer._transport_error = None
+    return peer
 
 
 def test_webrtc_peer_disables_blocking_public_stun_default(
@@ -76,3 +89,71 @@ def test_pcm_track_bounds_queued_input(monkeypatch: pytest.MonkeyPatch) -> None:
             track.feed(b"\x00\x00")
     finally:
         track.stop()
+
+
+def test_pcm_track_supports_a_tighter_live_session_bound() -> None:
+    track = PcmAudioTrack()
+    try:
+        track.set_maximum_buffer_milliseconds(20)
+        track.feed(b"\x00\x00" * 480)
+        with pytest.raises(ProtocolError, match="buffer exceeds 20 ms"):
+            track.feed(b"\x00\x00")
+    finally:
+        track.stop()
+
+
+def test_pcm_track_default_still_accepts_finite_stt_utterances() -> None:
+    """The live-device cap must not truncate whole-buffer STT adapters."""
+    track = PcmAudioTrack()
+    try:
+        track.feed(b"\x00\x00" * (webrtc.REALTIME_SAMPLE_RATE * 2))
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_audio_overflow_is_terminal_instead_of_dropping_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = SimpleNamespace(
+        format=SimpleNamespace(name="s16"),
+        layout=SimpleNamespace(name="mono"),
+        sample_rate=24_000,
+        samples=1,
+        planes=[b"\x01\x00"],
+    )
+
+    class Track:
+        async def recv(self) -> Any:
+            return frame
+
+    class Resampler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        def resample(self, value: Any) -> list[Any]:
+            return [value]
+
+    monkeypatch.setattr(webrtc, "AudioResampler", Resampler)
+    peer = _queue_only_peer()
+
+    await asyncio.wait_for(peer._consume_audio(Track()), timeout=1)
+
+    with pytest.raises(ProtocolError, match="remote audio buffer overflow"):
+        await peer.recv_audio(timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_remote_audio_eof_wakes_waiting_consumers_with_error() -> None:
+    class EndedTrack:
+        async def recv(self) -> Any:
+            raise webrtc.MediaStreamError
+
+    peer = _queue_only_peer()
+    receiver = asyncio.create_task(peer.recv_audio())
+    await asyncio.sleep(0)
+
+    await peer._consume_audio(EndedTrack())
+
+    with pytest.raises(ProtocolError, match="remote audio transport ended"):
+        await asyncio.wait_for(receiver, timeout=1)

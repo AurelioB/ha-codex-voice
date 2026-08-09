@@ -24,6 +24,8 @@ class PeerLike(Protocol):
 
     async def wait_connected(self, timeout: float | None = None) -> None: ...
 
+    def set_input_buffer_limit(self, maximum_milliseconds: int) -> None: ...
+
     def feed_audio(self, pcm: bytes) -> None: ...
 
     async def wait_input_drained(self, timeout: float | None = None) -> None: ...
@@ -170,6 +172,12 @@ class RealtimeSession:
         if not self._started:
             raise ProtocolError("realtime session has not started")
         self.peer.feed_audio(pcm)
+
+    def set_input_buffer_limit(self, maximum_milliseconds: int) -> None:
+        """Set a tighter input bound before starting a live audio session."""
+        if self._started:
+            raise ProtocolError("realtime input bound must be set before start")
+        self.peer.set_input_buffer_limit(maximum_milliseconds)
 
     async def wait_input_drained(
         self,

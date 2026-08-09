@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,15 +44,18 @@ from .errors import (
     RpcError,
 )
 from .realtime import RealtimeSession
+from .realtime_wire import RealtimeWireProtocol, parse_data_control_event
 from .runtime import IsolatedCodexRuntime, codex_child_environment
 from .webrtc import WebRtcPeer
 
 LOGGER = logging.getLogger(__name__)
 STATE_KEY = "ha_codex_bridge_state"
 MAX_AUDIO_BYTES = 24 * 1024 * 1024
+REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS = 2_250
 MAX_CONVERSATIONS = 128
 CONVERSATION_TTL = 60 * 60
 MAX_HISTORY_CONTEXT_CHARS = 16_000
+MAX_CONVERSATION_LANGUAGE_CHARS = 64
 MAX_EARLY_TURN_EVENTS = 64
 DEFAULT_CONVERSATION_EFFORT = "low"
 SUPPORTED_CONVERSATION_SERVICE_TIERS = frozenset({"standard", "priority"})
@@ -96,6 +99,22 @@ SPEECH_SESSION_HANDOFF_ENABLED = False
 SPEECH_SESSION_CLEANUP_ADMISSION_TIMEOUT_SECONDS = 5.0
 THREAD_DISPOSAL_TOTAL_TIMEOUT_SECONDS = 5.0
 THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS = 4.0
+REALTIME_CONTROL_TIMEOUT_SECONDS = 5.0
+REALTIME_WEBSOCKET_SEND_TIMEOUT_SECONDS = 2.0
+REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
+REALTIME_OUTPUT_PREROLL_MILLISECONDS = 200
+REALTIME_OUTPUT_PREROLL_MAX_BYTES = (
+    REALTIME_SAMPLE_RATE * 2 * REALTIME_OUTPUT_PREROLL_MILLISECONDS // 1_000
+)
+REALTIME_OUTPUT_TAIL_SECONDS = 0.12
+REALTIME_OUTPUT_TAIL_HARD_CAP_SECONDS = 1.0
+REALTIME_OUTPUT_ARM_TIMEOUT_SECONDS = 5.0
+REALTIME_OUTPUT_PREROLL_TTL_SECONDS = 0.5
+REALTIME_OUTPUT_SIGNAL_PEAK = 256
+
+_AUTH_IDENTITY_REQUEST_KEY = "ha_codex_voice.auth_identity"
+_AUTH_IDENTITY_PRIMARY = "primary"
+_AUTH_IDENTITY_REALTIME_DEVICE = "realtime_device"
 
 
 class _TranscriptionAttemptTimeout(TimeoutError):
@@ -114,6 +133,10 @@ class _TranscriptionStreamCancelled(Exception):
 
 class _TranscriptionStreamProtocolError(ProtocolError):
     """A client-safe streaming protocol error."""
+
+
+class _RealtimeClientDisconnected(Exception):
+    """The device disconnected while its provider session was starting."""
 
 
 def _codex_child_environment() -> dict[str, str]:
@@ -542,6 +565,7 @@ class BridgeState:
         self._speech_session_active = False
         self._speech_session_offer: _SpeechSessionOffer | None = None
         self._speech_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._realtime_startup_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._close_task: asyncio.Task[None] | None = None
 
     async def require_speech_session_available(self) -> None:
@@ -766,6 +790,17 @@ class BridgeState:
             self._speech_cleanup_tasks
         )
 
+    def track_realtime_startup_cleanup(self, task: asyncio.Task[None]) -> None:
+        """Keep a late thread/start response owned until it can be deleted."""
+        self._realtime_startup_cleanup_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._realtime_startup_cleanup_tasks.discard(completed)
+            with contextlib.suppress(BaseException):
+                completed.exception()
+
+        task.add_done_callback(finished)
+
     async def start_thread(
         self,
         payload: Mapping[str, Any],
@@ -923,6 +958,14 @@ class BridgeState:
                     *(
                         asyncio.shield(task)
                         for task in tuple(self._speech_cleanup_tasks)
+                    ),
+                    return_exceptions=True,
+                )
+            if self._realtime_startup_cleanup_tasks:
+                await asyncio.gather(
+                    *(
+                        asyncio.shield(task)
+                        for task in tuple(self._realtime_startup_cleanup_tasks)
                     ),
                     return_exceptions=True,
                 )
@@ -1476,7 +1519,18 @@ async def _bearer_middleware(request: web.Request, handler: Any) -> web.StreamRe
     authorization = request.headers.get("Authorization", "")
     prefix = "Bearer "
     supplied = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
-    if not supplied or not hmac.compare_digest(supplied, state.config.bearer_token):
+    primary_match = hmac.compare_digest(supplied, state.config.bearer_token)
+    device_token = state.config.realtime_device_token
+    device_match = device_token is not None and hmac.compare_digest(
+        supplied, device_token
+    )
+    if supplied and primary_match:
+        request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_PRIMARY
+    elif supplied and request.path == "/v1/realtime" and device_match:
+        # Carry only a non-secret identity marker. The realtime handler admits
+        # this restricted credential after a valid v2 negotiation is parsed.
+        request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_REALTIME_DEVICE
+    else:
         raise web.HTTPUnauthorized(
             text=json.dumps({"error": "unauthorized"}),
             content_type="application/json",
@@ -3209,6 +3263,7 @@ async def _conversation(request: web.Request) -> web.WebSocketResponse:
         first = await _receive_ws_json(websocket, timeout=30)
         if first.get("type") != "start":
             raise ProtocolError("first conversation message must have type 'start'")
+        language = _conversation_language(first)
         (
             thread_id,
             persistent,
@@ -3229,6 +3284,7 @@ async def _conversation(request: web.Request) -> web.WebSocketResponse:
             thread_id,
             first,
             conversation_turn_state,
+            language=language,
             persistent=persistent,
             seed_history=seed_history,
         )
@@ -3256,6 +3312,7 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
     start_payload: Mapping[str, Any],
     turn_state: _ConversationTurnState,
     *,
+    language: str | None,
     persistent: bool,
     seed_history: bool,
 ) -> None:
@@ -3351,6 +3408,18 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
                         additional_context["home_assistant_instructions"] = {
                             "kind": "application",
                             "value": instructions,
+                        }
+                    if language is not None:
+                        additional_context["home_assistant_language"] = {
+                            "kind": "application",
+                            "value": (
+                                f"Default response language: {language}. Respond in "
+                                "this language unless the user explicitly requests "
+                                "another language. Do not switch languages based only "
+                                "on accent, names, or isolated foreign words. If "
+                                "uncertain, ask a brief clarification in the default "
+                                "language."
+                            ),
                         }
                     if seed_history and (
                         history := _conversation_history(start_payload, text)
@@ -3579,8 +3648,11 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
 
 async def _realtime(request: web.Request) -> web.WebSocketResponse:
     state: BridgeState = request.app[STATE_KEY]
-    async with state.speech_session_lease():
-        return await _realtime_admitted(request, state)
+    # Preserve the HTTP 409 preflight for an already-owned speech lane, but do
+    # not let an authenticated socket reserve that lane while it idles before
+    # sending a valid start message.
+    await state.require_speech_session_available()
+    return await _realtime_admitted(request, state)
 
 
 async def _realtime_admitted(
@@ -3588,43 +3660,170 @@ async def _realtime_admitted(
 ) -> web.WebSocketResponse:
     websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
     await websocket.prepare(request)
-    session: RealtimeSession | None = None
-    thread_id: str | None = None
+    wire_protocol: RealtimeWireProtocol | None = None
     try:
         first = await _receive_ws_json(websocket, timeout=30)
         if first.get("type") != "start":
             raise ProtocolError("first realtime message must have type 'start'")
-        thread_payload = dict(first)
-        thread_payload.pop("model", None)
-        thread_id = await state.start_thread(
-            thread_payload,
-            base_instructions=(
-                "Act only as a realtime Home Assistant voice agent. Never inspect "
-                "local files or use undeclared tools."
-            ),
+        wire_protocol = RealtimeWireProtocol.negotiate(first)
+        if (
+            request.get(_AUTH_IDENTITY_REQUEST_KEY) == _AUTH_IDENTITY_REALTIME_DEVICE
+            and not wire_protocol.uses_binary_audio
+        ):
+            raise ProtocolError(
+                "realtime device authentication requires protocol_version 2"
+            )
+        configured_tools = normalize_dynamic_tools(first.get("tools"))
+        async with state.speech_session_lease():
+            await _serve_realtime_session(
+                state,
+                websocket,
+                first,
+                wire_protocol,
+                configured_tools=configured_tools,
+            )
+    except _RealtimeClientDisconnected:
+        pass
+    except BridgeBusyError as exc:
+        await _safe_realtime_json(
+            websocket, {"type": "error", "error": str(exc), "code": "busy"}
         )
-        version = str(first.get("version", state.config.realtime_version))
-        session = RealtimeSession(
-            state.rpc,
-            thread_id,
-            peer=state.peer_factory(),
-            version=version,
-            timeout=state.config.request_timeout,
+    except TimeoutError:
+        await _safe_realtime_json(
+            websocket, {"type": "error", "error": "realtime session timed out"}
         )
-        voice = first.get("voice")
-        await session.start(
-            prompt=first.get("prompt")
-            if isinstance(first.get("prompt"), str)
-            else None,
-            model=first.get("model") if isinstance(first.get("model"), str) else None,
-            voice=voice.lower() if isinstance(voice, str) and voice else None,
-            include_startup_context=bool(first.get("include_startup_context", True)),
-            client_managed_handoffs=bool(first.get("client_managed_handoffs", False)),
-            initial_items=first.get("initial_items")
-            if isinstance(first.get("initial_items"), list)
-            else None,
+    except AuthenticationRequired as exc:
+        await _safe_realtime_json(
+            websocket,
+            {"type": "error", "code": "authentication_required", "error": str(exc)},
         )
-        await websocket.send_json(
+    except RpcError as exc:
+        await _safe_realtime_json(
+            websocket,
+            {
+                "type": "error",
+                "error": (
+                    "realtime provider request failed"
+                    if wire_protocol is not None and wire_protocol.uses_binary_audio
+                    else str(exc)
+                ),
+            },
+        )
+    except (BridgeError, ValueError) as exc:
+        await _safe_realtime_json(websocket, {"type": "error", "error": str(exc)})
+    finally:
+        if not websocket.closed:
+            await websocket.close()
+    return websocket
+
+
+async def _serve_realtime_session(
+    state: BridgeState,
+    websocket: web.WebSocketResponse,
+    first: Mapping[str, Any],
+    wire_protocol: RealtimeWireProtocol,
+    *,
+    configured_tools: list[dict[str, Any]],
+) -> None:
+    """Start and serve one provider session while its speech lease is held."""
+    session: RealtimeSession | None = None
+    thread_id: str | None = None
+    startup_abandoned = asyncio.Event()
+    version = (
+        state.config.realtime_version
+        if wire_protocol.uses_binary_audio
+        else str(first.get("version", state.config.realtime_version))
+    )
+
+    async def close_provider() -> None:
+        nonlocal session, thread_id
+        owned_session = session
+        owned_thread_id = thread_id
+        session = None
+        thread_id = None
+        if owned_session is not None:
+            try:
+                await owned_session.stop()
+            finally:
+                if owned_thread_id is not None:
+                    await _dispose_thread(state.rpc, owned_thread_id)
+                    owned_thread_id = None
+        if owned_thread_id is not None:
+            await _dispose_thread(state.rpc, owned_thread_id)
+
+    async def start_provider() -> None:
+        nonlocal session, thread_id
+        try:
+            thread_payload = dict(first)
+            thread_payload.pop("model", None)
+            thread_id = await state.start_thread(
+                thread_payload,
+                tools=configured_tools,
+                base_instructions=(
+                    "Act only as a realtime Home Assistant voice agent. Never inspect "
+                    "local files or use undeclared tools."
+                ),
+            )
+            if startup_abandoned.is_set():
+                return
+            session = RealtimeSession(
+                state.rpc,
+                thread_id,
+                peer=state.peer_factory(),
+                version=version,
+                timeout=state.config.request_timeout,
+            )
+            if wire_protocol.uses_binary_audio:
+                session.set_input_buffer_limit(
+                    REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS
+                )
+            voice = first.get("voice")
+            await session.start(
+                prompt=first.get("prompt")
+                if isinstance(first.get("prompt"), str)
+                else None,
+                model=(
+                    None
+                    if wire_protocol.uses_binary_audio
+                    else first.get("model")
+                    if isinstance(first.get("model"), str)
+                    else None
+                ),
+                voice=voice.lower() if isinstance(voice, str) and voice else None,
+                include_startup_context=(
+                    True
+                    if wire_protocol.uses_binary_audio
+                    else bool(first.get("include_startup_context", True))
+                ),
+                client_managed_handoffs=(
+                    False
+                    if wire_protocol.uses_binary_audio
+                    else bool(first.get("client_managed_handoffs", False))
+                ),
+                initial_items=(
+                    None
+                    if wire_protocol.uses_binary_audio
+                    else first.get("initial_items")
+                    if isinstance(first.get("initial_items"), list)
+                    else None
+                ),
+            )
+        finally:
+            if startup_abandoned.is_set():
+                await close_provider()
+
+    try:
+        await _start_realtime_provider_or_disconnect(
+            websocket,
+            start_provider(),
+            abandoned=startup_abandoned,
+            thread_pending=lambda: thread_id is None,
+            track_detached=state.track_realtime_startup_cleanup,
+        )
+        assert session is not None
+        assert thread_id is not None
+        await _send_realtime_json(
+            websocket,
             {
                 "type": "started",
                 "conversation_id": first.get("conversation_id") or thread_id,
@@ -3633,53 +3832,279 @@ async def _realtime_admitted(
                 "version": version,
                 "sample_rate": REALTIME_SAMPLE_RATE,
                 "channels": 1,
-            }
+                **wire_protocol.started_fields(),
+            },
         )
-        await _run_realtime_socket(state, websocket, session)
-    except TimeoutError:
-        await _safe_ws_json(
-            websocket, {"type": "error", "error": "realtime session timed out"}
-        )
-    except AuthenticationRequired as exc:
-        await _safe_ws_json(
-            websocket,
-            {"type": "error", "code": "authentication_required", "error": str(exc)},
-        )
-    except (BridgeError, ValueError) as exc:
-        await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
+        await _run_realtime_socket(state, websocket, session, wire_protocol)
     finally:
-        if session is not None:
-            try:
-                await session.stop()
-            finally:
-                if thread_id is not None:
-                    await _dispose_thread(state.rpc, thread_id)
-                    thread_id = None
-        if thread_id is not None:
-            await _dispose_thread(state.rpc, thread_id)
-        if not websocket.closed:
-            await websocket.close()
-    return websocket
+        await close_provider()
+
+
+async def _start_realtime_provider_or_disconnect(
+    websocket: web.WebSocketResponse,
+    provider_start: Awaitable[None],
+    *,
+    abandoned: asyncio.Event,
+    thread_pending: Callable[[], bool],
+    track_detached: Callable[[asyncio.Task[None]], None],
+) -> None:
+    """Abandon provider startup when its device disappears before acknowledgement."""
+    startup_task = asyncio.create_task(
+        provider_start, name="codex-realtime-provider-startup"
+    )
+    client_task = asyncio.create_task(
+        websocket.receive(), name="codex-realtime-startup-client-monitor"
+    )
+    detached = False
+    try:
+        done, _ = await asyncio.wait(
+            {startup_task, client_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if client_task in done:
+            message = client_task.result()
+            abandoned.set()
+            if thread_pending() and not startup_task.done():
+                # A written thread/start RPC may still create a thread after
+                # local cancellation removes its response waiter. Keep the
+                # task alive so its eventual thread id can be deleted.
+                track_detached(startup_task)
+                detached = True
+            else:
+                startup_task.cancel()
+                await asyncio.gather(startup_task, return_exceptions=True)
+            if message.type in {
+                WSMsgType.CLOSE,
+                WSMsgType.CLOSING,
+                WSMsgType.CLOSED,
+                WSMsgType.ERROR,
+            }:
+                raise _RealtimeClientDisconnected
+            raise ProtocolError(
+                "realtime messages are not accepted before session startup completes"
+            )
+        await startup_task
+    except asyncio.CancelledError:
+        abandoned.set()
+        if thread_pending() and not startup_task.done():
+            track_detached(startup_task)
+            detached = True
+        else:
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
+        raise
+    finally:
+        if not client_task.done():
+            client_task.cancel()
+        if not detached and not startup_task.done():
+            startup_task.cancel()
+        cleanup_tasks = (client_task,) if detached else (startup_task, client_task)
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
 async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machine
     state: BridgeState,
     websocket: web.WebSocketResponse,
     session: RealtimeSession,
+    wire_protocol: RealtimeWireProtocol,
 ) -> None:
     send_lock = asyncio.Lock()
     stop = asyncio.Event()
     tool_requests: dict[str, int | str] = {}
+    input_resampler = (
+        Pcm16Mono24KhzResampler(wire_protocol.input_sample_rate)
+        if wire_protocol.uses_binary_audio
+        else None
+    )
+    output_state_lock = asyncio.Lock()
+    output_preroll: deque[tuple[int, float, bytes]] = deque()
+    output_preroll_bytes = 0
+    output_epoch = 0
+    output_speaking = False
+    output_last_pcm_at: float | None = None
+    output_armed = False
+    output_arm_generation = 0
+    output_arm_task: asyncio.Task[None] | None = None
+    output_aux_tasks: set[asyncio.Task[None]] = set()
 
     async def send(value: Mapping[str, Any]) -> None:
-        async with send_lock:
-            await websocket.send_json(dict(value))
+        await _send_realtime_json(websocket, value, send_lock=send_lock)
+
+    async def send_audio(chunk: bytes) -> None:
+        if wire_protocol.uses_binary_audio:
+            await _send_realtime_binary(websocket, chunk, send_lock=send_lock)
+            return
+        await send(
+            {
+                "type": "audio",
+                "audio": encode_base64_audio(chunk),
+                "sample_rate": REALTIME_SAMPLE_RATE,
+                "channels": 1,
+            }
+        )
+
+    async def run_control(operation: Awaitable[None], name: str) -> None:
+        try:
+            async with asyncio.timeout(REALTIME_CONTROL_TIMEOUT_SECONDS):
+                await operation
+        except TimeoutError as exc:
+            raise ProtocolError(f"realtime {name} timed out") from exc
+
+    async def begin_output_locked() -> None:
+        nonlocal output_armed, output_arm_task, output_epoch
+        nonlocal output_last_pcm_at, output_preroll_bytes, output_speaking
+        if output_speaking or stop.is_set():
+            return
+        output_armed = False
+        if output_arm_task is not None:
+            output_arm_task.cancel()
+            output_arm_task = None
+        output_epoch += 1
+        output_speaking = True
+        await send(
+            {
+                "type": "control",
+                "event_type": "speaking.started",
+                "output_epoch": output_epoch,
+            }
+        )
+        prune_output_preroll_locked()
+        if output_preroll:
+            output_last_pcm_at = output_preroll[-1][1]
+            await send_audio(b"".join(entry[2] for entry in output_preroll))
+            output_preroll.clear()
+            output_preroll_bytes = 0
+
+    def prune_output_preroll_locked() -> None:
+        """Discard PCM not causally bound to the current output arm."""
+        nonlocal output_preroll_bytes
+        cutoff = time.monotonic() - REALTIME_OUTPUT_PREROLL_TTL_SECONDS
+        while output_preroll and (
+            output_preroll[0][0] != output_arm_generation
+            or output_preroll[0][1] < cutoff
+        ):
+            output_preroll_bytes -= len(output_preroll.popleft()[2])
+
+    async def arm_output() -> None:
+        nonlocal output_armed, output_arm_generation, output_arm_task
+        nonlocal output_preroll_bytes
+
+        async def expire_arm(generation: int) -> None:
+            nonlocal output_armed, output_preroll_bytes
+            await asyncio.sleep(REALTIME_OUTPUT_ARM_TIMEOUT_SECONDS)
+            async with output_state_lock:
+                if output_arm_generation != generation or output_speaking:
+                    return
+                output_armed = False
+                output_preroll.clear()
+                output_preroll_bytes = 0
+
+        async with output_state_lock:
+            if output_speaking or stop.is_set():
+                return
+            if output_armed:
+                # Multiple provider lifecycle events can describe the same
+                # response. They must not create a new arm generation.
+                return
+            output_armed = True
+            output_arm_generation += 1
+            if output_arm_task is not None:
+                output_arm_task.cancel()
+            if output_preroll:
+                await begin_output_locked()
+                return
+            output_arm_task = asyncio.create_task(
+                expire_arm(output_arm_generation),
+                name="codex-realtime-output-arm-timeout",
+            )
+            output_aux_tasks.add(output_arm_task)
+            output_arm_task.add_done_callback(output_aux_tasks.discard)
+
+    async def end_output(*, after_tail: bool) -> None:
+        nonlocal output_armed, output_arm_generation, output_arm_task
+        nonlocal output_last_pcm_at, output_preroll_bytes
+        nonlocal output_speaking
+        expected_epoch: int | None = None
+        terminal_at = time.monotonic()
+        if after_tail:
+            async with output_state_lock:
+                if output_speaking:
+                    expected_epoch = output_epoch
+            if expected_epoch is not None:
+                hard_deadline = terminal_at + REALTIME_OUTPUT_TAIL_HARD_CAP_SECONDS
+                while True:
+                    async with output_state_lock:
+                        if (
+                            not output_speaking
+                            or output_epoch != expected_epoch
+                            or stop.is_set()
+                        ):
+                            return
+                        now = time.monotonic()
+                        last_activity = max(
+                            terminal_at,
+                            output_last_pcm_at
+                            if output_last_pcm_at is not None
+                            else terminal_at,
+                        )
+                        idle_remaining = REALTIME_OUTPUT_TAIL_SECONDS - (
+                            now - last_activity
+                        )
+                        hard_remaining = hard_deadline - now
+                        if idle_remaining <= 0 or hard_remaining <= 0:
+                            break
+                        sleep_for = min(idle_remaining, hard_remaining)
+                    await asyncio.sleep(sleep_for)
+        async with output_state_lock:
+            output_armed = False
+            output_arm_generation += 1
+            if output_arm_task is not None:
+                output_arm_task.cancel()
+                output_arm_task = None
+            if not output_speaking or (
+                expected_epoch is not None and output_epoch != expected_epoch
+            ):
+                output_preroll.clear()
+                output_preroll_bytes = 0
+                return
+            output_speaking = False
+            output_last_pcm_at = None
+            output_preroll.clear()
+            output_preroll_bytes = 0
+            await send(
+                {
+                    "type": "control",
+                    "event_type": "speaking.stopped",
+                    "output_epoch": output_epoch,
+                }
+            )
+
+    def quarantine_output(chunk: bytes) -> None:
+        nonlocal output_preroll_bytes
+        if not output_armed or not _realtime_pcm_has_signal(chunk):
+            return
+        prune_output_preroll_locked()
+        output_preroll.append((output_arm_generation, time.monotonic(), chunk))
+        output_preroll_bytes += len(chunk)
+        while output_preroll_bytes > REALTIME_OUTPUT_PREROLL_MAX_BYTES:
+            output_preroll_bytes -= len(output_preroll.popleft()[2])
 
     async def receive() -> None:
         while not stop.is_set():
-            message = await _receive_ws_json(websocket)
+            message = await _receive_realtime_message(
+                websocket, allow_binary=wire_protocol.uses_binary_audio
+            )
+            if isinstance(message, bytes):
+                assert input_resampler is not None
+                converted = input_resampler.feed(message)
+                if converted:
+                    session.feed_audio(converted)
+                continue
             message_type = message.get("type")
             if message_type == "audio":
+                if wire_protocol.uses_binary_audio:
+                    raise ProtocolError(
+                        "protocol_version 2 requires binary PCM16 audio frames"
+                    )
                 data = decode_base64_audio(message.get("audio", message.get("data")))
                 sample_rate = _positive_int(
                     message.get("sample_rate", REALTIME_SAMPLE_RATE), "sample_rate"
@@ -3690,14 +4115,53 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 text = message.get("text")
                 if not isinstance(text, str) or not text:
                     raise ProtocolError("text must be a non-empty string")
-                await session.append_text(text, str(message.get("role", "user")))
+                role = str(message.get("role", "user"))
+                if wire_protocol.uses_binary_audio and (
+                    role != "user" or len(text) > MAX_HISTORY_CONTEXT_CHARS
+                ):
+                    raise ProtocolError(
+                        "protocol_version 2 text must be a bounded user message"
+                    )
+                await run_control(
+                    session.append_text(text, role),
+                    "text control",
+                )
             elif message_type == "speech":
                 text = message.get("text")
                 if not isinstance(text, str) or not text:
                     raise ProtocolError("speech text must be a non-empty string")
-                await session.append_speech(text)
+                if (
+                    wire_protocol.uses_binary_audio
+                    and len(text) > MAX_SYNTHESIS_TEXT_CHARS
+                ):
+                    raise ProtocolError(
+                        "protocol_version 2 speech text exceeds its size limit"
+                    )
+                await run_control(session.append_speech(text), "speech control")
             elif message_type == "tool_result":
-                await _respond_to_tool_result(state.rpc, message, tool_requests)
+                if wire_protocol.uses_binary_audio:
+                    raise ProtocolError(
+                        "protocol_version 2 does not accept tool results"
+                    )
+                await _respond_to_tool_result(
+                    state.rpc,
+                    message,
+                    tool_requests,
+                    timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                )
+            elif message_type == "interrupt":
+                if wire_protocol.uses_binary_audio:
+                    await end_output(after_tail=False)
+                await send(
+                    {
+                        "type": "stopped",
+                        "reason": "interrupt",
+                        "fresh_session_required": True,
+                        "remote_cancelled": False,
+                    }
+                )
+                stop.set()
+                return
             elif message_type == "stop":
                 stop.set()
                 return
@@ -3707,7 +4171,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 await send(
                     {
                         "type": "error",
-                        "error": f"unsupported message type: {message_type}",
+                        "error": (
+                            "unsupported realtime control"
+                            if wire_protocol.uses_binary_audio
+                            else f"unsupported message type: {message_type}"
+                        ),
                     }
                 )
 
@@ -3717,6 +4185,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             method = event.get("method")
             params = event.get("params", {})
             if method == "item/tool/call" and "id" in event:
+                if wire_protocol.uses_binary_audio:
+                    raise ProtocolError(
+                        "protocol_version 2 does not expose provider tool calls"
+                    )
                 call_id = str(params.get("callId", event["id"]))
                 tool_requests[call_id] = event["id"]
                 await send(
@@ -3730,6 +4202,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     }
                 )
             elif method == "thread/realtime/transcript/delta":
+                if wire_protocol.uses_binary_audio:
+                    if str(params.get("role", "")).lower() in {
+                        "assistant",
+                        "output",
+                    }:
+                        await arm_output()
+                    continue
                 await send(
                     {
                         "type": "transcript_delta",
@@ -3738,6 +4217,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     }
                 )
             elif method == "thread/realtime/transcript/done":
+                if wire_protocol.uses_binary_audio:
+                    if str(params.get("role", "")).lower() in {
+                        "assistant",
+                        "output",
+                    }:
+                        await end_output(after_tail=True)
+                    continue
                 await send(
                     {
                         "type": "transcript_done",
@@ -3746,34 +4232,82 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     }
                 )
             elif method == "thread/realtime/itemAdded":
+                if wire_protocol.uses_binary_audio:
+                    continue
                 await send({"type": "item", "item": params.get("item")})
             elif method == "thread/realtime/error":
                 await send(
-                    {"type": "error", "error": params.get("message", "realtime error")}
+                    {
+                        "type": "error",
+                        "error": (
+                            "realtime provider error"
+                            if wire_protocol.uses_binary_audio
+                            else params.get("message", "realtime error")
+                        ),
+                    }
                 )
             elif method == "thread/realtime/closed":
-                await send({"type": "stopped", "reason": params.get("reason")})
+                if wire_protocol.uses_binary_audio:
+                    await end_output(after_tail=False)
+                    await send({"type": "stopped", "reason": "remote_closed"})
+                else:
+                    await send({"type": "stopped", "reason": params.get("reason")})
                 stop.set()
                 return
             elif method not in {"thread/realtime/started", "thread/realtime/sdp"}:
+                if wire_protocol.uses_binary_audio:
+                    continue
                 await send({"type": "event", "method": method, "params": params})
 
     async def audio() -> None:
+        nonlocal output_last_pcm_at
         while not stop.is_set():
             chunk = await session.recv_audio()
-            await send(
-                {
-                    "type": "audio",
-                    "audio": encode_base64_audio(chunk),
-                    "sample_rate": REALTIME_SAMPLE_RATE,
-                    "channels": 1,
-                }
-            )
+            if not wire_protocol.uses_binary_audio:
+                await send_audio(chunk)
+                continue
+            async with output_state_lock:
+                if output_speaking:
+                    output_last_pcm_at = time.monotonic()
+                    await send_audio(chunk)
+                else:
+                    quarantine_output(chunk)
+                    if output_armed and output_preroll:
+                        await begin_output_locked()
+
+    async def data_events() -> None:
+        while not stop.is_set():
+            raw_event = await session.recv_data_event()
+            control = parse_data_control_event(raw_event)
+            if control is None or not wire_protocol.uses_binary_audio:
+                continue
+            if control.event_type in {
+                "output_audio_buffer.started",
+                "response.created",
+            } or (
+                control.event_type == "turn.created"
+                and control.role in {"assistant", "output"}
+            ):
+                await arm_output()
+                await send(control.wire_value())
+                continue
+            if control.event_type in {
+                "output_audio_buffer.stopped",
+                "response.done",
+            } or (
+                control.event_type == "turn.done"
+                and (control.role in {"assistant", "output"} or output_speaking)
+            ):
+                await end_output(after_tail=True)
+                await send(control.wire_value())
+                continue
+            await send(control.wire_value())
 
     tasks = {
         asyncio.create_task(receive(), name="codex-realtime-receiver"),
         asyncio.create_task(events(), name="codex-realtime-events"),
         asyncio.create_task(audio(), name="codex-realtime-audio"),
+        asyncio.create_task(data_events(), name="codex-realtime-data-events"),
     }
     try:
         while not stop.is_set():
@@ -3785,9 +4319,16 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 stop.set()
     finally:
         stop.set()
+        auxiliary_tasks = tuple(output_aux_tasks)
+        for task in auxiliary_tasks:
+            task.cancel()
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *tasks,
+            *auxiliary_tasks,
+            return_exceptions=True,
+        )
 
 
 async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
@@ -4287,11 +4828,16 @@ async def _collect_speech_audio(
 async def _respond_to_tool_result(
     rpc: Any,
     message: Mapping[str, Any],
-    tool_requests: Mapping[str, int | str],
+    tool_requests: MutableMapping[str, int | str],
+    *,
+    timeout: float | None = None,
 ) -> None:
     call_id = message.get("call_id", message.get("id"))
+    normalized_call_id = str(call_id) if call_id is not None else None
     expected_request_id = (
-        tool_requests.get(str(call_id)) if call_id is not None else None
+        tool_requests.get(normalized_call_id)
+        if normalized_call_id is not None
+        else None
     )
     if not isinstance(expected_request_id, (int, str)):
         raise ProtocolError("tool_result does not match an active tool call")
@@ -4309,10 +4855,19 @@ async def _respond_to_tool_result(
             else json.dumps(value, separators=(",", ":"))
         )
         content_items = [{"type": "inputText", "text": text}]
-    await rpc.respond_result(
-        expected_request_id,
-        {"contentItems": content_items, "success": success},
+    response = rpc.respond_result(
+        expected_request_id, {"contentItems": content_items, "success": success}
     )
+    if timeout is None:
+        await response
+    else:
+        try:
+            async with asyncio.timeout(timeout):
+                await response
+        except TimeoutError as exc:
+            raise ProtocolError("tool_result delivery timed out") from exc
+    assert normalized_call_id is not None
+    tool_requests.pop(normalized_call_id, None)
 
 
 def normalize_dynamic_tools(value: object) -> list[dict[str, Any]]:
@@ -4355,6 +4910,16 @@ def normalize_dynamic_tools(value: object) -> list[dict[str, Any]]:
     return normalized
 
 
+def _realtime_pcm_has_signal(chunk: bytes) -> bool:
+    if not chunk or len(chunk) % 2:
+        return False
+    samples = array.array("h")
+    samples.frombytes(chunk)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return any(abs(sample) >= REALTIME_OUTPUT_SIGNAL_PEAK for sample in samples)
+
+
 async def _read_json(request: web.Request) -> dict[str, Any]:
     try:
         payload = await request.json()
@@ -4383,6 +4948,98 @@ async def _receive_ws_json(
     if message.type == WSMsgType.ERROR:
         raise ProtocolError(f"WebSocket failed: {websocket.exception()}")
     raise ProtocolError("binary WebSocket messages are not supported")
+
+
+async def _receive_realtime_message(
+    websocket: web.WebSocketResponse,
+    *,
+    allow_binary: bool,
+) -> dict[str, Any] | bytes:
+    message = await websocket.receive()
+    if message.type == WSMsgType.TEXT:
+        try:
+            value = json.loads(message.data)
+        except json.JSONDecodeError as exc:
+            raise ProtocolError("WebSocket message must be valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ProtocolError("WebSocket message must be a JSON object")
+        return value
+    if message.type == WSMsgType.BINARY:
+        if not allow_binary:
+            raise ProtocolError("binary realtime audio requires protocol_version 2")
+        data = bytes(message.data)
+        if not data:
+            raise ProtocolError("binary realtime audio must not be empty")
+        if len(data) > REALTIME_BINARY_FRAME_MAX_BYTES:
+            raise ProtocolError(
+                f"binary realtime audio frames must not exceed "
+                f"{REALTIME_BINARY_FRAME_MAX_BYTES} bytes"
+            )
+        if len(data) % 2:
+            raise ProtocolError("binary realtime PCM16 audio is not sample-aligned")
+        return data
+    if message.type in {WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED}:
+        raise ProtocolError("WebSocket closed")
+    if message.type == WSMsgType.ERROR:
+        raise ProtocolError(f"WebSocket failed: {websocket.exception()}")
+    raise ProtocolError("unsupported realtime WebSocket frame")
+
+
+async def _send_realtime_json(
+    websocket: web.WebSocketResponse,
+    value: Mapping[str, Any],
+    *,
+    send_lock: asyncio.Lock | None = None,
+) -> None:
+    await _send_realtime_frame(
+        websocket, dict(value), send_lock=send_lock, binary=False
+    )
+
+
+async def _send_realtime_binary(
+    websocket: web.WebSocketResponse,
+    value: bytes,
+    *,
+    send_lock: asyncio.Lock,
+) -> None:
+    await _send_realtime_frame(websocket, value, send_lock=send_lock, binary=True)
+
+
+async def _send_realtime_frame(
+    websocket: web.WebSocketResponse,
+    value: dict[str, Any] | bytes,
+    *,
+    send_lock: asyncio.Lock | None,
+    binary: bool,
+) -> None:
+    async def send() -> None:
+        if binary:
+            assert isinstance(value, bytes)
+            await websocket.send_bytes(value)
+        else:
+            assert isinstance(value, dict)
+            await websocket.send_json(value)
+
+    try:
+        async with asyncio.timeout(REALTIME_WEBSOCKET_SEND_TIMEOUT_SECONDS):
+            if send_lock is None:
+                await send()
+            else:
+                async with send_lock:
+                    await send()
+    except TimeoutError as exc:
+        raise ProtocolError("realtime WebSocket send timed out") from exc
+    except (ConnectionError, RuntimeError) as exc:
+        raise ProtocolError("realtime WebSocket send failed") from exc
+
+
+async def _safe_realtime_json(
+    websocket: web.WebSocketResponse, value: Mapping[str, Any]
+) -> None:
+    if websocket.closed:
+        return
+    with contextlib.suppress(ProtocolError):
+        await _send_realtime_json(websocket, value)
 
 
 async def _safe_ws_json(
@@ -4415,6 +5072,42 @@ def _app_server_service_tier(value: object) -> str | None:
     ):
         raise ProtocolError("service_tier must be standard or priority")
     return "priority" if value == "priority" else None
+
+
+def _conversation_language(payload: Mapping[str, Any]) -> str | None:
+    """Validate and canonicalize the trusted Assist pipeline language."""
+    if "language" not in payload:
+        return None
+    value = payload.get("language")
+    if not isinstance(value, str) or not value:
+        raise ProtocolError("language must be a non-empty BCP-47 language tag")
+    if len(value) > MAX_CONVERSATION_LANGUAGE_CHARS:
+        raise ProtocolError(
+            f"language must not exceed {MAX_CONVERSATION_LANGUAGE_CHARS} characters"
+        )
+
+    parts = value.split("-")
+    primary = parts[0]
+    if (
+        not 2 <= len(primary) <= 8
+        or not primary.isascii()
+        or not primary.isalpha()
+        or any(
+            not 1 <= len(part) <= 8 or not part.isascii() or not part.isalnum()
+            for part in parts[1:]
+        )
+    ):
+        raise ProtocolError("language must be a valid BCP-47 language tag")
+
+    normalized = [primary.lower()]
+    for part in parts[1:]:
+        if len(part) == 4 and part.isalpha():
+            normalized.append(part.title())
+        elif len(part) == 2 and part.isalpha():
+            normalized.append(part.upper())
+        else:
+            normalized.append(part.lower())
+    return "-".join(normalized)
 
 
 def _validate_started_thread(
