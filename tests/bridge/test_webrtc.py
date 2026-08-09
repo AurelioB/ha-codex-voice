@@ -8,7 +8,42 @@ import pytest
 
 from bridge import webrtc
 from bridge.errors import ProtocolError
-from bridge.webrtc import RTP_FRAME_SAMPLES, RTP_SAMPLE_RATE, PcmAudioTrack
+from bridge.webrtc import RTP_FRAME_SAMPLES, RTP_SAMPLE_RATE, PcmAudioTrack, WebRtcPeer
+
+
+def test_webrtc_peer_disables_blocking_public_stun_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finite speech requests must not wait on aiortc's public STUN probe."""
+    observed: dict[str, object] = {}
+
+    class FakePeerConnection:
+        def __init__(self, *, configuration: object) -> None:
+            observed["configuration"] = configuration
+
+        def addTrack(self, track: object) -> None:
+            del track
+
+        def createDataChannel(self, label: str) -> object:
+            del label
+
+            class Channel:
+                def on(self, event: str):
+                    del event
+                    return lambda handler: handler
+
+            return Channel()
+
+        def on(self, event: str):
+            del event
+            return lambda handler: handler
+
+    monkeypatch.setattr(webrtc, "RTCPeerConnection", FakePeerConnection)
+    peer = WebRtcPeer()
+
+    configuration = observed["configuration"]
+    assert configuration.iceServers == []
+    peer.input_track.stop()
 
 
 @pytest.mark.asyncio
