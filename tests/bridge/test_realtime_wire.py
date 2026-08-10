@@ -173,6 +173,90 @@ def test_response_done_without_cancelled_status_is_not_confirmation() -> None:
     assert control.response_id is None
 
 
+@pytest.mark.parametrize("key", ["turn_id", "turnId"])
+def test_data_control_event_preserves_turn_id_for_internal_correlation(
+    key: str,
+) -> None:
+    control = parse_data_control_event(
+        json.dumps({"type": "turn.done", key: "private-turn", "role": "assistant"})
+    )
+
+    assert control is not None
+    assert control.turn_id == "private-turn"
+    assert control.wire_value() == {"type": "control", "event_type": "turn.done"}
+
+
+def test_data_control_event_prefers_nested_turn_id() -> None:
+    control = parse_data_control_event(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "nested-turn", "role": "assistant"},
+                "turnId": "fallback-turn",
+            }
+        )
+    )
+
+    assert control is not None
+    assert control.turn_id == "nested-turn"
+
+
+def test_data_control_event_keeps_turn_transcript_internal() -> None:
+    control = parse_data_control_event(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {
+                    "id": "user-turn",
+                    "role": "user",
+                    "transcript": "enciende la cocina",
+                },
+            }
+        )
+    )
+
+    assert control is not None
+    assert control.transcript == "enciende la cocina"
+    assert control.wire_value() == {"type": "control", "event_type": "turn.done"}
+
+
+@pytest.mark.parametrize("outer_role", ["assistant", "invalid", 7])
+def test_data_control_event_rejects_conflicting_or_invalid_declared_roles(
+    outer_role: object,
+) -> None:
+    control = parse_data_control_event(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "role": outer_role,
+                "turn": {
+                    "id": "user-turn",
+                    "role": "user",
+                    "transcript": "private",
+                },
+            }
+        )
+    )
+
+    assert control is not None
+    assert control.role is None
+
+
+def test_data_control_event_normalizes_equivalent_input_role() -> None:
+    control = parse_data_control_event(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "role": "input",
+                "turn": {"id": "user-turn", "role": "user"},
+            }
+        )
+    )
+
+    assert control is not None
+    assert control.role == "user"
+
+
 @pytest.mark.parametrize(
     "value",
     [

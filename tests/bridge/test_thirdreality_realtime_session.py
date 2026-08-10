@@ -1670,6 +1670,31 @@ def test_interrupt_ack_requires_explicit_local_only_cancel_semantics() -> None:
         )
 
 
+def test_bridge_managed_interrupt_explicitly_resumes_same_socket() -> None:
+    session = RealtimeSession(_config())
+    player = _RecordingPlayer()
+
+    result = session._handle_message(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "stopped",
+                    "reason": "interrupt",
+                    "fresh_session_required": False,
+                    "remote_cancelled": False,
+                    "continuation_safe": True,
+                }
+            ),
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=3,
+    )
+
+    assert result == ("interrupt_resumed", None, 3, True)
+
+
 def test_interrupt_ack_timeout_is_bounded_and_not_reported_as_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
