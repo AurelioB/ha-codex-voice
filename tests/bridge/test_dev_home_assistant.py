@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
 import pytest
 
@@ -32,6 +33,11 @@ def _completed(
 _CONTAINER_ID = "a" * 64
 
 
+@pytest.fixture(autouse=True)
+def _clear_dev_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(dev._DEV_TOKEN_ENV, raising=False)
+
+
 def _inspect_document(
     repo_root: Path,
     status: str = "running",
@@ -41,6 +47,8 @@ def _inspect_document(
         "Id": _CONTAINER_ID,
         "Config": {
             "Image": dev.IMAGE,
+            "Entrypoint": ["/init"],
+            "Cmd": None,
             "Labels": {
                 dev._OWNER_LABEL: dev._OWNER_LABEL_VALUE,
                 dev._ROOT_LABEL: str(repo_root),
@@ -50,6 +58,7 @@ def _inspect_document(
         "State": {"Status": status},
         "HostConfig": {
             "NetworkMode": "bridge",
+            "ExtraHosts": [dev._BRIDGE_HOST_MAPPING],
             "PortBindings": port_bindings,
             "PublishAllPorts": False,
             "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
@@ -72,7 +81,7 @@ def _inspect_document(
             "Ports": port_bindings
             if status in {"paused", "restarting", "running"}
             else {},
-            "Networks": {"bridge": {}},
+            "Networks": {"bridge": {"Gateway": "172.17.0.1"}},
         },
     }
 
@@ -94,6 +103,10 @@ def _apply_drift(
 ) -> None:
     if drift == "image":
         document["Config"]["Image"] = f"{dev.IMAGE}-stale"
+    elif drift == "entrypoint":
+        document["Config"]["Entrypoint"] = ["python3"]
+    elif drift == "command":
+        document["Config"]["Cmd"] = ["--debug"]
     elif drift == "host_ip":
         document["HostConfig"]["PortBindings"]["8123/tcp"][0]["HostIp"] = "0.0.0.0"
     elif drift == "host_port":
@@ -126,6 +139,12 @@ def _apply_drift(
         )
     elif drift == "host_network":
         document["HostConfig"]["NetworkMode"] = "host"
+    elif drift == "missing_extra_host":
+        document["HostConfig"]["ExtraHosts"] = None
+    elif drift == "wrong_extra_host":
+        document["HostConfig"]["ExtraHosts"] = ["host.docker.internal:192.0.2.20"]
+    elif drift == "extra_host":
+        document["HostConfig"]["ExtraHosts"].append("example.test:192.0.2.21")
     elif drift == "extra_network":
         document["NetworkSettings"]["Networks"]["lan"] = {}
     elif drift == "runtime_host_ip":
@@ -142,15 +161,17 @@ def test_runtime_is_fixed_to_pinned_image_and_loopback_port() -> None:
         18123,
         8123,
     )
+    assert dev.BRIDGE_HOST_PORT == 18787
 
 
 def test_up_creates_private_state_and_safe_bind_mounts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     repo_root = _repository(tmp_path)
     calls: list[tuple[list[str], dict[str, object]]] = []
-    waits: list[float] = []
+    waits: list[tuple[float, str | None]] = []
 
     def fake_run(
         command: list[str], **kwargs: object
@@ -166,14 +187,20 @@ def test_up_creates_private_state_and_safe_bind_mounts(
 
     monkeypatch.setattr(dev.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        dev, "wait_for_home_assistant", lambda timeout: waits.append(timeout)
+        dev,
+        "wait_for_home_assistant",
+        lambda timeout, *, token: waits.append((timeout, token)) or False,
     )
 
     assert dev.main(["up", "--timeout", "12"], repo_root=repo_root) == 0
+    output = capsys.readouterr().out
+    assert "frontend is available" in output
+    assert "complete onboarding" in output
+    assert "is ready" not in output
 
     state = repo_root / ".ha-dev"
     assert state.is_dir()
-    assert waits == [12.0]
+    assert waits == [(12.0, None)]
     assert len(calls) == 2
     for _command, kwargs in calls:
         assert kwargs == {
@@ -186,7 +213,9 @@ def test_up_creates_private_state_and_safe_bind_mounts(
 
     run_command = calls[1][0]
     assert run_command[:2] == ["docker", "run"]
-    assert run_command[-1] == dev.IMAGE
+    assert run_command[run_command.index("--add-host") + 1] == (
+        "host.docker.internal:host-gateway"
+    )
     assert run_command[
         run_command.index("--publish") : run_command.index("--publish") + 2
     ] == ["--publish", "127.0.0.1:18123:8123/tcp"]
@@ -207,6 +236,8 @@ def test_up_creates_private_state_and_safe_bind_mounts(
     ]
     assert f"{dev._OWNER_LABEL}={dev._OWNER_LABEL_VALUE}" in run_command
     assert f"{dev._ROOT_LABEL}={repo_root}" in run_command
+    assert "--entrypoint" not in run_command
+    assert run_command[-1] == dev.IMAGE
 
 
 def test_up_starts_an_owned_stopped_container(
@@ -227,7 +258,9 @@ def test_up_starts_an_owned_stopped_container(
         return _completed(command)
 
     monkeypatch.setattr(dev.subprocess, "run", fake_run)
-    monkeypatch.setattr(dev, "wait_for_home_assistant", lambda _timeout: None)
+    monkeypatch.setattr(
+        dev, "wait_for_home_assistant", lambda _timeout, *, token: False
+    )
 
     assert dev.main(["up"], repo_root=repo_root) == 0
     assert commands == [
@@ -248,7 +281,8 @@ def test_restart_requires_owned_container_then_waits_for_health(
     repo_root = _repository(tmp_path)
     _private_state(repo_root)
     commands: list[list[str]] = []
-    waits: list[float] = []
+    waits: list[tuple[float, str | None]] = []
+    preflights: list[str] = []
 
     def fake_run(
         command: list[str], **_kwargs: object
@@ -259,8 +293,16 @@ def test_restart_requires_owned_container_then_waits_for_health(
         return _completed(command)
 
     monkeypatch.setattr(dev.subprocess, "run", fake_run)
+    monkeypatch.setenv(dev._DEV_TOKEN_ENV, "dev-token")
     monkeypatch.setattr(
-        dev, "wait_for_home_assistant", lambda timeout: waits.append(timeout)
+        dev,
+        "_require_running_preflight",
+        lambda token: preflights.append(token),
+    )
+    monkeypatch.setattr(
+        dev,
+        "wait_for_home_assistant",
+        lambda timeout, *, token: waits.append((timeout, token)) or True,
     )
 
     assert dev.main(["restart", "--timeout", "7.5"], repo_root=repo_root) == 0
@@ -272,7 +314,27 @@ def test_restart_requires_owned_container_then_waits_for_health(
         str(dev._STOP_GRACE_SECONDS),
         _CONTAINER_ID,
     ]
-    assert waits == [7.5]
+    assert waits == [(7.5, "dev-token")]
+    assert preflights == ["dev-token"]
+
+
+def test_restart_requires_dev_token_before_docker_or_state_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _repository(tmp_path)
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("restart must fail before Docker"),
+    )
+
+    assert dev.main(["restart"], repo_root=repo_root) == 1
+    output = capsys.readouterr()
+    assert "requires HA_CODEX_DEV_HASS_TOKEN" in output.err
+    assert output.out == ""
+    assert not (repo_root / ".ha-dev").exists()
 
 
 def test_check_is_isolated_read_only_and_does_not_create_state(
@@ -368,6 +430,177 @@ def test_status_logs_and_down_use_only_owned_container(
     ]
 
 
+class _BindableSocket:
+    def __init__(self, *, error: OSError | None = None) -> None:
+        self.error = error
+        self.bound: list[tuple[str, int]] = []
+
+    def __enter__(self) -> _BindableSocket:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def bind(self, address: tuple[str, int]) -> None:
+        self.bound.append(address)
+        if self.error is not None:
+            raise self.error
+
+
+def test_bridge_host_prints_only_validated_bindable_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _repository(tmp_path)
+    _private_state(repo_root)
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    bindable = _BindableSocket()
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        if command[1:3] == ["container", "inspect"]:
+            return _completed(command, stdout=_owned_inspect_output(repo_root))
+        if command[1:3] == ["container", "exec"]:
+            return _completed(command, stdout="172.17.0.1\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(dev.subprocess, "run", fake_run)
+    monkeypatch.setattr(dev.socket, "socket", lambda _family, _kind: bindable)
+
+    assert dev.main(["bridge-host"], repo_root=repo_root) == 0
+    assert capsys.readouterr() == ("172.17.0.1\n", "")
+    assert bindable.bound == [("172.17.0.1", dev.BRIDGE_HOST_PORT)]
+    assert calls[1] == (
+        [
+            "docker",
+            "container",
+            "exec",
+            _CONTAINER_ID,
+            "python3",
+            "-c",
+            dev._BRIDGE_RESOLVER,
+        ],
+        {
+            "check": False,
+            "text": True,
+            "capture_output": True,
+            "shell": False,
+            "timeout": dev._HEALTH_REQUEST_TIMEOUT,
+        },
+    )
+
+
+@pytest.mark.parametrize("status", ["created", "exited", "restarting", "paused"])
+def test_bridge_host_requires_running_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+) -> None:
+    repo_root = _repository(tmp_path)
+    _private_state(repo_root)
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda command, **_kwargs: _completed(
+            command, stdout=_owned_inspect_output(repo_root, status)
+        ),
+    )
+
+    assert dev.main(["bridge-host"], repo_root=repo_root) == 1
+    assert "must be running" in capsys.readouterr().err
+
+
+def test_bridge_host_rejects_missing_and_drifted_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _repository(tmp_path)
+    _private_state(repo_root)
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda command, **_kwargs: _completed(
+            command, 1, stderr="No such container: local-dev\n"
+        ),
+    )
+    assert dev.main(["bridge-host"], repo_root=repo_root) == 1
+    assert "does not exist" in capsys.readouterr().err
+
+    document = _inspect_document(repo_root)
+    _apply_drift(document, "wrong_extra_host", repo_root)
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda command, **_kwargs: _completed(command, stdout=json.dumps([document])),
+    )
+    assert dev.main(["bridge-host"], repo_root=repo_root) == 1
+    assert "refusing to reuse drifted" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("resolver_output", "message"),
+    [
+        ("", "malformed output"),
+        ("172.17.0.1 172.17.0.2\n", "malformed output"),
+        ("not-an-ip\n", "not an IPv4 address"),
+        ("127.0.0.1\n", "not a safe host address"),
+        ("0.0.0.0\n", "not a safe host address"),
+        ("224.0.0.1\n", "not a safe host address"),
+        ("x" * (dev._MAX_RESOLVER_OUTPUT_BYTES + 1), "oversized output"),
+    ],
+)
+def test_bridge_host_rejects_malformed_or_unsafe_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    resolver_output: str,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda command, **_kwargs: _completed(command, stdout=resolver_output),
+    )
+
+    with pytest.raises(dev.DevLoopError, match=message):
+        dev._resolve_bridge_host(_CONTAINER_ID)
+
+
+def test_bridge_host_rejects_gateway_mismatch_and_unbindable_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _repository(tmp_path)
+    _private_state(repo_root)
+    resolver_output = "172.17.0.2\n"
+
+    def fake_run(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[1:3] == ["container", "inspect"]:
+            return _completed(command, stdout=_owned_inspect_output(repo_root))
+        return _completed(command, stdout=resolver_output)
+
+    monkeypatch.setattr(dev.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        dev.socket,
+        "socket",
+        lambda *_args: pytest.fail("mismatch must fail before binding"),
+    )
+    assert dev.main(["bridge-host"], repo_root=repo_root) == 1
+    assert "does not match" in capsys.readouterr().err
+
+    resolver_output = "172.17.0.1\n"
+    unbindable = _BindableSocket(error=OSError("address unavailable"))
+    monkeypatch.setattr(dev.socket, "socket", lambda _family, _kind: unbindable)
+    assert dev.main(["bridge-host"], repo_root=repo_root) == 1
+    assert "host cannot bind" in capsys.readouterr().err
+
+
 def test_missing_container_status_and_down_are_non_destructive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -418,6 +651,8 @@ def test_refuses_same_named_container_from_another_checkout(
     "drift",
     [
         "image",
+        "entrypoint",
+        "command",
         "host_ip",
         "host_port",
         "container_port",
@@ -430,6 +665,9 @@ def test_refuses_same_named_container_from_another_checkout(
         "component_writable",
         "extra_mount",
         "host_network",
+        "missing_extra_host",
+        "wrong_extra_host",
+        "extra_host",
         "extra_network",
         "runtime_host_ip",
     ],
@@ -491,7 +729,7 @@ def test_up_safely_recreates_owned_drift_and_preserves_state(
     document = _inspect_document(repo_root)
     _apply_drift(document, "host_ip", repo_root)
     calls: list[tuple[list[str], object]] = []
-    waits: list[float] = []
+    waits: list[tuple[float, str | None]] = []
 
     def fake_run(
         command: list[str], **kwargs: object
@@ -503,7 +741,9 @@ def test_up_safely_recreates_owned_drift_and_preserves_state(
 
     monkeypatch.setattr(dev.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        dev, "wait_for_home_assistant", lambda timeout: waits.append(timeout)
+        dev,
+        "wait_for_home_assistant",
+        lambda timeout, *, token: waits.append((timeout, token)) or False,
     )
 
     assert dev.main(["up"], repo_root=repo_root) == 0
@@ -523,7 +763,7 @@ def test_up_safely_recreates_owned_drift_and_preserves_state(
     assert calls[1][1] == dev._STOP_COMMAND_TIMEOUT
     assert calls[-1][0][:2] == ["docker", "run"]
     assert marker.read_text(encoding="utf-8") == "preserve"
-    assert waits == [dev._DEFAULT_STARTUP_TIMEOUT]
+    assert waits == [(dev._DEFAULT_STARTUP_TIMEOUT, None)]
     assert "Recreating drifted container" in capsys.readouterr().err
 
 
@@ -779,15 +1019,71 @@ def test_docker_failure_and_missing_binary_are_concise(
 
 
 class _Response:
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, body: bytes = b"") -> None:
         self.status = status
+        self.body = body
         self.closed = False
+        self.read_limits: list[int] = []
 
     def getcode(self) -> int:
         return self.status
 
+    def read(self, amount: int) -> bytes:
+        self.read_limits.append(amount)
+        return self.body
+
     def close(self) -> None:
         self.closed = True
+
+
+def test_restart_bad_token_fails_preflight_before_docker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _repository(tmp_path)
+    secret = "bad-local-dev-token"
+    error = HTTPError(dev._CONFIG_URL, 401, "Unauthorized", {}, None)
+    monkeypatch.setenv(dev._DEV_TOKEN_ENV, secret)
+    monkeypatch.setattr(
+        dev, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error)
+    )
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("preflight must fail before Docker"),
+    )
+
+    assert dev.main(["restart"], repo_root=repo_root) == 1
+    output = capsys.readouterr()
+    assert "was rejected" in output.err
+    assert secret not in output.err
+    assert output.out == ""
+    assert not (repo_root / ".ha-dev").exists()
+    assert error.closed is True
+
+
+def test_restart_non_running_preflight_does_not_restart_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _repository(tmp_path)
+    response = _Response(200, b'{"state":"NOT_RUNNING"}')
+    monkeypatch.setenv(dev._DEV_TOKEN_ENV, "local-dev-token")
+    monkeypatch.setattr(dev, "urlopen", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(
+        dev.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("preflight must fail before Docker"),
+    )
+
+    assert dev.main(["restart"], repo_root=repo_root) == 1
+    output = capsys.readouterr()
+    assert "preflight Core state is NOT_RUNNING" in output.err
+    assert output.out == ""
+    assert not (repo_root / ".ha-dev").exists()
+    assert response.closed is True
 
 
 def test_health_probe_uses_fixed_loopback_url_and_request_timeout(
@@ -802,32 +1098,57 @@ def test_health_probe_uses_fixed_loopback_url_and_request_timeout(
 
     monkeypatch.setattr(dev, "urlopen", healthy)
 
-    dev.wait_for_home_assistant(5)
+    assert dev.wait_for_home_assistant(5, token=None) is False
 
     assert calls == [("http://127.0.0.1:18123/manifest.json", 2.0)]
     assert response.closed is True
 
 
-def test_health_probe_retries_unauthorized_response(
+def test_health_probe_waits_for_not_running_to_become_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    error = HTTPError(dev._HEALTH_URL, 401, "Unauthorized", {}, None)
-    response = _Response(200)
-    attempts = iter((error, response))
+    responses = iter(
+        (
+            _Response(200, b'{"state":"NOT_RUNNING"}'),
+            _Response(200, b'{"state":"RUNNING"}'),
+        )
+    )
+    requests: list[Request] = []
 
-    def probe(*_args: object, **_kwargs: object) -> _Response:
-        result = next(attempts)
-        if isinstance(result, HTTPError):
-            raise result
-        return result
+    def config(request: Request, *, timeout: float) -> _Response:
+        assert 0 < timeout <= dev._HEALTH_REQUEST_TIMEOUT
+        requests.append(request)
+        return next(responses)
 
-    monkeypatch.setattr(dev, "urlopen", probe)
+    monkeypatch.setattr(dev, "urlopen", config)
     monkeypatch.setattr(dev.time, "sleep", lambda _duration: None)
 
-    dev.wait_for_home_assistant(1)
+    assert dev.wait_for_home_assistant(1, token="local-dev-token") is True
+
+    assert len(requests) == 2
+    assert all(request.full_url == dev._CONFIG_URL for request in requests)
+    assert all(
+        request.get_header("Authorization") == "Bearer local-dev-token"
+        for request in requests
+    )
+
+
+def test_health_probe_rejects_unauthorized_token_without_leaking_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = HTTPError(dev._CONFIG_URL, 401, "Unauthorized", {}, None)
+    secret = "secret-local-dev-token"
+
+    def probe(*_args: object, **_kwargs: object) -> _Response:
+        raise error
+
+    monkeypatch.setattr(dev, "urlopen", probe)
+
+    with pytest.raises(dev.DevLoopError, match="was rejected") as raised:
+        dev.wait_for_home_assistant(1, token=secret)
 
     assert error.closed is True
-    assert response.closed is True
+    assert secret not in str(raised.value)
 
 
 def test_health_wait_is_bounded_when_network_never_answers(
@@ -845,7 +1166,7 @@ def test_health_wait_is_bounded_when_network_never_answers(
         sleeps.append(duration)
         now += duration
 
-    def unavailable(_url: str, *, timeout: float) -> _Response:
+    def unavailable(_request: object, *, timeout: float) -> _Response:
         attempts.append(timeout)
         raise URLError("not ready")
 
@@ -854,12 +1175,86 @@ def test_health_wait_is_bounded_when_network_never_answers(
     monkeypatch.setattr(dev, "urlopen", unavailable)
 
     with pytest.raises(dev.DevLoopError, match=r"within 1.2 seconds"):
-        dev.wait_for_home_assistant(1.2)
+        dev.wait_for_home_assistant(1.2, token="local-dev-token")
 
     assert len(attempts) == 3
     assert all(0 < timeout <= dev._HEALTH_REQUEST_TIMEOUT for timeout in attempts)
     assert attempts[-1] < attempts[0]
     assert sum(sleeps) == pytest.approx(1.2)
+
+
+def test_config_probe_uses_bounded_json_and_closes_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _Response(200, b'{"state":"RUNNING","other":"allowed"}')
+    calls: list[tuple[Request, float]] = []
+
+    def probe(request: Request, *, timeout: float) -> _Response:
+        calls.append((request, timeout))
+        return response
+
+    monkeypatch.setattr(dev, "urlopen", probe)
+
+    assert dev._config_state("local-dev-token", timeout=1.25) == "RUNNING"
+    assert len(calls) == 1
+    request, timeout = calls[0]
+    assert request.full_url == "http://127.0.0.1:18123/api/config"
+    assert request.get_header("Authorization") == "Bearer local-dev-token"
+    assert timeout == 1.25
+    assert response.read_limits == [dev._MAX_CONFIG_RESPONSE_BYTES + 1]
+    assert response.closed is True
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (b"not json", "malformed JSON"),
+        (b"[]", "malformed state"),
+        (b'{"state":1}', "malformed state"),
+        (b"x" * (dev._MAX_CONFIG_RESPONSE_BYTES + 1), "oversized JSON"),
+    ],
+)
+def test_config_probe_rejects_malformed_or_oversized_output(
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+    message: str,
+) -> None:
+    response = _Response(200, body)
+    monkeypatch.setattr(dev, "urlopen", lambda _request, **_kwargs: response)
+
+    with pytest.raises(dev.DevLoopError, match=message):
+        dev._config_state("local-dev-token", timeout=1)
+    assert response.closed is True
+
+
+def test_config_probe_rejects_non_200_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _Response(503, b'{"state":"RUNNING"}')
+    monkeypatch.setattr(dev, "urlopen", lambda _request, **_kwargs: response)
+    with pytest.raises(dev.DevLoopError, match="HTTP 503"):
+        dev._config_state("local-dev-token", timeout=1)
+    assert response.closed is True
+
+
+@pytest.mark.parametrize("value", ["", " token", "token ", "bad\nvalue", "x" * 4097])
+def test_dev_token_rejects_empty_unbounded_or_malformed_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(dev._DEV_TOKEN_ENV, value)
+    with pytest.raises(dev.DevLoopError, match="empty or malformed") as raised:
+        dev._dev_token()
+    assert str(raised.value) == "HA_CODEX_DEV_HASS_TOKEN is empty or malformed"
+
+
+def test_dev_token_is_optional_and_validated_without_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(dev._DEV_TOKEN_ENV, raising=False)
+    assert dev._dev_token() is None
+    monkeypatch.setenv(dev._DEV_TOKEN_ENV, "local-dev-token")
+    assert dev._dev_token() == "local-dev-token"
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "301", "nan", "inf"])

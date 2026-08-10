@@ -58,6 +58,21 @@ Start the interactive instance and open <http://127.0.0.1:18123>:
 python3 scripts/dev_home_assistant.py up
 ```
 
+Without a dedicated local token, `up` waits only for the frontend so onboarding
+remains possible and reports that Core lifecycle is unverified. After
+onboarding, create a long-lived token from the local development user's profile
+and export it only in the development shell:
+
+```bash
+export HA_CODEX_DEV_HASS_TOKEN="replace-with-the-local-development-token"
+```
+
+Do not reuse a production Home Assistant token. With this variable set, `up`
+and `restart` poll the authenticated local `/api/config` response and return
+only when Core reports `RUNNING`. `restart` requires the variable and validates
+it before changing container state, so it cannot report a frontend-only false
+ready result.
+
 The helper bind-mounts `custom_components/codex_voice` read-only at
 `/config/custom_components/codex_voice`. Home Assistant's writable local
 configuration and database stay in the ignored `.ha-dev/` directory. Do not
@@ -73,28 +88,50 @@ python3 scripts/dev_home_assistant.py restart
 python3 scripts/dev_home_assistant.py logs --follow
 ```
 
+For an end-to-end local component test, run a second bridge on its dedicated
+development port. The helper validates the owned container's exact
+`host.docker.internal:host-gateway` mapping, confirms that it resolves to the
+attached Docker bridge gateway, and refuses an unsafe, mismatched, or occupied
+address:
+
+```bash
+export HA_CODEX_BRIDGE_HOST="$(python3 scripts/dev_home_assistant.py bridge-host)"
+export HA_CODEX_BRIDGE_PORT=18787
+uv run --extra bridge python -m bridge
+```
+
+Keep the normal bridge token and file-backed Codex login environment described
+in the bridge setup. In the local Home Assistant config flow, use
+`http://host.docker.internal:18787` with that bridge token. The development
+bridge binds only the Docker gateway, not `0.0.0.0`; Home Assistant remains
+published only at `127.0.0.1:18123`. The mandatory bearer token still protects
+the bridge from other local containers on Docker's default bridge network.
+
 All commands are:
 
 | Command | Purpose |
 | --- | --- |
 | `up [--timeout SECONDS]` | Create or start the pinned instance and wait for its frontend availability probe |
-| `restart [--timeout SECONDS]` | Restart the existing instance and wait for the same availability probe |
+| `restart [--timeout SECONDS]` | Restart the existing instance and require authenticated Core state `RUNNING` |
 | `check` | Compile and import the component without onboarding |
 | `status` | Show the owned container's Docker state |
+| `bridge-host` | Print the validated gateway address for a bridge on port 18787 |
 | `logs [--tail LINES] [--follow]` | Print recent logs, optionally following them |
 | `down` | Remove the container while preserving `.ha-dev/` state |
 
 Startup waits are bounded to 60 seconds by default and can never exceed five
-minutes. The `/manifest.json` probe proves that the local frontend is answering;
-it is not an authenticated API or component-functionality test. The helper
-records ownership labels and validates the pinned image, exact read-only and
-read-write mounts, bridge-only networking, loopback port publication, and
-restart policy before reuse. `up` and `restart` gracefully recreate a drifted
-but owned container while preserving `.ha-dev/`; `status` and `logs` reject
-drift instead of presenting it as trusted. `down` gives Home Assistant ten
-seconds to stop, removes the container without forced or volume removal, and
-deliberately keeps `.ha-dev/`. Use the Home Assistant UI or a deliberate local
-filesystem action when a clean onboarding state is required.
+minutes. Without `HA_CODEX_DEV_HASS_TOKEN`, the `/manifest.json` probe proves
+only that the local frontend is answering. With the token, the bounded
+authenticated probe requires Core state `RUNNING`. The helper records ownership
+labels and validates the pinned image and `/init` entrypoint, exact read-only
+and read-write mounts, bridge-only networking, loopback port publication,
+host-gateway mapping, and restart policy before reuse. `up` and `restart`
+gracefully recreate a drifted but owned container while preserving `.ha-dev/`;
+`status`, `logs`, and `bridge-host` reject drift instead of presenting it as
+trusted. `down` gives Home Assistant ten seconds to stop, removes the container
+without forced or volume removal, and deliberately keeps `.ha-dev/`. Use the
+Home Assistant UI or a deliberate local filesystem action when a clean
+onboarding state is required.
 
 ## Production loop: SSH sync
 
@@ -133,6 +170,13 @@ Assistant instance reached by `--host`. The token is sent only in the Home
 Assistant REST authorization header and is redacted from dry-run output. A file
 sync without `--restart` does not activate changed Python; restart manually from
 the UI or run `ha core restart` in the Terminal & SSH shell before validation.
+
+The restart path first requires authenticated `/api/config` state `RUNNING`.
+Home Assistant may close or time out the restart POST after accepting it; the
+helper treats that response as ambiguous and succeeds only after observing a
+non-running/unavailable transition followed by `RUNNING`. A confirmed success
+response retains a bounded grace fallback for very fast restarts. Authentication
+and HTTP failures remain terminal and token values are never printed.
 
 The helper packages only the integration, uploads a bounded archive, verifies
 its size and SHA-256 digest on the host, and uses a random per-run upload and

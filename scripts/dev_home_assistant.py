@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -14,18 +16,21 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 IMAGE = "ghcr.io/home-assistant/home-assistant:2026.8.1"
 CONTAINER_NAME = "ha-codex-voice-dev"
 HOST = "127.0.0.1"
 HOST_PORT = 18123
 CONTAINER_PORT = 8123
+BRIDGE_HOST_PORT = 18787
 
 _DOCKER = "docker"
 _STATE_DIRECTORY = ".ha-dev"
 _COMPONENT_RELATIVE_PATH = Path("custom_components/codex_voice")
 _CONTAINER_COMPONENT_PATH = "/config/custom_components/codex_voice"
+_BRIDGE_HOST_NAME = "host.docker.internal"
+_BRIDGE_HOST_MAPPING = f"{_BRIDGE_HOST_NAME}:host-gateway"
 _OWNER_LABEL = "io.github.aureliob.ha-codex-voice.dev"
 _ROOT_LABEL = "io.github.aureliob.ha-codex-voice.dev-root"
 _OWNER_LABEL_VALUE = "1"
@@ -34,6 +39,24 @@ _MAX_STARTUP_TIMEOUT = 300.0
 _HEALTH_POLL_INTERVAL = 0.5
 _HEALTH_REQUEST_TIMEOUT = 2.0
 _HEALTH_URL = f"http://{HOST}:{HOST_PORT}/manifest.json"
+_CONFIG_URL = f"http://{HOST}:{HOST_PORT}/api/config"
+_DEV_TOKEN_ENV = "HA_CODEX_DEV_HASS_TOKEN"
+_MAX_DEV_TOKEN_BYTES = 4096
+_MAX_CONFIG_RESPONSE_BYTES = 64 * 1024
+_MAX_RESOLVER_OUTPUT_BYTES = 128
+_BRIDGE_RESOLVER = f'''\
+import socket
+
+addresses = {{
+    item[4][0]
+    for item in socket.getaddrinfo(
+        "{_BRIDGE_HOST_NAME}", None, socket.AF_INET, socket.SOCK_STREAM
+    )
+}}
+if len(addresses) != 1:
+    raise RuntimeError("bridge host did not resolve to exactly one IPv4 address")
+print(addresses.pop())
+'''
 _STOP_GRACE_SECONDS = 10
 _STOP_COMMAND_TIMEOUT = _STOP_GRACE_SECONDS + 5
 _CONTAINER_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
@@ -86,6 +109,7 @@ class ContainerInfo:
 
     identifier: str
     status: str
+    bridge_gateway: str | None
     configuration_error: str | None = None
 
 
@@ -222,17 +246,31 @@ def _mapping(value: object, *, description: str) -> dict[str, object]:
     return value
 
 
+def _safe_ipv4_address(value: object, *, description: str) -> str:
+    if not isinstance(value, str):
+        raise DevLoopError(f"{description} is not an IPv4 address")
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as error:
+        raise DevLoopError(f"{description} is not an IPv4 address") from error
+    if address.is_unspecified or address.is_loopback or address.is_multicast:
+        raise DevLoopError(f"{description} is not a safe host address")
+    return str(address)
+
+
 def _validate_container_configuration(
     document: dict[str, object],
     config: dict[str, object],
     paths: DevPaths,
     *,
     status: str,
-) -> None:
+) -> str | None:
     if config.get("Image") != IMAGE:
         raise ContainerDriftError(
             "image does not match the pinned Home Assistant image"
         )
+    if config.get("Entrypoint") != ["/init"] or config.get("Cmd") is not None:
+        raise ContainerDriftError("container does not use the image's /init entrypoint")
 
     try:
         host_config = _mapping(
@@ -257,6 +295,10 @@ def _validate_container_configuration(
         raise ContainerDriftError("Docker publish-all-ports must be disabled")
     if host_config.get("NetworkMode") != "bridge":
         raise ContainerDriftError("container network mode is not the isolated bridge")
+    if host_config.get("ExtraHosts") != [_BRIDGE_HOST_MAPPING]:
+        raise ContainerDriftError(
+            "container host mapping is not exactly host.docker.internal:host-gateway"
+        )
     if (
         restart_policy.get("Name") != "no"
         or restart_policy.get("MaximumRetryCount") != 0
@@ -310,11 +352,26 @@ def _validate_container_configuration(
     if set(networks) != {"bridge"}:
         raise ContainerDriftError("container has an unexpected network attachment")
 
+    bridge_gateway: str | None = None
     if status in {"paused", "restarting", "running"}:
         if network_settings.get("Ports") != expected_port_bindings:
             raise ContainerDriftError(
                 "active container port binding is not loopback-only"
             )
+        try:
+            bridge = _mapping(
+                networks.get("bridge"),
+                description="container bridge attachment",
+            )
+        except DevLoopError as error:
+            raise ContainerDriftError(str(error)) from error
+        try:
+            bridge_gateway = _safe_ipv4_address(
+                bridge.get("Gateway"), description="container bridge gateway"
+            )
+        except DevLoopError as error:
+            raise ContainerDriftError(str(error)) from error
+    return bridge_gateway
 
 
 def _inspect_container(paths: DevPaths) -> ContainerInfo | None:
@@ -359,8 +416,9 @@ def _inspect_container(paths: DevPaths) -> ContainerInfo | None:
         raise DevLoopError("docker returned an unsafe container status")
 
     configuration_error: str | None = None
+    bridge_gateway: str | None = None
     try:
-        _validate_container_configuration(
+        bridge_gateway = _validate_container_configuration(
             document,
             config,
             paths,
@@ -371,6 +429,7 @@ def _inspect_container(paths: DevPaths) -> ContainerInfo | None:
     return ContainerInfo(
         identifier=identifier,
         status=status,
+        bridge_gateway=bridge_gateway,
         configuration_error=configuration_error,
     )
 
@@ -405,8 +464,71 @@ def _log_tail(value: str) -> int:
     return lines
 
 
-def wait_for_home_assistant(timeout: float) -> None:
-    """Wait up to ``timeout`` seconds for Home Assistant's frontend manifest."""
+def _dev_token() -> str | None:
+    token = os.environ.get(_DEV_TOKEN_ENV)
+    if token is None:
+        return None
+    if (
+        not token
+        or token != token.strip()
+        or len(token.encode("utf-8")) > _MAX_DEV_TOKEN_BYTES
+        or any(ord(character) < 32 or ord(character) == 127 for character in token)
+    ):
+        raise DevLoopError(f"{_DEV_TOKEN_ENV} is empty or malformed")
+    return token
+
+
+def _config_state(token: str, *, timeout: float) -> str:
+    request = Request(
+        _CONFIG_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    response = urlopen(request, timeout=timeout)
+    try:
+        status = response.getcode()
+        body = response.read(_MAX_CONFIG_RESPONSE_BYTES + 1)
+    finally:
+        response.close()
+    if status != 200:
+        raise DevLoopError(f"Home Assistant config probe returned HTTP {status}")
+    if len(body) > _MAX_CONFIG_RESPONSE_BYTES:
+        raise DevLoopError("Home Assistant config probe returned oversized JSON")
+    try:
+        document = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DevLoopError(
+            "Home Assistant config probe returned malformed JSON"
+        ) from error
+    if not isinstance(document, dict) or not isinstance(
+        state := document.get("state"), str
+    ):
+        raise DevLoopError("Home Assistant config probe returned malformed state")
+    return state
+
+
+def _require_running_preflight(token: str) -> None:
+    try:
+        state = _config_state(token, timeout=_HEALTH_REQUEST_TIMEOUT)
+    except HTTPError as error:
+        code = error.code
+        error.close()
+        if code in {401, 403}:
+            raise DevLoopError(
+                f"{_DEV_TOKEN_ENV} was rejected by Home Assistant"
+            ) from error
+        raise DevLoopError(f"Home Assistant preflight returned HTTP {code}") from error
+    except (TimeoutError, URLError, OSError) as error:
+        raise DevLoopError(f"Home Assistant preflight failed: {error}") from error
+    if state != "RUNNING":
+        raise DevLoopError(f"Home Assistant preflight Core state is {state}")
+
+
+def wait_for_home_assistant(timeout: float, *, token: str | None) -> bool:
+    """Wait for Core RUNNING with a token, or frontend access without one.
+
+    Return ``True`` only when the authenticated Core state is ``RUNNING``.
+    """
     if not 0 < timeout <= _MAX_STARTUP_TIMEOUT:
         raise DevLoopError(
             f"startup timeout must be greater than 0 and at most "
@@ -423,26 +545,38 @@ def wait_for_home_assistant(timeout: float) -> None:
                 f"({last_error}); inspect it with the logs command"
             )
         request_timeout = min(_HEALTH_REQUEST_TIMEOUT, remaining)
-        try:
-            response = urlopen(
-                _HEALTH_URL,
-                timeout=request_timeout,
-            )
+        if token is not None:
             try:
-                status = response.getcode()
-            finally:
-                response.close()
-            if status == 200:
-                return
-            last_error = f"HTTP {status}"
-        except HTTPError as error:
-            if error.code == 200:
+                state = _config_state(token, timeout=request_timeout)
+            except HTTPError as error:
+                code = error.code
                 error.close()
-                return
-            last_error = f"HTTP {error.code}"
-            error.close()
-        except (TimeoutError, URLError, OSError) as error:
-            last_error = str(error) or type(error).__name__
+                if code in {401, 403}:
+                    raise DevLoopError(
+                        f"{_DEV_TOKEN_ENV} was rejected by Home Assistant"
+                    ) from error
+                last_error = f"HTTP {code}"
+            except (TimeoutError, URLError, OSError) as error:
+                last_error = str(error) or type(error).__name__
+            else:
+                if state == "RUNNING":
+                    return True
+                last_error = f"Core state is {state}"
+        else:
+            try:
+                response = urlopen(_HEALTH_URL, timeout=request_timeout)
+                try:
+                    status = response.getcode()
+                finally:
+                    response.close()
+                if status == 200:
+                    return False
+                last_error = f"HTTP {status}"
+            except HTTPError as error:
+                last_error = f"HTTP {error.code}"
+                error.close()
+            except (TimeoutError, URLError, OSError) as error:
+                last_error = str(error) or type(error).__name__
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -465,6 +599,8 @@ def _create_container(paths: DevPaths) -> None:
             "no",
             "--network",
             "bridge",
+            "--add-host",
+            _BRIDGE_HOST_MAPPING,
             "--publish",
             f"{HOST}:{HOST_PORT}:{CONTAINER_PORT}/tcp",
             "--mount",
@@ -520,7 +656,7 @@ def _recreate_container(paths: DevPaths, info: ContainerInfo) -> None:
     _create_container(paths)
 
 
-def _up(paths: DevPaths, *, timeout: float) -> None:
+def _up(paths: DevPaths, *, timeout: float, token: str | None) -> None:
     _ensure_state_directory(paths)
     info = _inspect_container(paths)
     if info is None:
@@ -533,11 +669,22 @@ def _up(paths: DevPaths, *, timeout: float) -> None:
         raise DevLoopError(
             f"container is {info.status!r}; run down and then up to recreate it"
         )
-    wait_for_home_assistant(timeout)
-    print(f"Home Assistant is ready at http://{HOST}:{HOST_PORT}")
+    running_verified = wait_for_home_assistant(timeout, token=token)
+    if running_verified:
+        print(f"Home Assistant is RUNNING at http://{HOST}:{HOST_PORT}")
+    else:
+        print(
+            f"Home Assistant frontend is available at http://{HOST}:{HOST_PORT}; "
+            f"complete onboarding and set {_DEV_TOKEN_ENV} to verify Core RUNNING"
+        )
 
 
-def _restart(paths: DevPaths, *, timeout: float) -> None:
+def _restart(paths: DevPaths, *, timeout: float, token: str | None) -> None:
+    if token is None:
+        raise DevLoopError(
+            f"restart requires {_DEV_TOKEN_ENV} to verify Core reaches RUNNING"
+        )
+    _require_running_preflight(token)
     _ensure_state_directory(paths)
     info = _inspect_container(paths)
     if info is None:
@@ -555,8 +702,8 @@ def _restart(paths: DevPaths, *, timeout: float) -> None:
             ],
             timeout=_STOP_COMMAND_TIMEOUT,
         )
-    wait_for_home_assistant(timeout)
-    print(f"Home Assistant restarted at http://{HOST}:{HOST_PORT}")
+    wait_for_home_assistant(timeout, token=token)
+    print(f"Home Assistant restarted and is RUNNING at http://{HOST}:{HOST_PORT}")
 
 
 def _check(paths: DevPaths) -> None:
@@ -595,6 +742,49 @@ def _status(paths: DevPaths) -> int:
     suffix = f" at http://{HOST}:{HOST_PORT}" if info.status == "running" else ""
     print(f"Home Assistant development container: {info.status}{suffix}")
     return 0
+
+
+def _resolve_bridge_host(identifier: str) -> str:
+    result = _run_docker(
+        ["container", "exec", identifier, "python3", "-c", _BRIDGE_RESOLVER],
+        capture_output=True,
+        timeout=_HEALTH_REQUEST_TIMEOUT,
+    )
+    encoded_output = result.stdout.encode("utf-8", errors="replace")
+    if len(encoded_output) > _MAX_RESOLVER_OUTPUT_BYTES:
+        raise DevLoopError("bridge-host resolver returned oversized output")
+    output = result.stdout.strip()
+    if not output or any(character.isspace() for character in output):
+        raise DevLoopError("bridge-host resolver returned malformed output")
+    return _safe_ipv4_address(output, description="resolved bridge host")
+
+
+def _bridge_host(paths: DevPaths) -> None:
+    info = _inspect_container(paths)
+    if info is None:
+        raise DevLoopError("development container does not exist; run up first")
+    _require_reusable_container(paths, info)
+    if info.status != "running":
+        raise DevLoopError(
+            f"development container must be running, not {info.status!r}"
+        )
+    if info.bridge_gateway is None:
+        raise DevLoopError("running container does not have a validated bridge gateway")
+
+    resolved = _resolve_bridge_host(info.identifier)
+    if resolved != info.bridge_gateway:
+        raise DevLoopError(
+            "host.docker.internal does not match the attached bridge gateway"
+        )
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+            probe_socket.bind((resolved, BRIDGE_HOST_PORT))
+    except OSError as error:
+        raise DevLoopError(
+            f"host cannot bind the attached bridge gateway on port {BRIDGE_HOST_PORT}: "
+            f"{error}"
+        ) from error
+    print(resolved)
 
 
 def _logs(paths: DevPaths, *, follow: bool, tail: int) -> None:
@@ -638,6 +828,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands.add_parser("check", help="compile and import the mounted component")
     commands.add_parser("status", help="show the container state")
+    commands.add_parser(
+        "bridge-host",
+        help="print the validated host address reachable from the container",
+    )
     logs = commands.add_parser("logs", help="show container logs")
     logs.add_argument("-f", "--follow", action="store_true")
     logs.add_argument("--tail", type=_log_tail, default=200)
@@ -654,17 +848,19 @@ def main(
     parser = _parser()
     args = parser.parse_args(argv)
     selected_root = repo_root if repo_root is not None else _default_repo_root()
-    require_component = args.command in {"up", "restart", "check"}
+    require_component = args.command in {"up", "restart", "check", "bridge-host"}
     try:
         paths = _dev_paths(selected_root, require_component=require_component)
         if args.command == "up":
-            _up(paths, timeout=args.timeout)
+            _up(paths, timeout=args.timeout, token=_dev_token())
         elif args.command == "restart":
-            _restart(paths, timeout=args.timeout)
+            _restart(paths, timeout=args.timeout, token=_dev_token())
         elif args.command == "check":
             _check(paths)
         elif args.command == "status":
             return _status(paths)
+        elif args.command == "bridge-host":
+            _bridge_host(paths)
         elif args.command == "logs":
             _logs(paths, follow=args.follow, tail=args.tail)
         elif args.command == "down":
