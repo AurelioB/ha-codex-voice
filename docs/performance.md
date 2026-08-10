@@ -90,7 +90,7 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge v2 WebRTC input track | 2,250 ms | Limits only live device lag; finite STT retains its whole-utterance capacity |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
-| Full-duplex AEC sink ceiling | Configured 1–60% (25% default), checked at preflight and every response | Fails closed if any live sink channel is too loud |
+| Full-duplex AEC sink ceiling | Persisted startup value and configured guard, 1–60% (25% default), checked at preflight and every response | Restores the reviewed value after reboot and fails closed if any live sink channel is too loud |
 | Home Assistant tool execution + result send | 25 s + 5 s | Bounds the authority action and component transport separately |
 | Bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
 | App Server tool fallback | 45 s | Remains responsible until the result write completes |

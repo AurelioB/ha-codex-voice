@@ -2,8 +2,10 @@
 
 These assets are an opt-in preparation step for the pinned ThirdReality
 `1.01.07`/upstream `v1.1.7` image. They do not deploy themselves. The helper
-never restarts PulseAudio or the voice service, never changes speaker volume,
-and never changes or disables TCP ADB on port 5555.
+never restarts PulseAudio or the voice service, never changes the running
+speaker volume, and never changes or disables TCP ADB on port 5555. It does
+write the explicitly selected AEC sink volume into the managed PulseAudio
+startup block so the reviewed value survives a service restart or reboot.
 
 The device starts PulseAudio with `--disallow-module-loading`. Its
 `/etc/pulse/default.pa` includes `default.pa.d` **before** the two raw ALSA
@@ -23,6 +25,9 @@ Speex, or
 [`pulse/codex-echo-cancel-adrian.pa`](pulse/codex-echo-cancel-adrian.pa) for
 Adrian. Only `webrtc`, `speex`, and `adrian` are accepted. Omitting the flag
 selects WebRTC; the helper does not probe engines or fall back automatically.
+`--aec-sink-volume-percent` selects a startup value from 1 through 60 and
+defaults to 25. The managed block renders the exact PulseAudio raw value
+(`65536 × percent // 100`) immediately after the AEC sink is created.
 `check`, `install`, and `remove` are content-safe and idempotent;
 install/remove remain dry runs without `--apply`. Installation requires an
 existing backup parent, creates a mode-0600 backup without overwriting a
@@ -39,10 +44,17 @@ Example device-side sequence after copying the reviewed assets from a pinned
 release:
 
 ```sh
-python3 prepare_pulseaudio_aec.py check --aec-method adrian
-python3 prepare_pulseaudio_aec.py install --aec-method adrian
-python3 prepare_pulseaudio_aec.py install --aec-method adrian --apply
+python3 prepare_pulseaudio_aec.py check --aec-method adrian --aec-sink-volume-percent 60
+python3 prepare_pulseaudio_aec.py install --aec-method adrian --aec-sink-volume-percent 60
+python3 prepare_pulseaudio_aec.py install --aec-method adrian --aec-sink-volume-percent 60 --apply
 ```
+
+Use 60 only for an installation that will be physically qualified at 60;
+otherwise omit the option for the safe 25% default or pass the lower reviewed
+value explicitly. A released legacy managed block without a startup volume is
+recognized for removal, but is not silently upgraded. Remove it with the dry
+run/apply pair documented below, then reinstall with the chosen method and
+volume so the change remains auditable.
 
 Do not restart anything until the exact resulting tail, backup, ownership, and
 modes have been reviewed and TCP ADB port 5555 has been verified reachable.
@@ -63,9 +75,11 @@ The source and sink must be `codex_echo_cancel_source` and
 `codex_echo_cancel_sink`, and on the stock image the static
 `module-echo-cancel` instance must use `aec_method=adrian` and
 `use_master_format=1` with the reviewed raw masters. The root-only realtime
-configuration must name the same method. The realtime client repeats these
-checks before opening the bridge socket and refuses a mismatched or unsupported
-engine instead of falling back. It additionally requires an uncorked
+configuration must name the same method and its sink ceiling must match the
+managed startup value. At 60%, `pactl get-sink-volume` must report raw `39321`
+for every channel; 25% is raw `16384`. The realtime client repeats these checks
+before opening the bridge socket and refuses a mismatched or unsupported engine
+instead of falling back. It additionally requires an uncorked
 `protocol-native.c` capture stream owned by its exact process PID (the vendor
 recorder that was opened before wake) to reference the AEC source index, and
 requires every reported AEC sink channel to be no louder than
@@ -89,7 +103,9 @@ value above a previously qualified level without repeating AEC qualification at
 the new values. Lower them for a quiet room or near-field test. Record the
 pre-test volume separately and restore it only after echo-rejection,
 early/middle/late barge-in, wake, normal Assist, and repeated-turn tests pass.
-The helper intentionally does not automate volume changes.
+The helper intentionally does not change the running sink. Its static startup
+setpoint takes effect on the next controlled PulseAudio/service start; use the
+following runtime command only for the immediate canary.
 
 For the default canary value, the explicit device-side volume command is:
 
@@ -98,8 +114,11 @@ pactl set-sink-volume codex_echo_cancel_sink 25%
 ```
 
 Use the exact configured ceiling. A 60% deployment must explicitly configure
-60, run the sink command with 60%, and pass the complete no-user echo plus
-early/middle/late double-talk canaries before normal use.
+60 in both the installer and root-only realtime configuration, run the sink
+command with 60% for an immediate canary before restart, and pass the complete
+no-user echo plus early/middle/late double-talk canaries before normal use. The
+static raw startup command, rather than PulseAudio's deferred restore database,
+is the reboot-persistence authority.
 
 Only after the static topology and acoustic canary pass should the root-only
 realtime configuration enable:
@@ -124,6 +143,8 @@ python3 prepare_pulseaudio_aec.py remove --apply
 ```
 
 The remover deletes only an exact installer-owned tail and refuses partial,
-modified, or duplicated markers. It does not restore the backup automatically
-or restart services. Keep the backup until physical acceptance is complete,
-and verify TCP ADB port 5555 before and after the controlled restart.
+modified, or duplicated markers. It recognizes both current method/volume
+blocks and the released method-only legacy blocks. It does not restore the
+backup automatically or restart services. Keep the backup until physical
+acceptance is complete, and verify TCP ADB port 5555 before and after the
+controlled restart.

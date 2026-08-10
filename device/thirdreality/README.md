@@ -296,8 +296,10 @@ exact fail-closed block after the `hw:0,2` capture and `hw:0,1` playback
 masters. Its `--aec-method` allowlist is `webrtc`, `speex`, and `adrian`; an
 omitted flag means WebRTC and never triggers a fallback. The stock v1.1.7 image
 must use `--aec-method adrian`. The helper never restarts services, changes
-volume, or changes ADB. Once its static and physical canaries pass, add all six
-settings together:
+the live volume, or changes ADB. It requires an explicit 1–60% startup sink
+value (`--aec-sink-volume-percent`, default 25) and writes its exact raw
+PulseAudio value into the managed block after sink creation. Once its static
+and physical canaries pass, add all six settings together:
 
 ```json
 {
@@ -310,8 +312,14 @@ settings together:
 }
 ```
 
-To run this device at 60%, set both volume values to `60`, set the live AEC
-sink to 60%, and repeat the complete physical qualification before normal use.
+To run this device at 60%, install the static block with
+`--aec-sink-volume-percent 60`, set both realtime volume values to `60`, set the
+live AEC sink to 60% for the immediate canary, and repeat the complete physical
+qualification before normal use. The resulting startup line uses raw `39321`
+and keeps the selected value across a service restart or reboot. Existing
+released blocks without a startup-volume line must be explicitly removed and
+then reinstalled; the helper will not silently rewrite a different managed
+block.
 The legacy `aec_test_volume_percent` key remains accepted as an alias that sets
 both values, but it cannot be combined with either explicit key.
 
