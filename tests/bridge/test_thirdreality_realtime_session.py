@@ -12,6 +12,7 @@ import pytest
 from device.thirdreality.realtime_client import session as session_module
 from device.thirdreality.realtime_client.config import (
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
     RealtimeConfig,
@@ -23,6 +24,7 @@ from device.thirdreality.realtime_client.session import (
     SessionState,
     SubmitResult,
     _AudioPacer,
+    _pcm_has_local_barge_in_signal,
     _pcm_has_signal,
     _PcmPlayer,
     _validate_started,
@@ -53,6 +55,7 @@ def _config(**overrides: object) -> RealtimeConfig:
         "prompt": None,
         "pulse_aec_source": None,
         "pulse_aec_sink": None,
+        "pulse_aec_method": None,
         "aec_test_volume_percent": DEFAULT_AEC_TEST_VOLUME_PERCENT,
     }
     values.update(overrides)
@@ -316,6 +319,19 @@ def test_input_activity_ignores_floor_but_keeps_long_speech_alive() -> None:
     assert _pcm_has_signal((-256).to_bytes(2, "little", signed=True) * 8)
 
 
+def test_local_barge_in_signal_requires_peak_and_sustained_energy() -> None:
+    assert not _pcm_has_local_barge_in_signal(b"\0" * 2_048)
+    assert not _pcm_has_local_barge_in_signal(
+        (1_023).to_bytes(2, "little", signed=True) * 1_024
+    )
+    assert not _pcm_has_local_barge_in_signal(
+        (1_024).to_bytes(2, "little", signed=True) + b"\0" * 2_046
+    )
+    assert _pcm_has_local_barge_in_signal(
+        (1_024).to_bytes(2, "little", signed=True) * 1_024
+    )
+
+
 def test_input_queue_is_nonblocking_bounded_and_pcm_aligned() -> None:
     session = RealtimeSession(_config(input_queue_bytes=4_096))
     with session._state_lock:
@@ -492,6 +508,89 @@ def test_full_duplex_preflight_requires_exact_active_pulseaudio_aec_routes(
             "close_fds": True,
             "shell": False,
         }
+
+
+@pytest.mark.parametrize("method", ["adrian", "speex"])
+def test_full_duplex_preflight_requires_configured_aec_method(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    outputs = {
+        (*_PACTL_ARGV, "get-default-source"): f"{DEFAULT_PULSE_AEC_SOURCE}\n",
+        (*_PACTL_ARGV, "get-default-sink"): f"{DEFAULT_PULSE_AEC_SINK}\n",
+        (*_PACTL_ARGV, "list", "short", "modules"): (
+            "7\tmodule-echo-cancel\t"
+            "source_master=alsa_input.hw_0_2 "
+            "sink_master=alsa_output.hw_0_1 "
+            "source_name=codex_echo_cancel_source "
+            "sink_name=codex_echo_cancel_sink "
+            f"aec_method={method} use_master_format=1\n"
+        ),
+        (*_PACTL_ARGV, "list", "short", "sources"): (
+            "1\talsa_input.hw_0_2\tmodule-alsa-source.c\n"
+            "3\tcodex_echo_cancel_source\tmodule-echo-cancel.c\n"
+        ),
+        (*_PACTL_ARGV, "--format=json", "list", "source-outputs"): json.dumps(
+            [
+                {
+                    "driver": "protocol-native.c",
+                    "source": 3,
+                    "corked": False,
+                    "properties": {"application.process.id": "4242"},
+                }
+            ]
+        ),
+        (*_PACTL_ARGV, "get-sink-volume", DEFAULT_PULSE_AEC_SINK): (
+            "Volume: left: 16384 / 25% / -36.12 dB\n"
+        ),
+    }
+    monkeypatch.setattr(
+        session_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=outputs[tuple(argv)].encode()
+        ),
+    )
+    monkeypatch.setattr(session_module.os, "getpid", lambda: 4242)
+
+    _verify_pulseaudio_aec(_duplex_config(pulse_aec_method=method))
+
+    with pytest.raises(WebSocketError, match="echo cancellation is not active"):
+        _verify_pulseaudio_aec(
+            _duplex_config(pulse_aec_method=DEFAULT_PULSE_AEC_METHOD)
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_argument",
+    ["aec_method=speex", "source_name=codex_echo_cancel_source"],
+)
+def test_full_duplex_preflight_rejects_extra_or_duplicate_module_arguments(
+    monkeypatch: pytest.MonkeyPatch, extra_argument: str
+) -> None:
+    outputs = deque(
+        [
+            f"{DEFAULT_PULSE_AEC_SOURCE}\n".encode(),
+            f"{DEFAULT_PULSE_AEC_SINK}\n".encode(),
+            (
+                "7\tmodule-echo-cancel\t"
+                "source_master=alsa_input.hw_0_2 "
+                "sink_master=alsa_output.hw_0_1 "
+                "source_name=codex_echo_cancel_source "
+                "sink_name=codex_echo_cancel_sink "
+                f"aec_method=webrtc use_master_format=1 {extra_argument}\n"
+            ).encode(),
+        ]
+    )
+    monkeypatch.setattr(
+        session_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=outputs.popleft()
+        ),
+    )
+
+    with pytest.raises(WebSocketError, match="echo cancellation is not active"):
+        _verify_pulseaudio_aec(_duplex_config())
 
 
 @pytest.mark.parametrize(
@@ -883,6 +982,199 @@ def test_full_duplex_speech_start_immediately_flushes_local_output_only() -> Non
     assert session._suppressed_output_epoch is None
 
 
+def test_local_barge_in_flushes_after_two_speech_frames_without_stopping() -> None:
+    session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
+    quiet = b"\0" * 2_048
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.output_active
+    assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.output_active
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    # Capture only records a generation-scoped request. The network thread
+    # remains the sole owner of observable playback state and the player child.
+    assert session.output_active
+    assert session._audio.bytes == 8_192
+
+    assert (
+        session._flush_local_barge_in(
+            player,
+            output_epoch=epoch,
+            last_output_epoch=last_epoch,
+        )
+        is None
+    )
+    assert session.output_active is False
+    # The utterance stays intact for provider VAD and same-session continuation.
+    assert session._audio.bytes == 8_192
+    assert session._suppressed_output_epoch == 1
+    assert session.state is SessionState.READY
+    assert session.terminal is False
+    assert player.events == [("begin", 1), ("abort", None)]
+
+
+def test_local_barge_in_counter_survives_faster_no_request_network_polls() -> None:
+    session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    # The network loop polls every 20 ms while recorder frames arrive every
+    # 64 ms. Empty polls must not erase the first qualifying frame.
+    for _ in range(3):
+        assert (
+            session._flush_local_barge_in(
+                player,
+                output_epoch=epoch,
+                last_output_epoch=last_epoch,
+            )
+            == 1
+        )
+        assert session.output_active
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert (
+        session._flush_local_barge_in(
+            player,
+            output_epoch=epoch,
+            last_output_epoch=last_epoch,
+        )
+        is None
+    )
+    assert session.output_active is False
+    assert session._suppressed_output_epoch == 1
+    assert player.events == [("begin", 1), ("abort", None)]
+
+
+def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector_entered = threading.Event()
+    release_detector = threading.Event()
+    second_epoch_guard_entered = threading.Event()
+    guard_calls = 0
+
+    def volume_guard(_config: RealtimeConfig) -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 2:
+            second_epoch_guard_entered.set()
+
+    session = RealtimeSession(
+        _duplex_config(),
+        aec_verifier=lambda _config: None,
+        volume_guard=volume_guard,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+
+    def blocking_detector(_value: bytes) -> bool:
+        detector_entered.set()
+        assert release_detector.wait(1.0)
+        return True
+
+    monkeypatch.setattr(
+        session_module,
+        "_pcm_has_local_barge_in_signal",
+        blocking_detector,
+    )
+    submit_results: list[SubmitResult] = []
+    transition_results: list[tuple[str | None, int | None, int, bool]] = []
+    submit_thread = threading.Thread(
+        target=lambda: submit_results.append(session.submit_audio(speech)),
+        daemon=True,
+    )
+    submit_thread.start()
+    detector_was_entered = detector_entered.wait(1.0)
+
+    def transition_output_epoch() -> None:
+        nonlocal epoch, last_epoch
+        _action, epoch, last_epoch, _semantic = session._handle_message(
+            Message(
+                "text",
+                '{"type":"control","event_type":"speaking.stopped","output_epoch":1}',
+            ),
+            player,
+            output_epoch=epoch,
+            last_output_epoch=last_epoch,
+        )
+        transition_results.append(
+            session._handle_message(
+                Message(
+                    "text",
+                    '{"type":"control","event_type":"speaking.started",'
+                    '"output_epoch":2}',
+                ),
+                player,
+                output_epoch=epoch,
+                last_output_epoch=last_epoch,
+            )
+        )
+
+    transition_thread = threading.Thread(target=transition_output_epoch, daemon=True)
+    transition_thread.start()
+    try:
+        assert detector_was_entered
+        assert second_epoch_guard_entered.wait(1.0)
+    finally:
+        release_detector.set()
+    submit_thread.join(1.0)
+    transition_thread.join(1.0)
+
+    assert not submit_thread.is_alive()
+    assert not transition_thread.is_alive()
+    assert submit_results == [SubmitResult.ACCEPTED]
+    assert transition_results == [(None, 2, 2, True)]
+    assert (
+        session._flush_local_barge_in(
+            player,
+            output_epoch=2,
+            last_output_epoch=2,
+        )
+        == 2
+    )
+    assert session.output_active
+    assert session._suppressed_output_epoch is None
+    assert player.events == [("begin", 1), ("finish", 1), ("begin", 2)]
+
+
 def test_full_duplex_rechecks_volume_ceiling_before_every_response() -> None:
     checks: list[int] = []
     session = RealtimeSession(
@@ -997,7 +1289,7 @@ def test_started_requires_local_only_cancel_semantics() -> None:
         _validate_started(without_same_session_ack)
 
 
-def test_interrupt_is_idempotent_flushes_gate_and_forces_fresh_object() -> None:
+def test_interrupt_is_idempotent_closes_admission_and_forces_fresh_object() -> None:
     session = RealtimeSession(_config())
     with session._state_lock:
         session._state = SessionState.READY
@@ -1006,11 +1298,67 @@ def test_interrupt_is_idempotent_flushes_gate_and_forces_fresh_object() -> None:
     session.interrupt()
     session.interrupt()
 
-    assert session.output_active is False
+    # The caller closes admission immediately; the network thread owns the
+    # subsequent player abort and observable playback-state transition.
+    assert session.output_active
     assert session.state is SessionState.STOPPING
+    assert session.submit_audio(b"\0\0") is SubmitResult.CLOSED
     assert session._interrupt_requested.is_set()
     with pytest.raises(RuntimeError, match="already been started"):
         session.start()
+
+
+@pytest.mark.parametrize("request_name", ["interrupt", "stop"])
+def test_stopping_transition_is_atomic_with_audio_admission_and_clear(
+    monkeypatch: pytest.MonkeyPatch, request_name: str
+) -> None:
+    session = RealtimeSession(_config())
+    with session._state_lock:
+        session._state = SessionState.READY
+    put_entered = threading.Event()
+    release_put = threading.Event()
+    request_started = threading.Event()
+    request_returned = threading.Event()
+    original_put = session._audio.put
+
+    def blocking_put(packet: Any) -> bool:
+        put_entered.set()
+        assert release_put.wait(1.0)
+        return original_put(packet)
+
+    monkeypatch.setattr(session._audio, "put", blocking_put)
+    submit_results: list[SubmitResult] = []
+    submit_thread = threading.Thread(
+        target=lambda: submit_results.append(session.submit_audio(b"a" * 2_048)),
+        daemon=True,
+    )
+    submit_thread.start()
+    assert put_entered.wait(1.0)
+
+    def request_stop() -> None:
+        request_started.set()
+        getattr(session, request_name)()
+        request_returned.set()
+
+    request_thread = threading.Thread(target=request_stop, daemon=True)
+    request_thread.start()
+    # The transition shares the admission lock, so it cannot clear the queue
+    # before the in-flight put has linearized.
+    try:
+        assert request_started.wait(1.0)
+        assert not request_returned.wait(0.05)
+    finally:
+        release_put.set()
+    submit_thread.join(1.0)
+    request_thread.join(1.0)
+
+    assert not submit_thread.is_alive()
+    assert not request_thread.is_alive()
+    assert submit_results == [SubmitResult.ACCEPTED]
+    assert request_returned.is_set()
+    assert session.state is SessionState.STOPPING
+    assert session._audio.bytes == 0
+    assert session.submit_audio(b"b" * 2_048) is SubmitResult.CLOSED
 
 
 def test_network_thread_runs_v2_audio_turn_and_drains_before_stop(

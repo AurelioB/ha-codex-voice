@@ -16,20 +16,32 @@ load-module module-alsa-sink ... device=hw:0,1 ...
 ```
 
 [`prepare_pulseaudio_aec.py`](prepare_pulseaudio_aec.py) verifies those
-definitions and appends the exact
-[`pulse/codex-echo-cancel.pa`](pulse/codex-echo-cancel.pa) block. `check`,
-`install`, and `remove` are content-safe and idempotent; install/remove remain
-dry runs without `--apply`. Installation requires an existing backup parent,
-creates a mode-0600 backup without overwriting a different file, and atomically
-replaces only a root-owned, non-group/world-writable regular `default.pa`.
+definitions and appends one exact reviewed block selected by `--aec-method`:
+[`pulse/codex-echo-cancel.pa`](pulse/codex-echo-cancel.pa) for WebRTC,
+[`pulse/codex-echo-cancel-speex.pa`](pulse/codex-echo-cancel-speex.pa) for
+Speex, or
+[`pulse/codex-echo-cancel-adrian.pa`](pulse/codex-echo-cancel-adrian.pa) for
+Adrian. Only `webrtc`, `speex`, and `adrian` are accepted. Omitting the flag
+selects WebRTC; the helper does not probe engines or fall back automatically.
+`check`, `install`, and `remove` are content-safe and idempotent;
+install/remove remain dry runs without `--apply`. Installation requires an
+existing backup parent, creates a mode-0600 backup without overwriting a
+different file, and atomically replaces only a root-owned,
+non-group/world-writable regular `default.pa`.
+
+The observed stock `1.01.07`/v1.1.7 image rejects WebRTC and Speex because its
+PulseAudio module was built without those engines. Adrian loads with the exact
+existing raw masters and `use_master_format=1`, and creates 16 kHz mono AEC
+endpoints. Therefore active commands for that stock image must explicitly use
+Adrian. Speex applies only to a firmware build that actually compiles it.
 
 Example device-side sequence after copying the reviewed assets from a pinned
 release:
 
 ```sh
-python3 prepare_pulseaudio_aec.py check
-python3 prepare_pulseaudio_aec.py install
-python3 prepare_pulseaudio_aec.py install --apply
+python3 prepare_pulseaudio_aec.py check --aec-method adrian
+python3 prepare_pulseaudio_aec.py install --aec-method adrian
+python3 prepare_pulseaudio_aec.py install --aec-method adrian --apply
 ```
 
 Do not restart anything until the exact resulting tail, backup, ownership, and
@@ -48,29 +60,34 @@ pactl get-sink-volume codex_echo_cancel_sink
 ```
 
 The source and sink must be `codex_echo_cancel_source` and
-`codex_echo_cancel_sink`, and the static `module-echo-cancel` instance must use
-`aec_method=webrtc` and `use_master_format=1` with the reviewed raw masters.
-The realtime client repeats these checks before opening the bridge socket. It
-additionally requires an uncorked `protocol-native.c` capture stream owned by
-its exact process PID (the vendor recorder that was opened before wake) to
-reference the AEC source index, and requires every reported AEC sink channel
-to be no louder than `aec_test_volume_percent`. It fails closed if any route or
-channel is wrong. Playback is additionally pinned to the AEC sink, and each full-duplex
-`paplay` stream starts with a fixed linear volume no greater than that
-configured percentage. Before every `speaking.started`, the client re-reads
-all AEC sink channels and fails the response closed if any exceeds the same
-ceiling; the startup preflight alone is not treated as a lasting volume claim.
-It compares PulseAudio's raw channel units with the exact linear ceiling
+`codex_echo_cancel_sink`, and on the stock image the static
+`module-echo-cancel` instance must use `aec_method=adrian` and
+`use_master_format=1` with the reviewed raw masters. The root-only realtime
+configuration must name the same method. The realtime client repeats these
+checks before opening the bridge socket and refuses a mismatched or unsupported
+engine instead of falling back. It additionally requires an uncorked
+`protocol-native.c` capture stream owned by its exact process PID (the vendor
+recorder that was opened before wake) to reference the AEC source index, and
+requires every reported AEC sink channel to be no louder than
+`aec_test_volume_percent`. It fails closed if any route or channel is wrong.
+Playback is additionally pinned to the AEC sink, and each full-duplex `paplay`
+stream starts with a fixed linear volume no greater than that configured
+percentage. Before every `speaking.started`, the client re-reads all AEC sink
+channels and fails the response closed if any exceeds the same ceiling; the
+startup preflight alone is not treated as a lasting volume claim. It compares
+PulseAudio's raw channel units with the exact linear ceiling
 (`65536 × percent // 100`), not the rounded percentage printed beside them.
 Operators must not raise a live sink or stream during the canary.
 
-For the first acoustic canary, read `aec_test_volume_percent` from the reviewed
-root-only realtime config and set the AEC sink to that percentage. The setting
-defaults to 25 and configuration validation enforces an absolute range of
-1–25; never exceed 25% during AEC qualification. Lower it for a quiet room or
-near-field test. Record the pre-test volume separately and restore it only
-after echo-rejection, barge-in, wake, normal Assist, and repeated-turn tests
-pass. The helper intentionally does not automate volume changes.
+Loading Adrian and observing its 16 kHz mono endpoints verifies topology, not
+acoustic echo cancellation. For the first physical double-talk canary, read
+`aec_test_volume_percent` from the reviewed root-only realtime config and set
+the AEC sink to that percentage. The setting defaults to 25 and configuration
+validation enforces an absolute range of 1–25; never exceed 25% during AEC
+qualification. Lower it for a quiet room or near-field test. Record the
+pre-test volume separately and restore it only after echo-rejection,
+early/middle/late barge-in, wake, normal Assist, and repeated-turn tests pass.
+The helper intentionally does not automate volume changes.
 
 For the default canary value, the explicit device-side volume command is:
 
@@ -89,6 +106,7 @@ realtime configuration enable:
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
+  "pulse_aec_method": "adrian",
   "aec_test_volume_percent": 25
 }
 ```

@@ -96,20 +96,32 @@ would hide the dominant remote stages.
 Direct output is turn-taking by default on v1.1.7. With `full_duplex: false`,
 the microphone gate stays closed from `speaking.started` until the
 corresponding PCM has drained from both the local queue and playback child.
-Opt-in full duplex requires the reviewed static PulseAudio WebRTC-AEC topology,
-exact current-process capture and playback routing, and a configured sink
-ceiling from 1–25%. The client checks that topology and ceiling before opening
-the bridge socket, rechecks every sink channel before every response, and pins
-each `paplay` stream to the AEC sink at or below the same ceiling.
+Opt-in full duplex requires a reviewed static PulseAudio AEC topology using the
+exact configured allowlisted engine, exact current-process capture and playback
+routing, and a configured sink ceiling from 1–25%. WebRTC is the omitted-value
+default and never automatically falls back. The stock v1.1.7 build rejects
+WebRTC and Speex, so active stock-device deployments explicitly select Adrian.
+The client checks that topology, method, and ceiling before opening the bridge
+socket, rechecks every sink channel before every response, and pins each
+`paplay` stream to the AEC sink at or below the same ceiling.
 
-With those checks active, capture continues during playback and provider VAD
-can flush local output for barge-in. This does not remove remote cancellation
+With those checks active, capture continues during playback. Two consecutive
+qualifying AEC-filtered 64 ms frames request an epoch-scoped local player flush;
+provider VAD independently reinforces that boundary. This removes the provider
+round trip from local speaker muting, but does not remove remote cancellation
 latency. Same-session resume is allowed only after the bridge receives a
 provider `response.cancelled` event correlated to the exact active response.
 Timeout, mismatch, ambiguity, or a completion event closes the session, so the
 next turn pays for a fresh WebSocket, thread, and realtime handshake.
 
-Physical acceptance must cover both wake routes, normal-wake preemption,
+Adrian loading with the reviewed raw masters and creating 16 kHz mono endpoints
+is a static-topology result, not an acoustic result. On the reference device at
+25%, a 5.531-second playback canary caused no false interruption across 86 mic
+frames (maximum peak 2 and integer RMS 0), and staged double-talk flushed
+playback in 141 ms versus 2.650 seconds when waiting for the provider-only
+boundary. The same socket continued and produced the next response. Physical
+acceptance for each installation must cover both wake routes, normal-wake
+preemption,
 pre-ready fallback, stop-word latency, first-audio latency, queue failures,
 repeated turns, memory stability, player cleanup, and recovery after bridge and
 Wi-Fi loss. Full-duplex acceptance must additionally cover early/middle/late
@@ -305,8 +317,8 @@ serialized LED DBus commands on a separate daemon worker. The vendor's
 two-second command timeout remained, but it could not hold the microphone
 processing thread; timed-out children were reaped, and an overloaded pending
 queue coalesced toward the newest state. The current optional full-duplex path
-adds separately qualified static PulseAudio WebRTC AEC; it does not change this
-historical latency sample.
+adds a separately qualified static PulseAudio AEC engine; it does not change
+this historical latency sample.
 
 The pinned ThirdReality subclass is patched directly in addition to the base
 class. Live diagnosis found that a voice-only restart could be replaced by a
@@ -553,8 +565,11 @@ it begins forwarding microphone audio. The measured stock cue was 0.946979 s;
 an older patched cue was 0.399592 s. The stock/default turn-taking path has no
 active acoustic echo cancellation, so listening during either audible cue
 would also capture the device's own acknowledgement. The optional static
-PulseAudio WebRTC-AEC path is qualified for full-duplex response playback, not
-used as a reason to restore the wake cue.
+PulseAudio AEC path is qualified for full-duplex response playback, not used as
+a reason to restore the wake cue. The stock v1.1.7 reference device passed its
+bounded Adrian canaries at 25%, but each installation remains unqualified until
+its own physical double-talk and echo-rejection canaries pass at no more than
+25%.
 
 The pinned overlay therefore skips audible-cue playback and uses the listening
 LED as best-effort visual acknowledgement. This avoids both self-audio and the

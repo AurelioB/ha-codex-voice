@@ -8,6 +8,7 @@ import pytest
 
 from device.thirdreality.realtime_client.config import (
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
     ConfigError,
@@ -48,6 +49,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.full_duplex is False
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
+    assert config.pulse_aec_method is None
     assert config.aec_test_volume_percent == DEFAULT_AEC_TEST_VOLUME_PERCENT
     assert config.input_queue_bytes == 64 * 1024
     assert config.fallback_buffer_bytes == 64 * 1024
@@ -115,6 +117,7 @@ def test_config_accepts_explicit_bounded_aec_full_duplex(tmp_path: Path) -> None
             "full_duplex": True,
             "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
             "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "pulse_aec_method": "speex",
             "aec_test_volume_percent": 12,
         },
     )
@@ -125,7 +128,26 @@ def test_config_accepts_explicit_bounded_aec_full_duplex(tmp_path: Path) -> None
     assert config.full_duplex is True
     assert config.pulse_aec_source == DEFAULT_PULSE_AEC_SOURCE
     assert config.pulse_aec_sink == DEFAULT_PULSE_AEC_SINK
+    assert config.pulse_aec_method == "speex"
     assert config.aec_test_volume_percent == 12
+
+
+def test_full_duplex_defaults_to_existing_webrtc_aec_contract(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.pulse_aec_method == DEFAULT_PULSE_AEC_METHOD
 
 
 @pytest.mark.parametrize("mode", [0o604, 0o640, 0o666])
@@ -175,6 +197,11 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"full_duplex": 1}, "boolean"),
         ({"full_duplex": True}, "requires explicit"),
         ({"pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE}, "requires full_duplex"),
+        ({"pulse_aec_method": "speex"}, "requires full_duplex"),
+        ({"pulse_aec_method": "null"}, "must be 'adrian', 'speex', or 'webrtc'"),
+        ({"pulse_aec_method": "WebRTC"}, "must be 'adrian', 'speex', or 'webrtc'"),
+        ({"pulse_aec_method": None}, "must be 'adrian', 'speex', or 'webrtc'"),
+        ({"pulse_aec_method": 1}, "must be 'adrian', 'speex', or 'webrtc'"),
         (
             {
                 "full_duplex": True,

@@ -21,7 +21,10 @@ _VOICE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _PULSE_OBJECT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9._]{0,127}\Z")
 DEFAULT_PULSE_AEC_SOURCE = "codex_echo_cancel_source"
 DEFAULT_PULSE_AEC_SINK = "codex_echo_cancel_sink"
+DEFAULT_PULSE_AEC_METHOD = "webrtc"
+SUPPORTED_PULSE_AEC_METHODS = frozenset({"adrian", "speex", "webrtc"})
 DEFAULT_AEC_TEST_VOLUME_PERCENT = 25
+_PULSE_AEC_METHOD_ERROR = "pulse_aec_method must be 'adrian', 'speex', or 'webrtc'"
 _ALLOWED_KEYS = frozenset(
     {
         "enabled",
@@ -45,6 +48,7 @@ _ALLOWED_KEYS = frozenset(
         "full_duplex",
         "pulse_aec_source",
         "pulse_aec_sink",
+        "pulse_aec_method",
         "aec_test_volume_percent",
     }
 )
@@ -78,6 +82,7 @@ class RealtimeConfig:
     prompt: str | None = field(default=None, repr=False)
     pulse_aec_source: str | None = None
     pulse_aec_sink: str | None = None
+    pulse_aec_method: str | None = None
     aec_test_volume_percent: int = DEFAULT_AEC_TEST_VOLUME_PERCENT
 
     def __post_init__(self) -> None:
@@ -101,12 +106,23 @@ class RealtimeConfig:
                 or not _PULSE_OBJECT_NAME.fullmatch(candidate)
             ):
                 raise ConfigError(f"{key} must be a safe PulseAudio object name")
+        if self.pulse_aec_method is not None and (
+            not isinstance(self.pulse_aec_method, str)
+            or self.pulse_aec_method not in SUPPORTED_PULSE_AEC_METHODS
+        ):
+            raise ConfigError(_PULSE_AEC_METHOD_ERROR)
         if self.full_duplex:
             if self.pulse_aec_source is None or self.pulse_aec_sink is None:
                 raise ConfigError(
                     "full_duplex requires explicit pulse_aec_source and pulse_aec_sink"
                 )
-        elif self.pulse_aec_source is not None or self.pulse_aec_sink is not None:
+            if self.pulse_aec_method is None:
+                object.__setattr__(self, "pulse_aec_method", DEFAULT_PULSE_AEC_METHOD)
+        elif (
+            self.pulse_aec_source is not None
+            or self.pulse_aec_sink is not None
+            or self.pulse_aec_method is not None
+        ):
             raise ConfigError("PulseAudio AEC routing requires full_duplex")
 
 
@@ -218,11 +234,18 @@ def load_config(
         raise ConfigError("full_duplex must be a boolean")
     pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
     pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
+    pulse_aec_method = _optional_pulse_aec_method(decoded)
     if full_duplex and (pulse_aec_source is None or pulse_aec_sink is None):
         raise ConfigError(
             "full_duplex requires explicit pulse_aec_source and pulse_aec_sink"
         )
-    if not full_duplex and (pulse_aec_source is not None or pulse_aec_sink is not None):
+    if full_duplex and pulse_aec_method is None:
+        pulse_aec_method = DEFAULT_PULSE_AEC_METHOD
+    if not full_duplex and (
+        pulse_aec_source is not None
+        or pulse_aec_sink is not None
+        or pulse_aec_method is not None
+    ):
         raise ConfigError("PulseAudio AEC routing requires full_duplex")
 
     config = RealtimeConfig(
@@ -295,6 +318,7 @@ def load_config(
         prompt=prompt,
         pulse_aec_source=pulse_aec_source,
         pulse_aec_sink=pulse_aec_sink,
+        pulse_aec_method=pulse_aec_method,
         aec_test_volume_percent=_bounded_int(
             decoded,
             "aec_test_volume_percent",
@@ -408,6 +432,15 @@ def _optional_pulse_name(value: dict[str, Any], key: str) -> str | None:
     candidate = value.get(key)
     if not isinstance(candidate, str) or not _PULSE_OBJECT_NAME.fullmatch(candidate):
         raise ConfigError(f"{key} must be a safe PulseAudio object name")
+    return candidate
+
+
+def _optional_pulse_aec_method(value: dict[str, Any]) -> str | None:
+    if "pulse_aec_method" not in value:
+        return None
+    candidate = value.get("pulse_aec_method")
+    if not isinstance(candidate, str) or candidate not in SUPPORTED_PULSE_AEC_METHODS:
+        raise ConfigError(_PULSE_AEC_METHOD_ERROR)
     return candidate
 
 

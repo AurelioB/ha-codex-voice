@@ -76,14 +76,21 @@ sides of a narrow bridge API.
   root voice process. Exact vendor bytecode guards fail closed before patching.
   Its JSON configuration must be a root-owned, non-symlink regular file with
   mode 0600; source directories/files must not be writable by group or other.
-- Full duplex is off by default and fails closed without the reviewed static
-  PulseAudio `module-echo-cancel` block using WebRTC AEC, exact raw masters and
-  default AEC routes, and the current voice process's capture stream routed
-  through the AEC source. The client checks this before opening the bridge
-  socket, enforces a configured 1–25% sink ceiling, rechecks every sink channel
-  before each response, and starts `paplay` on that sink with a fixed stream
-  volume no greater than the ceiling. The guard compares raw PulseAudio units
-  to the exact linear ceiling rather than trusting rounded display percentages.
+- Full duplex is off by default and fails closed without a reviewed static
+  PulseAudio `module-echo-cancel` block using the exact configured allowlisted
+  AEC engine, exact raw masters and default AEC routes, and the current voice
+  process's capture stream routed through the AEC source. The allowlist is
+  WebRTC, Speex, and Adrian. WebRTC is the omitted-value default; the installer
+  and client never probe or automatically downgrade to another engine. Stock
+  v1.1.7 must explicitly select Adrian because its module rejects the uncompiled
+  WebRTC and Speex engines. The client checks the exact method before opening
+  the bridge socket, enforces a configured 1–25% sink ceiling, rechecks every
+  sink channel before each response, and starts `paplay` on that sink with a
+  fixed stream volume no greater than the ceiling. The guard compares raw
+  PulseAudio units to the exact linear ceiling rather than trusting rounded
+  display percentages. A successfully loaded Adrian topology still requires a
+  physical double-talk canary on each installation at no more than 25%; the
+  reference device's bounded pass is not transferable evidence.
 - Local playback flush or provider VAD is not evidence of remote cancellation.
   A v2 session resumes after interruption only when the bridge correlates a
   sanitized provider `response.cancelled` event to the exact active response;
