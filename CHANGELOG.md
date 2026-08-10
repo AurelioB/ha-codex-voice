@@ -5,6 +5,53 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-09
+
+### Fixed
+
+- Continuously consume unwanted realtime model audio during finite speech
+  transcription. This prevents the hardened WebRTC receive queue from
+  overflowing before the user transcript arrives, while retaining the queue's
+  fail-closed memory bound.
+- Preserve retained speech-session safety while draining transcription audio:
+  any assistant audio invalidates session reuse without discarding an otherwise
+  valid STT result, and untracked handoff output still fails closed.
+- Accept the pinned ThirdReality `default.pa` with or without a final newline in
+  the guarded static AEC installer while preserving exact rollback text.
+- Flush full-duplex playback from two consecutive AEC-filtered speech frames
+  instead of waiting only for remote VAD. The local boundary keeps microphone
+  audio flowing on the same socket while provider lifecycle events remain the
+  authority for remote cancellation and safe session reuse.
+- Scope each local barge-in request to the exact output epoch, reset detector
+  state at every stop, interrupt, resume, and new response boundary, and make
+  microphone admission atomic with interrupt/stop queue clearing. A stale
+  request or pre-interrupt frame can no longer cross into a resumed response.
+- Make terminal WebRTC transport failure outrank cancellation-replay queues so
+  neither stale PCM nor data-channel events can be delivered after failure.
+
+### Added
+
+- Log only the exception class for unexpected streaming-transcription failures,
+  keeping wire responses and diagnostics free of request content.
+- Ship separately reviewable WebRTC, Speex, and Adrian PulseAudio
+  `module-echo-cancel` fragments in the ThirdReality release asset.
+
+### Changed
+
+- Allow full-duplex deployments to explicitly select only `webrtc`, `speex`,
+  or `adrian`, and require the installed module to match that selection exactly.
+  WebRTC remains the omitted-value default and never falls back automatically.
+- Use explicit Adrian installer and client configuration in active stock
+  ThirdReality v1.1.7 examples. Hardware probing found that image rejects its
+  uncompiled WebRTC and Speex engines, while Adrian loads with the exact pinned
+  masters and `use_master_format=1` and creates 16 kHz mono endpoints. On the
+  qualified reference device at 25%, a 5.531-second playback canary produced no
+  false interruption across 86 live microphone frames (maximum peak 2 and
+  integer RMS 0), and a staged double-talk canary flushed playback in 141 ms
+  while keeping the same session. Each installed device must still pass the
+  documented rollback, echo-rejection, and early/middle/late double-talk checks
+  at no more than 25%.
+
 ## [0.4.1] - 2026-08-09
 
 ### Fixed
