@@ -4,12 +4,17 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, HomeAssistant
 from pytest_homeassistant_custom_component.common import (  # type: ignore[import-untyped]
     MockConfigEntry,
 )
 
-from custom_components.codex_voice import async_migrate_entry, async_setup_entry
+from custom_components.codex_voice import (
+    _async_start_realtime_tool_broker_at_started,
+    async_migrate_entry,
+    async_setup_entry,
+)
 from custom_components.codex_voice.const import (
     CONF_ACCESS_TOKEN,
     CONF_BRIDGE_URL,
@@ -30,6 +35,8 @@ async def test_setup_owns_handoff_release_tasks_until_unload() -> None:
         config_entries=SimpleNamespace(async_forward_entry_setups=forward_setups)
     )
     update_unsubscribe = Mock()
+    startup_unsubscribe = Mock()
+    startup_callbacks: list[Any] = []
     entry = SimpleNamespace(
         data={
             CONF_BRIDGE_URL: "http://bridge.local:8787",
@@ -48,13 +55,104 @@ async def test_setup_owns_handoff_release_tasks_until_unload() -> None:
             "custom_components.codex_voice.async_get_clientsession",
             return_value=Mock(),
         ),
+        patch(
+            "custom_components.codex_voice.async_at_started",
+            side_effect=lambda _hass, callback: (
+                startup_callbacks.append(callback) or startup_unsubscribe
+            ),
+        ),
+        patch(
+            "custom_components.codex_voice.async_start_realtime_tool_broker"
+        ) as start_broker,
     ):
         assert await async_setup_entry(cast("Any", hass), cast("Any", entry))
+        start_broker.assert_not_called()
+        assert len(startup_callbacks) == 1
+        startup_callbacks[0](hass)
+        start_broker.assert_called_once()
 
     entry.async_on_unload.assert_any_call(client.cancel_handoff_release_tasks)
+    entry.async_on_unload.assert_any_call(startup_unsubscribe)
     entry.async_on_unload.assert_any_call(update_unsubscribe)
     assert entry.runtime_data is client
     forward_setups.assert_awaited_once()
+
+
+async def test_realtime_tool_snapshot_waits_for_home_assistant_started(
+    hass: HomeAssistant,
+) -> None:
+    """Full boot cannot capture tools before all integrations finish setup."""
+    entry = SimpleNamespace(entry_id="entry-1")
+    session = Mock()
+    hass.set_state(CoreState.starting)
+
+    with patch(
+        "custom_components.codex_voice.async_start_realtime_tool_broker"
+    ) as start_broker:
+        cancel = _async_start_realtime_tool_broker_at_started(
+            hass,
+            cast("Any", entry),
+            cast("Any", session),
+        )
+        await hass.async_block_till_done()
+        start_broker.assert_not_called()
+
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+
+        start_broker.assert_called_once_with(hass, entry, session)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+        start_broker.assert_called_once()
+
+    cancel()
+
+
+async def test_unload_cancels_deferred_realtime_tool_snapshot(
+    hass: HomeAssistant,
+) -> None:
+    """Unloading during startup cannot create a broker after the entry is gone."""
+    entry = SimpleNamespace(entry_id="entry-1")
+    session = Mock()
+    hass.set_state(CoreState.starting)
+
+    with patch(
+        "custom_components.codex_voice.async_start_realtime_tool_broker"
+    ) as start_broker:
+        cancel = _async_start_realtime_tool_broker_at_started(
+            hass,
+            cast("Any", entry),
+            cast("Any", session),
+        )
+        cancel()
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+
+    start_broker.assert_not_called()
+
+
+async def test_realtime_tool_snapshot_starts_immediately_after_boot(
+    hass: HomeAssistant,
+) -> None:
+    """Runtime setup and reload do not wait for another startup event."""
+    entry = SimpleNamespace(entry_id="entry-1")
+    session = Mock()
+    hass.set_state(CoreState.running)
+
+    with patch(
+        "custom_components.codex_voice.async_start_realtime_tool_broker"
+    ) as start_broker:
+        cancel = _async_start_realtime_tool_broker_at_started(
+            hass,
+            cast("Any", entry),
+            cast("Any", session),
+        )
+        await hass.async_block_till_done()
+
+    start_broker.assert_called_once_with(hass, entry, session)
+    cancel()
 
 
 async def test_migrate_requires_explicit_authority_opt_in_and_adds_language(

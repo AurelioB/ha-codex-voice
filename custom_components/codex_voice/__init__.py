@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import logging
 
+from aiohttp import ClientSession
 from awesomeversion import AwesomeVersion
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import __version__ as HA_VERSION
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
     ConfigEntryNotReady,
 )
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.start import async_at_started
 
 from .api import (
     BridgeAuthenticationError,
@@ -36,6 +38,21 @@ from .realtime_tools import async_start_realtime_tool_broker
 _LOGGER = logging.getLogger(__name__)
 
 type CodexVoiceConfigEntry = ConfigEntry[BridgeClient]
+
+
+@callback
+def _async_start_realtime_tool_broker_at_started(
+    hass: HomeAssistant,
+    entry: CodexVoiceConfigEntry,
+    session: ClientSession,
+) -> CALLBACK_TYPE:
+    """Capture realtime tools only after Home Assistant finishes startup."""
+
+    @callback
+    def _start(started_hass: HomeAssistant) -> None:
+        async_start_realtime_tool_broker(started_hass, entry, session)
+
+    return async_at_started(hass, _start)
 
 
 async def async_setup_entry(
@@ -67,8 +84,10 @@ async def async_setup_entry(
         raise ConfigEntryError(str(err)) from err
 
     entry.runtime_data = client
-    async_start_realtime_tool_broker(hass, entry, session)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(
+        _async_start_realtime_tool_broker_at_started(hass, entry, session)
+    )
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
