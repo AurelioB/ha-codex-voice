@@ -1,5 +1,13 @@
 # Realtime device wire protocol v2
 
+> [!NOTE]
+> Protocol v2 remains supported as the explicit `media_transport: "bridge_pcm"`
+> rollback and compatibility path. New direct-media deployments use
+> [protocol v3](realtime-wire-v3.md), where the ThirdReality device owns the
+> WebRTC peer and the bridge carries signaling/sideband JSON only. V2 behavior
+> below is intentionally preserved; selecting v3 never silently changes a v2
+> socket's framing or fallback semantics.
+
 This document defines the authenticated device-facing WebSocket contract at
 `GET /v1/realtime`. Version 2 is a narrow, low-latency PCM transport between a
 LAN audio endpoint and the host bridge. The bridge remains the only Codex App

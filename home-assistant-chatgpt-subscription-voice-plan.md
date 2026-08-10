@@ -14,6 +14,22 @@
 > experimental compatibility adapters rather than the production speech
 > boundaries.
 
+> [!NOTE]
+> **ThirdReality v3 implementation update (2026-08-10):** Okay Computer now
+> uses a device-owned `aiortc` peer on the aarch64 Buildroot Linux speaker.
+> Wire v3 sends SDP and content-free sideband JSON through the bridge, while
+> RTP audio and `oai-events` travel directly between the device and provider.
+> The bridge still owns Codex OAuth/App Server signaling and cleanup. Okay Nabu
+> remains the separate Assist/tool path. V2 `bridge_pcm` is retained for
+> rollback. Provider lifecycle never gates the continuous RTP lane; local media
+> boundaries come from first decoded audio and actual receiver quiet. Local
+> interruption normally uses conditional event-ID-scoped cancel/clear; actual
+> RTP before SCTP lifecycle forces an unkeyed cancel plus clear, while provider
+> VAD sends neither duplicate. Same-peer continuation requires control
+> settlement and a fresh post-fence quiet window. Exact sink preparation runs
+> once before direct-session negotiation, outside the response/interruption
+> loop. No end-to-end physical v3 acceptance is claimed yet.
+
 Build this as a hybrid Home Assistant custom integration plus a local companion add-on:
 
 - The custom integration exposes a standard Home Assistant Conversation entity
@@ -21,7 +37,10 @@ Build this as a hybrid Home Assistant custom integration plus a local companion 
 - The production Assist pipeline selects a local Wyoming faster-whisper STT
   entity and a local Wyoming Piper TTS entity, which Home Assistant composes
   independently around Codex Conversation.
-- The add-on runs a pinned `codex app-server` process, owns its JSON-RPC connection, and terminates the WebRTC media session used by subscription-backed voice.
+- The add-on runs a pinned `codex app-server` process and owns its JSON-RPC
+  connection. It terminates WebRTC for the experimental STT/TTS adapters and
+  v2 rollback, but v3 direct-device voice uses it for OAuth, signaling,
+  sideband lifecycle, and cleanup only.
 - Codex owns the ChatGPT browser/device-code OAuth flow, token persistence, and refresh.
 - All Codex model traffic goes through the ChatGPT-authenticated Codex process.
   Local Whisper STT does not use ChatGPT or OpenAI Platform quota. The
@@ -53,17 +72,20 @@ flowchart LR
     I["Codex Voice<br/>Conversation"]
     Y["Wyoming Piper<br/>external-host local TTS · es_MX-ald-medium"]
     D["ThirdReality<br/>Okay Computer"]
-    B["Local subscription bridge add-on<br/>sessions · WebRTC · quotas · safety"]
+    B["Local subscription bridge add-on<br/>OAuth · signaling · quotas · safety"]
     C["Pinned Codex App Server<br/>stdio JSON-RPC"]
-    W["App-Server-created WebRTC call<br/>RTP audio · oai-events"]
+    W["Subscription WebRTC call<br/>RTP audio · oai-events"]
+    DS["ThirdReality aarch64 Buildroot sidecar<br/>pinned aiortc"]
     O["ChatGPT OAuth<br/>subscription entitlement"]
     T["HA exposed-entity tools"]
 
     N --> P --> S --> I --> Y --> N
     I <-->|"authenticated local HTTP/WS"| B
-    D <-->|"direct realtime speech"| B
+    D <-->|"wire v3 SDP + sideband"| B
+    D <-->|"bounded local IPC"| DS
     B <-->|"JSON-RPC"| C
-    B <-->|"SDP + media/data channels"| W
+    B <-->|"App Server signaling"| W
+    DS <-->|"direct RTP + oai-events"| W
     C -->|"create/control call"| W
     C <-->|"managed login and refresh"| O
     I <-->|"validated tool calls"| T
@@ -123,7 +145,11 @@ alternative, but it must never activate automatically.
 
 - Supervise one pinned `codex app-server` child process over stdio.
 - Implement typed JSON-RPC request correlation, notification routing, cancellation, timeouts, and schema-version checks.
-- Own the WebRTC peer, SDP exchange, `oai-events` data channel, input audio track, remote audio track, resampling, jitter buffering, and media cancellation. Evaluate `aiortc` in the feasibility harness; use a small Rust/GStreamer media worker if it cannot meet stability or resource targets.
+- Own the WebRTC peer, tracks, data channel, resampling, and media cancellation
+  for the experimental STT/TTS adapters and v2 rollback. For ThirdReality v3,
+  validate and relay the device SDP instead; the pinned device `aiortc` sidecar
+  owns media and data-channel cancellation while the bridge owns App Server
+  start/stop and thread cleanup.
 - Expose a narrow authenticated local API to the HA component: login, logout, account status, conversation turn, transcribe stream, synthesize stream, cancel, and diagnostics.
 - Use App Server's managed device-code/browser login. Store the Codex credential cache only in the add-on's private persistent volume with restrictive permissions or a supported credential store.
 - Reject arbitrary Codex command execution, filesystem requests, external MCP configuration, and approval prompts at the bridge boundary.

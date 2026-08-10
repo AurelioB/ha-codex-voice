@@ -8,7 +8,7 @@ sides of a narrow bridge API.
 - Home Assistant stores only the bridge URL and a dedicated bearer token.
 - A ThirdReality realtime endpoint stores a separate route-scoped bearer in a
   root-owned, mode-0600 device file. When configured, that token works only on
-  `/v1/realtime` after strict v2 negotiation; it cannot enter legacy v1 or call
+  `/v1/realtime` after strict v2 or v3 negotiation; it cannot enter legacy v1 or call
   health, Conversation, STT, TTS, or the Home Assistant tool-authority route.
 - The bridge delegates authentication, storage, and refresh to the installed
   Codex CLI. It locates an existing file-backed `auth.json` but does not parse,
@@ -18,10 +18,11 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
-- The current ThirdReality client explicitly requests
+- The current ThirdReality v3 client explicitly requests
   `conversation_mode: "native"`. The bridge ignores any Home Assistant broker
-  snapshot for that session and creates one tool-free native App Server WebRTC
-  voice thread. Okay Computer therefore has no Home Assistant control
+  snapshot for that session and creates one tool-free native App Server
+  realtime thread. It relays validated SDP and lifecycle sideband but never
+  carries v3 PCM or raw provider data. Okay Computer therefore has no Home Assistant control
   authority; Okay Nabu retains the official Assist/tool route.
 - The bridge echoes an accepted explicit mode in `started`; the reference
   client requires `conversation_mode: "native"` and fails closed if the echo is
@@ -81,7 +82,12 @@ sides of a narrow bridge API.
   not receive the ChatGPT credential, bridge bearer, microphone audio, or Home
   Assistant access token, and synthesis does not consume the subscription
   speech lane.
-- Device-facing realtime v2 remains audio/control only. It rejects
+- Device-facing realtime v3 carries signaling/control only. The isolated
+  device peer carries RTP audio and `oai-events` directly to/from the provider;
+  the bridge rejects binary v3 media, device-declared tools, and device tool
+  results. Provider transcript/model text and arbitrary nested data are removed
+  before lifecycle metadata crosses the sidecar IPC boundary. Device-facing v2
+  remains the explicit bridge-PCM rollback and compatibility path. It rejects
   device-declared tools and device tool results, and never exposes provider
   tool calls or Home Assistant results to the speaker. Explicit native mode
   ignores a separately registered authority. In the legacy automatic managed
@@ -101,7 +107,7 @@ sides of a narrow bridge API.
   teardown the active turn is tombstoned and interrupted before its event
   consumer closes, and provider/thread cleanup remains tracked and shielded
   from request-handler cancellation.
-- “Okay Computer” selects explicit native v2 and gains no Home Assistant
+- “Okay Computer” selects explicit native v3 and gains no Home Assistant
   authority. “Okay Nabu” selects the official Assist path;
   a normal wake can preempt a direct session and reclaim the microphone.
 - The device retains at most six idle microphone frames for the direct wake:
@@ -109,12 +115,23 @@ sides of a narrow bridge API.
   consumes it; Okay Nabu, stop, mute, disconnect, and teardown discard it. It
   is never written to configuration, disk, diagnostics, or logs, remains inside
   existing queue bounds, and is trimmed or omitted to preserve 32 KiB of live
-  post-wake capacity.
-- The ThirdReality client is standard-library code imported into the existing
-  root voice process. Exact vendor bytecode guards fail closed before patching.
+  post-wake capacity. Any v3 startup/runtime failure clears its captured direct
+  audio and returns idle rather than handing it to Home Assistant. The v2
+  rollback alone preserves bounded pre-ready Assist replay.
+- The ThirdReality controller is standard-library code imported into the
+  existing root voice process. Direct media runs in a separate
+  `/usr/bin/python3 -I -S` child with a complete hash-locked Python
+  3.11/aarch64 runtime, root-owned immutable source/runtime paths, and bounded
+  sequenced-packet IPC. The launcher assigns UID/GID 65534 with no supplementary
+  groups, a minimal fixed environment, and umask 077; no credential is passed
+  through argv, environment, or IPC. Root-owned mode-0755 runtime/source
+  directories and mode-0644 files remain readable but not writable, while the
+  mode-0600 device configuration and staging archive are unreadable to the
+  child. This is privilege separation, not a general filesystem, syscall, or
+  network sandbox. Exact vendor bytecode guards fail closed before patching.
   Its JSON configuration must be a root-owned, non-symlink regular file with
   mode 0600; source directories/files must not be writable by group or other.
-- Full duplex is off by default and fails closed without a reviewed static
+- V3 `device_webrtc` requires full duplex and fails closed without a reviewed static
   PulseAudio `module-echo-cancel` block using the exact configured allowlisted
   AEC engine, exact raw masters and default AEC routes, and the current voice
   process's capture stream routed through the AEC source. The allowlist is
@@ -123,20 +140,40 @@ sides of a narrow bridge API.
   v1.1.7 must explicitly select Adrian because its module rejects the uncompiled
   WebRTC and Speex engines. The client checks the exact method before opening
   the bridge socket, enforces a configured 1–60% sink ceiling with a safe 25%
-  default, rechecks every
-  sink channel before each response, and starts `paplay` on that sink with a
-  fixed stream volume no greater than the ceiling. The guard compares raw
-  PulseAudio units to the exact linear ceiling rather than trusting rounded
-  display percentages. The installer writes the matching raw setpoint in the
-  static startup block immediately after sink creation. The stock voice process
-  later applies its persistent Home Assistant media-player preference, which
-  must match; deferred PulseAudio restore state alone is not trusted across
-  reboot. A successfully loaded Adrian topology still requires a
+  default, then once per direct session uses fixed-argv `pactl` to set and
+  verify the dedicated sink at the exact configured raw playback value. Both
+  checks finish before the SDP offer or bridge connection. V3 runs `paplay`
+  only on that allowlisted sink with raw stream volume 65536 (100% relative),
+  non-blocking stdin, and fixed format and latency arguments. It never
+  enumerates or mutates a sink-input; the live response/interruption path
+  performs no blocking volume subprocess work, and the v2 rollback retains its
+  configured stream-volume behavior. The guard compares raw PulseAudio units
+  to the exact linear ceiling rather than trusting rounded display percentages.
+  The installer writes the matching raw setpoint in the static startup block
+  immediately after sink creation. The stock voice process later applies its
+  persistent Home Assistant media-player preference, which must match;
+  deferred PulseAudio restore state alone is not trusted across reboot. Other
+  software must not mutate the qualified sink during a live direct session. A
+  successfully loaded Adrian topology still requires a
   physical double-talk canary on each installation at its configured sink and
-  stream values; the reference device's bounded 25% pass is not transferable
-  evidence for another device or for an increase up to the explicit 60% maximum.
-- Local playback flush or provider VAD is not evidence of remote cancellation.
-  On the current native v2 path, resume still requires a sanitized provider
+  stream values. The reference device's bounded 25% pass exercised the prior
+  v2 path; it is not v3 validation, transferable evidence for another device,
+  or evidence for an increase up to the explicit 60% maximum.
+- Provider lifecycle never labels or gates direct RTP; local media boundaries
+  come only from first decoded audio and an actual roughly 120 ms receiver
+  quiet gap. Local/explicit v3 interruption drops queued media, immediately
+  SIGKILLs `paplay`, and mutes decoded RTP. Generated event IDs normally
+  constrain cancel to an in-progress response and clear to active output. If
+  decoded RTP precedes both provider SCTP states, actual media instead forces
+  an unkeyed cancel followed by clear. Only a causally matched cancel-no-op is
+  recoverable; clear or unmatched provider errors fail closed. Provider VAD
+  `speech_started` sends neither duplicate control. Same-peer continuation
+  requires provider control settlement plus a fresh full receiver-quiet window
+  begun after the fence to emit `interrupt.fenced`; cached pre-fence quiet is
+  insufficient, late RTP resets the window, and failure by the bounded deadline
+  requires a fresh session. These protections still require physical validation
+  under independent RTP/SCTP ordering. On the native v2 rollback path, resume still
+  requires a sanitized provider
   `response.cancelled` event correlated to the exact active response. On the
   legacy broker-managed path, a new utterance invalidates the bridge generation
   and best-effort cancellation cannot reopen the local output gate. Before Home

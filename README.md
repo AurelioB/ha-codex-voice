@@ -29,9 +29,9 @@ ThirdReality: "Okay Nabu"
   -> speaker
 
 ThirdReality: "Okay Computer"
-  -> in-process stdlib client -> realtime wire v2 -> bridge
-  -> explicit conversation_mode: native
-  -> one native Codex App Server WebRTC voice thread -> speaker
+  -> in-process stdlib controller + isolated aiortc sidecar
+  -> realtime wire v3 SDP/sideband -> bridge -> Codex App Server/OAuth
+  -> direct device/provider WebRTC RTP + oai-events -> speaker
 
 No Home Assistant broker, transcript executor, or appendSpeech render handoff
 participates in the Okay Computer session.
@@ -44,15 +44,16 @@ Codex home, and forces file-backed CLI authentication so Codex refreshes the
 original credential through the link. Normal Codex history, configuration,
 apps, plugins, and MCP servers are not imported into voice sessions. The
 bridge sends Home Assistant only text/audio results; Home Assistant never
-receives the ChatGPT credential. Device-facing v2 returns only audio and
-content-free lifecycle controls. The device never declares tools or receives
-tool calls/results. The current reference client always requests native mode;
-the bridge ignores any registered Home Assistant realtime-tool snapshot for
-that session and creates one tool-free voice thread. With qualified device AEC,
-this is the full-duplex/barge-in route. “Okay Nabu” remains the Home Assistant
-Assist and home-control route. Older strict-v2 clients that omit
-`conversation_mode` retain the prior automatic native/managed behavior for
-wire compatibility.
+receives the ChatGPT credential. Device-facing v3 carries authenticated SDP and
+content-free sideband controls only. The aarch64 Buildroot Linux speaker—not
+Android—owns the `aiortc` media peer and provider data channel in an isolated,
+pinned child runtime. The device never declares tools or receives tool
+calls/results from the bridge. The reference client always requests native
+mode; the bridge ignores any registered Home Assistant realtime-tool snapshot
+for that session and creates one tool-free voice thread. With qualified device
+AEC, this is the full-duplex/barge-in route. “Okay Nabu” remains the Home
+Assistant Assist and home-control route. Strict v2 `bridge_pcm` remains the
+explicit rollback path, including older omitted-mode compatibility behavior.
 External Wyoming service templates and smoke scripts are repository assets,
 not part of the component-only HACS ZIP.
 
@@ -73,40 +74,66 @@ not part of the component-only HACS ZIP.
 - Automatic experimental STT-to-TTS session reuse is disabled: current
   realtime v3 sessions can begin assistant output before finite transcription
   completes.
-- Milestone 2: an experimental ThirdReality v1.1.7 realtime client and strict
-  binary wire protocol. “Okay Computer” explicitly starts native, tool-free,
-  single-thread subscription voice.
-  “Okay Nabu” keeps the official Home Assistant Assist flow. The client runs
-  inside the existing Python voice process and requires no firmware flash or
-  second device daemon. It remains an untrusted audio/control endpoint.
+- Milestone 2: an experimental ThirdReality v1.1.7 direct-media client and
+  strict wire v3 signaling protocol. “Okay Computer” explicitly starts native,
+  tool-free, single-thread subscription voice. The existing Python voice
+  process owns capture/playback while an isolated `aiortc` child owns direct
+  provider WebRTC; the bridge owns OAuth, App Server signaling, and lifecycle
+  sideband only. “Okay Nabu” keeps the official Home Assistant Assist flow.
+  No firmware flash or separately supervised device daemon is required.
 - Home Assistant tool authority remains available to the official Conversation
   flow and to older strict-v2 clients that omit `conversation_mode`. It is not
   attached to current “Okay Computer” sessions. The route-scoped device token
   cannot open the broker, and no tool schema, call, result, or Home Assistant
-  credential is exposed on wire v2.
+  credential is exposed on wire v3.
+- The device WebRTC dependency set is pinned by version and wheel hash for
+  Python 3.11/aarch64-manylinux, built into a reproducible manifest archive,
+  verified and smoke-tested before an atomic root-owned activation, and loaded
+  under `python3 -I -S` as UID/GID 65534 with a minimal environment. Runtime
+  directories/files are root-owned 0755/0644 and immutable to that child; the
+  mode-0600 device configuration and archive remain unreadable. Ambient device
+  `pip install` is not supported.
 - Okay Computer is the native tool-free route; qualified installations enable
   full duplex for continuous microphone capture and barge-in. The safe package
   default remains turn-taking until the installation passes the reviewed
   static PulseAudio `module-echo-cancel` requirements with one explicit,
   allowlisted AEC engine, exact capture/playback routing, an explicit startup
   sink value aligned with the vendor media-player preference, a startup safety
-  preflight, a sink-volume ceiling recheck before every response, and a fixed
-  `paplay` stream volume with a safe 25% default and explicit 60% hard maximum.
+  preflight, and one exact sink set/verify sequence before direct-session SDP
+  negotiation. The v3 response and interruption loops perform no blocking
+  `pactl` work. V3 then feeds at most one fixed-argv `paplay` child on that sink
+  with raw stream volume 65536 (100% relative), non-blocking 20 ms writes, and
+  60 ms/20 ms latency/process settings. It never mutates a sink-input. The sink
+  has a safe 25% default and explicit 60% hard maximum; v2 retains its older
+  configured `paplay` stream-volume behavior.
   WebRTC remains the configuration and
   installer default; neither layer automatically falls back to another engine.
-  The stock ThirdReality v1.1.7 module rejects WebRTC and Speex but loads Adrian,
-  which passed the bounded reference-device echo and barge-in canaries at 25%.
+  The stock ThirdReality v1.1.7 PulseAudio module rejects WebRTC and Speex but
+  loads Adrian. The prior bridge-PCM route passed bounded reference-device echo
+  and barge-in canaries at 25%; those measurements do not validate v3.
   Every new installation—and every increase above a previously qualified
   level—still requires the documented physical qualification.
-  The current native client flushes local playback immediately on qualified
-  barge-in and requires correlated provider cancellation before same-socket
-  resume; otherwise it safely starts a fresh session.
+  On locally detected or explicit v3 interruption, the client clears queued
+  playback, immediately SIGKILLs `paplay`, and mutes decoded RTP while the
+  sidecar proves a continuation fence. It normally cancels only an in-progress
+  response and clears only active output, using causal event IDs. Actual RTP
+  received before SCTP lifecycle is the fail-safe exception: the sidecar sends
+  both controls and leaves the cancel unkeyed rather than attaching a stale
+  response ID. Provider VAD `speech_started` sends neither duplicate.
+  Same-peer continuation requires provider control settlement plus a fresh,
+  full receiver-quiescence gap that begins after the fence, otherwise the
+  bounded fence fails to a fresh session. This still requires the documented
+  physical canary.
+- The v3 implementation and pinned runtime have automated protocol/static
+  coverage, but this repository does not yet claim an end-to-end physical v3
+  acceptance run. Wire v2 `bridge_pcm` remains documented and supported for
+  rollback.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.147.0 or newer.
 
 The recommended Assist pipeline remains turn-based. Direct realtime is a
-separate full-duplex-capable streaming PCM transport, not an STT/text/TTS
-simulation. Home control intentionally stays on “Okay Nabu.”
+separate full-duplex device WebRTC session, not an STT/text/TTS simulation.
+Home control intentionally stays on “Okay Nabu.”
 
 ## Quick start
 
@@ -216,27 +243,38 @@ open-ended conversation.
 
 Release assets include `thirdreality-realtime.zip` for the pinned Python-based
 ThirdReality v1.1.7 client. It contains the guarded `sitecustomize.py`, the
-stdlib-only `realtime_client` package, and a secret-free configuration example.
+stdlib-only controller, isolated `webrtc_sidecar`, deterministic aarch64/Python
+3.11 runtime lock/installer material, and a secret-free disabled v3 example.
 Follow the [device deployment, verification, and rollback
-contract](device/thirdreality/README.md). `full_duplex` remains `false` by
-default. Enabling it is fail-closed unless the reviewed static PulseAudio AEC
+contract](device/thirdreality/README.md) and build/install the hash-locked
+runtime as documented in
+[the runtime guide](device/thirdreality/webrtc-runtime.md). The configuration
+loader retains `bridge_pcm`/turn-taking defaults for compatibility; selecting
+`media_transport: "device_webrtc"` requires `full_duplex: true` and fails closed
+unless the reviewed static PulseAudio AEC
 topology uses the exact configured allowlisted engine, exact source/sink
 routing, current-process capture route, and configured 1–60% sink ceiling.
 WebRTC is the default when `pulse_aec_method` or installer `--aec-method` is
 omitted, with no automatic fallback. The observed stock v1.1.7 image instead
 requires an explicit `adrian` selection; its WebRTC and Speex engines are not
-compiled in and are rejected. The sink ceiling is checked again before every
-response, and full-duplex `paplay` is pinned to that AEC sink with a fixed
-stream volume no greater than the configured ceiling. The guarded installer
+compiled in and are rejected. Once per direct session, before the SDP offer or
+bridge connection, v3 checks the sink ceiling and sets and verifies the
+dedicated AEC sink to the exact raw `playback_volume_percent`. Its fixed-argv
+`paplay` child targets only that sink, forces raw stream volume 65536 (100%
+relative), and never enumerates or mutates a sink-input. No volume subprocess
+runs on `response.created`, playback begin/resume, or interruption. V2 retains
+its configured fixed stream volume. The guarded installer
 writes the chosen 1–60% sink value into the static PulseAudio block after the
 AEC sink is created. The stock voice process later reapplies its persistent
 Home Assistant media-player preference, so that setting must match; deferred
 PulseAudio restore state alone is not reboot evidence. Adrian creating the
-expected 16 kHz mono endpoints is only a topology canary. The reference device
-passed a bounded 25% echo-residual and staged double-talk canary. The sink and
-stream controls default to 25% and permit an explicit maximum of 60%; physical
-echo and early/middle/late double-talk tests must pass at the configured
-operational values on each installation before use or after an increase.
+expected 16 kHz mono endpoints is only a topology canary. A prior v2
+bridge-PCM deployment passed a bounded 25% echo-residual and staged double-talk
+canary; v3 has not yet completed the documented physical acceptance matrix.
+The v3 sink ceiling and playback setting default to 25% and permit an explicit
+maximum of 60%, with playback rejected above the ceiling. Physical echo and
+early/middle/late double-talk tests must pass at the configured operational
+values on each installation before use or after an increase.
 
 The deployment adds “Okay Computer” alongside “Okay Nabu”; it does not replace
 the standard Assist path. The device configuration is root-owned and mode 0600,
@@ -244,14 +282,15 @@ and stores only the route-scoped realtime bearer—not the Home Assistant token
 or the Codex OAuth credential. Deployment and rollback must preserve and verify
 TCP ADB port 5555 on devices where it is the approved recovery path.
 
-The reference client hardcodes `conversation_mode: "native"` in every strict-v2
-start and requires the bridge to echo it in `started`. It is deliberately not a
-device setting: Okay Computer cannot silently become a transcript/executor/TTS
-pipeline because a Home Assistant broker happens to be connected.
+The reference client hardcodes `conversation_mode: "native"` in every v3 or
+rollback-v2 start and requires the bridge to echo it in `started`. It is
+deliberately not a device setting: Okay Computer cannot silently become a
+transcript/executor/TTS pipeline because a Home Assistant broker happens to be
+connected.
 
-That route-scoped token authorizes only a successfully negotiated v2 audio
-session. It cannot connect to the Home Assistant tool broker. A broker may
-still be maintained for compatibility clients, but the bridge ignores its
+That route-scoped token authorizes only a successfully negotiated v2 or v3
+realtime session. It cannot connect to the Home Assistant tool broker. A broker
+may still be maintained for compatibility clients, but the bridge ignores its
 snapshot for an explicit native session.
 
 Direct sessions can optionally select a realtime voice and a bounded session
@@ -343,8 +382,9 @@ only inside that isolated home, then deleted with `thread/delete` when their
 bridge-managed lifetime ends. This keeps ordinary Codex history and locally
 installed apps, including automatically discovered MCP sidecars, outside voice
 sessions and prevents finished threads from lingering in App Server's idle
-cache. An authority-enabled strict-v2/v3 session owns both its speech frontend
-and executor thread; teardown deletes both independently.
+cache. Only an authority-enabled legacy strict-v2 managed session owns both a
+speech frontend and executor thread; teardown deletes both independently. A v3
+device session is always tool-free and owns one realtime thread.
 
 No OAuth secret is copied into Home Assistant or this repository. The isolated
 home contains a link to the source credential so refreshes remain owned by the
@@ -360,49 +400,70 @@ defense in depth.
 
 ## Realtime protocol
 
-`ws://BRIDGE/v1/realtime` supports the legacy JSON/base64 v1 protocol and a
-strict device-facing v2 protocol. The shipped ThirdReality client negotiates
-v2 with `conversation_mode: "native"`, streams binary 16 kHz mono PCM16 input,
-and receives binary 24 kHz mono PCM16 output between explicit, monotonic
-speaking-epoch controls. The `started` acknowledgement must echo native mode.
-The bridge ignores any Home Assistant broker snapshot and connects microphone
-and speaker audio to one native App Server WebRTC voice thread. There is no
-completed-transcript gate, executor thread, or `appendSpeech` render step. V2
-exposes no transcripts, raw provider events, tool calls, or tool results.
+`ws://BRIDGE/v1/realtime` supports legacy JSON/base64 v1, binary-PCM v2, and
+direct-device WebRTC v3. The shipped direct example negotiates v3 with required
+`conversation_mode: "native"` and an SDP offer containing audio plus the
+ordered `oai-events` data channel. The bridge passes that offer to Codex App
+Server using its managed login and returns the exact SDP answer. Once the
+device confirms that its answer, ICE/DTLS peer, and data channel are ready, the
+bridge acknowledges:
 
-Omitting `conversation_mode` preserves the previous automatic route for older
-strict-v2 clients: App Server v3 plus a captured broker snapshot selects the
-isolated managed executor; otherwise it selects native. The current reference
-client never omits the field.
+```json
+{
+  "type": "started",
+  "version": "v3",
+  "protocol_version": 3,
+  "conversation_mode": "native",
+  "transport": "webrtc",
+  "audio_over_bridge": false,
+  "sideband_control": true
+}
+```
 
-The client keeps startup and fallback audio in bounded 64 KiB queues (2.048 s
-at its input format). After a cold handshake, it transfers a queued backlog at
-no more than 2× capture rate until it catches up, then resumes realtime pacing.
-Direct-wake pre-roll is counted inside both bounds and is trimmed or omitted as
-needed to preserve at least 32 KiB (1.024 s) for live post-wake PCM. The default
-64 KiB queues retain the full 12 KiB pre-roll and more than that minimum
-headroom.
+RTP audio and provider data events then travel directly between the device's
+isolated `aiortc` peer and the provider. The bridge WebSocket accepts JSON
+lifeline controls only; binary media is a protocol error. The bridge still owns
+the one tool-free App Server thread, rejects unexpected tool requests, watches
+for remote failure, and performs bounded stop/delete cleanup, but it never
+constructs a media peer for v3.
 
-The bridge separately caps v2 live WebRTC input at 2,250 ms without reducing
-the finite STT adapter's whole-utterance capacity. These bounds prevent an
-unlimited stale backlog; they do not eliminate the cold handshake or provider
-response latency. Device playback buffering is limited to 48 KiB, about 1.024
-s at the output format.
+The device keeps capture/startup audio in a bounded 64 KiB queue, retains at
+most 12 KiB of direct-only pre-roll inside that bound, and reserves at least 32
+KiB for post-wake capture. Accepted backlog catches up at no more than 2× before
+returning to realtime pacing. The isolated sidecar preserves timestamped 16 kHz
+mono PCM16 input, decodes provider output to bounded 24 kHz mono PCM16 playback,
+and fails rather than dropping on IPC or queue pressure. Provider lifecycle
+events do not label or gate RTP: first decoded audio emits internal
+`media.started`, and only an actual roughly 120 ms receiver gap emits
+`media.quiet`. This preserves RTP-before-start prefixes and stopped-before-tail
+audio. V3 never enters the bridge's v2 2,250 ms media queue.
 
-The bridge advertises `local_flush: true`, `remote_cancel: false`, and
-`same_session_interrupt_ack: true`. The first two fields still forbid assuming
-that a local flush truncated provider output. In qualified full duplex, two
-consecutive AEC-filtered speech frames can stop local playback before the
-provider VAD boundary; the provider event independently reinforces that flush.
-The current client identifies itself with
-`User-Agent: ha-codex-voice-thirdreality/2`. In a legacy broker-managed session, an
-interrupt invalidates the bridge-owned executor/output generation and returns
-`fresh_session_required: false`, `remote_cancelled: false`, and
-`continuation_safe: true`; this does not claim provider cancellation. A legacy
-client receives the established fresh-session fallback and the socket closes.
-In the current native path, same-socket continuation requires a
-`response.cancelled` event correlated to the exact active response. See the
-complete [v2 wire contract](protocol/realtime-wire-v2.md).
+Qualified full duplex detects two consecutive AEC-filtered speech frames and
+immediately kills local `paplay`, drops queued playback IPC, and mutes decoded
+RTP. Generated event IDs make cancel-no-op errors recoverable: cancel is
+normally sent only for an in-progress response, while clear is normally sent
+only for active output. If decoded RTP precedes all SCTP lifecycle, however,
+actual media forces both controls and the cancel carries no `response_id`;
+clear or unmatched errors fail closed. Provider
+`input_audio_buffer.speech_started` sends no duplicate control. The peer can
+continue only after provider control settlement plus a fresh roughly 120 ms
+receiver-quiescence window started at the fence produce `interrupt.fenced`;
+every late decoded frame restarts that window. Failure to prove the bound
+requires a fresh session. This design still needs physical validation under
+independent RTP/SCTP ordering.
+
+V3 failures never hand captured Okay Computer audio to Home Assistant. Startup,
+runtime, transport, backpressure, or playback failure clears the direct queues
+and returns idle so the user can explicitly invoke Okay Nabu.
+
+The retained `media_transport: "bridge_pcm"` rollback negotiates strict v2,
+streams binary 16 kHz mono PCM16 to the bridge, and receives binary 24 kHz mono
+PCM16 between speaking epochs. It preserves v2's bounded pre-ready Assist
+fallback, bridge-mediated interrupt acknowledgements, and omitted-mode legacy
+managed compatibility; it never silently changes framing to v3. See the
+complete [v3 wire contract](protocol/realtime-wire-v3.md), [v2 rollback
+contract](protocol/realtime-wire-v2.md), and [device deployment
+guide](device/thirdreality/README.md).
 
 The retained experimental Codex TTS entity uses the authenticated
 `POST /v1/synthesize/stream` route. It sends an EOF-terminated PCM16 WAV stream
@@ -494,7 +555,9 @@ stage does not use this remote handoff mechanism.
 Always-on remote prewarming is not enabled: there is no provider hook before a
 wake word, an idle WebRTC peer still sends silent RTP, App Server does not
 document idle sessions as quota-neutral, and speculative sessions would occupy
-the single speech lane. See [performance and ThirdReality
+the single speech lane. The v3 overlay may prewarm one local isolated sidecar,
+but it creates no Codex thread, bridge socket, or remote peer until wake. See
+[performance and ThirdReality
 tuning](docs/performance.md) for measurement scope, handoff privacy and
 fallback behavior, safe device settings, and the firmware canary decision.
 
@@ -550,19 +613,30 @@ opt-in and must never print OAuth tokens or recorded audio.
   until a timeout. Wyoming STT does not use that lane.
 - HACS cannot install the bridge process. Run it separately or use the future
   add-on/container packaging.
-- The pinned ThirdReality v1.1.7 overlay defaults to direct realtime
-  turn-taking. Full duplex is an explicit post-qualification option that
+- The pinned ThirdReality v1.1.7 configuration loader defaults to the retained
+  v2 `bridge_pcm` turn-taking path. V3 `device_webrtc` is explicit and requires
+  full duplex plus a deterministic aarch64/Python 3.11 sidecar runtime. It also
   requires a repository-reviewed PulseAudio AEC fragment, an exact configured
-  engine match, exact process routing, a preflight plus per-response sink
-  ceiling, and a fixed `paplay` stream cap with a 25% default and 60% hard
-  maximum. WebRTC is the
+  engine match, exact process routing, and a fixed-argv `paplay` route to that
+  sink. Once before each direct session negotiates SDP, the client performs the
+  sink-ceiling preflight and sets/verifies the dedicated sink at the exact
+  configured raw playback value; the live response/interruption loop does not
+  invoke `pactl`. `paplay` is forced to raw 65536 (100% relative) without
+  sink-input manipulation. The sink has a 25% default and 60% hard maximum; v2
+  retains its configured stream-volume behavior. WebRTC is the
   fail-closed default and is never automatically replaced. Stock v1.1.7 rejects
-  WebRTC and Speex and must explicitly select Adrian. The reference device
-  passed bounded echo-residual and staged barge-in canaries at 25%, but a
-  syntactically valid Adrian topology is not proof for another installation;
+  WebRTC and Speex and must explicitly select Adrian. A reference device
+  passed bounded echo-residual and staged barge-in canaries at 25% on the prior
+  v2 path, but v3 has no claimed physical acceptance run and a syntactically
+  valid Adrian topology is not proof for another installation;
   do not enable it there before physical double-talk and rollback canaries pass
-  at the configured sink and stream values. Values above the previously
+  at the configured sink value (and the separate stream value when testing v2).
+  Values above the previously
   qualified 25% reference require new physical evidence, up to the 60% maximum.
+- V3 is fail-closed rather than failover: if direct startup or runtime fails,
+  captured Okay Computer audio is cleared and never replayed into Home
+  Assistant. The user must explicitly wake Okay Nabu. The v2 rollback path
+  intentionally retains its older bounded pre-ready Assist replay behavior.
 - “Okay Computer” remains an untrusted, native, tool-free audio/control client
   and cannot control Home Assistant. Use “Okay Nabu” for exposed Home Assistant
   entities and tools. The separately registered realtime authority exists only

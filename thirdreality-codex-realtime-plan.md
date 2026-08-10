@@ -10,27 +10,76 @@ That matches the documented Codex Voice behavior—GPT-Live manages the conversa
 
 This plan assumes the hardware is the ThirdReality Voice & Music Assistant Dev Edition.
 
+## Implementation status (2026-08-10)
+
+The repository now implements a narrower subscription-backed design than the
+original greenfield plan:
+
+- Okay Nabu remains the official Home Assistant Assist path and owns Home
+  Assistant tools.
+- Okay Computer is a separate native, tool-free path. It does not delegate to
+  a coding thread or Home Assistant executor.
+- The target speaker is Python 3.11 on aarch64 Buildroot Linux, not Android.
+- Wire v3 carries authenticated SDP and sideband JSON between the device and
+  bridge. A deterministic isolated `aiortc` child running as UID/GID 65534 on
+  the device owns RTP audio and the ordered provider `oai-events` data channel
+  directly; root-owned readable runtime files remain immutable to it, and the
+  mode-0600 device configuration remains unreadable.
+- The bridge owns the managed Codex login, App Server thread/realtime
+  start/stop, SDP relay, unexpected-tool rejection, sanitized remote lifecycle,
+  and cleanup. It is not a media proxy in v3.
+- Provider lifecycle never labels or gates RTP. First decoded audio and an
+  actual roughly 120 ms receiver gap create transcript-free local media
+  boundaries, preserving RTP-before-start prefixes and stopped-before-tail
+  audio. Local/explicit barge-in immediately kills `paplay`, drops queued
+  media, and mutes the receiver. Event-ID-scoped cancel/clear is normally
+  conditional on observed provider state; actual RTP before SCTP lifecycle
+  forces an unkeyed cancel plus clear, while provider VAD sends neither
+  duplicate. Same-peer continuation requires control settlement plus a fresh
+  post-fence receiver-quiet window, while a fence failure requires a fresh
+  session. Exact sink set/verify happens once before direct-session negotiation,
+  outside response and interruption handling. Physical v3 validation remains
+  pending.
+- A direct v3 failure clears captured Okay Computer audio and returns idle; it
+  never hands that audio to Home Assistant. Protocol v2 `bridge_pcm` remains
+  the explicit rollback path and preserves its older pre-ready Assist replay.
+
+The v3 implementation, protocol, deterministic runtime installer, sidecar,
+queue bounds, cancellation, and cleanup have local automated coverage. An
+end-to-end physical v3 acceptance run is still outstanding. Earlier 25% AEC
+and barge-in canaries exercised the v2 bridge-PCM route and must not be cited as
+v3 validation.
+
 ## Target architecture
 
 ```mermaid
 flowchart LR
-    D["ThirdReality speaker<br/>wake word · AEC · microphone · playback"]
-    G["Codex Voice Gateway<br/>Home Assistant add-on"]
-    R["OpenAI Realtime API<br/>live spoken conversation"]
-    C["Codex SDK / App Server<br/>persistent task threads"]
-    H["Home Assistant MCP<br/>scoped home controls"]
-    A["HA UI / mobile<br/>approvals"]
+    N["ThirdReality · Okay Nabu"] --> H["Home Assistant Assist<br/>STT · Conversation/tools · TTS"]
+    H --> N
+    D["ThirdReality · Okay Computer<br/>AEC · stdlib controller"]
+    S["Isolated pinned aiortc sidecar"]
+    B["Codex Voice bridge<br/>OAuth · App Server signaling · cleanup"]
+    C["Pinned Codex App Server"]
+    R["Subscription realtime provider"]
 
-    D <-->|"authenticated PCM + control stream"| G
-    G <-->|"duplex audio and events"| R
-    G <-->|"start · resume · steer · interrupt"| C
-    G <-->|"optional scoped tools"| H
-    A -->|"approve sensitive actions"| G
+    D <-->|"bounded PCM/lifecycle IPC"| S
+    D <-->|"wire v3 SDP + sideband JSON"| B
+    B <-->|"JSON-RPC thread/realtime"| C
+    S <-->|"direct RTP + oai-events"| R
+    C -->|"creates/controls call"| R
 ```
 
-The OpenAI credentials, Codex runtime, thread state, and tool execution stay on the HA host. The 256 MB speaker remains an audio endpoint. See the [ThirdReality hardware specifications](https://www.thirdreality.com/products/voice-music-assistant-dev-edition).
+The Codex OAuth credential and App Server remain on the bridge host. The
+speaker stores only a route-scoped bearer and a root-owned, hash-locked media
+runtime. No Home Assistant token, tool schema, transcript executor, or Codex
+OAuth secret goes to the device. See the [v3 wire
+contract](protocol/realtime-wire-v3.md) and [device deployment
+contract](device/thirdreality/README.md).
 
-## Implementation plan
+## Original greenfield implementation plan (superseded)
+
+The phase table below records the initial proposal. It is not the status of the
+shipped v1.1.7 overlay described above.
 
 | Phase | Work | Exit gate |
 |---|---|---|
@@ -44,7 +93,7 @@ The OpenAI credentials, Codex runtime, thread state, and tool execution stay on 
 
 Estimated effort: roughly 3–5 engineering weeks for one engineer, with Phase 3's duplex/AEC test as the main feasibility gate.
 
-## Firmware changes
+## Proposed firmware changes (historical)
 
 Stock firmware cannot deliver desktop-style duplex voice by configuration alone: its current state machine is sequential and playback is URL-oriented. The production path therefore needs a narrow firmware extension. See the ThirdReality [`Satellite` state machine](https://github.com/thirdreality/voice-music-assistant/blob/aec2910db333f3f16e035583f83736441dc523ea/buildroot/package/thirdreality/linux-voice-assistant-cpp/src/satellite/Satellite.cpp#L408-L507).
 
@@ -91,7 +140,15 @@ docs/
 
 When consuming a ChatGPT subscription is a requirement, the gateway can run Codex App Server and use its managed ChatGPT browser or device-code OAuth flow. Codex owns token storage and refresh; the gateway must never extract the OAuth token or treat it as a general OpenAI API key. This routes the client through ChatGPT-authenticated Codex rather than Platform API-key billing. See [Codex authentication](https://learn.chatgpt.com/docs/auth).
 
-With the researched App Server version, the subscription-backed realtime path requires the gateway to own a genuine WebRTC peer: it creates an audio track and `oai-events` data channel, passes the SDP offer to `thread/realtime/start`, applies the returned answer, and relays media between that peer and the ThirdReality PCM stream. The raw realtime WebSocket path still expects API-key authentication. See the pinned [realtime conversation source](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/core/src/realtime_conversation.rs).
+With the researched App Server version, subscription-backed speech requires a
+genuine WebRTC peer with an audio transceiver and `oai-events` data channel. The
+original proposal placed that peer in the gateway. The implemented v3 route
+instead places it in the isolated device sidecar: the bridge passes the
+device's SDP offer to `thread/realtime/start`, relays the answer, and keeps only
+the OAuth/App Server signaling lifeline. The v2 rollback still uses a
+bridge-owned peer. The raw realtime WebSocket path historically required
+API-key authentication and is not used for subscription voice. See the pinned
+[realtime conversation source](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/core/src/realtime_conversation.rs).
 
 The same pinned App Server can expose `thread/realtime/*` and its built-in Codex handoff behavior. Those voice methods require the experimental capability, are version-coupled to the Codex CLI schema, and emit ephemeral realtime events. Isolate them behind an adapter, pin an exact CLI release, and run subscription/quota and protocol contract tests before every upgrade. See the [Codex App Server realtime API](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md) and [OpenAI feature maturity](https://learn.chatgpt.com/docs/feature-maturity).
 

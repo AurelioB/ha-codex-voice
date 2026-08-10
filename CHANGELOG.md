@@ -5,6 +5,48 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Add strict ThirdReality wire protocol v3: the device supplies an SDP offer,
+  confirms ICE/DTLS/SCTP and `oai-events` readiness, and keeps RTP audio plus
+  provider data directly on its own WebRTC peer. The bridge now owns only the
+  managed Codex login, App Server signaling/lifecycle sideband, tool rejection,
+  and bounded cleanup for that route.
+- Add an isolated ThirdReality `aiortc` sidecar for the Python 3.11/aarch64
+  Buildroot Linux target, bounded transcript-free sequenced-packet IPC, direct
+  continuous-RTP media boundaries based on first audio/receiver quiet, exact
+  once-per-session pre-negotiation AEC sink-volume preparation, fixed-argv
+  non-blocking `paplay`, and provable same-peer interruption fences.
+- Add a complete hash-locked `aarch64-manylinux_2_28` runtime, reproducible
+  manifest archive builder, atomic root-owned device installer, exact-version
+  import/SDP smoke test as UID/GID 65534 on root installs, unprivileged sidecar
+  launch with a minimal environment, and explicit runtime rollback
+  documentation.
+- Document the complete [v3 wire contract](protocol/realtime-wire-v3.md),
+  including signaling order, privacy boundaries, failure semantics, and the
+  retained [v2 rollback contract](protocol/realtime-wire-v2.md).
+
+### Changed
+
+- Configure the disabled ThirdReality example for `device_webrtc`, the
+  separately qualified Adrian AEC topology, 25% sink/playback ceilings, and a
+  Mexican Spanish prompt. Protocol v2 remains selectable explicitly with
+  `media_transport: "bridge_pcm"`.
+- Make direct v3 startup and runtime failures clear bounded Okay Computer audio
+  and return idle instead of replaying captured audio into Home Assistant.
+  Okay Nabu remains the separate official Assist/home-control route.
+- Make v3 provider lifecycle control-only: it never labels or gates RTP, so
+  RTP-before-start prefixes and stopped-before-tail audio remain in one decoded
+  lane. Local/explicit interruption immediately SIGKILLs `paplay`, drops queued
+  media, and conditionally sends event-ID-scoped cancel/clear. Actual RTP that
+  precedes provider SCTP lifecycle forces an unkeyed cancel plus clear;
+  provider VAD sends neither duplicate. Same-peer continuation requires
+  provider settlement plus a fresh post-fence receiver-quiet window to prove
+  `interrupt.fenced`, otherwise a fresh session is required. Cancel-no-op
+  errors are recoverable; clear/unmatched errors fail closed.
+- Distinguish prior v2/AEC physical canaries from the new v3 path. V3 has local
+  automated coverage but no claimed end-to-end physical acceptance yet.
+
 ## [0.6.0] - 2026-08-10
 
 ### Added

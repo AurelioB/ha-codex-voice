@@ -90,23 +90,29 @@ unsupported engine instead of falling back. It additionally requires an uncorked
 recorder that was opened before wake) to reference the AEC source index, and
 requires every reported AEC sink channel to be no louder than
 `aec_sink_volume_ceiling_percent`. It fails closed if any route or channel is
-wrong. Playback is additionally pinned to the AEC sink, and each full-duplex
-`paplay` stream starts with the fixed linear `playback_volume_percent`. Before
-every `speaking.started`, the client re-reads all AEC sink
-channels and fails the response closed if any exceeds the same ceiling; the
-startup preflight alone is not treated as a lasting volume claim. It compares
-PulseAudio's raw channel units with the exact linear ceiling
-(`65536 × percent // 100`), not the rounded percentage printed beside them.
-Operators must not raise a live sink or stream during the canary.
+wrong. Playback is additionally pinned to the AEC sink. Once per direct
+session, after the preflight and before requesting the SDP offer or opening the
+bridge socket, a fixed-argv `pactl` controller sets and verifies the dedicated
+sink itself to the exact raw `playback_volume_percent`. Direct v3 `paplay`
+targets that sink with raw stream volume 65536 (100% relative),
+`--latency-msec=60`, and `--process-time-msec=20`; the client never enumerates
+or mutates a sink-input. The retained v2 `paplay` path instead derives its
+stream volume from the configured playback percentage. The response,
+playback-begin/resume, and interruption paths intentionally perform no live
+volume subprocess work. The preflight and preparation compare PulseAudio's raw
+channel units with the exact linear value (`65536 × percent // 100`), not the
+rounded percentage printed beside them. Admission is not a continuing monitor:
+operators and other software must not mutate the qualified sink during a live
+direct session or raise a live sink or stream during the canary.
 
 Loading Adrian and observing its 16 kHz mono endpoints verifies topology, not
 acoustic echo cancellation. For the first physical double-talk canary, read
-`aec_sink_volume_ceiling_percent` and `playback_volume_percent` from the
-reviewed root-only realtime config and set the AEC sink to the former. Both
-settings default to 25 and configuration validation enforces an absolute range
-of 1–60 while rejecting playback above the sink ceiling. Never increase either
-value above a previously qualified level without repeating AEC qualification at
-the new values. Lower them for a quiet room or near-field test. Record the
+`aec_sink_volume_ceiling_percent` from the reviewed root-only realtime config
+and set the AEC sink to it. V3 and the v2 rollback both read
+`playback_volume_percent`; configuration rejects that value above the sink
+ceiling. Both settings default to 25 and have an absolute 1–60 range. Never
+increase the active value above a previously qualified level without repeating
+AEC qualification at the new value. Lower it for a quiet room or near-field test. Record the
 pre-test volume separately and restore it only after echo-rejection,
 early/middle/late barge-in, wake, normal Assist, and repeated-turn tests pass.
 The helper intentionally does not change the running sink. Its static startup
@@ -133,6 +139,7 @@ realtime configuration enable:
 
 ```json
 {
+  "media_transport": "device_webrtc",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
@@ -142,8 +149,13 @@ realtime configuration enable:
 }
 ```
 
-Rollback first sets `full_duplex` to `false`, then uses a dry run followed by
-the explicit removal:
+These checks qualify only the AEC topology and acoustics. The earlier 25%
+reference measurements exercised v2 bridge PCM; they are not proof that the
+device-owned WebRTC v3 media/data path has passed physical acceptance.
+
+Transport-only rollback sets `media_transport` to `bridge_pcm` and
+`full_duplex` to `false`, then removes the AEC route keys. Full AEC rollback
+uses a dry run followed by the explicit removal:
 
 ```sh
 python3 prepare_pulseaudio_aec.py remove

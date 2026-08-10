@@ -9,6 +9,15 @@ service-level guarantees. CPU load, network path, ChatGPT load and quota, Codex
 CLI version, Home Assistant pipeline choices, utterance length, and
 media-player buffering all affect a turn.
 
+> [!IMPORTANT]
+> The current Okay Computer implementation uses wire v3 and a device-owned
+> `aiortc` peer on the aarch64 Buildroot Linux speaker. The bridge carries
+> OAuth/App Server signaling and sideband only; RTP and `oai-events` bypass it.
+> V3 clears captured direct audio on failure and has no claimed end-to-end
+> physical acceptance run yet. Measurements below that mention bridge PCM,
+> bridge audio queues, v2 interrupt acknowledgements, or Assist replay are
+> retained historical v2/adapter results and do not validate v3.
+
 ## What is optimized
 
 The standard Assist path remains turn-based:
@@ -49,11 +58,11 @@ The Milestone 2 ThirdReality client is a separate path selected by “Okay
 Computer.” “Okay Nabu” retains the standard Assist pipeline and all Home
 Assistant entity control. The current client always requests
 `conversation_mode: "native"`; the bridge echoes it, ignores any Home Assistant
-broker snapshot, and creates one tool-free App Server WebRTC voice thread.
-Microphone audio and provider speech remain on that thread. There is no finite
+broker snapshot, and creates one tool-free App Server realtime thread. The
+device creates the WebRTC offer, audio transceiver, and `oai-events` data
+channel; the bridge relays SDP but never carries v3 PCM. There is no finite
 transcript gate, isolated executor, or `thread/realtime/appendSpeech` render
-handoff. This removes the sequential stages that made the old automatic
-managed route feel turn-based.
+handoff.
 
 Native mode does not make cold startup free. Each new direct session still has
 to acquire the bridge's single speech lane, create a Codex thread, negotiate
@@ -64,7 +73,8 @@ audible playback separately. The experimental App Server surface provides no
 latency or availability SLA, and an already-open ChatGPT voice session is not
 an equivalent cold-start comparison.
 
-Older strict-v2 clients that omit `conversation_mode` retain the prior
+The explicit `bridge_pcm` rollback and older strict-v2 clients that omit
+`conversation_mode` retain the prior
 automatic native/managed behavior. App Server v3 plus a captured Home Assistant
 authority can still create the two-thread transcript/executor/render sequence
 for those compatibility clients, but the reference ThirdReality client never
@@ -76,17 +86,20 @@ The shipped bounds are intentionally small and fail closed:
 |---|---:|---|
 | Direct-wake idle pre-roll | 12 KiB / 384 ms | Retains the newest six 64 ms recorder frames in RAM for Okay Computer only |
 | Device microphone queue | 64 KiB / 2.048 s | Holds PCM while the network thread connects and while paced transfer catches up |
-| Device pre-ready fallback copy | 64 KiB / 2.048 s | Replays the retained prefix into official Assist if direct startup fails |
+| Device retained pre-ready copy | 64 KiB / 2.048 s | V3 clears it on failure; only the v2 rollback may replay it into official Assist |
 | Reserved live startup headroom | 32 KiB / 1.024 s | Trims or omits pre-roll before it can consume this post-wake allowance |
-| Bridge v2 WebRTC input track | 2,250 ms | Limits only live device lag; finite STT retains its whole-utterance capacity |
-| Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
-| Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
-| Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked at preflight and every response | Keeps both boot-time writers aligned and fails closed if any live sink channel is too loud |
+| Bridge v2 WebRTC input track | 2,250 ms | V2 rollback only; v3 media bypasses the bridge |
+| Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | V1/v2/adapters only; v3 provider audio stays on the device peer |
+| Device playback queue | 48 KiB / about 1.024 s | Bounds v2 child input and the v3 direct player's configured buffer allowance |
+| V3 decoded-receiver quiet boundary | About 120 ms without an audio frame | Splits only the continuous RTP media lane; provider lifecycle is not a media gate |
+| V3 interruption fence | 1 s sidecar deadline | Requires provider control settlement plus a fresh full quiet window begun at the fence; timeout fails continuation to a fresh session |
+| Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked once at direct-session preflight | Keeps boot-time writers aligned; exact set/verify runs once before negotiation, with no live-loop volume monitor |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
 | Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
 | Legacy managed: App Server tool fallback | 45 s | Remains responsible until the result write completes |
 | Legacy managed: post-tool provider continuation | 20 s | Requires output or a terminal response after result delivery |
-| Full-duplex `paplay` stream | Independently configured 1–60% (25% default), never above the sink ceiling | Pins each response to the reviewed AEC sink and fixed linear volume |
+| V3 direct `paplay` | Dedicated AEC sink set/verified to exact raw `playback_volume_percent`; stream forced to raw 65536; 60 ms latency, 20 ms process time and writes | One fixed-argv child, non-blocking stdin, immediate SIGKILL on abort, no sink-input manipulation |
+| V2 full-duplex `paplay` stream | Configured 1–60% (25% default), never above the sink ceiling | Retained rollback-only fixed linear playback setting |
 
 The pre-roll is included inside the microphone and fallback bounds; it is not
 additional queue capacity. It is transferred only for Okay Computer. Okay Nabu
@@ -96,36 +109,57 @@ pre-ready audio, not a 4.096-second serial buffer. If the handshake becomes
 ready within the bound, the client transfers queued frames at no more than 2×
 capture cadence while more than one frame remains. It then sends at normal
 cadence. This shrinks startup lag without a burst and without dropping accepted
-audio. If the pre-ready bound is exhausted, the official Assist fallback wins;
-after readiness, a bound failure terminates the direct session safely.
+audio. If a v3 pre-ready or post-ready bound is exhausted, the direct owner
+clears both copies and returns idle without invoking Assist. Only the v2
+rollback preserves the official Assist fallback.
 
 The 2× catch-up does not shorten the cold handshake or provider response time.
-Time to first audible output must therefore be reported with at least wake to
-v2 `started`, `started` to the first speaking epoch, speaking epoch to first
-PCM, and first PCM to audible playback. Reporting only the catch-up interval
+Time to first audible v3 output must therefore separate wake to SDP answer,
+answer to `transport_ready`/`started`, started to the first receiver-owned
+`media.started`, and decoded PCM to audible playback. Reporting only catch-up
 would hide the dominant remote stages. For a legacy managed path, also separate
 speech endpoint to completed transcript, transcript to executor completion
 (including any Home Assistant broker time), executor completion to
 `session.context.appended`, acknowledgement to identified assistant turn, and
 that turn to the first authorized PCM.
 
-Direct output is turn-taking by default on v1.1.7. With `full_duplex: false`,
+The retained v2 route is turn-taking by default on v1.1.7. With
+`full_duplex: false`,
 the microphone gate stays closed from `speaking.started` until the
 corresponding PCM has drained from both the local queue and playback child.
-Opt-in full duplex requires a reviewed static PulseAudio AEC topology using the
+V3 `device_webrtc` requires full duplex and a reviewed static PulseAudio AEC topology using the
 exact configured allowlisted engine, exact current-process capture and playback
 routing, and a configured sink ceiling from 1–60% with a 25% default. WebRTC is the omitted-value
 default and never automatically falls back. The stock v1.1.7 build rejects
 WebRTC and Speex, so active stock-device deployments explicitly select Adrian.
-The client checks that topology, method, and ceiling before opening the bridge
-socket, rechecks every sink channel before every response, and pins each
-`paplay` stream to the AEC sink at or below the same ceiling.
+The client checks that topology, method, and ceiling before constructing the
+device peer or opening the bridge socket. A fixed-argv `pactl` controller then
+sets and verifies the dedicated AEC sink itself at the exact raw playback value
+once, before the SDP offer. Direct v3 uses one fixed-argv `paplay` child on that
+sink with raw stream volume 65536 (100% relative), non-blocking 20 ms writes,
+and 60 ms/20 ms latency/process arguments. Abort clears queued PCM and issues
+SIGKILL immediately without waiting on the network loop; reap is bounded
+separately. No sink-input is enumerated or mutated, and no `pactl` process runs
+on `response.created`, playback begin/resume, or interruption. V2 instead
+derives its `paplay` stream volume from the configured percentage.
+
+Provider lifecycle never labels or gates RTP. The decoded receiver opens a
+local media epoch on first audio and closes it only after an actual roughly
+120 ms quiet gap, preserving RTP-before-start prefixes and stopped-before-tail
+audio.
 
 With those checks active, capture continues during playback. Two consecutive
-qualifying AEC-filtered 64 ms frames request an epoch-scoped local player flush;
-provider VAD independently reinforces that boundary. This removes the provider
-round trip from local speaker muting, but does not remove remote cancellation
-latency.
+qualifying AEC-filtered 64 ms frames immediately kill `paplay`, drop queued
+playback IPC, and mute decoded RTP. Generated event IDs normally limit cancel
+to an in-progress response and clear to active output. Actual RTP received
+before both SCTP lifecycle states forces an unkeyed cancel followed by clear. A
+causal cancel-no-op is recoverable; clear and unmatched provider errors fail
+closed. Provider VAD `speech_started` sends neither duplicate. Same-peer
+continuation requires both control settlement and a fresh full receiver-quiet
+window started at the fence to emit `interrupt.fenced` within the one-second
+deadline. A late frame restarts that entire window; otherwise a fresh session
+is required. These independent RTP/SCTP and physical-muting behaviors remain
+acceptance items.
 
 For legacy broker-managed sessions, every new utterance invalidates the previous
 executor/output generation. Frontend cancellation is requested only after an
@@ -137,27 +171,33 @@ waits in a one-item queue. This preserves the Home Assistant side-effect
 boundary at the cost of serializing a barged-in request behind an already
 dispatched call.
 
-The current ThirdReality client advertises
+The v2 ThirdReality path advertises
 `User-Agent: ha-codex-voice-thirdreality/2`; this retains compatibility with the
 managed `continuation_safe` acknowledgement but does not select that route.
-Native same-session resume is allowed only after the bridge receives a provider
+V2 native same-session resume is allowed only after the bridge receives a provider
 `response.cancelled` event correlated to the exact active response; timeout,
 mismatch, ambiguity, or completion closes the session.
 
 Adrian loading with the reviewed raw masters and creating 16 kHz mono endpoints
-is a static-topology result, not an acoustic result. On the reference device at
-25%, a 5.531-second playback canary caused no false interruption across 86 mic
+is a static-topology result, not an acoustic result. On the reference device's
+historical v2 path at 25%, a 5.531-second playback canary caused no false interruption across 86 mic
 frames (maximum peak 2 and integer RMS 0), and staged double-talk flushed
 playback in 141 ms versus 2.650 seconds when waiting for the provider-only
-boundary. The same socket continued and produced the next response. Physical
-acceptance for each installation must cover both wake routes, normal-wake
-preemption,
-pre-ready fallback, stop-word latency, first-audio latency, queue failures,
-repeated turns, memory stability, player cleanup, and recovery after bridge and
-Wi-Fi loss. Full-duplex acceptance must additionally cover early/middle/late
-double-talk at the configured sink and stream values, self-echo rejection, per-response volume
-failure, `paplay` device/stream pinning, and both correlated-resume and
-fresh-session cancellation outcomes. It must also verify TCP ADB port 5555
+boundary. The same v2 socket continued and produced the next response. These
+measurements do not validate v3. Physical acceptance for each v3 installation
+must cover both wake routes, normal-wake preemption, fail-closed pre-ready
+behavior, stop-word latency, first-audio latency, queue failures, repeated
+turns, memory stability, player cleanup, and recovery after bridge and Wi-Fi
+loss. Full-duplex acceptance must additionally cover early/middle/late
+double-talk at the configured sink/playback values, self-echo rejection, exact
+once-per-session pre-negotiation raw sink-volume preparation, absence of live
+response/interruption `pactl` work, playback sink pinning, fixed `paplay`
+arguments and immediate abort, RTP-before-start and stopped-before-tail
+preservation, pre-SCTP-RTP unkeyed cancel/clear, conditional event-ID-scoped
+controls otherwise, provider-VAD no-duplicate-control behavior, fresh
+post-fence quiet proof, successful and timed-out media fences, and no
+captured-audio Assist handoff.
+It must also verify TCP ADB port 5555
 before and after every device restart or reboot; the overlay never changes the
 ADB service.
 

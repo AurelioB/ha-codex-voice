@@ -61,7 +61,7 @@ All routes, including `GET /health`, accept
 legacy realtime v1 compatibility. When the optional, distinct
 `HA_CODEX_REALTIME_DEVICE_TOKEN` is set, it is accepted only for
 `GET /v1/realtime` and only after the first start message successfully
-negotiates strict v2. A device-token v1 or malformed negotiation is rejected
+negotiates strict v2 or v3. A device-token v1 or malformed negotiation is rejected
 before provider/thread startup, and the device token is rejected by every
 other route. This lets a speaker use content-private realtime audio without
 storing the Home Assistant/component credential. In particular, the device
@@ -96,16 +96,20 @@ requires the primary Home Assistant bridge token.
   bounded immutable generation of rendered instructions, locale, and selected
   LLM API tools; correlated tool calls/results remain on this socket. The
   route-scoped realtime-device token is never accepted here.
-- `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages or the strict
-  device-facing v2 binary PCM16 transport. V2 emits content-free lifecycle
+- `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages, strict v2
+  binary PCM16, or strict v3 device-owned WebRTC signaling. V3 relays a
+  validated SDP offer/answer and then carries JSON lifeline controls only;
+  audio and `oai-events` go directly between the device peer and provider.
+  V2 emits content-free lifecycle
   controls, filters continuous WebRTC silence, gates output with monotonic
   epochs, and supports negotiated same-session interruption. It does not expose
   transcripts, provider payloads, tool calls, or tool results to the device.
   The optional strict-v2 `conversation_mode` currently accepts only `native`;
   an accepted value is echoed in `started`.
   A v2 `text` control is a bounded user message; its role must be omitted or
-  exactly `user`. See the
-  [v2 wire contract](../protocol/realtime-wire-v2.md).
+  exactly `user`. See the [v3 direct-media
+  contract](../protocol/realtime-wire-v3.md) and [v2 rollback
+  contract](../protocol/realtime-wire-v2.md).
 
 Authenticated health includes a content-free `home_assistant_tools` object:
 registration/open-transport readiness, locale, tool count, pending calls,
@@ -113,19 +117,31 @@ exclusive process-lifetime outcome counters, and the duration of the most
 recent completed attempt. It never includes authority IDs, tool names,
 schemas, arguments, results, prompts, or conversation content.
 
-Device-facing v2 is the transport used by the pinned ThirdReality v1.1.7
-in-process client. “Okay Computer” enters this direct mode; “Okay Nabu” remains
-on Home Assistant's official Assist flow. The device sends 16 kHz mono PCM16
-and receives 24 kHz mono PCM16. It remains an untrusted audio/control endpoint:
-it cannot declare tools or send tool results. The current reference client
-always sends `conversation_mode: "native"` and requires that value in the
-`started` acknowledgement. For that session, the bridge does not capture the
-Home Assistant broker snapshot. It creates exactly one tool-free native App
-Server WebRTC voice thread and relays its speech directly; no completed
-transcript, executor thread, or `thread/realtime/appendSpeech` operation is in
-the audio path. With qualified device AEC, this is the full-duplex/barge-in
-route. The bridge applies a 2,250 ms input-track limit only to v2 live
-sessions; finite STT keeps its existing whole-utterance input capacity.
+Device-facing v3 is the direct-media transport used by the new ThirdReality
+v1.1.7 client. The aarch64 Buildroot Linux speaker creates an `aiortc` offer
+with audio and `oai-events`; the bridge starts one tool-free native App Server
+v3 session with its managed login and returns the provider SDP answer. The
+device must acknowledge its applied answer, connected peer, and open data
+channel before the bridge sends `started`. The bridge never constructs a v3
+media peer or accepts binary audio on that socket. It owns OAuth, App Server
+start/stop, SDP relay, unexpected-tool rejection, sanitized remote lifecycle,
+and one-thread cleanup only.
+
+“Okay Computer” enters this native, tool-free route; “Okay Nabu” remains on
+Home Assistant's official Assist flow. The bridge does not capture a Home
+Assistant broker snapshot, wait for a transcript, create an executor, or call
+`thread/realtime/appendSpeech` for v3. Device/provider RTP and data-channel
+traffic bypass the bridge, and the route-scoped device bearer cannot access
+the Home Assistant broker.
+
+The v3 signaling, cleanup, rejection, and no-bridge-media boundaries have local
+automated coverage. This documentation does not claim that the new v3 path has
+completed the physical ThirdReality acceptance matrix.
+
+Device-facing v2 remains the explicit `bridge_pcm` rollback. It sends 16 kHz
+mono PCM16 to the bridge and receives 24 kHz mono PCM16. The bridge applies its
+2,250 ms input-track limit only to these v2 live sessions; finite STT keeps its
+existing whole-utterance input capacity.
 
 Strict-v2 clients that omit `conversation_mode` retain compatibility with the
 previous automatic policy. When exactly one Conversation subentry is opted in,
@@ -165,25 +181,31 @@ service shutdown tombstone and interrupt an active executor before its event
 subscription closes; transport and two-thread deletion then continue in
 tracked, cancellation-shielded cleanup.
 
-The reference device keeps at most 64 KiB (2.048 s) of startup/fallback input,
-drains a post-handshake backlog at no more than 2× capture rate, and keeps at
-most 48 KiB (about 1.024 s) queued for playback. Provider output also crosses a
-bounded bridge queue. A bound violation is terminal or triggers the documented
-pre-ready Home Assistant fallback; audio is never silently discarded to make
-latency metrics look better. Catch-up prevents a permanent handshake-sized
-offset once v2 becomes ready, but it cannot make the cold App Server/WebRTC
-handshake or provider response generation disappear.
+The reference device keeps at most 64 KiB (2.048 s) of startup input, drains a
+post-handshake backlog at no more than 2× capture rate, and keeps at most 48 KiB
+(about 1.024 s) queued for playback. V3 bounds its device-side sequenced-packet
+IPC and fails instead of dropping media under pressure; provider output never
+crosses a bridge media queue. A v3 bound or transport failure clears captured
+direct audio and returns the device to idle rather than replaying it into Home
+Assistant. The v2 rollback deliberately preserves its historical bounded
+pre-ready Assist fallback. Catch-up cannot make cold App Server/WebRTC setup or
+provider response generation disappear.
 
-The device mode is turn-taking by default. Opt-in full duplex is a device-side
-contract: the pinned client must verify the reviewed static PulseAudio
+V3 `device_webrtc` requires full duplex as a device-side contract: the pinned
+client must verify the reviewed static PulseAudio
 `module-echo-cancel` topology with the exact configured allowlisted AEC engine,
 exact source/sink and capture-process routing, and a configured 1–60% sink
 ceiling (25% by default) before
 it opens this route. WebRTC is the default when no method is supplied; there is
 no automatic fallback. The stock ThirdReality v1.1.7 module rejects WebRTC and
 Speex, so its qualified configuration must explicitly select Adrian. The client
-rechecks the ceiling before every response and pins `paplay` to the AEC sink
-with a fixed configured stream volume that cannot exceed the sink ceiling. The
+checks the ceiling and sets and verifies the dedicated AEC sink at the exact
+configured raw playback value once per direct session, before requesting its
+SDP offer or connecting to the bridge. Direct `paplay` targets that sink with
+raw stream volume 65536, non-blocking 20 ms writes, and reviewed 60 ms/20 ms
+latency/process arguments; no sink-input is mutated and no `pactl` subprocess
+runs from the live response or interruption path. The v2 rollback retains its
+configured stream-volume behavior. The
 guarded device installer writes the matching raw sink value in the static
 PulseAudio startup block. The stock voice process later reapplies the persistent
 Home Assistant media-player preference, which must match the configured
@@ -191,7 +213,7 @@ ceiling; runtime restore state alone is not treated as reboot evidence.
 
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises
-`same_session_interrupt_ack: true`. The current ThirdReality client sends
+`same_session_interrupt_ack: true`. The v2 ThirdReality client path sends
 `User-Agent: ha-codex-voice-thirdreality/2`; that header retains compatibility
 with the managed interrupt policy but does not select it. On a legacy
 broker-managed interrupt, the bridge invalidates the executor/output generation
@@ -203,14 +225,30 @@ newest request when its transcript arrives.
 It then returns `fresh_session_required: false`, `remote_cancelled: false`, and
 `continuation_safe: true`; the local generation gate makes continuation safe
 without claiming remote cancellation. A legacy client gets the established
-fresh-session fallback and socket teardown. On the current native path,
+fresh-session fallback and socket teardown. On the v2 native path,
 same-socket continuation still requires a sanitized `response.cancelled` event
 correlated to the active provider response.
 
-Audio uses Codex app-server's experimental WebRTC v3 path by default. The peer
-creates a real paced outbound audio track and `oai-events` data channel before
-the SDP offer; app-server supplies the remote SDP answer and transcript
-notifications. Codex 0.147.0 or newer is required for the managed frontend's
+V3 barge-in does not use a bridge interrupt acknowledgement. The device kills
+local `paplay`, drops queued media, and mutes decoded RTP. Provider lifecycle
+never labels or gates that continuous media lane; only first decoded audio and
+an actual roughly 120 ms receiver gap create internal `media.started` and
+`media.quiet` boundaries. For explicit interruption, generated event IDs
+normally scope cancel to an in-progress response and clear to active output.
+Decoded RTP that arrives before provider SCTP lifecycle instead forces both
+controls, with no `response_id` on the cancel. A cancel-no-op is recoverable,
+while clear/unmatched errors fail closed. Provider VAD `speech_started` sends
+no duplicate control. The peer continues only after control settlement plus a
+fresh full receiver-quiet window begun at the fence emit `interrupt.fenced`;
+otherwise the bounded fence requires a fresh session. Physical v3 acceptance
+remains outstanding.
+
+Bridge-owned v1/v2/STT/TTS audio adapters use Codex App Server's experimental
+WebRTC v3 path. Their peer creates a real paced outbound audio track and
+`oai-events` data channel before the SDP offer. Device protocol v3 instead
+relays the device's offer and never creates that bridge peer. App Server
+supplies the remote SDP answer and lifecycle notifications. Codex 0.147.0 or
+newer is required for the managed frontend's
 delegation acknowledgement control. This is the subscription-compatible path.
 Raw Realtime v2 WebSockets require API-key authentication and are intentionally
 not used.
