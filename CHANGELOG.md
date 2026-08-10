@@ -5,8 +5,23 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-09
+
 ### Added
 
+- Add an outbound, Home Assistant-owned realtime tool broker. Exactly one
+  explicitly opted-in Conversation subentry may register its rendered
+  instructions, `es-MX`-by-default locale, and selected LLM API tool schemas;
+  Home Assistant executes correlated calls without exposing broker traffic or
+  credentials to the device.
+- Add opt-in full duplex for the pinned ThirdReality v1.1.7 overlay, backed by
+  guarded static PulseAudio `module-echo-cancel` assets using WebRTC AEC,
+  exact-route startup verification, continuous capture, speech-start playback
+  flush, and late-output quarantine. Turn-taking remains the default.
+- Add correlation-gated same-session interruption. The bridge requests
+  provider response cancellation and permits socket reuse only after a
+  matching `response.cancelled` event; every ambiguous or timed-out case keeps
+  the fresh-session fallback.
 - Add a hardened external Wyoming Piper user-service template pinned to
   `wyoming-piper==2.3.1`, a bounded ONNX Runtime threading runner, a
   privacy-safe synthesis smoke test, and deployment guidance for
@@ -16,6 +31,14 @@ and releases use semantic versioning.
 
 ### Changed
 
+- Keep realtime wire v2 device-facing authority limited to binary audio and
+  content-free controls while allowing the bridge to bind an independently
+  registered Home Assistant tool snapshot to a provider session. Device
+  `tools` and `tool_result` messages remain invalid.
+- Require full-duplex deployments to use explicit PulseAudio AEC source/sink
+  names and a configured 1–25% qualification ceiling. Preflight verifies the
+  static WebRTC-AEC topology, default routes, current-process capture route,
+  and every sink channel before microphone audio leaves the device.
 - Make the recommended “Okay Nabu” production pipeline local Wyoming
   faster-whisper STT, Codex Voice Conversation, and local Wyoming Piper TTS.
   Keep Codex TTS as an explicit experimental compatibility entity and preserve
@@ -40,8 +63,33 @@ and releases use semantic versioning.
   satellite entered responding at 8.324 seconds and returned idle at 13.919
   seconds from pipeline start. Actual audible onset was not instrumented.
 
+### Fixed
+
+- Recheck every AEC sink channel against the configured ceiling before each
+  full-duplex response, and pin every `paplay` child to the reviewed AEC sink
+  with a fixed linear stream volume no greater than 25%, so a later response
+  cannot bypass the startup preflight. Compare raw PulseAudio volume units to
+  the exact linear ceiling rather than trusting the rounded displayed percent;
+  changing volume during active playback remains forbidden operator action.
+- Correlate provider cancellation to the exact active response before returning
+  `fresh_session_required: false` / `remote_cancelled: true`; completion,
+  mismatched cancellation, send failure, and timeout cannot keep the session.
+- Fail realtime tool calls closed on undeclared names, stale generations,
+  duplicates, disconnects, timeout, oversized/non-JSON payloads, or ambiguous
+  outcomes, while returning at most one result to each provider request.
+
 ### Security
 
+- Keep the ThirdReality endpoint untrusted even when realtime tools are
+  enabled: the route-scoped device bearer cannot open the primary-token
+  `/v1/home-assistant/tools` broker, and wire v2 never exposes tool schemas,
+  calls, results, transcripts, or raw provider payloads.
+- Bound broker registration, tool count, schemas, arguments, results, pending
+  calls, retired correlation state, and calls per provider session. Capture one
+  immutable authority generation per session and fail closed if it changes.
+- Require static, startup-ordered WebRTC AEC and both a startup and per-response
+  volume check before full-duplex playback. A local playback flush or VAD event
+  alone never claims remote cancellation.
 - Keep Piper synthesis and model access local after Codex returns the
   Conversation text, bind the external service to loopback by default, and
   require operators to restrict the unauthenticated Wyoming port `10200` to

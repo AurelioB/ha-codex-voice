@@ -57,7 +57,9 @@ legacy realtime v1 compatibility. When the optional, distinct
 negotiates strict v2. A device-token v1 or malformed negotiation is rejected
 before provider/thread startup, and the device token is rejected by every
 other route. This lets a speaker use content-private realtime audio without
-storing the Home Assistant/component credential.
+storing the Home Assistant/component credential. In particular, the device
+token cannot connect to `/v1/home-assistant/tools`; that authority route
+requires the primary Home Assistant bridge token.
 
 ## API
 
@@ -66,7 +68,9 @@ storing the Home Assistant/component credential.
   `tool_result`, and `done` messages. Stable Home Assistant `conversation_id`
   values reuse a bounded in-memory Codex thread for multi-turn context. A
   start may select `service_tier` as `standard` or `priority`; priority targets
-  lower latency while increasing subscription usage.
+  lower latency while increasing subscription usage. Its optional, bounded
+  BCP-47 `language` is attached to every turn as trusted application context;
+  the Home Assistant pipeline supplies `es-MX` for Mexican Spanish.
 - `POST /v1/transcribe`: up to 60 seconds of base64 PCM16/WAV plus audio
   metadata; returns JSON `{ "text": "..." }` under a bounded end-to-end
   deadline.
@@ -80,19 +84,30 @@ storing the Home Assistant/component credential.
   rate.
 - `POST /v1/speech-session/release`: idempotently release a private,
   unconsumed STT-to-TTS handoff ticket.
+- `GET /v1/home-assistant/tools` WebSocket: one primary-token, Home
+  Assistant-owned realtime tool authority. The first message registers a
+  bounded immutable generation of rendered instructions, locale, and selected
+  LLM API tools; correlated tool calls/results remain on this socket. The
+  route-scoped realtime-device token is never accepted here.
 - `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages or the strict
   device-facing v2 binary PCM16 transport. V2 emits content-free lifecycle
   controls, filters continuous WebRTC silence, gates output with monotonic
-  epochs, and supports local-flush/fresh-session interruption. It does not
-  expose transcripts, provider payloads, or tools. See the
+  epochs, and supports correlation-gated same-session interruption. It does not
+  expose transcripts, provider payloads, tool calls, or tool results to the
+  device. See the
   [v2 wire contract](../protocol/realtime-wire-v2.md).
 
 Device-facing v2 is the transport used by the pinned ThirdReality v1.1.7
-in-process client. “Okay Computer” enters this direct chat-only mode; “Okay
-Nabu” remains on Home Assistant's official Assist flow for exposed-entity
-control. The device sends 16 kHz mono PCM16 and receives 24 kHz mono PCM16. The
-bridge applies a 2,250 ms input-track limit only to v2 live sessions; finite STT
-keeps its existing whole-utterance input capacity.
+in-process client. “Okay Computer” enters this direct mode; “Okay Nabu” remains
+on Home Assistant's official Assist flow. The device sends 16 kHz mono PCM16
+and receives 24 kHz mono PCM16. It remains an untrusted audio/control endpoint:
+it cannot declare tools or send tool results. When exactly one Conversation
+subentry is explicitly opted in, the Home Assistant component separately
+registers that subentry's selected, bounded tool view with the primary token;
+the bridge snapshots it for the v2 provider session and returns each provider
+tool call to Home Assistant for execution. The bridge applies a 2,250 ms
+input-track limit only to v2 live sessions; finite STT keeps its existing
+whole-utterance input capacity.
 
 The reference device keeps at most 64 KiB (2.048 s) of startup/fallback input,
 drains a post-handshake backlog at no more than 2× capture rate, and keeps at
@@ -103,12 +118,19 @@ latency metrics look better. Catch-up prevents a permanent handshake-sized
 offset once v2 becomes ready, but it cannot make the cold App Server/WebRTC
 handshake or provider response generation disappear.
 
-The released device mode is turn-taking. It gates microphone input while local
-output remains potentially audible and does not configure acoustic echo
-cancellation. `interrupt` flushes local output, closes the socket and remote
-resource, and requires a fresh session; the negotiated capability remains
-`remote_cancel: false` because the provider transport has no reliable response
-truncate operation.
+The device mode is turn-taking by default. Opt-in full duplex is a device-side
+contract: the pinned client must verify the reviewed static PulseAudio
+`module-echo-cancel` topology with `aec_method=webrtc`, exact source/sink and
+capture-process routing, and a 1–25% sink ceiling before it opens this route.
+It rechecks that ceiling before every response and pins `paplay` to the AEC
+sink with the same fixed stream-volume ceiling.
+
+V2 advertises `remote_cancel: false` because clients may never infer remote
+cancellation from a local flush. It separately advertises
+`same_session_interrupt_ack: true`. On `interrupt`, the bridge sends a provider
+cancel request and keeps the socket usable only after a sanitized
+`response.cancelled` event is correlated to the active response. Otherwise it
+returns the explicit fresh-session fallback and disposes the thread/session.
 
 Audio uses Codex app-server's experimental WebRTC v3 path by default. The peer
 creates a real paced outbound audio track and `oai-events` data channel before
@@ -205,6 +227,12 @@ verify overlap without recording content.
 
 Interactive approvals, permission requests, and unsupported server-initiated
 requests fail closed. Only explicitly declared dynamic Home Assistant tools are
-relayed to the official Conversation WebSocket or a legacy v1 realtime client.
-Device-facing realtime v2 is chat-only; the normal Home Assistant Assist path
-retains home-control authority.
+relayed to the official Conversation WebSocket, a legacy v1 realtime client,
+or a v2 session bound to the current Home Assistant broker generation. V2
+devices never declare, receive, or answer tool calls themselves. Exactly one
+explicitly opted-in Conversation subentry may register at most 128 tools; tool
+schemas, arguments, results, pending calls, and per-session calls are bounded.
+Home Assistant renders the authority instructions, defaults its realtime
+locale to `es-MX`, executes calls through the selected LLM API, and returns
+correlated results. Missing, ambiguous, replaced, disconnected, timed-out, or
+invalid authority fails closed.

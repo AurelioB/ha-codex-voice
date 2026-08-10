@@ -43,14 +43,20 @@ Frameless Bidi outbound protocol does not define a response-cancel message.
 These paths preserve the finite Home Assistant provider contracts. They do not
 turn the standard Assist pipeline into a full-duplex or barge-in session.
 
-## Direct realtime turn-taking path
+## Direct realtime path
 
 The Milestone 2 ThirdReality client is a separate path selected by “Okay
 Computer.” “Okay Nabu” retains the standard Assist pipeline and all Home
-Assistant entity control. The direct path removes finite STT, Conversation,
-and TTS provider boundaries from the middle of a turn, but it still has to
-create a Codex thread, negotiate App Server/WebRTC, wait for provider
-endpointing and response generation, and buffer physical playback.
+Assistant entity control. The direct device remains audio/control only.
+Realtime Home Assistant tools are disabled by default; when exactly one
+Conversation subentry is explicitly opted in, Home Assistant separately
+registers its bounded LLM API view over the primary-token broker and executes
+calls locally. Its authority locale defaults to `es-MX`. The direct path
+removes finite STT, Conversation, and TTS provider boundaries from the middle
+of a turn, but it still has to create a Codex thread, negotiate App
+Server/WebRTC, wait for provider endpointing and response generation, and
+buffer physical playback. A Home Assistant tool call adds its own bounded
+broker/execution round trip and should be measured separately from first audio.
 
 The shipped bounds are intentionally small and fail closed:
 
@@ -63,6 +69,8 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge v2 WebRTC input track | 2,250 ms | Limits only live device lag; finite STT retains its whole-utterance capacity |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
+| Full-duplex AEC sink ceiling | Configured 1–25%, checked at preflight and every response | Fails closed if any live sink channel is too loud |
+| Full-duplex `paplay` stream | Same configured ceiling, never above 25% | Pins each response to the reviewed AEC sink and fixed linear volume |
 
 The pre-roll is included inside the microphone and fallback bounds; it is not
 additional queue capacity. It is transferred only for Okay Computer. Okay Nabu
@@ -81,19 +89,31 @@ v2 `started`, `started` to the first speaking epoch, speaking epoch to first
 PCM, and first PCM to audible playback. Reporting only the catch-up interval
 would hide the dominant remote stages.
 
-Direct output is turn-taking on v1.1.7. The microphone gate stays closed from
-`speaking.started` until the corresponding PCM has drained from both the local
-queue and playback child. There is no active acoustic echo cancellation, so
-simultaneous listening would make the device hear its own speaker. An interrupt
-aborts local playback and closes the session; `remote_cancel: false` means the
-next turn pays for a fresh WebSocket, thread, and realtime handshake. Full
-duplex, double-talk, and barge-in are not performance claims for this release.
+Direct output is turn-taking by default on v1.1.7. With `full_duplex: false`,
+the microphone gate stays closed from `speaking.started` until the
+corresponding PCM has drained from both the local queue and playback child.
+Opt-in full duplex requires the reviewed static PulseAudio WebRTC-AEC topology,
+exact current-process capture and playback routing, and a configured sink
+ceiling from 1–25%. The client checks that topology and ceiling before opening
+the bridge socket, rechecks every sink channel before every response, and pins
+each `paplay` stream to the AEC sink at or below the same ceiling.
+
+With those checks active, capture continues during playback and provider VAD
+can flush local output for barge-in. This does not remove remote cancellation
+latency. Same-session resume is allowed only after the bridge receives a
+provider `response.cancelled` event correlated to the exact active response.
+Timeout, mismatch, ambiguity, or a completion event closes the session, so the
+next turn pays for a fresh WebSocket, thread, and realtime handshake.
 
 Physical acceptance must cover both wake routes, normal-wake preemption,
 pre-ready fallback, stop-word latency, first-audio latency, queue failures,
 repeated turns, memory stability, player cleanup, and recovery after bridge and
-Wi-Fi loss. It must also verify TCP ADB port 5555 before and after every device
-restart or reboot; the overlay never changes the ADB service.
+Wi-Fi loss. Full-duplex acceptance must additionally cover early/middle/late
+double-talk at no more than 25%, self-echo rejection, per-response volume
+failure, `paplay` device/stream pinning, and both correlated-resume and
+fresh-session cancellation outcomes. It must also verify TCP ADB port 5555
+before and after every device restart or reboot; the overlay never changes the
+ADB service.
 
 ### Physical quick-command regression canary
 
@@ -272,14 +292,17 @@ successful human baselines captured on 2026-08-09 reached Home Assistant VAD
 include the combined device and Home Assistant path; they show the user-visible
 variable delay but do not isolate the LED call.
 
-The reversible device overlay uses an LED-only acknowledgement on this hardware
-without active acoustic echo cancellation. It sends the Home Assistant start
-request and music duck while pre-arming microphone forwarding on the same
-pinned microphone thread, without playing the local cue. Forwarding cannot
-actually handle a frame until wake setup returns. It also serializes LED DBus
-commands on a separate daemon worker. The vendor's two-second command timeout
-remains, but it cannot hold the microphone processing thread; timed-out children
-are reaped, and an overloaded pending queue coalesces toward the newest state.
+At the time of these historical measurements, the reversible device overlay
+used an LED-only acknowledgement without active acoustic echo cancellation. It
+sent the Home Assistant start request and music duck while pre-arming microphone
+forwarding on the same pinned microphone thread, without playing the local cue.
+Forwarding could not actually handle a frame until wake setup returned. It also
+serialized LED DBus commands on a separate daemon worker. The vendor's
+two-second command timeout remained, but it could not hold the microphone
+processing thread; timed-out children were reaped, and an overloaded pending
+queue coalesced toward the newest state. The current optional full-duplex path
+adds separately qualified static PulseAudio WebRTC AEC; it does not change this
+historical latency sample.
 
 The pinned ThirdReality subclass is patched directly in addition to the base
 class. Live diagnosis found that a voice-only restart could be replaced by a
@@ -523,10 +546,11 @@ fixed phrase set before accepting it.
 
 Firmware `1.01.07` normally waits for the entire wake confirmation file before
 it begins forwarding microphone audio. The measured stock cue was 0.946979 s;
-an older patched cue was 0.399592 s. Because the measured v1.1.7 device has no
-active acoustic echo cancellation, safely listening during either audible cue
-is not possible: the microphone would also receive the device's own
-acknowledgement.
+an older patched cue was 0.399592 s. The stock/default turn-taking path has no
+active acoustic echo cancellation, so listening during either audible cue
+would also capture the device's own acknowledgement. The optional static
+PulseAudio WebRTC-AEC path is qualified for full-duplex response playback, not
+used as a reason to restore the wake cue.
 
 The pinned overlay therefore skips audible-cue playback and uses the listening
 LED as best-effort visual acknowledgement. This avoids both self-audio and the
