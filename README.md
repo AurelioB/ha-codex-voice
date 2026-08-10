@@ -30,16 +30,11 @@ ThirdReality: "Okay Nabu"
 
 ThirdReality: "Okay Computer"
   -> in-process stdlib client -> realtime wire v2 -> bridge
-  -> when managed conditions are absent: native App Server realtime -> speaker
-  -> with App Server v3 + captured Home Assistant authority:
-     -> tool-free speech frontend (WebRTC)
-     -> identified raw user turn -> isolated Codex executor thread
-     -> completed executor final -> one-frame frontend appendSpeech
-     -> context-acknowledged, turn-identified, generation-gated PCM -> speaker
+  -> explicit conversation_mode: native
+  -> one native Codex App Server WebRTC voice thread -> speaker
 
-Explicitly opted-in Conversation subentry
-  -> primary-token Home Assistant tool broker -> bridge
-  -> bounded tools/results for the isolated executor thread
+No Home Assistant broker, transcript executor, or appendSpeech render handoff
+participates in the Okay Computer session.
 ```
 
 HACS installs only `custom_components/codex_voice`. The bridge must run on a
@@ -51,13 +46,13 @@ apps, plugins, and MCP servers are not imported into voice sessions. The
 bridge sends Home Assistant only text/audio results; Home Assistant never
 receives the ChatGPT credential. Device-facing v2 returns only audio and
 content-free lifecycle controls. The device never declares tools or receives
-tool calls/results. When exactly one Conversation subentry is explicitly
-enabled as the realtime authority, Home Assistant separately registers its
-bounded LLM-tool view over the primary-token broker and executes every call
-locally, so its exposed-entity and Assist policies stay authoritative. For a
-strict wire-v2, App Server v3 session with that captured authority, the bridge
-uses separate speech-frontend and tool-bearing executor threads. Other
-realtime combinations retain their native single-thread behavior.
+tool calls/results. The current reference client always requests native mode;
+the bridge ignores any registered Home Assistant realtime-tool snapshot for
+that session and creates one tool-free voice thread. With qualified device AEC,
+this is the full-duplex/barge-in route. “Okay Nabu” remains the Home Assistant
+Assist and home-control route. Older strict-v2 clients that omit
+`conversation_mode` retain the prior automatic native/managed behavior for
+wire compatibility.
 External Wyoming service templates and smoke scripts are repository assets,
 not part of the component-only HACS ZIP.
 
@@ -79,21 +74,20 @@ not part of the component-only HACS ZIP.
   realtime v3 sessions can begin assistant output before finite transcription
   completes.
 - Milestone 2: an experimental ThirdReality v1.1.7 realtime client and strict
-  binary wire protocol. “Okay Computer” starts direct subscription voice;
+  binary wire protocol. “Okay Computer” explicitly starts native, tool-free,
+  single-thread subscription voice.
   “Okay Nabu” keeps the official Home Assistant Assist flow. The client runs
   inside the existing Python voice process and requires no firmware flash or
   second device daemon. It remains an untrusted audio/control endpoint.
-- Realtime Home Assistant tools are disabled by default. An operator may
-  explicitly designate exactly one Conversation subentry as the authority;
-  that subentry registers only its selected Home Assistant LLM API tools over
-  a separate primary-token broker. The route-scoped device token cannot open
-  the broker, and no tool schema, call, result, or Home Assistant credential is
-  exposed on wire v2. When strict v2 and App Server v3 capture that authority,
-  the bridge routes a completed frontend transcript to a separate executor,
-  then renders only the executor's completed final answer through the
-  tool-free frontend.
-- Direct mode remains turn-taking by default. Opt-in full duplex requires the
-  reviewed static PulseAudio `module-echo-cancel` topology with one explicit,
+- Home Assistant tool authority remains available to the official Conversation
+  flow and to older strict-v2 clients that omit `conversation_mode`. It is not
+  attached to current “Okay Computer” sessions. The route-scoped device token
+  cannot open the broker, and no tool schema, call, result, or Home Assistant
+  credential is exposed on wire v2.
+- Okay Computer is the native tool-free route; qualified installations enable
+  full duplex for continuous microphone capture and barge-in. The safe package
+  default remains turn-taking until the installation passes the reviewed
+  static PulseAudio `module-echo-cancel` requirements with one explicit,
   allowlisted AEC engine, exact capture/playback routing, an explicit startup
   sink value aligned with the vendor media-player preference, a startup safety
   preflight, a sink-volume ceiling recheck before every response, and a fixed
@@ -104,18 +98,15 @@ not part of the component-only HACS ZIP.
   which passed the bounded reference-device echo and barge-in canaries at 25%.
   Every new installation—and every increase above a previously qualified
   level—still requires the documented physical qualification.
-  In broker-managed sessions, barge-in interrupts an executor turn only before
-  it dispatches a Home Assistant tool. After dispatch, the bridge lets that
-  side effect settle once, queues the newest request, and suppresses the stale
-  final. The current ThirdReality client negotiates locally safe same-socket
-  continuation; older clients use a fresh-session fallback. Native sessions
-  still require a correlated provider cancellation before same-socket resume.
+  The current native client flushes local playback immediately on qualified
+  barge-in and requires correlated provider cancellation before same-socket
+  resume; otherwise it safely starts a fresh session.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.147.0 or newer.
 
 The recommended Assist pipeline remains turn-based. Direct realtime is a
-separate streaming PCM transport, not a pretend STT/TTS pipeline and not a path
-around Home Assistant's home-control policy.
+separate full-duplex-capable streaming PCM transport, not an STT/text/TTS
+simulation. Home control intentionally stays on “Okay Nabu.”
 
 ## Quick start
 
@@ -213,6 +204,8 @@ voice** and **Realtime voice language**. Tool authority is off by default and
 may be enabled on exactly one Conversation subentry. Its realtime language
 defaults to `es-MX`. Only the Home Assistant LLM APIs selected on that subentry
 are registered; enabling it does not give the speaker a Home Assistant token.
+This authority supports the compatibility auto/managed wire route. It does not
+override `conversation_mode: "native"` from the current ThirdReality client.
 
 For the lowest latency on ordinary device-control commands, enable **Prefer
 handling commands locally** on that pipeline. Home Assistant will handle
@@ -251,11 +244,15 @@ and stores only the route-scoped realtime bearer—not the Home Assistant token
 or the Codex OAuth credential. Deployment and rollback must preserve and verify
 TCP ADB port 5555 on devices where it is the approved recovery path.
 
+The reference client hardcodes `conversation_mode: "native"` in every strict-v2
+start and requires the bridge to echo it in `started`. It is deliberately not a
+device setting: Okay Computer cannot silently become a transcript/executor/TTS
+pipeline because a Home Assistant broker happens to be connected.
+
 That route-scoped token authorizes only a successfully negotiated v2 audio
-session. It cannot connect to the Home Assistant tool broker. If realtime tools
-are explicitly enabled, the Home Assistant integration maintains the separate
-broker connection with the primary bridge token and executes calls against its
-captured, bounded LLM API view.
+session. It cannot connect to the Home Assistant tool broker. A broker may
+still be maintained for compatibility clients, but the bridge ignores its
+snapshot for an explicit native session.
 
 Direct sessions can optionally select a realtime voice and a bounded session
 prompt. The shipped disabled example uses `cove` and explicitly keeps Mexican
@@ -276,13 +273,19 @@ are returned to the integration, executed inside Home Assistant, and sent back
 to the same Codex turn. The bridge does not need a Home Assistant long-lived
 access token.
 
-Direct realtime uses the same authority only after a second, explicit opt-in
-on exactly one Conversation subentry. Home Assistant captures that subentry's
+The current Okay Computer route does not use this authority. It explicitly
+requests one native, tool-free WebRTC voice thread, while Okay Nabu uses the
+official Assist flow for Home Assistant controls.
+
+For compatibility with older strict-v2 clients that omit `conversation_mode`,
+direct realtime can use the same authority only after a second, explicit
+opt-in on exactly one Conversation subentry. Home Assistant captures that subentry's
 rendered instructions, `es-MX`-by-default realtime locale, and selected LLM API
 tool schemas, then registers a bounded generation over
-`/v1/home-assistant/tools` with the primary bridge token. Each direct session
-captures one immutable generation. With strict wire v2 and App Server v3, that
-snapshot activates a two-thread path: a tool-free realtime frontend emits an
+`/v1/home-assistant/tools` with the primary bridge token. Each legacy-auto
+session captures one immutable generation. With strict wire v2 and App Server
+v3, that snapshot activates a two-thread path: a tool-free realtime frontend
+emits an
 identified raw v3 user turn, and a separate executor thread alone owns the
 selected tools. The bridge forwards only allowlisted, size-bounded executor
 calls to Home Assistant and fails closed if the authority changes, disconnects,
@@ -359,14 +362,18 @@ defense in depth.
 
 `ws://BRIDGE/v1/realtime` supports the legacy JSON/base64 v1 protocol and a
 strict device-facing v2 protocol. The shipped ThirdReality client negotiates
-v2, streams binary 16 kHz mono PCM16 input, and receives binary 24 kHz mono
-PCM16 output between explicit, monotonic speaking-epoch controls. V2 exposes
-no transcripts, raw provider events, tool calls, or tool results. Optional
-Home Assistant tools travel only over the separate primary-token authority
-broker; for strict v2 on App Server v3, a captured broker snapshot makes the
-bridge bind them only to an isolated executor while keeping the speech frontend
-tool-free. Without all three conditions, the native realtime path remains in
-effect.
+v2 with `conversation_mode: "native"`, streams binary 16 kHz mono PCM16 input,
+and receives binary 24 kHz mono PCM16 output between explicit, monotonic
+speaking-epoch controls. The `started` acknowledgement must echo native mode.
+The bridge ignores any Home Assistant broker snapshot and connects microphone
+and speaker audio to one native App Server WebRTC voice thread. There is no
+completed-transcript gate, executor thread, or `appendSpeech` render step. V2
+exposes no transcripts, raw provider events, tool calls, or tool results.
+
+Omitting `conversation_mode` preserves the previous automatic route for older
+strict-v2 clients: App Server v3 plus a captured broker snapshot selects the
+isolated managed executor; otherwise it selects native. The current reference
+client never omits the field.
 
 The client keeps startup and fallback audio in bounded 64 KiB queues (2.048 s
 at its input format). After a cold handshake, it transfers a queued backlog at
@@ -388,12 +395,12 @@ that a local flush truncated provider output. In qualified full duplex, two
 consecutive AEC-filtered speech frames can stop local playback before the
 provider VAD boundary; the provider event independently reinforces that flush.
 The current client identifies itself with
-`User-Agent: ha-codex-voice-thirdreality/2`. In a broker-managed session, an
+`User-Agent: ha-codex-voice-thirdreality/2`. In a legacy broker-managed session, an
 interrupt invalidates the bridge-owned executor/output generation and returns
 `fresh_session_required: false`, `remote_cancelled: false`, and
 `continuation_safe: true`; this does not claim provider cancellation. A legacy
 client receives the established fresh-session fallback and the socket closes.
-Outside the broker-managed path, same-socket continuation still requires a
+In the current native path, same-socket continuation requires a
 `response.cancelled` event correlated to the exact active response. See the
 complete [v2 wire contract](protocol/realtime-wire-v2.md).
 
@@ -419,6 +426,15 @@ Codex 0.146.0. The supported bridge now requires Codex 0.147.0 or newer for the
 managed frontend controls. App Server's raw realtime WebSocket route is
 deliberately not used because it required API-key authentication in the
 historically tested release.
+
+This subscription-backed App Server realtime surface is experimental and is
+not the [documented OpenAI Realtime API WebRTC
+interface](https://developers.openai.com/api/docs/guides/realtime-webrtc).
+Native mode removes the artificial
+transcript/executor/render sequence, but it cannot eliminate cold Codex thread
+creation, WebRTC negotiation, network, service admission, or provider response
+latency. A first wake may therefore still be slower than an already-open
+ChatGPT voice session.
 
 ## Performance
 
@@ -516,7 +532,8 @@ opt-in and must never print OAuth tokens or recorded audio.
 
 - Subscription-backed audio depends on an experimental Codex realtime
   conversation feature and consumes ChatGPT subscription availability, not
-  OpenAI Platform API quota. It is not the stable OpenAI Audio API.
+  OpenAI Platform API quota. It is not the stable OpenAI Audio or Realtime API,
+  and Codex CLI/App Server upgrades may change it.
 - The reliable pipeline's STT is local faster-whisper, not OpenAI-hosted and
   does not consume ChatGPT quota. ChatGPT subscription OAuth does not expose a
   supported standalone transcription endpoint. The retained Codex STT adapter
@@ -546,11 +563,10 @@ opt-in and must never print OAuth tokens or recorded audio.
   do not enable it there before physical double-talk and rollback canaries pass
   at the configured sink and stream values. Values above the previously
   qualified 25% reference require new physical evidence, up to the 60% maximum.
-- “Okay Computer” remains an untrusted audio/control client. Home Assistant
-  control is available only when exactly one Conversation subentry is
-  explicitly opted in as realtime authority. Home Assistant—not the device—
-  registers bounded tools over the primary-token broker and executes calls.
-  Missing, ambiguous, changed, or disconnected authority fails closed.
+- “Okay Computer” remains an untrusted, native, tool-free audio/control client
+  and cannot control Home Assistant. Use “Okay Nabu” for exposed Home Assistant
+  entities and tools. The separately registered realtime authority exists only
+  for older strict-v2 clients that omit `conversation_mode`.
 - ThirdReality firmware 1.01.07 normally withholds microphone audio until its
   wake confirmation sound finishes, then may block the microphone thread for
   up to two seconds while updating the LED. The optional pinned overlay uses an

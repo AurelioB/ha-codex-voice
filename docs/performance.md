@@ -47,37 +47,28 @@ turn the standard Assist pipeline into a full-duplex or barge-in session.
 
 The Milestone 2 ThirdReality client is a separate path selected by “Okay
 Computer.” “Okay Nabu” retains the standard Assist pipeline and all Home
-Assistant entity control. The direct device remains audio/control only.
-Realtime Home Assistant tools are disabled by default; when exactly one
-Conversation subentry is explicitly opted in, Home Assistant separately
-registers its bounded LLM API view over the primary-token broker and executes
-calls locally. Its authority locale defaults to `es-MX`.
+Assistant entity control. The current client always requests
+`conversation_mode: "native"`; the bridge echoes it, ignores any Home Assistant
+broker snapshot, and creates one tool-free App Server WebRTC voice thread.
+Microphone audio and provider speech remain on that thread. There is no finite
+transcript gate, isolated executor, or `thread/realtime/appendSpeech` render
+handoff. This removes the sequential stages that made the old automatic
+managed route feel turn-based.
 
-When strict wire v2, App Server realtime v3, and that captured broker snapshot
-are all present, the bridge uses a managed two-thread path that requires Codex
-CLI 0.147.0 or newer. The tool-free WebRTC frontend produces one identified raw
-v3 user turn; the bridge starts a text turn on an isolated, tool-bearing
-executor. After that turn completes, the bridge sends at most 500 UTF-8 bytes
-of its final answer back in one `thread/realtime/appendSpeech` context frame.
-Both `session.context.appended` and a new identified assistant turn for the
-current generation are required before frontend PCM can enter the bounded
-authorized leading-audio buffer.
-Other realtime combinations keep their native single-thread behavior.
+Native mode does not make cold startup free. Each new direct session still has
+to acquire the bridge's single speech lane, create a Codex thread, negotiate
+App Server/WebRTC, catch up bounded microphone audio, wait for provider
+endpointing/response generation, and begin physical playback. Report wake to
+`started`, `started` to speaking epoch, epoch to first PCM, and first PCM to
+audible playback separately. The experimental App Server surface provides no
+latency or availability SLA, and an already-open ChatGPT voice session is not
+an equivalent cold-start comparison.
 
-The direct route still removes Home Assistant's finite STT, Conversation, and
-TTS provider boundaries from the middle of a turn, but the managed authority
-path deliberately introduces sequential transcript, executor, render-handoff,
-context-acknowledgement, and playback stages. It also has to create two Codex
-threads, negotiate App Server/WebRTC, wait for provider endpointing and
-executor response generation, and buffer physical playback. A Home Assistant
-tool call adds its own bounded broker/execution round trip. Report each of these
-stages separately; the historical single-path measurements below are not a
-latency claim for the new two-thread route.
-
-The executor cannot wait forever: its completion deadline is the configured
-bridge request timeout. Expiry interrupts the exact turn and closes the device
-session with a generic error, so this bound is a failure ceiling rather than a
-normal latency target.
+Older strict-v2 clients that omit `conversation_mode` retain the prior
+automatic native/managed behavior. App Server v3 plus a captured Home Assistant
+authority can still create the two-thread transcript/executor/render sequence
+for those compatibility clients, but the reference ThirdReality client never
+selects it.
 
 The shipped bounds are intentionally small and fail closed:
 
@@ -91,10 +82,10 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
 | Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked at preflight and every response | Keeps both boot-time writers aligned and fails closed if any live sink channel is too loud |
-| Home Assistant tool execution + result send | 25 s + 5 s | Bounds the authority action and component transport separately |
-| Bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
-| App Server tool fallback | 45 s | Remains responsible until the result write completes |
-| Post-tool provider continuation | 20 s | Requires output or a terminal response after result delivery |
+| Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
+| Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
+| Legacy managed: App Server tool fallback | 45 s | Remains responsible until the result write completes |
+| Legacy managed: post-tool provider continuation | 20 s | Requires output or a terminal response after result delivery |
 | Full-duplex `paplay` stream | Independently configured 1–60% (25% default), never above the sink ceiling | Pins each response to the reviewed AEC sink and fixed linear volume |
 
 The pre-roll is included inside the microphone and fallback bounds; it is not
@@ -112,7 +103,7 @@ The 2× catch-up does not shorten the cold handshake or provider response time.
 Time to first audible output must therefore be reported with at least wake to
 v2 `started`, `started` to the first speaking epoch, speaking epoch to first
 PCM, and first PCM to audible playback. Reporting only the catch-up interval
-would hide the dominant remote stages. For the managed path, also separate
+would hide the dominant remote stages. For a legacy managed path, also separate
 speech endpoint to completed transcript, transcript to executor completion
 (including any Home Assistant broker time), executor completion to
 `session.context.appended`, acknowledgement to identified assistant turn, and
@@ -136,7 +127,7 @@ provider VAD independently reinforces that boundary. This removes the provider
 round trip from local speaker muting, but does not remove remote cancellation
 latency.
 
-For broker-managed sessions, every new utterance invalidates the previous
+For legacy broker-managed sessions, every new utterance invalidates the previous
 executor/output generation. Frontend cancellation is requested only after an
 identified assistant render has started, avoiding an invalid idle-session
 cancel. Before any Home Assistant tool dispatch, the active executor turn is
@@ -147,11 +138,9 @@ boundary at the cost of serializing a barged-in request behind an already
 dispatched call.
 
 The current ThirdReality client advertises
-`User-Agent: ha-codex-voice-thirdreality/2` and accepts the managed
-`continuation_safe` acknowledgement on the same socket even though
-`remote_cancelled` remains false. Older clients pay for a fresh WebSocket, both
-owned threads, and a new realtime handshake. Outside the managed path,
-same-session resume is still allowed only after the bridge receives a provider
+`User-Agent: ha-codex-voice-thirdreality/2`; this retains compatibility with the
+managed `continuation_safe` acknowledgement but does not select that route.
+Native same-session resume is allowed only after the bridge receives a provider
 `response.cancelled` event correlated to the exact active response; timeout,
 mismatch, ambiguity, or completion closes the session.
 
