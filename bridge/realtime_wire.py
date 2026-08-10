@@ -39,6 +39,7 @@ DATA_CONTROL_EVENT_TYPES = frozenset(
         "response.cancelled",
         "response.created",
         "response.done",
+        "session.context.appended",
         "session.started",
         "session.updated",
         "turn.created",
@@ -55,6 +56,8 @@ class RealtimeDataControl:
     role: str | None
     response_cancelled: bool = False
     response_id: str | None = None
+    turn_id: str | None = None
+    transcript: str | None = None
 
     def wire_value(self) -> dict[str, str]:
         return {"type": "control", "event_type": self.event_type}
@@ -155,6 +158,8 @@ def parse_data_control_event(value: str | bytes) -> RealtimeDataControl | None:
         role=role,
         response_cancelled=_event_confirms_response_cancelled(decoded, event_type),
         response_id=_event_response_id(decoded),
+        turn_id=_event_turn_id(decoded),
+        transcript=_event_transcript(decoded),
     )
 
 
@@ -166,17 +171,25 @@ def _required_integer(value: Mapping[str, Any], key: str) -> int:
 
 
 def _event_role(value: Mapping[str, Any]) -> str | None:
-    candidates = [value.get("role")]
+    candidates: list[object] = []
+    if "role" in value:
+        candidates.append(value.get("role"))
     for key in ("turn", "response", "item"):
         nested = value.get(key)
-        if isinstance(nested, Mapping):
+        if isinstance(nested, Mapping) and "role" in nested:
             candidates.append(nested.get("role"))
+    roles: set[str] = set()
     for candidate in candidates:
-        if isinstance(candidate, str):
-            normalized = candidate.lower()
-            if normalized in {"assistant", "input", "output", "user"}:
-                return normalized
-    return None
+        if not isinstance(candidate, str):
+            return None
+        normalized = candidate.lower()
+        if normalized not in {"assistant", "input", "output", "user"}:
+            return None
+        normalized = {"input": "user", "output": "assistant"}.get(
+            normalized, normalized
+        )
+        roles.add(normalized)
+    return roles.pop() if len(roles) == 1 else None
 
 
 def _event_confirms_response_cancelled(
@@ -204,6 +217,28 @@ def _event_response_id(value: Mapping[str, Any]) -> str | None:
         if isinstance(candidate, str) and candidate:
             return candidate
     return None
+
+
+def _event_turn_id(value: Mapping[str, Any]) -> str | None:
+    """Retain a turn correlation id internally without exposing it."""
+    turn = value.get("turn")
+    if isinstance(turn, Mapping) and isinstance(turn.get("id"), str):
+        return turn["id"] or None
+    for key in ("turn_id", "turnId"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _event_transcript(value: Mapping[str, Any]) -> str | None:
+    """Retain a completed turn transcript internally without exposing it."""
+    turn = value.get("turn")
+    nested = turn.get("transcript") if isinstance(turn, Mapping) else None
+    if isinstance(nested, str):
+        return nested
+    transcript = value.get("transcript")
+    return transcript if isinstance(transcript, str) else None
 
 
 def _validate_v2_start(start: Mapping[str, Any]) -> None:

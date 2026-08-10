@@ -17,7 +17,13 @@ def main() -> None:
     )
     logging.getLogger("aioice").setLevel(logging.WARNING)
     config = BridgeConfig.from_env()
-    web.run_app(create_app(config), host=config.host, port=config.port, print=None)
+    web.run_app(
+        create_app(config),
+        host=config.host,
+        port=config.port,
+        print=None,
+        shutdown_timeout=5,
+    )
 
 
 if __name__ == "__main__":

@@ -281,6 +281,39 @@ async def test_start_accepts_sdp_before_started_notification() -> None:
     assert rpc.subscription.closed is True
 
 
+@pytest.mark.asyncio
+async def test_v3_start_can_disable_delegation_ack_filler() -> None:
+    rpc = SdpFirstRpc()
+    session = RealtimeSession(rpc, "thread-1", peer=FakePeer(), timeout=1)
+
+    await session.start(delegation_ack_filler=False)
+
+    method, params = rpc.calls[0]
+    assert method == "thread/realtime/start"
+    assert params["delegationAckFiller"] is False
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_v1_start_rejects_delegation_ack_filler_control() -> None:
+    rpc = SdpFirstRpc()
+    session = RealtimeSession(
+        rpc,
+        "thread-1",
+        peer=FakePeer(),
+        version="v1",
+        timeout=1,
+    )
+
+    with pytest.raises(
+        ProtocolError, match="delegation acknowledgement control requires version v3"
+    ):
+        await session.start(delegation_ack_filler=False)
+
+    assert rpc.calls == []
+    await session.stop()
+
+
 def test_response_cancel_uses_provider_data_channel() -> None:
     peer = FakePeer()
     session = RealtimeSession(SdpFirstRpc(), "thread-1", peer=peer, timeout=1)

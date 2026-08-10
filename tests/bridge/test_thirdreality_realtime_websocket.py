@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterator
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -12,6 +13,7 @@ from device.thirdreality.realtime_client.websocket import (
     WebSocketConnection,
     WebSocketError,
     _read_http_response,
+    _upgrade_request,
     encode_client_frame,
 )
 
@@ -120,6 +122,18 @@ def test_client_frame_uses_canonical_extended_length() -> None:
 
     assert encoded[:2] == b"\x82\xfe"
     assert encoded[2:4] == struct.pack("!H", 126)
+
+
+def test_upgrade_advertises_managed_interrupt_support_version() -> None:
+    request = _upgrade_request(
+        urlsplit("ws://bridge.example/v1/realtime"),
+        "bridge.example",
+        80,
+        "websocket-key",
+        "route-token",
+    )
+
+    assert b"User-Agent: ha-codex-voice-thirdreality/2\r\n" in request
 
 
 def test_fragmented_text_allows_interleaved_ping_and_replies_with_pong(

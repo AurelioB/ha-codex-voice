@@ -7,7 +7,7 @@ private temporary Codex home; no OAuth token is copied into Home Assistant.
 
 ## Run
 
-Python 3.11 or newer, Codex CLI 0.146 or newer, and a working file-backed
+Python 3.11 or newer, Codex CLI 0.147.0 or newer, and a working file-backed
 `codex login` are required. The bridge auto-detects `auth.json` below
 `CODEX_HOME` or `$HOME/.codex`; set `HA_CODEX_AUTH_FILE` to an absolute path
 when it lives elsewhere. Keyring-only and group/world-readable credentials
@@ -99,9 +99,10 @@ requires the primary Home Assistant bridge token.
 - `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages or the strict
   device-facing v2 binary PCM16 transport. V2 emits content-free lifecycle
   controls, filters continuous WebRTC silence, gates output with monotonic
-  epochs, and supports correlation-gated same-session interruption. It does not
-  expose transcripts, provider payloads, tool calls, or tool results to the
-  device. See the
+  epochs, and supports negotiated same-session interruption. It does not expose
+  transcripts, provider payloads, tool calls, or tool results to the device.
+  A v2 `text` control is a bounded user message; its role must be omitted or
+  exactly `user`. See the
   [v2 wire contract](../protocol/realtime-wire-v2.md).
 
 Authenticated health includes a content-free `home_assistant_tools` object:
@@ -117,10 +118,45 @@ and receives 24 kHz mono PCM16. It remains an untrusted audio/control endpoint:
 it cannot declare tools or send tool results. When exactly one Conversation
 subentry is explicitly opted in, the Home Assistant component separately
 registers that subentry's selected, bounded tool view with the primary token;
-the bridge snapshots it for the v2 provider session and returns each provider
-tool call to Home Assistant for execution. The bridge applies a 2,250 ms
-input-track limit only to v2 live sessions; finite STT keeps its existing
-whole-utterance input capacity.
+the bridge snapshots it for the v2 provider session. When strict wire v2,
+realtime version v3, and that snapshot are all present, the bridge starts two
+Codex threads: a tool-free realtime speech frontend and an isolated executor
+that alone receives the selected tools. A completed frontend user transcript,
+or a valid v2 user `text` control, starts an executor turn; each accepted
+executor tool call is returned to Home Assistant for execution. Other protocol,
+version, or authority combinations retain the native single-thread route. The
+bridge applies a 2,250 ms input-track limit only to v2 live sessions; finite STT
+keeps its existing whole-utterance input capacity.
+
+The managed frontend starts with immutable routing instructions,
+`clientManagedHandoffs: true`, and `delegationAckFiller: false`. App Server v3
+can route native delegation before a notification is observable, so the
+separate tool-bearing thread—not the prompt alone—is the authority boundary.
+The frontend also disables unrelated repository startup context and admits the
+device after the required `session.started`; v3 does not consistently emit a
+separate startup context acknowledgement.
+Any frontend, foreign, stale, or post-interrupt tool call is answered with
+`unowned_home_assistant_tool_call` and `do_not_retry: true` without invoking
+Home Assistant. An identified raw v3 user `turn.created`/`turn.done` pair—not
+the identity-free normalized transcript notification—owns each microphone
+request. On a completed executor turn, the bridge selects the final agent
+answer and sends one valid UTF-8 prefix of at most 500 bytes to the frontend
+with `thread/realtime/appendSpeech`. It drops frontend PCM until
+`session.context.appended` acknowledges the append and a session-unique
+assistant `turn.created` identifies and arms the current bridge generation.
+The first authorized non-silent PCM begins the speaking epoch, and only the
+matching assistant `turn.done` releases the serialized render slot;
+unsolicited, replayed, and stale audio remains inaudible. Managed v3 ignores
+response/output-buffer lifecycle aliases. Codex 0.147 frameless cancellation
+terminates through the identified turn lifecycle; a missing matching terminal
+fails the next render closed rather than permitting overlap.
+
+Executor completion is independently bounded by the configured bridge request
+timeout. A failed terminal or expired turn returns a generic device error and
+closes the session instead of waiting indefinitely. Stop, disconnect, and
+service shutdown tombstone and interrupt an active executor before its event
+subscription closes; transport and two-thread deletion then continue in
+tracked, cancellation-shielded cleanup.
 
 The reference device keeps at most 64 KiB (2.048 s) of startup/fallback input,
 drains a post-handshake backlog at no more than 2× capture rate, and keeps at
@@ -143,16 +179,28 @@ with the same fixed stream-volume ceiling.
 
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises
-`same_session_interrupt_ack: true`. On `interrupt`, the bridge sends a provider
-cancel request and keeps the socket usable only after a sanitized
-`response.cancelled` event is correlated to the active response. Otherwise it
-returns the explicit fresh-session fallback and disposes the thread/session.
+`same_session_interrupt_ack: true`. The current ThirdReality client negotiates
+the managed policy with `User-Agent: ha-codex-voice-thirdreality/2`. On a
+broker-managed interrupt, the bridge invalidates the executor/output generation
+and asks the frontend provider to cancel only when an identified assistant
+render is active; it never cancels an idle or pending frontend. Before Home
+Assistant tool dispatch it tombstones and interrupts the executor turn; after dispatch it
+lets the tool-bearing turn settle, suppresses the old final, and queues the
+newest request when its transcript arrives.
+It then returns `fresh_session_required: false`, `remote_cancelled: false`, and
+`continuation_safe: true`; the local generation gate makes continuation safe
+without claiming remote cancellation. A legacy client gets the established
+fresh-session fallback and socket teardown. On the native path, same-socket
+continuation still requires a sanitized `response.cancelled` event correlated
+to the active provider response.
 
 Audio uses Codex app-server's experimental WebRTC v3 path by default. The peer
 creates a real paced outbound audio track and `oai-events` data channel before
 the SDP offer; app-server supplies the remote SDP answer and transcript
-notifications. This is the subscription-compatible path. Raw Realtime v2
-WebSockets require API-key authentication and are intentionally not used.
+notifications. Codex 0.147.0 or newer is required for the managed frontend's
+delegation acknowledgement control. This is the subscription-compatible path.
+Raw Realtime v2 WebSockets require API-key authentication and are intentionally
+not used.
 
 The subscription realtime voice is conversational, not a verbatim
 text-to-speech API. `/v1/synthesize` sends a tightly constrained text turn but
@@ -244,8 +292,10 @@ verify overlap without recording content.
 Interactive approvals, permission requests, and unsupported server-initiated
 requests fail closed. Only explicitly declared dynamic Home Assistant tools are
 relayed to the official Conversation WebSocket, a legacy v1 realtime client,
-or a v2 session bound to the current Home Assistant broker generation. V2
-devices never declare, receive, or answer tool calls themselves. Exactly one
+or the isolated executor of a managed v2 session bound to the current Home
+Assistant broker generation. The managed speech frontend has no tools and its
+unexpected requests are explicitly rejected. V2 devices never declare,
+receive, or answer tool calls themselves. Exactly one
 explicitly opted-in Conversation subentry may register at most 128 tools; tool
 schemas, arguments, results, pending calls, and per-session calls are bounded.
 Home Assistant renders the authority instructions, defaults its realtime

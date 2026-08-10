@@ -5,6 +5,56 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-10
+
+### Added
+
+- Add a broker-managed realtime architecture for strict device wire v2 on
+  Codex realtime v3. A tool-free speech frontend produces one canonical user
+  transcript, a separate Home Assistant-aware executor owns tool calls, and
+  only its completed final answer is explicitly rendered through
+  `appendSpeech`.
+- Add content-free, deduplicated provider event-shape tracing and absolute
+  handshake/output smoke deadlines that cannot be extended by heartbeats.
+
+### Changed
+
+- Require Codex CLI 0.147.0 or newer for the isolated realtime path, disable
+  delegation acknowledgement filler and irrelevant repository startup context,
+  use client-managed handoffs, and gate output on both the explicit
+  context-append acknowledgement and identified v3 assistant turn for the
+  current bridge generation.
+- Correlate microphone requests from the identified raw v3 user-turn lifecycle
+  instead of identity-free transcript notifications. Limit each managed
+  `appendSpeech` to one 500-byte UTF-8 context frame and serialize one render at
+  a time through its matching `turn.done` boundary.
+- Negotiate bridge-managed same-socket interruption with the updated
+  ThirdReality client User-Agent. Older clients retain the established
+  fresh-session fallback; the new client accepts the explicit
+  `continuation_safe` acknowledgement without claiming provider cancellation.
+
+### Fixed
+
+- Reject frontend, foreign, stale, and post-interrupt tool calls without
+  executing Home Assistant actions. Buffer bounded executor events that beat
+  `turn/start`, answer abandoned early tool requests exactly once, and suppress
+  stale finals and post-tool watchdogs across barge-in generations.
+- Drop unsolicited frontend PCM until an authorized executor final is appended,
+  and preserve the active tool-bearing turn through barge-in so an ambiguous
+  Home Assistant side effect is never cancelled or retried.
+- Avoid invalid `response.cancel` requests against idle or merely pending
+  frontend sessions; cancellation is attempted only after an identified
+  assistant render has actually started.
+- Tombstone user and assistant turn IDs for the session, reject replayed or
+  contradictory lifecycle events, and recheck output ownership while holding
+  the device send lock so stale PCM cannot cross a barge-in boundary.
+- Bound WebSocket shutdown and make bridge service restarts release active
+  realtime sockets promptly. Track and shield the two-thread provider cleanup,
+  interrupt active executor turns before deletion, and fail closed with a
+  generic device error when an executor fails or misses its completion
+  deadline. Executor timeout and socket teardown now also tombstone queued work
+  and synchronize with an in-flight `turn/start` before thread disposal.
+
 ## [0.5.1] - 2026-08-10
 
 ### Fixed

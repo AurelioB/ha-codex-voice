@@ -45,12 +45,17 @@ The pinned v1.1.7 device overlay adds a second, explicitly separate route:
 ```text
 "Okay Nabu" -> stock satellite protocol -> Home Assistant Assist/tools
 "Okay Computer" -> in-process stdlib client -> realtime wire v2 -> bridge
-                 -> Codex App Server WebRTC -> local device playback
+                 -> native realtime when managed conditions are absent
+                 -> managed when App Server v3 + authority snapshot:
+                    -> tool-free speech frontend (WebRTC)
+                    -> completed transcript -> isolated executor thread
+                    -> completed final -> appendSpeech -> acknowledged PCM
+                 -> local device playback
 
 one explicitly opted-in Conversation subentry
   -> Home Assistant LLM API snapshot
   -> primary-token /v1/home-assistant/tools broker -> bridge
-  -> provider dynamic tools for the captured direct session
+  -> [managed v3 branch] dynamic tools for the isolated executor only
 ```
 
 The direct device remains an untrusted audio/control endpoint. It never
@@ -75,6 +80,60 @@ an authority replacement, disconnect, timeout, correlation mismatch, or
 undeclared provider tool fails closed without exposing the broker exchange to
 the device.
 
+## Broker-managed realtime isolation
+
+The two-thread route is conditional. It activates only when all three inputs
+are present: strict device wire v2, App Server realtime version v3, and a
+captured Home Assistant broker snapshot. A session without any one of those
+conditions keeps the native single-thread realtime behavior. Codex CLI 0.147.0
+or newer is required because this route explicitly disables App Server's
+delegation acknowledgement filler.
+
+For the managed route, the bridge creates a tool-free realtime speech frontend
+and a separate executor thread carrying the immutable Home Assistant context
+and selected tools. The frontend receives immutable routing instructions plus
+the bounded device language, voice-style, and brevity preferences. Its App
+Server start sets `clientManagedHandoffs: true` and
+`delegationAckFiller: false`. App Server v3 can route a native delegation before
+the bridge observes a handoff notification, so prompts and client-managed
+handoffs alone are not the security boundary; physical thread separation keeps
+the provider-facing frontend unable to execute Home Assistant side effects.
+
+```text
+identified raw v3 user turn (or bounded v2 user text)
+  -> bridge generation -> turn/start on isolated executor
+  -> allowlisted tool call -> captured HA broker generation -> Home Assistant
+  -> correlated result -> same executor turn
+  -> completed final agent answer
+  -> one <=500-byte UTF-8 appendSpeech on tool-free frontend
+  -> session.context.appended for the same bridge generation
+  -> unique assistant turn.created -> authorize and arm frontend PCM
+  -> first authorized non-silent PCM -> begin speaking epoch
+  -> matching assistant turn.done -> retire render -> device
+```
+
+Executor events are accepted only for the owned executor thread and active
+turn. A bounded buffer handles events that arrive before `turn/start` returns.
+The bridge prefers a completed `final_answer` agent message, otherwise the
+latest completed non-commentary agent message, and never speaks an incomplete
+or stale turn. A tool request from the frontend, a foreign or stale executor
+turn, or a turn already tombstoned for interruption receives
+`unowned_home_assistant_tool_call` with `do_not_retry: true`; it never crosses
+the Home Assistant broker.
+
+The frontend's provider audio is unauthorized by default. Only a completed
+executor answer submitted through a single `thread/realtime/appendSpeech`
+context frame, followed by the provider's `session.context.appended`
+acknowledgement and a new identified assistant turn for the current generation,
+can open the output gate. Only its matching `turn.done` retires the one-render
+slot. Turn IDs are claimed for the socket lifetime across both roles, so replay
+and role swapping cannot reopen command or audio authority. Direct frontend
+answers, acknowledgements, late PCM, and stale-generation output stay blocked
+or are dropped. Once a stale assistant render is identified as started,
+provider cancellation is requested as a latency optimization; idle and merely
+pending sessions are never cancelled. The local generation gate is the
+authoritative suppression boundary.
+
 ## Isolated App Server profile and thread lifecycle
 
 The bridge does not launch App Server against the user's everyday Codex home.
@@ -95,12 +154,14 @@ copied into Home Assistant or the repository.
 Threads start with `ephemeral: false`, but their persistence is confined to the
 temporary profile. This is intentional: App Server cannot apply
 `thread/delete` to an ephemeral thread. The bridge deletes one-shot STT, TTS,
-and realtime threads as soon as their session ends. The bundled Home Assistant
-component does not retain STT sessions for TTS, and the released bridge never
-issues a handoff ticket. Dormant validation and ownership machinery remains for
-future protocol work. Cached Conversation threads are deleted when retired,
-evicted, or the bridge closes. Deletion unloads the thread immediately instead
-of retaining it for App Server's idle-unload period.
+and realtime threads as soon as their session ends. A broker-managed realtime
+session owns both a frontend and executor thread, and its cleanup disposes both
+even if stopping or deleting the other resource fails. The bundled Home
+Assistant component does not retain STT sessions for TTS, and the released
+bridge never issues a handoff ticket. Dormant validation and ownership
+machinery remains for future protocol work. Cached Conversation threads are
+deleted when retired, evicted, or the bridge closes. Deletion unloads the
+thread immediately instead of retaining it for App Server's idle-unload period.
 
 ## Experimental subscription audio adapters
 
@@ -257,9 +318,15 @@ vendor microphone callback (16 kHz PCM16)
   -> bounded device input/fallback queues (64 KiB / 2.048 s)
   -> paced v2 binary WebSocket (up to 2x while catching up)
   -> bridge v2-only WebRTC input cap (2,250 ms)
-  -> Codex App Server realtime v3
+  -> Codex App Server realtime v3 speech frontend
 
-provider audio (48 kHz WebRTC)
+when App Server v3 and a Home Assistant broker snapshot are captured
+  -> identified raw user turn -> isolated App Server executor turn
+  -> selected tool calls/results -> primary-token Home Assistant broker
+  -> completed final -> one-frame frontend appendSpeech
+  -> context acknowledgement + identified assistant turn lifecycle
+
+authorized provider audio (48 kHz WebRTC)
   -> bridge downmix/resample and content-free epoch gate (24 kHz PCM16)
   -> bounded device playback queue (48 KiB / about 1.024 s)
   -> fixed-argument paplay child pinned to the AEC sink and <=25% stream volume
@@ -306,12 +373,29 @@ player and quarantines late PCM without pausing upstream audio. Provider
 `input_audio_buffer.speech_started` independently reinforces that boundary.
 Neither event itself proves provider cancellation. The bridge truthfully keeps
 `remote_cancel: false` and separately advertises
-`same_session_interrupt_ack: true`. Same-socket continuation occurs only when
-the bridge's explicit cancel request is followed by a provider
-`response.cancelled` event whose response identifier matches the active
-response. Timeout, mismatch, or ambiguity returns
-`fresh_session_required: true` / `remote_cancelled: false`, closes the socket,
-and disposes the remote thread/session.
+`same_session_interrupt_ack: true`.
+
+In the broker-managed two-thread path, every new speech boundary or accepted
+user message advances the bridge generation and revokes prior output. The
+bridge requests frontend cancellation only if an identified assistant render
+has actually started. If the active executor turn has not
+dispatched a Home Assistant tool, the bridge tombstones it before sending
+`turn/interrupt`, waits for its terminal event, and rejects any late tool call.
+If a tool has already crossed the broker boundary, the bridge does not cancel
+or retry that potentially side-effecting turn. It lets the result settle,
+suppresses the stale final, and runs the newest queued request afterward.
+
+The current client advertises support with the exact HTTP header
+`User-Agent: ha-codex-voice-thirdreality/2`. For that client, managed
+interruption returns `fresh_session_required: false`,
+`remote_cancelled: false`, and `continuation_safe: true`: continuation is safe
+because the bridge invalidated its executor/output generation, not because the
+provider confirmed cancellation of the tool-free frontend. An older client
+does not advertise that contract, so the bridge returns the established
+fresh-session fallback, closes the socket, and disposes both owned threads.
+Outside the managed path, same-socket continuation still requires a provider
+`response.cancelled` event whose identifier matches the active response;
+timeout, mismatch, completion, or ambiguity tears the session down.
 
 The device stores a distinct route-scoped bearer in a root-owned mode-0600
 file. The bridge accepts it only on `/v1/realtime`; the primary Home Assistant

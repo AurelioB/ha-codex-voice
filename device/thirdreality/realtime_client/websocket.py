@@ -385,7 +385,10 @@ def _upgrade_request(
         f"Sec-WebSocket-Key: {key}",
         "Sec-WebSocket-Version: 13",
         f"Authorization: Bearer {token}",
-        "User-Agent: ha-codex-voice-thirdreality/1",
+        # Version 2 advertises support for the bridge-managed
+        # continuation_safe interrupt acknowledgement. Older bridges ignore
+        # this header value and retain the original wire-v2 semantics.
+        "User-Agent: ha-codex-voice-thirdreality/2",
         "",
         "",
     ]

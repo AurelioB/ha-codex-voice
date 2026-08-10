@@ -29,6 +29,18 @@ sides of a narrow bridge API.
   independently reject undeclared tools, duplicate or stale correlation,
   oversized/non-JSON values, replacement, disconnect, and timeout. An unknown
   outcome is never retried implicitly.
+- Only a strict wire-v2, App Server v3 session with a captured broker snapshot
+  enters the managed two-thread route. Its provider-facing speech frontend is
+  created with no tools; a separate executor thread alone receives the
+  immutable Home Assistant instructions and tool view. Other realtime modes
+  retain their native behavior. Codex CLI 0.147.0 or newer is required for the
+  managed route's `clientManagedHandoffs: true` and
+  `delegationAckFiller: false` controls.
+- The frontend cannot be trusted to enforce isolation from instructions alone:
+  App Server v3 may route native delegation before notifying the bridge. A
+  frontend, foreign, stale, or post-interrupt tool request is therefore
+  answered with `unowned_home_assistant_tool_call` and `do_not_retry: true`
+  without crossing the Home Assistant authority boundary.
 - Conversation start and tool-result events use Home Assistant's canonical JSON
   serializer. Nested temporal values are normalized to ISO text; unsupported
   values are rejected before transmission with an error that does not include
@@ -46,9 +58,10 @@ sides of a narrow bridge API.
   if a local or managed layer still configures an MCP server.
 - Threads are deliberately non-ephemeral inside that isolated home so App
   Server can delete them immediately with `thread/delete`. Experimental Codex
-  STT, TTS, and realtime threads are deleted when their session ends; reusable
-  Conversation threads are deleted when retired, evicted, or the bridge shuts
-  down.
+  STT, TTS, and realtime threads are deleted when their session ends. A
+  managed realtime session owns two threads, and cleanup independently deletes
+  both its tool-free frontend and its executor. Reusable Conversation threads
+  are deleted when retired, evicted, or the bridge shuts down.
 - Production STT audio travels only from Home Assistant to the selected local
   Wyoming faster-whisper service. It does not enter Codex App Server or consume
   ChatGPT/OpenAI quota.
@@ -63,6 +76,19 @@ sides of a narrow bridge API.
   authority is present, the bridge sends provider calls only to the captured
   Home Assistant generation; Home Assistant's selected LLM API retains
   exposed-entity policy and execution authority.
+- In the managed path, only a session-unique, identified raw v3 user turn or
+  bounded v2 user `text` control can start an executor turn. Only the completed
+  executor final is returned through a single, at-most-500-byte
+  `thread/realtime/appendSpeech`; frontend PCM is dropped until both
+  `session.context.appended` and a session-unique assistant turn identify and
+  arm that render for the current bridge generation. Replayed, role-conflicting,
+  unsolicited, direct, or stale frontend events cannot open command or audio
+  authority.
+- Managed executor turns have an absolute completion deadline. Failed or
+  missing terminals close the device session with a content-free error. During
+  teardown the active turn is tombstoned and interrupted before its event
+  consumer closes, and provider/thread cleanup remains tracked and shielded
+  from request-handler cancellation.
 - “Okay Computer” selects the v2 route, but its weaker device credential gains
   no Home Assistant authority. “Okay Nabu” selects the official Assist path;
   a normal wake can preempt a direct session and reclaim the microphone.
@@ -92,10 +118,20 @@ sides of a narrow bridge API.
   physical double-talk canary on each installation at no more than 25%; the
   reference device's bounded pass is not transferable evidence.
 - Local playback flush or provider VAD is not evidence of remote cancellation.
-  A v2 session resumes after interruption only when the bridge correlates a
-  sanitized provider `response.cancelled` event to the exact active response;
-  timeout, mismatch, completion-only events, or ambiguity require teardown and
-  a fresh session.
+  On the native v2 path, resume still requires a sanitized provider
+  `response.cancelled` event correlated to the exact active response. On the
+  broker-managed path, a new utterance invalidates the bridge generation and
+  best-effort cancellation cannot reopen the local output gate. Before Home
+  Assistant tool dispatch, the bridge tombstones and interrupts the executor;
+  after dispatch it lets the potentially side-effecting call settle without
+  cancellation or replay, suppresses the stale final, and queues the newest
+  request.
+- Managed same-socket continuation is enabled only for the exact negotiated
+  `User-Agent: ha-codex-voice-thirdreality/2`. Its acknowledgement sets
+  `fresh_session_required: false`, `remote_cancelled: false`, and
+  `continuation_safe: true`; safety refers to bridge-owned generation
+  invalidation, not confirmed provider cancellation. Older clients receive the
+  fresh-session fallback and the socket is closed.
 
 The authentication source is resolved from `HA_CODEX_AUTH_FILE`,
 `${CODEX_HOME}/auth.json`, or `${HOME}/.codex/auth.json`. The bridge fails
@@ -153,6 +189,11 @@ objects at normal log levels. Conversation serialization failures report only
 that an unsupported JSON value was present; they do not interpolate that
 value's potentially sensitive representation.
 
+Realtime event-shape tracing records only deduplicated source/event types,
+allowlisted item types, and coarse role/target labels. It omits transcript text,
+agent deltas, prompts, tool names, arguments, results, raw provider payloads,
+SDP, audio, and provider identifiers.
+
 Upstream `wyoming-faster-whisper` 3.5.0 logs recognized text at INFO. The
 supplied systemd unit deliberately starts it through the privacy runner, which
 raises only `wyoming_faster_whisper.dispatch_handler` to WARNING. Do not replace
@@ -174,8 +215,10 @@ requests that would download a different model.
 
 Subscription audio uses an under-development Codex App Server WebRTC interface
 and consumes ChatGPT subscription availability rather than OpenAI Platform API
-quota. It must never silently fall back to an OpenAI Platform API key. Upgrade
-Codex only after running the local contract tests and the opt-in WebRTC probe.
+quota. It must never silently fall back to an OpenAI Platform API key. The
+supported minimum is Codex CLI 0.147.0 because managed realtime disables
+delegation acknowledgement filler explicitly. Upgrade Codex only after running
+the local contract tests and the opt-in WebRTC probe.
 
 Experimental Codex transcription and speech rendering are behaviors of a
 conversational voice model. They are not the separately billed Speech-to-Text

@@ -51,12 +51,33 @@ Assistant entity control. The direct device remains audio/control only.
 Realtime Home Assistant tools are disabled by default; when exactly one
 Conversation subentry is explicitly opted in, Home Assistant separately
 registers its bounded LLM API view over the primary-token broker and executes
-calls locally. Its authority locale defaults to `es-MX`. The direct path
-removes finite STT, Conversation, and TTS provider boundaries from the middle
-of a turn, but it still has to create a Codex thread, negotiate App
-Server/WebRTC, wait for provider endpointing and response generation, and
-buffer physical playback. A Home Assistant tool call adds its own bounded
-broker/execution round trip and should be measured separately from first audio.
+calls locally. Its authority locale defaults to `es-MX`.
+
+When strict wire v2, App Server realtime v3, and that captured broker snapshot
+are all present, the bridge uses a managed two-thread path that requires Codex
+CLI 0.147.0 or newer. The tool-free WebRTC frontend produces one identified raw
+v3 user turn; the bridge starts a text turn on an isolated, tool-bearing
+executor. After that turn completes, the bridge sends at most 500 UTF-8 bytes
+of its final answer back in one `thread/realtime/appendSpeech` context frame.
+Both `session.context.appended` and a new identified assistant turn for the
+current generation are required before frontend PCM can enter the bounded
+authorized leading-audio buffer.
+Other realtime combinations keep their native single-thread behavior.
+
+The direct route still removes Home Assistant's finite STT, Conversation, and
+TTS provider boundaries from the middle of a turn, but the managed authority
+path deliberately introduces sequential transcript, executor, render-handoff,
+context-acknowledgement, and playback stages. It also has to create two Codex
+threads, negotiate App Server/WebRTC, wait for provider endpointing and
+executor response generation, and buffer physical playback. A Home Assistant
+tool call adds its own bounded broker/execution round trip. Report each of these
+stages separately; the historical single-path measurements below are not a
+latency claim for the new two-thread route.
+
+The executor cannot wait forever: its completion deadline is the configured
+bridge request timeout. Expiry interrupts the exact turn and closes the device
+session with a generic error, so this bound is a failure ceiling rather than a
+normal latency target.
 
 The shipped bounds are intentionally small and fail closed:
 
@@ -91,7 +112,11 @@ The 2× catch-up does not shorten the cold handshake or provider response time.
 Time to first audible output must therefore be reported with at least wake to
 v2 `started`, `started` to the first speaking epoch, speaking epoch to first
 PCM, and first PCM to audible playback. Reporting only the catch-up interval
-would hide the dominant remote stages.
+would hide the dominant remote stages. For the managed path, also separate
+speech endpoint to completed transcript, transcript to executor completion
+(including any Home Assistant broker time), executor completion to
+`session.context.appended`, acknowledgement to identified assistant turn, and
+that turn to the first authorized PCM.
 
 Direct output is turn-taking by default on v1.1.7. With `full_duplex: false`,
 the microphone gate stays closed from `speaking.started` until the
@@ -109,10 +134,26 @@ With those checks active, capture continues during playback. Two consecutive
 qualifying AEC-filtered 64 ms frames request an epoch-scoped local player flush;
 provider VAD independently reinforces that boundary. This removes the provider
 round trip from local speaker muting, but does not remove remote cancellation
-latency. Same-session resume is allowed only after the bridge receives a
-provider `response.cancelled` event correlated to the exact active response.
-Timeout, mismatch, ambiguity, or a completion event closes the session, so the
-next turn pays for a fresh WebSocket, thread, and realtime handshake.
+latency.
+
+For broker-managed sessions, every new utterance invalidates the previous
+executor/output generation. Frontend cancellation is requested only after an
+identified assistant render has started, avoiding an invalid idle-session
+cancel. Before any Home Assistant tool dispatch, the active executor turn is
+tombstoned and interrupted; after dispatch, it is deliberately allowed to settle without
+cancellation or replay, its stale final is suppressed, and the newest request
+waits in a one-item queue. This preserves the Home Assistant side-effect
+boundary at the cost of serializing a barged-in request behind an already
+dispatched call.
+
+The current ThirdReality client advertises
+`User-Agent: ha-codex-voice-thirdreality/2` and accepts the managed
+`continuation_safe` acknowledgement on the same socket even though
+`remote_cancelled` remains false. Older clients pay for a fresh WebSocket, both
+owned threads, and a new realtime handshake. Outside the managed path,
+same-session resume is still allowed only after the bridge receives a provider
+`response.cancelled` event correlated to the exact active response; timeout,
+mismatch, ambiguity, or completion closes the session.
 
 Adrian loading with the reviewed raw masters and creating 16 kHz mono endpoints
 is a static-topology result, not an acoustic result. On the reference device at
