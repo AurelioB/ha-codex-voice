@@ -3,7 +3,10 @@
 This document defines the authenticated device-facing WebSocket contract at
 `GET /v1/realtime`. Version 2 is a narrow, low-latency PCM transport between a
 LAN audio endpoint and the host bridge. The bridge remains the only Codex App
-Server/WebRTC peer and the device never receives ChatGPT credentials.
+Server/WebRTC peer and the device never receives ChatGPT credentials. V2
+deliberately grants the device only audio and bounded lifecycle-control
+authority; optional Home Assistant tools use a separate primary-token broker
+that is invisible to this wire.
 
 Version 1 remains supported for existing clients. A start message with no
 `protocol_version` selects v1 and continues to use JSON objects containing
@@ -73,16 +76,20 @@ input/output shapes and capabilities:
   "capabilities": {
     "binary_pcm16": true,
     "local_flush": true,
-    "remote_cancel": false
+    "remote_cancel": false,
+    "same_session_interrupt_ack": true
   }
 }
 ```
 
 `local_flush` means the device is expected to discard queued speaker PCM when
-it interrupts playback. `remote_cancel: false` is intentionally explicit: the
-subscription-backed App Server transport does not expose a reliable response
-truncation operation. The bridge never reports that already-generated remote
-speech was truncated.
+it interrupts playback. `remote_cancel: false` is intentionally explicit: a
+client may never infer remote cancellation from a local flush or VAD event.
+`same_session_interrupt_ack: true` means the bridge can separately acknowledge
+one cancellation after it observes a provider `response.cancelled` event whose
+response identifier matches the active response. The bridge never claims that
+already-played audio was unheard or that an uncorrelated response was
+truncated.
 
 Invalid or ambiguous negotiation produces a JSON `error` and closes the
 socket before a Codex thread is created.
@@ -142,15 +149,30 @@ client must gate playback from these controls and must not infer that any bare
 binary frame starts a new response. After `speaking.stopped`, PCM for that
 epoch is no longer forwarded.
 
-The reference v1.1.7 client is turn-taking: its configuration accepts only
-`full_duplex: false`, and it gates microphone submission from
-`speaking.started` until queued PCM and the playback child have drained. A
-`max_message_bytes` setting ranges from 2,048 through 65,536 payload bytes and
-defaults to 65,536; WebSocket framing overhead is separate, and the minimum
-carries one fixed 2,048-byte recorder frame. Protocol v2 does not supply
-acoustic echo cancellation, and the released device setup has no active AEC.
-Simultaneous listen/speak, true double-talk, and barge-in are therefore outside
-this milestone.
+The reference v1.1.7 client remains turn-taking by default: with
+`full_duplex: false`, it gates microphone submission from `speaking.started`
+until queued PCM and the playback child have drained. A `max_message_bytes`
+setting ranges from 2,048 through 65,536 payload bytes and defaults to 65,536;
+WebSocket framing overhead is separate, and the minimum carries one fixed
+2,048-byte recorder frame.
+
+Full duplex is an explicit, fail-closed device option; protocol v2 itself does
+not provide AEC. Before opening the socket, the reference client requires the
+reviewed static PulseAudio `module-echo-cancel` topology with
+`aec_method=webrtc`, exact raw hardware masters and AEC endpoint names, those
+endpoints as defaults, and every current-process native capture stream routed
+through the uncorked AEC source. Every AEC sink channel must be at or below the
+configured `aec_test_volume_percent`, which is limited to 1–25. The same sink
+ceiling is rechecked before every speaking epoch, and `paplay` is pinned to the
+AEC sink with a fixed linear stream volume no greater than that ceiling. The
+sink guard compares raw PulseAudio volume units against the exact linear
+ceiling; it does not trust the rounded displayed percentage.
+
+Only after those checks does the client keep microphone submission active
+during playback. `input_audio_buffer.speech_started` flushes the local player
+and quarantines late output PCM, but it is only a local barge-in boundary; the
+correlated interrupt acknowledgement below decides whether the remote session
+is safe to resume.
 
 ## JSON control messages
 
@@ -160,15 +182,23 @@ The following client-to-bridge controls remain JSON:
 - `speech`: request speech from non-empty text.
 - `ping`: request `{"type":"pong"}`.
 - `stop`: end the session normally.
-- `interrupt`: end the current remote realtime session immediately.
+- `interrupt`: flush local output and request cancellation of the active
+  provider response.
 
-V2 device mode is chat-only. A v2 start containing `tools`, an incoming
-`tool_result`, or a provider tool call is rejected and never forwarded to the
-speaker. Okay Nabu and Home Assistant retain home-control authority. An
-audited, Home Assistant-owned tool broker is future work. Legacy v1 keeps its
-existing tool exchange, including one-shot result consumption.
+The v2 device remains audio/control only. A v2 start containing `tools` or an
+incoming device `tool_result` is rejected. Provider tool calls and Home
+Assistant results are never forwarded to the speaker. Realtime home control is
+disabled unless exactly one Home Assistant Conversation subentry is explicitly
+opted in as authority. That subentry opens the separate
+`/v1/home-assistant/tools` WebSocket with the primary bridge token, registers a
+bounded snapshot of its selected Home Assistant LLM API tools and rendered
+instructions, and executes correlated calls locally. Its locale defaults to
+`es-MX`. The route-scoped device bearer cannot open that broker, and zero,
+ambiguous, stale, disconnected, timed-out, or invalid authority fails closed.
+Legacy v1 keeps its existing device-visible tool exchange for compatibility.
 
-An interrupt returns the following control before the socket closes:
+An interrupt that is not explicitly confirmed returns the safe fallback before
+the socket closes:
 
 ```json
 {
@@ -183,6 +213,24 @@ The device should flush its local playback queue on receipt. Continuing after
 an interrupt requires a new WebSocket and therefore a fresh remote realtime
 session. This is session teardown, not a claim that the provider truncated a
 response.
+
+If and only if the bridge receives a provider `response.cancelled` event whose
+response identifier matches the response active when the request was sent, it
+returns:
+
+```json
+{
+  "type": "stopped",
+  "reason": "interrupt",
+  "fresh_session_required": false,
+  "remote_cancelled": true
+}
+```
+
+The client may then continue on the same WebSocket. A cancellation event for a
+different response, a completion event, send failure, or the bounded
+confirmation timeout cannot produce this acknowledgement and falls back to
+fresh-session teardown.
 
 Control RPCs and WebSocket sends have finite deadlines. A failure is returned
 as an `error` when the socket remains writable, followed by exactly-once
@@ -200,9 +248,12 @@ emit only an allowlisted, content-free signal:
 ```
 
 The allowlist is limited to session, speech-boundary, response-boundary, and
-turn-boundary event names. Transcript fragments, deltas, delegation payloads,
-unknown future events, malformed JSON, and every other provider field are
-dropped at the trust boundary.
+turn-boundary event names, including the content-free name
+`response.cancelled`. The provider response identifier is consumed only inside
+the bridge to correlate an outstanding interrupt; it is not included in the
+device control. Transcript fragments, deltas, tool payloads, delegation
+payloads, unknown future events, malformed JSON, and every other provider field
+are dropped at the trust boundary.
 
 ## Version 1 compatibility
 

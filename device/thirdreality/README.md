@@ -1,7 +1,7 @@
 # ThirdReality v1.1.7 device overlay
 
 This directory contains the guarded wake-latency patch and the Milestone 2
-realtime turn-taking client for the Python-based ThirdReality
+realtime client for the Python-based ThirdReality
 `1.01.07`/upstream `v1.1.7` image. The realtime client uses only the Python
 standard library, runs inside the existing `linux_voice_assistant` process, and
 does not add a daemon, replace firmware, or change Home Assistant.
@@ -11,23 +11,29 @@ The two wake phrases deliberately have different authority:
 | Wake phrase | Route | Capability |
 |---|---|---|
 | Okay Nabu | Official Home Assistant Assist satellite flow | Local/remote STT, Conversation, TTS, and Home Assistant controls |
-| Okay Computer | Direct realtime wire v2 to the Codex Voice bridge | Subscription-backed chat voice only; no Home Assistant tools |
+| Okay Computer | Direct realtime wire v2 to the Codex Voice bridge | Subscription voice over untrusted audio/control wire; optional Home Assistant tools only through a separate HA-owned broker |
 
 Okay Nabu can preempt an active direct session and immediately reclaim the
-microphone for the normal Home Assistant path. Saying the configured stop word
-or otherwise stopping direct mode flushes local playback and tears down the
-remote session. A later direct turn always creates a fresh WebSocket, Codex
-thread, and realtime session; the provider does not offer reliable response
-cancellation or truncation.
+microphone for the normal Home Assistant path. Saying the configured stop word,
+starting the normal Home Assistant path, mute/disconnect, or otherwise releasing
+the vendor owner flushes local playback and tears down the remote session. A
+later wake after any such teardown creates a fresh WebSocket and realtime
+session. In opt-in full-duplex mode, provider VAD can instead flush playback for
+natural barge-in without releasing that owner. An explicit interrupt preserves
+the same socket only when the bridge returns an authoritative acknowledgement
+that remote cancellation succeeded; timeout or ambiguous cancellation closes
+the session.
 
 ## Realtime behavior and bounds
 
 [`realtime_client`](realtime_client) opens the authenticated v2 WebSocket,
 sends 16 kHz mono PCM16 microphone frames, and plays 24 kHz mono PCM16 through
 a fixed-argument `paplay` child. Explicit `speaking.started` and
-`speaking.stopped` epochs own playback. In the released turn-taking mode,
+`speaking.stopped` epochs own playback. In the default turn-taking mode,
 microphone frames are gated for as long as remote or locally buffered output
-can still be audible.
+can still be audible. Opt-in full duplex keeps microphone submission continuous
+only after a startup preflight verifies the exact echo-cancel source, sink, and
+loaded PulseAudio module.
 
 The default input and pre-ready fallback buffers are each 64 KiB: 2.048 seconds
 at 16 kHz mono PCM16. Once a cold handshake completes, queued input is sent at
@@ -60,11 +66,39 @@ PCM16. The bridge separately caps only v2 live input at 2,250 ms; its finite STT
 adapters retain their whole-utterance capacity. These are safety bounds, not a
 latency promise.
 
-`full_duplex` accepts only `false` for this release; `true` fails configuration
-loading. The v1.1.7 deployment has no active acoustic echo cancellation, so
-listening while `paplay` is audible would feed the assistant's response back
-into its microphone. True full duplex, measured AEC, and barge-in acceptance
-are future milestones.
+`full_duplex` remains `false` by default. Setting it to `true` also requires
+explicit safe `pulse_aec_source` and `pulse_aec_sink` names. Before it connects
+to the bridge, the client requires those exact PulseAudio defaults and a loaded
+`module-echo-cancel` with the expected raw hardware masters, endpoint names,
+WebRTC method, and master format. It also requires an uncorked native capture
+stream owned by the current voice-process PID—including the already-open vendor
+recorder—to use that AEC source, and requires every live AEC sink channel to be
+at or below `aec_test_volume_percent`; output `paplay` is pinned to the same
+sink. A failed or mismatched check ends startup before any microphone audio
+leaves the device. Every full-duplex `paplay` child also receives a fixed linear
+stream-volume cap derived from that percentage, so a new response cannot start
+above the canary ceiling established by configuration. The sink-volume check
+runs again before every `speaking.started`, not only during startup; a raised
+channel fails the response closed. The guard compares raw PulseAudio units to
+the exact linear ceiling rather than trusting the rounded displayed percent.
+
+While verified full duplex is active, capture remains continuous during
+playback. A provider `input_audio_buffer.speech_started` event immediately
+terminates the owned `paplay` child, clears the local output gate, and
+quarantines already-in-flight PCM until the matching speaking stop or a newer
+monotonic epoch. The event does not itself claim remote cancellation or tear
+down the session. The client separately negotiates
+`same_session_interrupt_ack: true`, accepts the bridge's sanitized
+`response.cancelled` event, and reuses the socket only for the explicit
+`fresh_session_required: false` / `remote_cancelled: true` stopped
+acknowledgement. The older safe fallback acknowledgement still closes it.
+
+Full duplex is deliberately opt-in because a syntactically correct topology is
+not proof of acoustic performance. Install and qualify the static PulseAudio
+AEC assets in [`deploy`](deploy) first. The initial acoustic canary must use the
+configured `aec_test_volume_percent`, which defaults to 25 and is hard-limited
+to 1–25. Do not exceed 25% until echo rejection and barge-in pass on the physical
+device.
 
 ## Wake-latency patch
 
@@ -78,10 +112,11 @@ include the combined device and Home Assistant path; they do not isolate the
 LED call by itself.
 
 [`latency_sitecustomize/sitecustomize.py`](latency_sitecustomize/sitecustomize.py)
-uses an LED-only acknowledgement on this hardware without active acoustic echo
-cancellation. On the pinned single microphone thread, it pre-arms forwarding,
-queues the pipeline start request, and ducks music without playing the local
-wake cue. For Okay Computer only, its bounded RAM pre-roll recovers recorder
+uses an LED-only acknowledgement and does not play wake audio; this cue-free
+path remains independent of whether the optional full-duplex AEC topology is
+enabled. On the pinned single microphone thread, it pre-arms forwarding, queues
+the pipeline start request, and ducks music without playing the local wake cue.
+For Okay Computer only, its bounded RAM pre-roll recovers recorder
 frames handled before that direct owner exists; Okay Nabu explicitly discards
 the same history. The
 ThirdReality LED command is queued on one daemon worker, so the DBus subprocess
@@ -120,6 +155,11 @@ realtime_client/
   config.py
   session.py
   websocket.py
+deploy/
+  README.md
+  prepare_pulseaudio_aec.py
+  pulse/
+    codex-echo-cancel.pa
 codex-realtime.example.json
 README.md
 LICENSE
@@ -130,8 +170,18 @@ credential. Generate a distinct `HA_CODEX_REALTIME_DEVICE_TOKEN` on the bridge
 host, configure that same value only in the root-only device file, and never
 put the token in the archive, repository, shell history, or diagnostics. The
 device token is accepted only by `/v1/realtime` after a valid v2 negotiation;
-it cannot enter legacy v1. Do not reuse the Home Assistant bridge token, a Home
-Assistant access token, or Codex `auth.json`.
+it cannot enter legacy v1 or `/v1/home-assistant/tools`. Do not reuse the Home
+Assistant bridge token, a Home Assistant access token, or Codex `auth.json`.
+
+The device never receives tool schemas, tool calls, results, or a Home
+Assistant credential. Realtime home control is disabled by default. To enable
+it, explicitly select **Provide Home Assistant tools to realtime voice** on
+exactly one Codex Voice Conversation subentry and choose only the Home Assistant
+LLM APIs that should be exposed. The integration uses its primary bridge token
+to maintain a separate broker connection, defaults that authority's response
+locale to `es-MX`, and executes every correlated call inside Home Assistant.
+Zero, multiple, disconnected, or changed authorities fail closed; nothing is
+added to the device configuration or v2 frames.
 
 Treat `PYTHONPATH` as root-process code execution. Copy only the reviewed file
 and package from a pinned repository commit or release asset, verify SHA-256
@@ -174,7 +224,8 @@ replace the documentation address and placeholder token, then explicitly set
   "wake_phrase": "okay computer",
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
-  "full_duplex": false
+  "full_duplex": false,
+  "aec_test_volume_percent": 25
 }
 ```
 
@@ -188,6 +239,29 @@ bytes, excluding framing overhead; its minimum therefore carries exactly one
 fixed 2,048-byte recorder frame. An absent or explicitly disabled config
 leaves the direct client inactive while retaining the guarded wake-latency
 patch.
+
+To qualify full duplex, first follow [`deploy/README.md`](deploy/README.md).
+The pinned PulseAudio server starts with `--disallow-module-loading`, and its
+`default.pa.d` include occurs before the raw hardware masters; dynamic module
+loading or a naive drop-in cannot establish the required startup order. The
+guarded helper dry-runs by default, backs up the root config, and appends an
+exact fail-closed block after the `hw:0,2` capture and `hw:0,1` playback
+masters. It never restarts services, changes volume, or changes ADB. Once its
+static and physical canaries pass, add all four settings together:
+
+```json
+{
+  "full_duplex": true,
+  "pulse_aec_source": "codex_echo_cancel_source",
+  "pulse_aec_sink": "codex_echo_cancel_sink",
+  "aec_test_volume_percent": 25
+}
+```
+
+PulseAudio object names must start with an ASCII letter, contain only ASCII
+letters, digits, `.` or `_`, and be at most 128 characters. Supplying AEC routes
+while full duplex is disabled, omitting either route while it is enabled, or
+setting the canary volume outside 1–25 fails configuration loading.
 
 Optional `voice` and `prompt` settings are sent only in the v2 start message.
 Voice names start with an ASCII letter, contain 1–64 ASCII letters, digits,
@@ -237,22 +311,39 @@ post-wake microphone frame, VAD/run-end/disconnect/mute flag races during setup,
 startup guards and exceptions, bounded direct-only pre-roll, normal-wake
 discard, 32 KiB live headroom, normal-wake preemption, pre-ready fallback and
 replay, strict v2 framing, bounded pacing and queues, output-epoch playback,
-interrupt cleanup, timer interruption, serialized non-blocking LED execution,
-newest-state overload coalescing, DBus timeout/nonzero handling, explicit
-worker shutdown, and the atomic unknown-bytecode fail-closed path.
+PulseAudio AEC preflight and explicit sink routing, continuous full-duplex
+capture, speech-start local flush and late-frame quarantine, authoritative
+same-socket interrupt acknowledgement, guarded static-AEC installation and
+rollback, interrupt cleanup, timer interruption, serialized non-blocking LED
+execution, newest-state overload coalescing, DBus timeout/nonzero handling,
+explicit worker shutdown, and the atomic unknown-bytecode fail-closed path.
 
 On the physical device, verify these independently:
 
 1. Okay Nabu still completes Home Assistant commands, timers, announcements,
    reconnects, and repeated wakes.
-2. Okay Computer starts direct chat, speaks a response, returns to listening,
+2. Okay Computer starts direct voice, speaks a response, returns to listening,
    and responds to the stop word without replaying its own output.
-3. A normal wake can preempt direct mode and then control Home Assistant.
-4. A forced pre-ready connection failure enters the official Assist fallback
+3. With realtime authority disabled, Okay Computer cannot control Home
+   Assistant. With exactly one deliberately opted-in Conversation authority,
+   it can invoke only a reviewed test entity from the selected LLM API, while
+   the device still receives no tool schema, call, result, or primary token.
+4. A normal wake can preempt direct mode and then control Home Assistant.
+5. A forced pre-ready connection failure enters the official Assist fallback
    without clipping the retained command prefix.
-5. Repeated direct and standard turns leave one stable voice process, no
+6. Repeated direct and standard turns leave one stable voice process, no
    `paplay` child or LED/duck state behind, and bounded memory.
-6. TCP ADB remains reachable on port 5555 before deployment, after the service
+7. At no more than the configured 25% canary volume, speak over early, middle,
+   and late response audio from near and far positions. Playback must stop at
+   speech detection, the command must be recognized once, and response audio
+   must not appear as user speech. Repeat after an idle gap and reconnect.
+   Raising any AEC sink channel above the configured ceiling between responses
+   must fail the next response, and the spawned `paplay` stream must remain
+   pinned at or below 25%.
+8. A deliberately missing AEC module or mismatched default source/sink must fail
+   direct startup before sending microphone audio, while Okay Nabu remains
+   usable after rollback to `full_duplex: false`.
+9. TCP ADB remains reachable on port 5555 before deployment, after the service
    restart, and after any reboot. The overlay and its procedures must never
    stop `adbd`, blank its TCP-port setting, or remove that recovery path.
 
@@ -271,10 +362,13 @@ or breaks the standard Home Assistant path.
 
 To disable only direct mode, set `enabled` to `false` in the root-only config
 and restart `voice-assistant`; the latency patch remains active. Full rollback
-removes the process-specific `PYTHONPATH` assignment and restarts only
-`voice-assistant`, allowing untouched vendor bytecode to supply the original
-behavior. Preserve the init-script and configuration backups until all physical
-tests pass. Verify TCP ADB on port 5555 before and after either operation.
+first sets `full_duplex` to `false`, removes the exact managed PulseAudio tail
+with the guarded deploy helper, and performs the controlled PulseAudio/service
+restart. Removing the process-specific `PYTHONPATH` assignment and restarting
+only `voice-assistant` then allows untouched vendor bytecode to supply the
+original behavior. Preserve the PulseAudio, init-script, and configuration
+backups until all physical tests pass. Verify TCP ADB on port 5555 before and
+after every operation.
 
 ## Rejected global playback-cache experiment
 

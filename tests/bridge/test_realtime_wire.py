@@ -5,7 +5,11 @@ import json
 import pytest
 
 from bridge.errors import ProtocolError
-from bridge.realtime_wire import RealtimeWireProtocol, sanitized_data_control_event
+from bridge.realtime_wire import (
+    RealtimeWireProtocol,
+    parse_data_control_event,
+    sanitized_data_control_event,
+)
 
 
 def test_legacy_realtime_wire_defaults_to_json_base64() -> None:
@@ -40,6 +44,7 @@ def test_binary_realtime_wire_negotiates_explicit_pcm_shape() -> None:
             "binary_pcm16": True,
             "local_flush": True,
             "remote_cancel": False,
+            "same_session_interrupt_ack": True,
         },
     }
 
@@ -132,6 +137,40 @@ def test_data_control_event_is_allowlisted_and_content_free() -> None:
     )
 
     assert event == {"type": "control", "event_type": "turn.done"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"type": "response.cancelled", "response": {"id": "private-id"}},
+        {
+            "type": "response.done",
+            "response": {"id": "private-id", "status": "cancelled"},
+        },
+    ],
+)
+def test_data_control_event_recognizes_explicit_cancel_confirmation(
+    value: dict[str, object],
+) -> None:
+    control = parse_data_control_event(json.dumps(value))
+
+    assert control is not None
+    assert control.response_cancelled is True
+    assert control.response_id == "private-id"
+    assert control.wire_value() == {
+        "type": "control",
+        "event_type": value["type"],
+    }
+
+
+def test_response_done_without_cancelled_status_is_not_confirmation() -> None:
+    control = parse_data_control_event(
+        json.dumps({"type": "response.done", "response": {"status": "completed"}})
+    )
+
+    assert control is not None
+    assert control.response_cancelled is False
+    assert control.response_id is None
 
 
 @pytest.mark.parametrize(

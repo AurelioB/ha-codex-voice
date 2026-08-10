@@ -18,6 +18,10 @@ _MAX_PROMPT_CHARACTERS = 1_024
 _RECORDER_FRAME_BYTES = 2_048
 _NORMAL_WAKE_PHRASE = "okay nabu"
 _VOICE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+_PULSE_OBJECT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9._]{0,127}\Z")
+DEFAULT_PULSE_AEC_SOURCE = "codex_echo_cancel_source"
+DEFAULT_PULSE_AEC_SINK = "codex_echo_cancel_sink"
+DEFAULT_AEC_TEST_VOLUME_PERCENT = 25
 _ALLOWED_KEYS = frozenset(
     {
         "enabled",
@@ -39,6 +43,9 @@ _ALLOWED_KEYS = frozenset(
         "output_queue_bytes",
         "max_message_bytes",
         "full_duplex",
+        "pulse_aec_source",
+        "pulse_aec_sink",
+        "aec_test_volume_percent",
     }
 )
 
@@ -69,6 +76,38 @@ class RealtimeConfig:
     full_duplex: bool
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
+    pulse_aec_source: str | None = None
+    pulse_aec_sink: str | None = None
+    aec_test_volume_percent: int = DEFAULT_AEC_TEST_VOLUME_PERCENT
+
+    def __post_init__(self) -> None:
+        """Keep direct construction as strict as the root-only JSON loader."""
+        if not isinstance(self.full_duplex, bool):
+            raise ConfigError("full_duplex must be a boolean")
+        if (
+            isinstance(self.aec_test_volume_percent, bool)
+            or not isinstance(self.aec_test_volume_percent, int)
+            or not 1 <= self.aec_test_volume_percent <= DEFAULT_AEC_TEST_VOLUME_PERCENT
+        ):
+            raise ConfigError(
+                "aec_test_volume_percent must be an integer from 1 through 25"
+            )
+        for key, candidate in (
+            ("pulse_aec_source", self.pulse_aec_source),
+            ("pulse_aec_sink", self.pulse_aec_sink),
+        ):
+            if candidate is not None and (
+                not isinstance(candidate, str)
+                or not _PULSE_OBJECT_NAME.fullmatch(candidate)
+            ):
+                raise ConfigError(f"{key} must be a safe PulseAudio object name")
+        if self.full_duplex:
+            if self.pulse_aec_source is None or self.pulse_aec_sink is None:
+                raise ConfigError(
+                    "full_duplex requires explicit pulse_aec_source and pulse_aec_sink"
+                )
+        elif self.pulse_aec_source is not None or self.pulse_aec_sink is not None:
+            raise ConfigError("PulseAudio AEC routing requires full_duplex")
 
 
 def normalize_wake_phrase(value: str) -> str:
@@ -177,10 +216,14 @@ def load_config(
     full_duplex = decoded.get("full_duplex", False)
     if not isinstance(full_duplex, bool):
         raise ConfigError("full_duplex must be a boolean")
-    if full_duplex:
+    pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
+    pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
+    if full_duplex and (pulse_aec_source is None or pulse_aec_sink is None):
         raise ConfigError(
-            "full_duplex must be false because acoustic echo cancellation is unavailable"
+            "full_duplex requires explicit pulse_aec_source and pulse_aec_sink"
         )
+    if not full_duplex and (pulse_aec_source is not None or pulse_aec_sink is not None):
+        raise ConfigError("PulseAudio AEC routing requires full_duplex")
 
     config = RealtimeConfig(
         url=parsed.geturl(),
@@ -250,6 +293,15 @@ def load_config(
         full_duplex=full_duplex,
         voice=voice,
         prompt=prompt,
+        pulse_aec_source=pulse_aec_source,
+        pulse_aec_sink=pulse_aec_sink,
+        aec_test_volume_percent=_bounded_int(
+            decoded,
+            "aec_test_volume_percent",
+            default=DEFAULT_AEC_TEST_VOLUME_PERCENT,
+            minimum=1,
+            maximum=DEFAULT_AEC_TEST_VOLUME_PERCENT,
+        ),
     )
     _validate_start_message_size(config)
     return config
@@ -347,6 +399,15 @@ def _optional_prompt(value: dict[str, Any]) -> str | None:
         raise ConfigError("prompt must be non-empty text up to 1024 characters")
     if any(not character.isprintable() for character in candidate):
         raise ConfigError("prompt must not contain control characters")
+    return candidate
+
+
+def _optional_pulse_name(value: dict[str, Any], key: str) -> str | None:
+    if key not in value:
+        return None
+    candidate = value.get(key)
+    if not isinstance(candidate, str) or not _PULSE_OBJECT_NAME.fullmatch(candidate):
+        raise ConfigError(f"{key} must be a safe PulseAudio object name")
     return candidate
 
 

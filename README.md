@@ -2,7 +2,7 @@
 
 Codex Voice is an unofficial Home Assistant integration that exposes a
 Conversation agent, an experimental text-to-speech adapter, an experimental
-speech-to-text adapter, and an experimental realtime turn-taking transport
+speech-to-text adapter, and an experimental direct realtime transport
 backed by a user's existing ChatGPT/Codex login. The recommended Assist
 configuration uses Home Assistant's native Wyoming integration for local
 faster-whisper STT and local Piper TTS, with Codex Voice providing the
@@ -31,6 +31,10 @@ ThirdReality: "Okay Nabu"
 ThirdReality: "Okay Computer"
   -> in-process stdlib client -> realtime wire v2 -> bridge
   -> Codex App Server WebRTC (ChatGPT OAuth) -> speaker
+
+Explicitly opted-in Conversation subentry
+  -> primary-token Home Assistant tool broker -> bridge
+  -> bounded tools/results for the direct realtime session
 ```
 
 HACS installs only `custom_components/codex_voice`. The bridge must run on a
@@ -41,8 +45,11 @@ original credential through the link. Normal Codex history, configuration,
 apps, plugins, and MCP servers are not imported into voice sessions. The
 bridge sends Home Assistant only text/audio results; Home Assistant never
 receives the ChatGPT credential. Device-facing v2 returns only audio and
-content-free lifecycle controls. Entity exposure and tool execution remain
-inside Home Assistant, so its user and Assist policies stay authoritative.
+content-free lifecycle controls. The device never declares tools or receives
+tool calls/results. When exactly one Conversation subentry is explicitly
+enabled as the realtime authority, Home Assistant separately registers its
+bounded LLM-tool view over the primary-token broker and executes every call
+locally, so its exposed-entity and Assist policies stay authoritative.
 External Wyoming service templates and smoke scripts are repository assets,
 not part of the component-only HACS ZIP.
 
@@ -63,21 +70,30 @@ not part of the component-only HACS ZIP.
 - Automatic experimental STT-to-TTS session reuse is disabled: current
   realtime v3 sessions can begin assistant output before finite transcription
   completes.
-- Milestone 2: an experimental ThirdReality v1.1.7 realtime turn-taking client
-  and strict binary wire protocol. “Okay Computer” starts direct, chat-only
-  subscription voice; “Okay Nabu” keeps the official Home Assistant Assist
-  flow and its entity controls. The client runs inside the existing Python
-  voice process and requires no firmware flash or second device daemon.
-- Acoustic echo cancellation, simultaneous listen/speak, and true barge-in are
-  not enabled. Direct mode gates microphone forwarding while its own output can
-  still be audible. A stop or preemption flushes local playback and creates a
-  fresh remote session because provider response cancellation is unavailable.
+- Milestone 2: an experimental ThirdReality v1.1.7 realtime client and strict
+  binary wire protocol. “Okay Computer” starts direct subscription voice;
+  “Okay Nabu” keeps the official Home Assistant Assist flow. The client runs
+  inside the existing Python voice process and requires no firmware flash or
+  second device daemon. It remains an untrusted audio/control endpoint.
+- Realtime Home Assistant tools are disabled by default. An operator may
+  explicitly designate exactly one Conversation subentry as the authority;
+  that subentry registers only its selected Home Assistant LLM API tools over
+  a separate primary-token broker. The route-scoped device token cannot open
+  the broker, and no tool schema, call, result, or Home Assistant credential is
+  exposed on wire v2.
+- Direct mode remains turn-taking by default. Opt-in full duplex requires the
+  reviewed static PulseAudio `module-echo-cancel` topology with WebRTC AEC,
+  exact capture/playback routing, a startup safety preflight, a sink-volume
+  ceiling recheck before every response, and a fixed `paplay` stream volume of
+  at most 25%. Barge-in resumes the same remote session only after the bridge
+  correlates an explicit provider cancellation; timeout or ambiguity tears it
+  down and requires a fresh session.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.146.0 or newer.
 
-Both modes currently take turns. Realtime mode is a separate streaming PCM
-transport, not a pretend STT/TTS pipeline and not a path around Home
-Assistant's home-control policy.
+The recommended Assist pipeline remains turn-based. Direct realtime is a
+separate streaming PCM transport, not a pretend STT/TTS pipeline and not a path
+around Home Assistant's home-control policy.
 
 ## Quick start
 
@@ -170,6 +186,12 @@ and select voice `es_MX-ald-medium`. The bridge treats the pipeline locale as
 trusted response-language context. The component leaves Home Assistant's
 global interface language unchanged.
 
+Conversation profiles also expose **Provide Home Assistant tools to realtime
+voice** and **Realtime voice language**. Tool authority is off by default and
+may be enabled on exactly one Conversation subentry. Its realtime language
+defaults to `es-MX`. Only the Home Assistant LLM APIs selected on that subentry
+are registered; enabling it does not give the speaker a Home Assistant token.
+
 For the lowest latency on ordinary device-control commands, enable **Prefer
 handling commands locally** on that pipeline. Home Assistant will handle
 matching built-in intents locally and retain Codex Voice as the fallback for
@@ -181,15 +203,25 @@ Release assets include `thirdreality-realtime.zip` for the pinned Python-based
 ThirdReality v1.1.7 client. It contains the guarded `sitecustomize.py`, the
 stdlib-only `realtime_client` package, and a secret-free configuration example.
 Follow the [device deployment, verification, and rollback
-contract](device/thirdreality/README.md). `full_duplex` accepts only `false` in
-this release because the device path has no verified acoustic echo
-cancellation; `true` fails configuration loading.
+contract](device/thirdreality/README.md). `full_duplex` remains `false` by
+default. Enabling it is fail-closed unless the reviewed static PulseAudio
+WebRTC-AEC topology, exact source/sink routing, current-process capture route,
+and configured 1–25% sink ceiling all pass before the bridge socket opens.
+The sink ceiling is checked again before every response, and full-duplex
+`paplay` is pinned to that AEC sink with a fixed stream volume no greater than
+the configured ceiling.
 
 The deployment adds “Okay Computer” alongside “Okay Nabu”; it does not replace
 the standard Assist path. The device configuration is root-owned and mode 0600,
 and stores only the route-scoped realtime bearer—not the Home Assistant token
 or the Codex OAuth credential. Deployment and rollback must preserve and verify
 TCP ADB port 5555 on devices where it is the approved recovery path.
+
+That route-scoped token authorizes only a successfully negotiated v2 audio
+session. It cannot connect to the Home Assistant tool broker. If realtime tools
+are explicitly enabled, the Home Assistant integration maintains the separate
+broker connection with the primary bridge token and executes calls against its
+captured, bounded LLM API view.
 
 Direct sessions can optionally select a realtime voice and a bounded session
 prompt. The shipped disabled example uses `cove` and explicitly keeps Mexican
@@ -209,6 +241,16 @@ subentry, the model receives only tools selected by Home Assistant. Tool calls
 are returned to the integration, executed inside Home Assistant, and sent back
 to the same Codex turn. The bridge does not need a Home Assistant long-lived
 access token.
+
+Direct realtime uses the same authority only after a second, explicit opt-in
+on exactly one Conversation subentry. Home Assistant captures that subentry's
+rendered instructions, `es-MX`-by-default realtime locale, and selected LLM API
+tool schemas, then registers a bounded generation over
+`/v1/home-assistant/tools` with the primary bridge token. Each direct session
+captures one immutable generation. The bridge forwards only allowlisted,
+size-bounded calls to Home Assistant and fails closed if the authority changes,
+disconnects, times out, or returns an invalid result. The device token cannot
+use this route, and the device wire remains audio/control only.
 
 Codex threads use a required named permission profile that exposes only minimal
 runtime paths. The default bridge command also disables shell, web, plugins,
@@ -242,7 +284,9 @@ defense in depth.
 strict device-facing v2 protocol. The shipped ThirdReality client negotiates
 v2, streams binary 16 kHz mono PCM16 input, and receives binary 24 kHz mono
 PCM16 output between explicit, monotonic speaking-epoch controls. V2 exposes
-no transcripts, raw provider events, tool calls, or tool results.
+no transcripts, raw provider events, tool calls, or tool results. Optional
+Home Assistant tools travel only over the separate primary-token authority
+broker; the bridge, not the device, binds them to the provider session.
 
 The client keeps startup and fallback audio in bounded 64 KiB queues (2.048 s
 at its input format). After a cold handshake, it transfers a queued backlog at
@@ -258,9 +302,14 @@ unlimited stale backlog; they do not eliminate the cold handshake or provider
 response latency. Device playback buffering is limited to 48 KiB, about 1.024
 s at the output format.
 
-An `interrupt` means local playback flush plus socket/session teardown. The
-bridge advertises `local_flush: true` and `remote_cancel: false`; the next turn
-uses a new WebSocket, Codex thread, and realtime session. See the complete
+The bridge advertises `local_flush: true`, `remote_cancel: false`, and
+`same_session_interrupt_ack: true`. The first two fields still forbid assuming
+that a local flush truncated provider output. On `interrupt`, the bridge asks
+the provider to cancel the active response and permits same-socket continuation
+only after a `response.cancelled` event correlated to that exact response. The
+explicit success acknowledgement has `fresh_session_required: false` and
+`remote_cancelled: true`; timeout, mismatch, or ambiguity returns the safe
+fresh-session acknowledgement and closes the remote resource. See the complete
 [v2 wire contract](protocol/realtime-wire-v2.md).
 
 The retained experimental Codex TTS entity uses the authenticated
@@ -394,11 +443,18 @@ opt-in and must never print OAuth tokens or recorded audio.
   until a timeout. Wyoming STT does not use that lane.
 - HACS cannot install the bridge process. Run it separately or use the future
   add-on/container packaging.
-- The pinned ThirdReality v1.1.7 overlay supports direct realtime turn-taking,
-  not full duplex. “Okay Computer” is chat-only and cannot control Home
-  Assistant; use “Okay Nabu” for the official Assist pipeline and its exposed
-  entities. Without active AEC, listening during playback would feed the
-  speaker's own response back into the microphone.
+- The pinned ThirdReality v1.1.7 overlay defaults to direct realtime
+  turn-taking. Full duplex is an explicit post-qualification option that
+  requires the repository's static PulseAudio WebRTC-AEC topology, exact
+  process routing, a preflight plus per-response sink ceiling, and a fixed
+  `paplay` stream cap of at most 25%. A syntactically valid topology is not
+  proof of acoustic echo rejection; do not enable it before physical
+  double-talk and rollback canaries pass.
+- “Okay Computer” remains an untrusted audio/control client. Home Assistant
+  control is available only when exactly one Conversation subentry is
+  explicitly opted in as realtime authority. Home Assistant—not the device—
+  registers bounded tools over the primary-token broker and executes calls.
+  Missing, ambiguous, changed, or disconnected authority fails closed.
 - ThirdReality firmware 1.01.07 normally withholds microphone audio until its
   wake confirmation sound finishes, then may block the microphone thread for
   up to two seconds while updating the LED. The optional pinned overlay uses an

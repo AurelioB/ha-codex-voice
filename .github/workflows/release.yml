@@ -22,6 +22,7 @@ jobs:
         run: |
           mkdir -p release/thirdreality-realtime/latency_sitecustomize
           mkdir -p release/thirdreality-realtime/realtime_client
+          mkdir -p release/thirdreality-realtime/deploy/pulse
           install -m 0644 \
             device/thirdreality/latency_sitecustomize/sitecustomize.py \
             release/thirdreality-realtime/latency_sitecustomize/sitecustomize.py
@@ -32,6 +33,13 @@ jobs:
             release/thirdreality-realtime/codex-realtime.example.json
           install -m 0644 device/thirdreality/README.md \
             release/thirdreality-realtime/README.md
+          install -m 0644 device/thirdreality/deploy/README.md \
+            release/thirdreality-realtime/deploy/README.md
+          install -m 0755 device/thirdreality/deploy/prepare_pulseaudio_aec.py \
+            release/thirdreality-realtime/deploy/prepare_pulseaudio_aec.py
+          install -m 0644 \
+            device/thirdreality/deploy/pulse/codex-echo-cancel.pa \
+            release/thirdreality-realtime/deploy/pulse/codex-echo-cancel.pa
           install -m 0644 LICENSE release/thirdreality-realtime/LICENSE
           cd release/thirdreality-realtime
           zip -r ../../thirdreality-realtime.zip .

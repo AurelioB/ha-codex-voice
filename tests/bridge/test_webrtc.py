@@ -111,6 +111,37 @@ def test_pcm_track_default_still_accepts_finite_stt_utterances() -> None:
         track.stop()
 
 
+def test_webrtc_data_channel_sends_provider_control_only_when_open() -> None:
+    class Channel:
+        readyState = "open"
+
+        def __init__(self) -> None:
+            self.sent: list[str | bytes] = []
+
+        def send(self, value: str | bytes) -> None:
+            self.sent.append(value)
+
+    channel = Channel()
+    peer = object.__new__(WebRtcPeer)
+    peer.data_channel = channel
+    peer.closed = False
+    peer._transport_error = None
+
+    peer.send_data_event('{"type":"response.cancel"}')
+
+    assert channel.sent == ['{"type":"response.cancel"}']
+
+
+def test_webrtc_data_channel_send_fails_closed_before_open() -> None:
+    peer = object.__new__(WebRtcPeer)
+    peer.data_channel = SimpleNamespace(readyState="connecting")
+    peer.closed = False
+    peer._transport_error = None
+
+    with pytest.raises(ProtocolError, match="data channel is not open"):
+        peer.send_data_event('{"type":"response.cancel"}')
+
+
 @pytest.mark.asyncio
 async def test_remote_audio_overflow_is_terminal_instead_of_dropping_audio(
     monkeypatch: pytest.MonkeyPatch,

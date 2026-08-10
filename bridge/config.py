@@ -111,8 +111,15 @@ class BridgeConfig:
 
         token = os.environ.get("HA_CODEX_BRIDGE_TOKEN", "")
         command_text = os.environ.get("CODEX_APP_SERVER_COMMAND")
+        codex_binary = os.environ.get("HA_CODEX_BINARY")
         command = (
-            tuple(shlex.split(command_text)) if command_text else DEFAULT_CODEX_COMMAND
+            tuple(shlex.split(command_text))
+            if command_text
+            else (
+                (codex_binary, *DEFAULT_CODEX_COMMAND[1:])
+                if codex_binary
+                else DEFAULT_CODEX_COMMAND
+            )
         )
         return cls(
             bearer_token=token,

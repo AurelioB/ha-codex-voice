@@ -150,7 +150,7 @@ class CodexAppServer:
                         "clientInfo": {
                             "name": "ha_codex_voice",
                             "title": "Home Assistant Codex Voice Bridge",
-                            "version": "0.3.0",
+                            "version": "0.4.0",
                         },
                         "capabilities": {"experimentalApi": True},
                     },

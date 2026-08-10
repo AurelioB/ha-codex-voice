@@ -9,7 +9,7 @@ sides of a narrow bridge API.
 - A ThirdReality realtime endpoint stores a separate route-scoped bearer in a
   root-owned, mode-0600 device file. When configured, that token works only on
   `/v1/realtime` after strict v2 negotiation; it cannot enter legacy v1 or call
-  health, Conversation, STT, or TTS routes.
+  health, Conversation, STT, TTS, or the Home Assistant tool-authority route.
 - The bridge delegates authentication, storage, and refresh to the installed
   Codex CLI. It locates an existing file-backed `auth.json` but does not parse,
   copy, log, or return it. The credential is linked into a mode-0700 temporary
@@ -18,6 +18,17 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
+- Direct realtime tool authority is disabled by default and never comes from a
+  device message. Exactly one explicitly opted-in Conversation subentry may
+  open `/v1/home-assistant/tools` with the primary bridge token. It registers
+  an immutable, generation-scoped snapshot of that subentry's rendered
+  instructions, `es-MX`-by-default locale, and selected LLM API tools. Zero or
+  ambiguous authorities register nothing.
+- Tool registrations, schemas, arguments, results, messages, pending calls,
+  and calls per realtime session are bounded. Home Assistant and the bridge
+  independently reject undeclared tools, duplicate or stale correlation,
+  oversized/non-JSON values, replacement, disconnect, and timeout. An unknown
+  outcome is never retried implicitly.
 - Conversation start and tool-result events use Home Assistant's canonical JSON
   serializer. Nested temporal values are normalized to ISO text; unsupported
   values are rejected before transmission with an error that does not include
@@ -46,13 +57,15 @@ sides of a narrow bridge API.
   not receive the ChatGPT credential, bridge bearer, microphone audio, or Home
   Assistant access token, and synthesis does not consume the subscription
   speech lane.
-- Device-facing realtime v2 is chat-only. It rejects device-declared tools and
-  tool results and never forwards provider tool calls. Home control remains on
-  the normal Home Assistant pipeline, where `ChatLog` and the selected LLM API
-  enforce exposed-entity policy.
-- “Okay Computer” selects that chat-only v2 route. “Okay Nabu” selects the
-  official Assist path; a normal wake preempts a direct session rather than
-  lending its weaker device credential any Home Assistant authority.
+- Device-facing realtime v2 remains audio/control only. It rejects
+  device-declared tools and device tool results, and never exposes provider
+  tool calls or Home Assistant results to the speaker. When the separate
+  authority is present, the bridge sends provider calls only to the captured
+  Home Assistant generation; Home Assistant's selected LLM API retains
+  exposed-entity policy and execution authority.
+- “Okay Computer” selects the v2 route, but its weaker device credential gains
+  no Home Assistant authority. “Okay Nabu” selects the official Assist path;
+  a normal wake can preempt a direct session and reclaim the microphone.
 - The device retains at most six idle microphone frames for the direct wake:
   384 ms, or 12 KiB of PCM16, in process memory only. Okay Computer atomically
   consumes it; Okay Nabu, stop, mute, disconnect, and teardown discard it. It
@@ -63,6 +76,19 @@ sides of a narrow bridge API.
   root voice process. Exact vendor bytecode guards fail closed before patching.
   Its JSON configuration must be a root-owned, non-symlink regular file with
   mode 0600; source directories/files must not be writable by group or other.
+- Full duplex is off by default and fails closed without the reviewed static
+  PulseAudio `module-echo-cancel` block using WebRTC AEC, exact raw masters and
+  default AEC routes, and the current voice process's capture stream routed
+  through the AEC source. The client checks this before opening the bridge
+  socket, enforces a configured 1–25% sink ceiling, rechecks every sink channel
+  before each response, and starts `paplay` on that sink with a fixed stream
+  volume no greater than the ceiling. The guard compares raw PulseAudio units
+  to the exact linear ceiling rather than trusting rounded display percentages.
+- Local playback flush or provider VAD is not evidence of remote cancellation.
+  A v2 session resumes after interruption only when the bridge correlates a
+  sanitized provider `response.cancelled` event to the exact active response;
+  timeout, mismatch, completion-only events, or ambiguity require teardown and
+  a fresh session.
 
 The authentication source is resolved from `HA_CODEX_AUTH_FILE`,
 `${CODEX_HOME}/auth.json`, or `${HOME}/.codex/auth.json`. The bridge fails
@@ -92,6 +118,9 @@ differ. Do not reuse a Home Assistant token, Codex credential, GitHub token, or
 password. Keep host tokens in a service-user-readable environment file and the
 device token in its root-only configuration, never shell history or the
 repository. Neither bridge token enters the App Server child environment.
+Home Assistant uses the primary token for both its normal component API and
+outbound tool-authority socket; the device token cannot broker tools even when
+realtime authority is enabled.
 
 The release archive contains only a disabled example with a placeholder token.
 Never package a populated `codex-realtime.json`. The device URL accepts only

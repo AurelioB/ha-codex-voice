@@ -10,8 +10,14 @@ from typing import Any
 import pytest
 
 from device.thirdreality.realtime_client import session as session_module
-from device.thirdreality.realtime_client.config import RealtimeConfig
+from device.thirdreality.realtime_client.config import (
+    DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_PULSE_AEC_SINK,
+    DEFAULT_PULSE_AEC_SOURCE,
+    RealtimeConfig,
+)
 from device.thirdreality.realtime_client.session import (
+    _PACTL_ARGV,
     _PAPLAY_ARGV,
     RealtimeSession,
     SessionState,
@@ -20,6 +26,7 @@ from device.thirdreality.realtime_client.session import (
     _pcm_has_signal,
     _PcmPlayer,
     _validate_started,
+    _verify_pulseaudio_aec,
 )
 from device.thirdreality.realtime_client.websocket import Message, WebSocketError
 
@@ -44,9 +51,21 @@ def _config(**overrides: object) -> RealtimeConfig:
         "full_duplex": False,
         "voice": None,
         "prompt": None,
+        "pulse_aec_source": None,
+        "pulse_aec_sink": None,
+        "aec_test_volume_percent": DEFAULT_AEC_TEST_VOLUME_PERCENT,
     }
     values.update(overrides)
     return RealtimeConfig(**values)
+
+
+def _duplex_config(**overrides: object) -> RealtimeConfig:
+    return _config(
+        full_duplex=True,
+        pulse_aec_source=DEFAULT_PULSE_AEC_SOURCE,
+        pulse_aec_sink=DEFAULT_PULSE_AEC_SINK,
+        **overrides,
+    )
 
 
 class _FakeStdin:
@@ -90,8 +109,10 @@ class _FakeProcess:
 class _RecordingPlayer:
     def __init__(self) -> None:
         self.events: list[tuple[str, object]] = []
+        self._active = False
 
     def begin(self, epoch: int) -> None:
+        self._active = True
         self.events.append(("begin", epoch))
 
     def enqueue(self, value: bytes) -> None:
@@ -101,7 +122,12 @@ class _RecordingPlayer:
         self.events.append(("finish", epoch))
 
     def abort(self) -> None:
+        self._active = False
         self.events.append(("abort", None))
+
+    @property
+    def active(self) -> bool:
+        return self._active
 
 
 class _LoopPlayer:
@@ -251,6 +277,7 @@ def _started(*, remote_cancel: bool = False) -> dict[str, object]:
             "binary_pcm16": True,
             "local_flush": True,
             "remote_cancel": remote_cancel,
+            "same_session_interrupt_ack": True,
         },
     }
 
@@ -309,20 +336,18 @@ def test_message_bound_accepts_exactly_one_fixed_recorder_frame() -> None:
     assert session.submit_audio(b"b" * 2_050) is SubmitResult.INVALID
 
 
-def test_output_always_gates_mic_without_verified_echo_cancellation() -> None:
+def test_output_gates_half_duplex_but_verified_full_duplex_keeps_mic_open() -> None:
     session = RealtimeSession(_config())
     with session._state_lock:
         session._state = SessionState.READY
     session._output_active.set()
     assert session.submit_audio(b"\0\0") is SubmitResult.GATED
 
-    # Direct construction must remain fail-closed even if it bypasses the
-    # secure loader, which rejects full_duplex=true.
-    duplex = RealtimeSession(_config(full_duplex=True))
+    duplex = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
     with duplex._state_lock:
         duplex._state = SessionState.READY
     duplex._output_active.set()
-    assert duplex.submit_audio(b"\0\0") is SubmitResult.GATED
+    assert duplex.submit_audio(b"\0\0") is SubmitResult.ACCEPTED
 
 
 def test_paplay_uses_fixed_low_latency_argv_and_reaps_owned_child(
@@ -369,6 +394,315 @@ def test_paplay_uses_fixed_low_latency_argv_and_reaps_owned_child(
     player.service()
     assert player.active is False
     assert process.waited == 1
+
+
+def test_full_duplex_paplay_routes_only_to_configured_aec_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess()
+    calls: list[list[str]] = []
+    monkeypatch.setattr("os.set_blocking", lambda _fd, _blocking: None)
+    player = _PcmPlayer(
+        4_096,
+        sink=DEFAULT_PULSE_AEC_SINK,
+        volume_percent=25,
+        popen=lambda argv, **_kwargs: calls.append(argv) or process,
+    )
+
+    player.begin(1)
+
+    assert calls == [
+        [
+            *_PAPLAY_ARGV,
+            f"--device={DEFAULT_PULSE_AEC_SINK}",
+            "--volume=16384",
+        ]
+    ]
+    player.abort()
+
+
+def test_full_duplex_preflight_requires_exact_active_pulseaudio_aec_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    responses = {
+        (*_PACTL_ARGV, "get-default-source"): (
+            f"{DEFAULT_PULSE_AEC_SOURCE}\n".encode()
+        ),
+        (*_PACTL_ARGV, "get-default-sink"): (f"{DEFAULT_PULSE_AEC_SINK}\n".encode()),
+        (*_PACTL_ARGV, "list", "short", "modules"): (
+            b"1\tmodule-alsa-source\tdevice=hw:0,2\n"
+            b"7\tmodule-echo-cancel\t"
+            b"source_master=alsa_input.hw_0_2 "
+            b"sink_master=alsa_output.hw_0_1 "
+            b"source_name=codex_echo_cancel_source "
+            b"sink_name=codex_echo_cancel_sink "
+            b"aec_method=webrtc use_master_format=1\n"
+        ),
+        (*_PACTL_ARGV, "list", "short", "sources"): (
+            b"1\talsa_input.hw_0_2\tmodule-alsa-source.c\ts16le 2ch 16000Hz\n"
+            b"3\tcodex_echo_cancel_source\tmodule-echo-cancel.c\ts16le 2ch 16000Hz\n"
+        ),
+        (*_PACTL_ARGV, "--format=json", "list", "source-outputs"): json.dumps(
+            [
+                {
+                    "driver": "module-echo-cancel.c",
+                    "source": 1,
+                    "corked": False,
+                    "properties": {},
+                },
+                {
+                    "driver": "protocol-native.c",
+                    "source": 3,
+                    "corked": False,
+                    "properties": {"application.process.id": "6096"},
+                },
+            ]
+        ).encode(),
+        (*_PACTL_ARGV, "get-sink-volume", DEFAULT_PULSE_AEC_SINK): (
+            b"Volume: front-left: 16384 / 25% / -36.12 dB, "
+            b"front-right: 16384 / 25% / -36.12 dB\n"
+        ),
+    }
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout=responses[tuple(argv)])
+
+    monkeypatch.setattr(session_module.subprocess, "run", run)
+    monkeypatch.setattr(session_module.os, "getpid", lambda: 6096)
+
+    _verify_pulseaudio_aec(_duplex_config(io_timeout_seconds=0.75))
+
+    assert [argv for argv, _kwargs in calls] == [
+        [*_PACTL_ARGV, "get-default-source"],
+        [*_PACTL_ARGV, "get-default-sink"],
+        [*_PACTL_ARGV, "list", "short", "modules"],
+        [*_PACTL_ARGV, "list", "short", "sources"],
+        [*_PACTL_ARGV, "--format=json", "list", "source-outputs"],
+        [*_PACTL_ARGV, "get-sink-volume", DEFAULT_PULSE_AEC_SINK],
+    ]
+    for _argv, kwargs in calls:
+        assert kwargs == {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "timeout": 0.75,
+            "check": False,
+            "close_fds": True,
+            "shell": False,
+        }
+
+
+@pytest.mark.parametrize(
+    ("source", "sink", "modules"),
+    [
+        ("alsa_input.hw_0_2\n", f"{DEFAULT_PULSE_AEC_SINK}\n", "aec"),
+        (f"{DEFAULT_PULSE_AEC_SOURCE}\n", "alsa_output.hw_0_1\n", "aec"),
+        (
+            f"{DEFAULT_PULSE_AEC_SOURCE}\n",
+            f"{DEFAULT_PULSE_AEC_SINK}\n",
+            "raw",
+        ),
+        (
+            f"{DEFAULT_PULSE_AEC_SOURCE}\n",
+            f"{DEFAULT_PULSE_AEC_SINK}\n",
+            "wrong-master",
+        ),
+    ],
+)
+def test_full_duplex_preflight_fails_closed_on_aec_topology_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    sink: str,
+    modules: str,
+) -> None:
+    outputs = deque(
+        [
+            source.encode(),
+            sink.encode(),
+            {
+                "aec": (
+                    "7\tmodule-echo-cancel\t"
+                    "source_master=alsa_input.hw_0_2 "
+                    "sink_master=alsa_output.hw_0_1 "
+                    "source_name=codex_echo_cancel_source "
+                    "sink_name=codex_echo_cancel_sink "
+                    "aec_method=webrtc use_master_format=1\n"
+                ),
+                "raw": "1\tmodule-alsa-source\tdevice=hw:0,2\n",
+                "wrong-master": (
+                    "7\tmodule-echo-cancel\t"
+                    "source_master=other_source sink_master=other_sink "
+                    "source_name=codex_echo_cancel_source "
+                    "sink_name=codex_echo_cancel_sink "
+                    "aec_method=webrtc use_master_format=1\n"
+                ),
+            }[modules].encode(),
+        ]
+    )
+    monkeypatch.setattr(
+        session_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=outputs.popleft()
+        ),
+    )
+
+    with pytest.raises(WebSocketError, match="echo cancellation is not active"):
+        _verify_pulseaudio_aec(_duplex_config())
+
+
+def test_full_duplex_preflight_contains_pactl_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 1, stdout=b""),
+    )
+
+    with pytest.raises(WebSocketError, match="could not be verified"):
+        _verify_pulseaudio_aec(_duplex_config())
+
+
+@pytest.mark.parametrize(
+    ("source_outputs", "volume_output", "ceiling"),
+    [
+        (
+            json.dumps(
+                [
+                    {
+                        "driver": "protocol-native.c",
+                        "source": 1,
+                        "corked": False,
+                        "properties": {"application.process.id": "4242"},
+                    }
+                ]
+            ),
+            "Volume: left: 16384 / 25% / -36.12 dB\n",
+            25,
+        ),
+        ("[]", "Volume: left: 16384 / 25% / -36.12 dB\n", 25),
+        (
+            json.dumps(
+                [
+                    {
+                        "driver": "protocol-native.c",
+                        "source": 3,
+                        "corked": True,
+                        "properties": {"application.process.id": "4242"},
+                    }
+                ]
+            ),
+            "Volume: left: 16384 / 25% / -36.12 dB\n",
+            25,
+        ),
+        (
+            json.dumps(
+                [
+                    {
+                        "driver": "protocol-native.c",
+                        "source": 3,
+                        "corked": False,
+                        "properties": {"application.process.id": "9999"},
+                    }
+                ]
+            ),
+            "Volume: left: 16384 / 25% / -36.12 dB\n",
+            25,
+        ),
+        (
+            json.dumps(
+                [
+                    {
+                        "driver": "protocol-native.c",
+                        "source": 3,
+                        "corked": False,
+                        "properties": {"application.process.id": "4242"},
+                    }
+                ]
+            ),
+            "Volume: left: 17039 / 26% / -35.10 dB\n",
+            25,
+        ),
+        (
+            json.dumps(
+                [
+                    {
+                        "driver": "protocol-native.c",
+                        "source": 3,
+                        "corked": False,
+                        "properties": {"application.process.id": "4242"},
+                    }
+                ]
+            ),
+            ("Volume: left: 7864 / 12% / -55.00 dB, right: 8519 / 13% / -53.00 dB\n"),
+            12,
+        ),
+        (
+            json.dumps(
+                [
+                    {
+                        "driver": "protocol-native.c",
+                        "source": 3,
+                        "corked": False,
+                        "properties": {"application.process.id": "4242"},
+                    }
+                ]
+            ),
+            "Volume: unknown\n",
+            25,
+        ),
+    ],
+)
+def test_full_duplex_preflight_rejects_capture_bypass_or_excess_volume(
+    monkeypatch: pytest.MonkeyPatch,
+    source_outputs: str,
+    volume_output: str,
+    ceiling: int,
+) -> None:
+    outputs = {
+        (*_PACTL_ARGV, "get-default-source"): f"{DEFAULT_PULSE_AEC_SOURCE}\n",
+        (*_PACTL_ARGV, "get-default-sink"): f"{DEFAULT_PULSE_AEC_SINK}\n",
+        (*_PACTL_ARGV, "list", "short", "modules"): (
+            "7\tmodule-echo-cancel\t"
+            "source_master=alsa_input.hw_0_2 "
+            "sink_master=alsa_output.hw_0_1 "
+            "source_name=codex_echo_cancel_source "
+            "sink_name=codex_echo_cancel_sink "
+            "aec_method=webrtc use_master_format=1\n"
+        ),
+        (*_PACTL_ARGV, "list", "short", "sources"): (
+            "1\talsa_input.hw_0_2\tmodule-alsa-source.c\n"
+            "3\tcodex_echo_cancel_source\tmodule-echo-cancel.c\n"
+        ),
+        (*_PACTL_ARGV, "--format=json", "list", "source-outputs"): source_outputs,
+        (*_PACTL_ARGV, "get-sink-volume", DEFAULT_PULSE_AEC_SINK): volume_output,
+    }
+    monkeypatch.setattr(
+        session_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=outputs[tuple(argv)].encode()
+        ),
+    )
+    monkeypatch.setattr(session_module.os, "getpid", lambda: 4242)
+
+    with pytest.raises(WebSocketError, match="echo cancellation is not active"):
+        _verify_pulseaudio_aec(_duplex_config(aec_test_volume_percent=ceiling))
+
+
+@pytest.mark.parametrize(
+    ("raw_volume", "expected"),
+    [(16_384, True), (16_385, False)],
+)
+def test_sink_volume_ceiling_uses_exact_raw_pulseaudio_units(
+    raw_volume: int, expected: bool
+) -> None:
+    displayed = f"Volume: mono: {raw_volume} / 25% / -36.12 dB\n"
+
+    assert session_module._sink_volume_within_ceiling(displayed, ceiling=25) is expected
 
 
 def test_paplay_output_queue_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -490,6 +824,148 @@ def test_speaking_epoch_exclusively_controls_playback_and_mic_gate() -> None:
     ]
 
 
+def test_full_duplex_speech_start_immediately_flushes_local_output_only() -> None:
+    session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    assert session.output_active
+    assert session.submit_audio(b"\x01\x00") is SubmitResult.ACCEPTED
+
+    result = session._handle_message(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "control",
+                    "event_type": "input_audio_buffer.speech_started",
+                }
+            ),
+        ),
+        player,
+        output_epoch=epoch,
+        last_output_epoch=last_epoch,
+    )
+
+    assert result == (None, None, 1, True)
+    assert session.output_active is False
+    assert session.state is SessionState.READY
+    assert session.terminal is False
+    assert player.events == [("begin", 1), ("abort", None)]
+
+    # Provider frames already in flight are quarantined until the matching
+    # stop or a newer monotonic speaking epoch arrives.
+    assert session._handle_message(
+        Message("binary", b"late"),
+        player,
+        output_epoch=None,
+        last_output_epoch=last_epoch,
+    ) == (None, None, 1, False)
+    assert session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.stopped","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=last_epoch,
+    ) == (None, None, 1, True)
+    assert session._suppressed_output_epoch is None
+
+
+def test_full_duplex_rechecks_volume_ceiling_before_every_response() -> None:
+    checks: list[int] = []
+    session = RealtimeSession(
+        _duplex_config(),
+        aec_verifier=lambda _config: None,
+        volume_guard=lambda config: checks.append(config.aec_test_volume_percent),
+    )
+    player = _RecordingPlayer()
+
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.stopped","output_epoch":1}',
+        ),
+        player,
+        output_epoch=epoch,
+        last_output_epoch=last_epoch,
+    )
+    session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":2}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=last_epoch,
+    )
+
+    assert checks == [25, 25]
+    assert player.events == [("begin", 1), ("finish", 1), ("begin", 2)]
+
+
+def test_full_duplex_speech_start_quarantines_tail_after_speaking_stop() -> None:
+    session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
+    player = _RecordingPlayer()
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    _action, epoch, last_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.stopped","output_epoch":1}',
+        ),
+        player,
+        output_epoch=epoch,
+        last_output_epoch=last_epoch,
+    )
+    assert epoch is None
+    assert player.active
+
+    assert session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"input_audio_buffer.speech_started"}',
+        ),
+        player,
+        output_epoch=epoch,
+        last_output_epoch=last_epoch,
+    ) == (None, None, 1, True)
+    assert session._suppressed_output_epoch == 1
+    assert session._handle_message(
+        Message("binary", b"late"),
+        player,
+        output_epoch=None,
+        last_output_epoch=last_epoch,
+    ) == (None, None, 1, False)
+
+
 def test_stale_output_epoch_is_quarantined() -> None:
     session = RealtimeSession(_config())
     player = _RecordingPlayer()
@@ -512,6 +988,13 @@ def test_started_requires_local_only_cancel_semantics() -> None:
 
     with pytest.raises(WebSocketError, match="cancel semantics"):
         _validate_started(_started(remote_cancel=True))
+
+    without_same_session_ack = _started()
+    capabilities = without_same_session_ack["capabilities"]
+    assert isinstance(capabilities, dict)
+    capabilities.pop("same_session_interrupt_ack")
+    with pytest.raises(WebSocketError, match="same-session interrupt"):
+        _validate_started(without_same_session_ack)
 
 
 def test_interrupt_is_idempotent_flushes_gate_and_forces_fresh_object() -> None:
@@ -713,6 +1196,108 @@ def test_interrupt_waits_for_bridge_ack_then_closes_fresh_session(
     assert session.terminal
     assert not session.failed_before_ready
     assert connection.json_sent.count({"type": "interrupt"}) == 1
+
+
+def test_confirmed_remote_interrupt_resumes_same_socket_and_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    _install_fake_loop_io(monkeypatch, player)
+    session = RealtimeSession(
+        _config(io_timeout_seconds=0.2),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+    )
+    session.start()
+    assert connection.wait_for_json(
+        {
+            "type": "start",
+            "protocol_version": 2,
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
+    )
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+
+    session.interrupt()
+    assert connection.wait_for_json({"type": "interrupt"})
+    connection.feed(
+        Message(
+            "text",
+            json.dumps({"type": "control", "event_type": "response.cancelled"}),
+        )
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "stopped",
+                    "reason": "interrupt",
+                    "fresh_session_required": False,
+                    "remote_cancelled": True,
+                }
+            ),
+        )
+    )
+
+    assert _wait_for(lambda: session.state is SessionState.READY)
+    assert session.terminal is False
+    assert connection.closed is False
+    assert session.submit_audio(b"\x01\x00") is SubmitResult.ACCEPTED
+    assert connection.wait_for_binary_count(1)
+
+    session.stop()
+    assert session.join(1.0)
+    assert connection.json_sent.count({"type": "interrupt"}) == 1
+    assert connection.json_sent.count({"type": "stop"}) == 1
+
+
+def test_detached_owner_closes_after_confirmed_remote_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    _install_fake_loop_io(monkeypatch, player)
+    session = RealtimeSession(
+        _config(io_timeout_seconds=0.2),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+    )
+    session.start()
+    assert connection.wait_for_json(
+        {
+            "type": "start",
+            "protocol_version": 2,
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
+    )
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+
+    session.interrupt()
+    session.interrupt(preserve_session=False)
+    assert connection.wait_for_json({"type": "interrupt"})
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "stopped",
+                    "reason": "interrupt",
+                    "fresh_session_required": False,
+                    "remote_cancelled": True,
+                }
+            ),
+        )
+    )
+
+    assert session.join(1.0)
+    assert session.state is SessionState.STOPPED
+    assert connection.json_sent.count({"type": "stop"}) == 1
 
 
 def test_interrupt_ack_requires_explicit_local_only_cancel_semantics() -> None:

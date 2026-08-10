@@ -15,9 +15,16 @@ import sys
 import tempfile
 import time
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    MutableMapping,
+)
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from aiohttp import WSMsgType, web
 
@@ -46,6 +53,12 @@ from .errors import (
 from .realtime import RealtimeSession
 from .realtime_wire import RealtimeWireProtocol, parse_data_control_event
 from .runtime import IsolatedCodexRuntime, codex_child_environment
+from .tool_broker import (
+    MAX_TOOL_BROKER_MESSAGE_BYTES,
+    HomeAssistantToolBroker,
+    ToolBrokerSnapshot,
+    ToolBrokerUnavailable,
+)
 from .webrtc import WebRtcPeer
 
 LOGGER = logging.getLogger(__name__)
@@ -111,6 +124,9 @@ REALTIME_OUTPUT_TAIL_HARD_CAP_SECONDS = 1.0
 REALTIME_OUTPUT_ARM_TIMEOUT_SECONDS = 5.0
 REALTIME_OUTPUT_PREROLL_TTL_SECONDS = 0.5
 REALTIME_OUTPUT_SIGNAL_PEAK = 256
+REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS = 0.5
+REALTIME_MAX_PENDING_TOOL_CALLS = 16
+REALTIME_MAX_TOOL_CALLS_PER_SESSION = 1_024
 
 _AUTH_IDENTITY_REQUEST_KEY = "ha_codex_voice.auth_identity"
 _AUTH_IDENTITY_PRIMARY = "primary"
@@ -366,7 +382,9 @@ class _StreamingTranscriptionCalibrator:
         self, probe_frames: int
     ) -> _StreamingTranscriptionCalibration | None:
         """Recognize quiet speech without opening on silence or steady noise."""
-        if len(self._quiet_frames) < self._quiet_frames.maxlen:
+        quiet_frame_limit = self._quiet_frames.maxlen
+        assert quiet_frame_limit is not None
+        if len(self._quiet_frames) < quiet_frame_limit:
             return None
         frames = list(self._quiet_frames)
         levels = [frame.rms for frame in frames]
@@ -558,6 +576,7 @@ class BridgeState:
         else:
             self.rpc = rpc
         self.peer_factory = peer_factory
+        self.home_assistant_tools = HomeAssistantToolBroker()
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
         self._speech_state_lock = asyncio.Lock()
@@ -1508,6 +1527,7 @@ def create_app(
     app.router.add_post("/v1/synthesize", _synthesize)
     app.router.add_post("/v1/synthesize/stream", _synthesize_stream)
     app.router.add_post("/v1/speech-session/release", _release_speech_session)
+    app.router.add_get("/v1/home-assistant/tools", _home_assistant_tools)
     app.router.add_get("/v1/realtime", _realtime)
     app.cleanup_ctx.append(_app_server_lifecycle)
     return app
@@ -1536,13 +1556,13 @@ async def _bearer_middleware(request: web.Request, handler: Any) -> web.StreamRe
             content_type="application/json",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return await handler(request)
+    return cast(web.StreamResponse, await handler(request))
 
 
 @web.middleware
 async def _error_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
     try:
-        return await handler(request)
+        return cast(web.StreamResponse, await handler(request))
     except web.HTTPException:
         raise
     except (ProtocolError, ValueError) as exc:
@@ -2941,7 +2961,7 @@ def _synthesis_output_sample_rate(payload: Mapping[str, Any]) -> int:
     return sample_rate
 
 
-async def _synthesize(request: web.Request) -> web.Response:
+async def _synthesize(request: web.Request) -> web.StreamResponse:
     return await _synthesize_request(request)
 
 
@@ -3336,8 +3356,10 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
         if isinstance(value, str):
             return value
         turn = params.get("turn")
-        if isinstance(turn, Mapping) and isinstance(turn.get("id"), str):
-            return turn["id"]
+        if isinstance(turn, Mapping):
+            nested_id = turn.get("id")
+            if isinstance(nested_id, str):
+                return nested_id
         return None
 
     async def handle_active_turn_event(
@@ -3646,6 +3668,56 @@ async def _run_conversation_socket(  # noqa: C901 - protocol state machine
             await _dispose_thread(state.rpc, thread_id)
 
 
+async def _home_assistant_tools(request: web.Request) -> web.WebSocketResponse:
+    """Serve the single authenticated Home Assistant-owned tool authority."""
+    state: BridgeState = request.app[STATE_KEY]
+    websocket = web.WebSocketResponse(
+        heartbeat=30,
+        max_msg_size=MAX_TOOL_BROKER_MESSAGE_BYTES,
+    )
+    await websocket.prepare(request)
+    try:
+        first = await _receive_ws_json(websocket, timeout=30)
+        await state.home_assistant_tools.register(websocket, first)
+        while True:
+            message = await websocket.receive()
+            if message.type in {
+                WSMsgType.CLOSE,
+                WSMsgType.CLOSING,
+                WSMsgType.CLOSED,
+            }:
+                break
+            if message.type is WSMsgType.ERROR:
+                raise ProtocolError("Home Assistant tool WebSocket failed")
+            if message.type is not WSMsgType.TEXT:
+                raise ProtocolError(
+                    "Home Assistant tool broker accepts only JSON text messages"
+                )
+            try:
+                value = json.loads(message.data)
+            except json.JSONDecodeError as exc:
+                raise ProtocolError(
+                    "Home Assistant tool broker message must be valid JSON"
+                ) from exc
+            if not isinstance(value, dict):
+                raise ProtocolError(
+                    "Home Assistant tool broker message must be a JSON object"
+                )
+            await state.home_assistant_tools.handle_message(websocket, value)
+    except BridgeBusyError as exc:
+        await _safe_ws_json(
+            websocket,
+            {"type": "error", "error": str(exc), "code": "busy"},
+        )
+    except (BridgeError, ValueError) as exc:
+        await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
+    finally:
+        await state.home_assistant_tools.unregister(websocket)
+        if not websocket.closed:
+            await websocket.close()
+    return websocket
+
+
 async def _realtime(request: web.Request) -> web.WebSocketResponse:
     state: BridgeState = request.app[STATE_KEY]
     # Preserve the HTTP 409 preflight for an already-owned speech lane, but do
@@ -3673,7 +3745,16 @@ async def _realtime_admitted(
             raise ProtocolError(
                 "realtime device authentication requires protocol_version 2"
             )
-        configured_tools = normalize_dynamic_tools(first.get("tools"))
+        broker_snapshot = (
+            state.home_assistant_tools.snapshot
+            if wire_protocol.uses_binary_audio
+            else None
+        )
+        configured_tools = normalize_dynamic_tools(
+            list(broker_snapshot.tools)
+            if broker_snapshot is not None
+            else first.get("tools")
+        )
         async with state.speech_session_lease():
             await _serve_realtime_session(
                 state,
@@ -3681,6 +3762,7 @@ async def _realtime_admitted(
                 first,
                 wire_protocol,
                 configured_tools=configured_tools,
+                broker_snapshot=broker_snapshot,
             )
     except _RealtimeClientDisconnected:
         pass
@@ -3724,6 +3806,7 @@ async def _serve_realtime_session(
     wire_protocol: RealtimeWireProtocol,
     *,
     configured_tools: list[dict[str, Any]],
+    broker_snapshot: ToolBrokerSnapshot | None,
 ) -> None:
     """Start and serve one provider session while its speech lease is held."""
     session: RealtimeSession | None = None
@@ -3756,13 +3839,21 @@ async def _serve_realtime_session(
         try:
             thread_payload = dict(first)
             thread_payload.pop("model", None)
+            base_instructions = (
+                "Act only as a realtime Home Assistant voice agent. Never inspect "
+                "local files or use undeclared tools."
+            )
+            if broker_snapshot is not None:
+                base_instructions += (
+                    "\n\nTrusted Home Assistant context follows. The available tools "
+                    "and entity exposure are authoritative for this session.\n"
+                    f"Language: {broker_snapshot.language}\n"
+                    f"{broker_snapshot.instructions}"
+                )
             thread_id = await state.start_thread(
                 thread_payload,
                 tools=configured_tools,
-                base_instructions=(
-                    "Act only as a realtime Home Assistant voice agent. Never inspect "
-                    "local files or use undeclared tools."
-                ),
+                base_instructions=base_instructions,
             )
             if startup_abandoned.is_set():
                 return
@@ -3835,21 +3926,27 @@ async def _serve_realtime_session(
                 **wire_protocol.started_fields(),
             },
         )
-        await _run_realtime_socket(state, websocket, session, wire_protocol)
+        await _run_realtime_socket(
+            state,
+            websocket,
+            session,
+            wire_protocol,
+            broker_snapshot=broker_snapshot,
+        )
     finally:
         await close_provider()
 
 
 async def _start_realtime_provider_or_disconnect(
     websocket: web.WebSocketResponse,
-    provider_start: Awaitable[None],
+    provider_start: Coroutine[Any, Any, None],
     *,
     abandoned: asyncio.Event,
     thread_pending: Callable[[], bool],
     track_detached: Callable[[asyncio.Task[None]], None],
 ) -> None:
     """Abandon provider startup when its device disappears before acknowledgement."""
-    startup_task = asyncio.create_task(
+    startup_task: asyncio.Task[None] = asyncio.create_task(
         provider_start, name="codex-realtime-provider-startup"
     )
     client_task = asyncio.create_task(
@@ -3906,6 +4003,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     websocket: web.WebSocketResponse,
     session: RealtimeSession,
     wire_protocol: RealtimeWireProtocol,
+    *,
+    broker_snapshot: ToolBrokerSnapshot | None,
 ) -> None:
     send_lock = asyncio.Lock()
     stop = asyncio.Event()
@@ -3925,6 +4024,18 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     output_arm_generation = 0
     output_arm_task: asyncio.Task[None] | None = None
     output_aux_tasks: set[asyncio.Task[None]] = set()
+    tool_call_tasks: set[asyncio.Task[None]] = set()
+    active_tool_calls: dict[
+        int | str,
+        tuple[str, asyncio.Task[None]],
+    ] = {}
+    seen_tool_request_ids: set[int | str] = set()
+    seen_tool_call_ids: set[str] = set()
+    claimed_tool_responses: set[int | str] = set()
+    tool_call_failures: asyncio.Queue[BaseException] = asyncio.Queue(maxsize=1)
+    pending_cancel_confirmation: asyncio.Future[None] | None = None
+    pending_cancel_response_id: str | None = None
+    active_response_id: str | None = None
 
     async def send(value: Mapping[str, Any]) -> None:
         await _send_realtime_json(websocket, value, send_lock=send_lock)
@@ -4088,6 +4199,171 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         while output_preroll_bytes > REALTIME_OUTPUT_PREROLL_MAX_BYTES:
             output_preroll_bytes -= len(output_preroll.popleft()[2])
 
+    async def request_remote_response_cancel() -> bool:
+        """Return true only after the provider explicitly confirms cancellation."""
+        nonlocal pending_cancel_confirmation, pending_cancel_response_id
+        if pending_cancel_confirmation is not None:
+            return False
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        pending_cancel_confirmation = waiter
+        pending_cancel_response_id = active_response_id
+        try:
+            try:
+                session.request_response_cancel()
+            except Exception as exc:  # noqa: BLE001 - cancellation is best effort.
+                LOGGER.info(
+                    "Realtime provider response cancel was unavailable: %s", exc
+                )
+                return False
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(waiter),
+                    timeout=REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                LOGGER.info("Realtime provider did not confirm response cancellation")
+                return False
+            return True
+        finally:
+            if pending_cancel_confirmation is waiter:
+                pending_cancel_confirmation = None
+                pending_cancel_response_id = None
+            if not waiter.done():
+                waiter.cancel()
+
+    async def respond_to_provider_tool_once(
+        request_id: int | str,
+        call_id: str,
+        *,
+        success: bool,
+        result: object,
+    ) -> None:
+        """Attempt exactly one App Server response for a provider request id."""
+        if request_id in claimed_tool_responses:
+            return
+        claimed_tool_responses.add(request_id)
+        tool_requests = {call_id: request_id}
+        await _respond_to_tool_result(
+            state.rpc,
+            {
+                "call_id": call_id,
+                "success": success,
+                "result": result,
+            },
+            tool_requests,
+            timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+        )
+
+    async def execute_home_assistant_tool_call(
+        request_id: int | str,
+        call_id: str,
+        name: object,
+        arguments: object,
+    ) -> None:
+        """Execute one provider call through the captured HA authority only."""
+        success = False
+        result: object = {"error": "home_assistant_tool_unavailable"}
+        if (
+            broker_snapshot is not None
+            and isinstance(name, str)
+            and isinstance(arguments, Mapping)
+        ):
+            try:
+                broker_result = await state.home_assistant_tools.call(
+                    broker_snapshot,
+                    name=name,
+                    arguments=arguments,
+                )
+            except (ToolBrokerUnavailable, ProtocolError):
+                LOGGER.warning(
+                    "Realtime Home Assistant tool call failed closed",
+                    exc_info=True,
+                )
+            else:
+                success = broker_result.success
+                result = broker_result.result
+        await respond_to_provider_tool_once(
+            request_id,
+            call_id,
+            success=success,
+            result=result,
+        )
+
+    def start_home_assistant_tool_call(event: Mapping[str, Any]) -> None:
+        """Run one bounded, deduplicated call without blocking lifecycle events."""
+        request_id = event.get("id")
+        params = event.get("params")
+        if not isinstance(request_id, (int, str)) or not isinstance(params, Mapping):
+            if tool_call_failures.empty():
+                tool_call_failures.put_nowait(
+                    ProtocolError("realtime provider returned an invalid tool call")
+                )
+            return
+        if request_id in seen_tool_request_ids:
+            return
+        seen_tool_request_ids.add(request_id)
+        call_id = str(params.get("callId", request_id))
+        name = params.get("tool")
+        arguments = params.get("arguments", {})
+
+        rejection: object | None = None
+        session_limit_exceeded = (
+            len(seen_tool_request_ids) > REALTIME_MAX_TOOL_CALLS_PER_SESSION
+        )
+        if session_limit_exceeded:
+            rejection = {"error": "home_assistant_tool_session_limit"}
+        elif call_id in seen_tool_call_ids:
+            rejection = {"error": "duplicate_home_assistant_tool_call"}
+        elif len(active_tool_calls) >= REALTIME_MAX_PENDING_TOOL_CALLS:
+            rejection = {"error": "too_many_home_assistant_tool_calls"}
+        else:
+            seen_tool_call_ids.add(call_id)
+
+        async def run() -> None:
+            try:
+                if rejection is not None:
+                    await respond_to_provider_tool_once(
+                        request_id,
+                        call_id,
+                        success=False,
+                        result=rejection,
+                    )
+                else:
+                    await execute_home_assistant_tool_call(
+                        request_id,
+                        call_id,
+                        name,
+                        arguments,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - wake the socket owner.
+                if tool_call_failures.empty():
+                    tool_call_failures.put_nowait(exc)
+
+        task = asyncio.create_task(run(), name="codex-realtime-home-assistant-tool")
+        active_tool_calls[request_id] = (call_id, task)
+        tool_call_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            tool_call_tasks.discard(completed)
+            active = active_tool_calls.get(request_id)
+            if (
+                active is not None
+                and active[1] is completed
+                and request_id in claimed_tool_responses
+            ):
+                active_tool_calls.pop(request_id, None)
+
+        task.add_done_callback(finished)
+        if session_limit_exceeded and tool_call_failures.empty():
+            tool_call_failures.put_nowait(
+                ProtocolError("realtime provider exceeded the tool-call limit")
+            )
+
+    async def raise_tool_call_failure() -> None:
+        raise await tool_call_failures.get()
+
     async def receive() -> None:
         while not stop.is_set():
             message = await _receive_realtime_message(
@@ -4152,6 +4428,17 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             elif message_type == "interrupt":
                 if wire_protocol.uses_binary_audio:
                     await end_output(after_tail=False)
+                    remote_cancelled = await request_remote_response_cancel()
+                    if remote_cancelled:
+                        await send(
+                            {
+                                "type": "stopped",
+                                "reason": "interrupt",
+                                "fresh_session_required": False,
+                                "remote_cancelled": True,
+                            }
+                        )
+                        continue
                 await send(
                     {
                         "type": "stopped",
@@ -4186,9 +4473,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             params = event.get("params", {})
             if method == "item/tool/call" and "id" in event:
                 if wire_protocol.uses_binary_audio:
-                    raise ProtocolError(
-                        "protocol_version 2 does not expose provider tool calls"
-                    )
+                    start_home_assistant_tool_call(event)
+                    continue
                 call_id = str(params.get("callId", event["id"]))
                 tool_requests[call_id] = event["id"]
                 await send(
@@ -4276,10 +4562,32 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         await begin_output_locked()
 
     async def data_events() -> None:
+        nonlocal active_response_id
         while not stop.is_set():
             raw_event = await session.recv_data_event()
             control = parse_data_control_event(raw_event)
             if control is None or not wire_protocol.uses_binary_audio:
+                continue
+            if control.event_type == "input_audio_buffer.speech_started":
+                # Local playback must stop on the first provider VAD signal. The
+                # provider owns automatic interruption; this event alone does not
+                # prove that it cancelled the response.
+                await send(control.wire_value())
+                await end_output(after_tail=False)
+                continue
+            if control.response_cancelled:
+                await end_output(after_tail=False)
+                waiter = pending_cancel_confirmation
+                if (
+                    waiter is not None
+                    and not waiter.done()
+                    and pending_cancel_response_id is not None
+                    and control.response_id == pending_cancel_response_id
+                ):
+                    waiter.set_result(None)
+                if control.response_id == active_response_id:
+                    active_response_id = None
+                await send(control.wire_value())
                 continue
             if control.event_type in {
                 "output_audio_buffer.started",
@@ -4288,6 +4596,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 control.event_type == "turn.created"
                 and control.role in {"assistant", "output"}
             ):
+                if control.event_type == "response.created":
+                    active_response_id = control.response_id
                 await arm_output()
                 await send(control.wire_value())
                 continue
@@ -4298,6 +4608,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 control.event_type == "turn.done"
                 and (control.role in {"assistant", "output"} or output_speaking)
             ):
+                if (
+                    control.event_type == "response.done"
+                    and control.response_id == active_response_id
+                ):
+                    active_response_id = None
                 await end_output(after_tail=True)
                 await send(control.wire_value())
                 continue
@@ -4308,6 +4623,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         asyncio.create_task(events(), name="codex-realtime-events"),
         asyncio.create_task(audio(), name="codex-realtime-audio"),
         asyncio.create_task(data_events(), name="codex-realtime-data-events"),
+        asyncio.create_task(
+            raise_tool_call_failure(), name="codex-realtime-tool-failure"
+        ),
     }
     try:
         while not stop.is_set():
@@ -4320,15 +4638,42 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     finally:
         stop.set()
         auxiliary_tasks = tuple(output_aux_tasks)
+        pending_tool_calls = tuple(tool_call_tasks)
         for task in auxiliary_tasks:
             task.cancel()
+        for request_id, (_call_id, task) in tuple(active_tool_calls.items()):
+            if request_id not in claimed_tool_responses:
+                task.cancel()
         for task in tasks:
             task.cancel()
         await asyncio.gather(
             *tasks,
             *auxiliary_tasks,
+            *pending_tool_calls,
             return_exceptions=True,
         )
+        unresolved = [
+            (request_id, call_id)
+            for request_id, (call_id, _task) in active_tool_calls.items()
+            if request_id not in claimed_tool_responses
+        ]
+        if unresolved:
+            cleanup_responses = [
+                respond_to_provider_tool_once(
+                    request_id,
+                    call_id,
+                    success=False,
+                    result={"error": "home_assistant_tool_outcome_unknown"},
+                )
+                for request_id, call_id in unresolved
+            ]
+            try:
+                async with asyncio.timeout(REALTIME_CONTROL_TIMEOUT_SECONDS):
+                    await asyncio.gather(*cleanup_responses, return_exceptions=True)
+            except TimeoutError:
+                LOGGER.warning(
+                    "Timed out closing realtime Home Assistant tool requests"
+                )
 
 
 async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
@@ -4890,8 +5235,10 @@ def normalize_dynamic_tools(value: object) -> list[dict[str, Any]]:
                 }
             )
             continue
-        function = (
-            tool.get("function") if isinstance(tool.get("function"), Mapping) else tool
+        raw_function = tool.get("function")
+        function = cast(
+            Mapping[str, Any],
+            raw_function if isinstance(raw_function, Mapping) else tool,
         )
         name = _required_string(function, "name", "tool")
         schema = function.get(
@@ -5167,7 +5514,7 @@ def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool):
         raise ProtocolError(f"{name} must be a positive integer")
     try:
-        result = int(value)  # type: ignore[arg-type]
+        result: int = int(value)  # type: ignore[call-overload]
     except (TypeError, ValueError) as exc:
         raise ProtocolError(f"{name} must be a positive integer") from exc
     if result <= 0:
@@ -5252,11 +5599,13 @@ def _current_user_text(payload: Mapping[str, Any]) -> str | None:
         if isinstance(content, str) and content.strip():
             return content
         if isinstance(content, list):
-            parts = [
-                part.get("text")
-                for part in content
-                if isinstance(part, Mapping) and isinstance(part.get("text"), str)
-            ]
+            parts: list[str] = []
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                part_text = part.get("text")
+                if isinstance(part_text, str):
+                    parts.append(part_text)
             text = "".join(parts)
             if text.strip():
                 return text

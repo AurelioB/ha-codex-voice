@@ -396,7 +396,10 @@ def _interrupt_realtime_owner(instance: Any, owner: _RealtimeOwner) -> None:
         if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner:
             return
         try:
-            owner.session.interrupt()
+            # Vendor teardown releases the microphone owner immediately. Even
+            # when the bridge confirms provider cancellation, this session
+            # must therefore close instead of resuming without an owner.
+            owner.session.interrupt(preserve_session=False)
         except Exception:  # noqa: BLE001 - cleanup must still release vendor state
             _LOGGER.warning("Failed to interrupt ThirdReality realtime session")
         finally:

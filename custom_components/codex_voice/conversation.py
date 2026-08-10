@@ -12,7 +12,6 @@ from homeassistant.const import CONF_LLM_HASS_API, CONF_PROMPT, MATCH_ALL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import intent, llm
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from voluptuous_openapi import convert  # type: ignore[import-untyped]
 
 from . import CodexVoiceConfigEntry
 from .api import (
@@ -35,6 +34,7 @@ from .const import (
     SUPPORTED_SERVICE_TIERS,
 )
 from .entity import CodexVoiceEntity
+from .llm_tools import serialize_llm_tools
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -269,21 +269,7 @@ def _serialize_chat_log(chat_log: conversation.ChatLog) -> list[dict[str, Any]]:
 
 def _serialize_tools(chat_log: conversation.ChatLog) -> list[dict[str, Any]]:
     """Convert selected Home Assistant LLM tools to JSON Schema."""
-    if chat_log.llm_api is None:
-        return []
-    return [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": convert(
-                tool.parameters,
-                custom_serializer=(
-                    chat_log.llm_api.custom_serializer or llm.selector_serializer
-                ),
-            ),
-        }
-        for tool in chat_log.llm_api.tools
-    ]
+    return serialize_llm_tools(chat_log.llm_api)
 
 
 def _conversation_instructions(chat_log: conversation.ChatLog) -> str:

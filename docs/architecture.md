@@ -46,13 +46,34 @@ The pinned v1.1.7 device overlay adds a second, explicitly separate route:
 "Okay Nabu" -> stock satellite protocol -> Home Assistant Assist/tools
 "Okay Computer" -> in-process stdlib client -> realtime wire v2 -> bridge
                  -> Codex App Server WebRTC -> local device playback
+
+one explicitly opted-in Conversation subentry
+  -> Home Assistant LLM API snapshot
+  -> primary-token /v1/home-assistant/tools broker -> bridge
+  -> provider dynamic tools for the captured direct session
 ```
 
-The direct route is chat-only. It never receives a Home Assistant credential,
-does not advertise tools, rejects tool results, and does not proxy provider
-tool calls or transcript content back to the device. A normal Okay Nabu wake
-can preempt direct mode and regain the microphone on the same vendor capture
-thread.
+The direct device remains an untrusted audio/control endpoint. It never
+receives a Home Assistant credential, advertises tools, sends tool results, or
+receives provider tool calls or transcript content. Realtime home control is
+disabled by default. If an operator explicitly designates exactly one
+Conversation subentry as authority, the Home Assistant integration opens the
+separate broker with the primary bridge token, registers only that subentry's
+selected and bounded LLM API view, executes correlated calls locally, and
+returns results to the bridge. The route-scoped device token cannot open the
+broker. A normal Okay Nabu wake can preempt direct mode and regain the
+microphone on the same vendor capture thread.
+
+The authority is selected from Conversation config subentries, not from a
+device message. Zero or multiple opted-in subentries disable registration; the
+configuration flow also rejects a second authority. A successful registration
+captures one immutable generation containing the rendered Home Assistant
+instructions, an `es-MX`-by-default locale, and no more than 128 selected tools.
+Each v2 provider session snapshots that generation. Schema, argument, result,
+message, pending-call, and per-session-call limits are enforced on both sides;
+an authority replacement, disconnect, timeout, correlation mismatch, or
+undeclared provider tool fails closed without exposing the broker exchange to
+the device.
 
 ## Isolated App Server profile and thread lifecycle
 
@@ -231,6 +252,7 @@ untouched.
 
 ```text
 vendor microphone callback (16 kHz PCM16)
+  -> static PulseAudio WebRTC-AEC source when full duplex is enabled
   -> direct-only idle pre-roll (up to 6 × 64 ms / 12 KiB in RAM)
   -> bounded device input/fallback queues (64 KiB / 2.048 s)
   -> paced v2 binary WebSocket (up to 2x while catching up)
@@ -240,7 +262,7 @@ vendor microphone callback (16 kHz PCM16)
 provider audio (48 kHz WebRTC)
   -> bridge downmix/resample and content-free epoch gate (24 kHz PCM16)
   -> bounded device playback queue (48 KiB / about 1.024 s)
-  -> fixed-argument paplay child
+  -> fixed-argument paplay child pinned to the AEC sink and <=25% stream volume
 ```
 
 The recorder callback runs before local wake-model activation. The overlay
@@ -258,19 +280,34 @@ handshake-sized delay, but cannot remove cold thread/WebRTC setup or provider
 latency. The v2 2,250 ms input limit is applied per session before start;
 finite STT retains its existing whole-utterance track capacity.
 
-The released client is turn-taking. A speaking epoch gates microphone
-submission until both its queued PCM and playback child have drained. There is
-no enabled acoustic echo cancellation, simultaneous listen/speak, or verified
-barge-in. Interruption aborts local playback and closes the socket/session. The
-bridge truthfully negotiates `local_flush: true` and `remote_cancel: false`, so
-continuation requires a fresh WebSocket, thread, and realtime session rather
-than pretending remote output was truncated.
+The client remains turn-taking by default: a speaking epoch gates microphone
+submission until both its queued PCM and playback child have drained. Opt-in
+full duplex requires a statically loaded PulseAudio `module-echo-cancel` with
+`aec_method=webrtc`, the reviewed raw hardware masters, exact default AEC
+source/sink names, and the already-open vendor capture stream routed through
+that source. A startup preflight verifies the topology and configured 1–25%
+sink ceiling before any microphone audio leaves the device. The ceiling is
+rechecked at every `speaking.started`, and every `paplay` child is pinned to
+the AEC sink with a fixed stream volume at or below that ceiling.
+
+In verified full duplex, provider VAD continues receiving capture during
+playback. `input_audio_buffer.speech_started` immediately flushes local output
+and quarantines late PCM, but does not itself prove provider cancellation. The
+bridge truthfully keeps `remote_cancel: false` and separately advertises
+`same_session_interrupt_ack: true`. Same-socket continuation occurs only when
+the bridge's explicit cancel request is followed by a provider
+`response.cancelled` event whose response identifier matches the active
+response. Timeout, mismatch, or ambiguity returns
+`fresh_session_required: true` / `remote_cancelled: false`, closes the socket,
+and disposes the remote thread/session.
 
 The device stores a distinct route-scoped bearer in a root-owned mode-0600
 file. The bridge accepts it only on `/v1/realtime`; the primary Home Assistant
 bridge token, ChatGPT credential, and Home Assistant token do not go to the
-speaker. See the [wire protocol](../protocol/realtime-wire-v2.md) and [device
-deployment contract](../device/thirdreality/README.md).
+speaker. The device bearer cannot open the tool-authority route; Home Assistant
+uses the primary bridge token for that outbound connection. See the [wire
+protocol](../protocol/realtime-wire-v2.md) and [device deployment
+contract](../device/thirdreality/README.md).
 
 ThirdReality v1.2 is a native C++ rewrite with a changed audio, AEC, playback,
 and continued-conversation path; it is not merely a drop-in performance flag.

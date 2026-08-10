@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 from device.thirdreality.realtime_client.config import (
+    DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_PULSE_AEC_SINK,
+    DEFAULT_PULSE_AEC_SOURCE,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -43,6 +46,9 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.voice is None
     assert config.prompt is None
     assert config.full_duplex is False
+    assert config.pulse_aec_source is None
+    assert config.pulse_aec_sink is None
+    assert config.aec_test_volume_percent == DEFAULT_AEC_TEST_VOLUME_PERCENT
     assert config.input_queue_bytes == 64 * 1024
     assert config.fallback_buffer_bytes == 64 * 1024
     assert config.io_timeout_seconds == 1.0
@@ -100,6 +106,28 @@ def test_config_accepts_explicit_turn_taking_and_one_recorder_frame(
     assert config.max_message_bytes == 2_048
 
 
+def test_config_accepts_explicit_bounded_aec_full_duplex(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "aec_test_volume_percent": 12,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.full_duplex is True
+    assert config.pulse_aec_source == DEFAULT_PULSE_AEC_SOURCE
+    assert config.pulse_aec_sink == DEFAULT_PULSE_AEC_SINK
+    assert config.aec_test_volume_percent == 12
+
+
 @pytest.mark.parametrize("mode", [0o604, 0o640, 0o666])
 def test_config_rejects_group_or_other_access(tmp_path: Path, mode: int) -> None:
     path = tmp_path / "realtime.json"
@@ -145,7 +173,19 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"input_queue_bytes": 64 * 1024 + 2}, "outside its supported range"),
         ({"io_timeout_seconds": 3.1}, "outside its supported range"),
         ({"full_duplex": 1}, "boolean"),
-        ({"full_duplex": True}, "must be false"),
+        ({"full_duplex": True}, "requires explicit"),
+        ({"pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE}, "requires full_duplex"),
+        (
+            {
+                "full_duplex": True,
+                "pulse_aec_source": "unsafe-source",
+                "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            },
+            "safe PulseAudio object name",
+        ),
+        ({"aec_test_volume_percent": True}, "must be an integer"),
+        ({"aec_test_volume_percent": 0}, "outside its supported range"),
+        ({"aec_test_volume_percent": 26}, "outside its supported range"),
     ],
 )
 def test_config_rejects_unsafe_or_ambiguous_values(
@@ -220,3 +260,49 @@ def test_maximum_safe_preferences_fit_the_fixed_text_and_message_bounds(
 
 def test_normalize_wake_phrase_is_casefolded_and_whitespace_stable() -> None:
     assert normalize_wake_phrase("  OKAY\tComputer  ") == "okay computer"
+
+
+def test_direct_config_construction_rejects_unverified_full_duplex() -> None:
+    with pytest.raises(ConfigError, match="requires explicit"):
+        RealtimeConfig(
+            url="ws://192.0.2.10:8787/v1/realtime",
+            connect_address="192.0.2.10",
+            token="token",
+            wake_phrase="okay computer",
+            connect_timeout_seconds=1.0,
+            handshake_timeout_seconds=2.0,
+            io_timeout_seconds=1.0,
+            idle_timeout_seconds=10.0,
+            max_session_seconds=30.0,
+            ping_interval_seconds=5.0,
+            pong_timeout_seconds=2.0,
+            input_queue_bytes=8_192,
+            fallback_buffer_bytes=4_096,
+            output_queue_bytes=8_192,
+            max_message_bytes=4_096,
+            full_duplex=True,
+        )
+
+
+def test_direct_config_construction_rejects_non_string_pulse_name() -> None:
+    with pytest.raises(ConfigError, match="safe PulseAudio object name"):
+        RealtimeConfig(
+            url="ws://192.0.2.10:8787/v1/realtime",
+            connect_address="192.0.2.10",
+            token="token",
+            wake_phrase="okay computer",
+            connect_timeout_seconds=1.0,
+            handshake_timeout_seconds=2.0,
+            io_timeout_seconds=1.0,
+            idle_timeout_seconds=10.0,
+            max_session_seconds=30.0,
+            ping_interval_seconds=5.0,
+            pong_timeout_seconds=2.0,
+            input_queue_bytes=8_192,
+            fallback_buffer_bytes=4_096,
+            output_queue_bytes=8_192,
+            max_message_bytes=4_096,
+            full_duplex=True,
+            pulse_aec_source=1,  # type: ignore[arg-type]
+            pulse_aec_sink=DEFAULT_PULSE_AEC_SINK,
+        )
