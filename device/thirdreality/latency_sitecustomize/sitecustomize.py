@@ -158,6 +158,15 @@ def _is_realtime_wake(wake_word: Any) -> bool:
     )
 
 
+def _uses_device_webrtc() -> bool:
+    """Return whether the configured wake owns provider media on this device."""
+    if _REALTIME_CONFIG is None or _REALTIME_SUPPORT is None:
+        return False
+    return getattr(_REALTIME_CONFIG, "media_transport", None) == getattr(
+        _REALTIME_SUPPORT, "DEVICE_WEBRTC_TRANSPORT", "device_webrtc"
+    )
+
+
 def _stop_word_membership(instance: Any) -> tuple[Any, bool]:
     stop_word = getattr(instance.state, "stop_word", None)
     stop_word_id = getattr(stop_word, "id", None)
@@ -283,11 +292,17 @@ def _start_realtime_wakeup(
         except Exception:  # noqa: BLE001 - optional client must fail closed
             if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
                 return
-            _LOGGER.warning("ThirdReality realtime startup fell back to Home Assistant")
-            _fast_wakeup(instance, wake_word)
-            if _wake_is_armed(instance):
-                for chunk in preroll_audio:
-                    _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
+            if _uses_device_webrtc():
+                _LOGGER.warning("ThirdReality direct WebRTC startup failed closed")
+                _nonblocking_led_fire("idle", to_idle=True)
+            else:
+                _LOGGER.warning(
+                    "ThirdReality realtime startup fell back to Home Assistant"
+                )
+                _fast_wakeup(instance, wake_word)
+                if _wake_is_armed(instance):
+                    for chunk in preroll_audio:
+                        _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
             return
 
         if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
@@ -311,7 +326,10 @@ def _start_realtime_wakeup(
                 session.stop()
             except Exception:  # noqa: BLE001 - best-effort unowned cleanup
                 _LOGGER.warning("Failed to stop unowned ThirdReality session")
-            if not getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
+            if (
+                not getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False)
+                and not _uses_device_webrtc()
+            ):
                 _LOGGER.warning(
                     "ThirdReality realtime startup fell back to Home Assistant"
                 )
@@ -319,6 +337,9 @@ def _start_realtime_wakeup(
                 if _wake_is_armed(instance):
                     for chunk in preroll_audio:
                         _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
+            elif not getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
+                _LOGGER.warning("ThirdReality direct WebRTC startup failed closed")
+                _nonblocking_led_fire("idle", to_idle=True)
             return
         owner.fallback_audio.extend(preroll_audio)
         owner.fallback_bytes = sum(len(chunk) for chunk in preroll_audio)
@@ -463,6 +484,10 @@ def _fallback_realtime_to_ha(
             owner.session.stop()
         except Exception:  # noqa: BLE001 - HA fallback must survive cleanup errors
             _LOGGER.warning("Failed to stop ThirdReality realtime session")
+        if _uses_device_webrtc():
+            _LOGGER.warning("ThirdReality direct WebRTC session failed closed")
+            _detach_realtime_owner(instance, owner, unduck=owner.ducked)
+            return
         if owner.stop_requested or getattr(
             instance,
             _REALTIME_STOP_REQUESTED_ATTRIBUTE,
@@ -899,6 +924,8 @@ if _observed_hashes == _expected_hashes:
             VoiceSatelliteProtocol.handle_audio = _realtime_handle_audio
             VoiceSatelliteProtocol.stop = _realtime_stop
             atexit.register(_REALTIME_SUPPORT.shutdown_all_sessions)
+            if _uses_device_webrtc() and not _REALTIME_SUPPORT.prewarm_device_webrtc():
+                _LOGGER.warning("ThirdReality direct WebRTC prewarm is unavailable")
         else:
             _LOGGER.warning(
                 "Skipping ThirdReality realtime client: unrecognized vendor bytecode"

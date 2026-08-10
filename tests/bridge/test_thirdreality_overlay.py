@@ -280,12 +280,15 @@ def _fake_realtime_support(
     start_release: threading.Event | None = None,
     submit_entered: threading.Event | None = None,
     submit_release: threading.Event | None = None,
+    media_transport: str = "bridge_pcm",
+    prewarm_result: bool = True,
 ) -> ModuleType:
     support = ModuleType("realtime_client")
     config = SimpleNamespace(
         wake_phrase="okay computer",
         fallback_buffer_bytes=fallback_buffer_bytes,
         input_queue_bytes=input_queue_bytes,
+        media_transport=media_transport,
     )
     sessions: list[Any] = []
 
@@ -342,6 +345,7 @@ def _fake_realtime_support(
             return self.submit_result
 
     support.ConfigError = ConfigError  # type: ignore[attr-defined]
+    support.DEVICE_WEBRTC_TRANSPORT = "device_webrtc"  # type: ignore[attr-defined]
     support.SubmitResult = SubmitResult  # type: ignore[attr-defined]
     support.RealtimeSession = RealtimeSession  # type: ignore[attr-defined]
     support.load_config = lambda: config  # type: ignore[attr-defined]
@@ -349,8 +353,66 @@ def _fake_realtime_support(
         lambda phrase: " ".join(phrase.casefold().split())
     )
     support.shutdown_all_sessions = lambda: None  # type: ignore[attr-defined]
+    prewarm_calls: list[None] = []
+
+    def prewarm_device_webrtc() -> bool:
+        prewarm_calls.append(None)
+        return prewarm_result
+
+    support.prewarm_device_webrtc = prewarm_device_webrtc  # type: ignore[attr-defined]
+    support.prewarm_calls = prewarm_calls  # type: ignore[attr-defined]
     support.sessions = sessions  # type: ignore[attr-defined]
     return support
+
+
+def test_direct_webrtc_prewarms_only_after_guarded_overlay_activation(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(media_transport="device_webrtc")
+
+    _protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+
+    assert module._REALTIME_PATCH_ACTIVE
+    assert support.prewarm_calls == [None]  # type: ignore[attr-defined]
+
+
+def test_direct_webrtc_constructor_failure_does_not_start_ha_fallback(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        media_transport="device_webrtc",
+        constructor_error=RuntimeError("unavailable"),
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "okay computer")
+
+    assert not instance.requests
+    assert not instance.audio
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+
+
+def test_direct_webrtc_pre_ready_failure_releases_mic_without_ha_replay(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(media_transport="device_webrtc")
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    preroll = _pcm_frame(7)
+    instance.handle_audio(preroll)
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    session.failed_before_ready = True
+
+    instance.handle_audio(_pcm_frame(8))
+
+    assert session.stopped == 1
+    assert not instance.requests
+    assert not instance.audio
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
 
 
 def test_realtime_wake_claims_mic_without_starting_home_assistant(

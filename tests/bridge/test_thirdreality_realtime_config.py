@@ -8,12 +8,14 @@ from pathlib import Path
 import pytest
 
 from device.thirdreality.realtime_client.config import (
+    BRIDGE_PCM_TRANSPORT,
     DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
     DEFAULT_PLAYBACK_VOLUME_PERCENT,
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
+    DEVICE_WEBRTC_TRANSPORT,
     MAX_REALTIME_VOLUME_PERCENT,
     NATIVE_CONVERSATION_MODE,
     ConfigError,
@@ -52,6 +54,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.voice is None
     assert config.prompt is None
     assert config.full_duplex is False
+    assert config.media_transport == BRIDGE_PCM_TRANSPORT
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
     assert config.pulse_aec_method is None
@@ -104,6 +107,60 @@ def test_realtime_start_message_hardcodes_native_conversation_mode(
     assert realtime_start_message(config)["conversation_mode"] == (
         NATIVE_CONVERSATION_MODE
     )
+
+
+def test_device_webrtc_start_carries_only_direct_offer_and_preferences(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "voice": "Cove",
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+    assert realtime_start_message(config, webrtc_sdp=offer) == {
+        "type": "start",
+        "protocol_version": 3,
+        "conversation_mode": NATIVE_CONVERSATION_MODE,
+        "transport": {"type": "webrtc", "sdp": offer},
+        "voice": "cove",
+    }
+
+
+def test_device_webrtc_requires_full_duplex_and_an_offer(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {**_valid_config(), "media_transport": DEVICE_WEBRTC_TRANSPORT},
+    )
+    with pytest.raises(ConfigError, match="requires full_duplex"):
+        load_config(path, expected_uid=os.getuid())
+
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        },
+    )
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+    with pytest.raises(ConfigError, match="requires an SDP offer"):
+        realtime_start_message(config)
 
 
 def test_conversation_mode_is_not_a_user_configurable_setting(tmp_path: Path) -> None:
@@ -315,6 +372,7 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"input_queue_bytes": 64 * 1024 + 2}, "outside its supported range"),
         ({"io_timeout_seconds": 3.1}, "outside its supported range"),
         ({"full_duplex": 1}, "boolean"),
+        ({"media_transport": "rtp"}, "media_transport must be"),
         ({"full_duplex": True}, "requires explicit"),
         ({"pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE}, "requires full_duplex"),
         ({"pulse_aec_method": "speex"}, "requires full_duplex"),

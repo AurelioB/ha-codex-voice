@@ -24,6 +24,9 @@ DEFAULT_PULSE_AEC_SINK = "codex_echo_cancel_sink"
 DEFAULT_PULSE_AEC_METHOD = "webrtc"
 SUPPORTED_PULSE_AEC_METHODS = frozenset({"adrian", "speex", "webrtc"})
 NATIVE_CONVERSATION_MODE = "native"
+BRIDGE_PCM_TRANSPORT = "bridge_pcm"
+DEVICE_WEBRTC_TRANSPORT = "device_webrtc"
+SUPPORTED_MEDIA_TRANSPORTS = frozenset({BRIDGE_PCM_TRANSPORT, DEVICE_WEBRTC_TRANSPORT})
 DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
 MAX_REALTIME_VOLUME_PERCENT = 60
@@ -54,6 +57,7 @@ _ALLOWED_KEYS = frozenset(
         "output_queue_bytes",
         "max_message_bytes",
         "full_duplex",
+        "media_transport",
         "pulse_aec_source",
         "pulse_aec_sink",
         "pulse_aec_method",
@@ -88,6 +92,7 @@ class RealtimeConfig:
     output_queue_bytes: int
     max_message_bytes: int
     full_duplex: bool
+    media_transport: str = BRIDGE_PCM_TRANSPORT
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
     pulse_aec_source: str | None = None
@@ -104,6 +109,13 @@ class RealtimeConfig:
         """Keep direct construction as strict as the root-only JSON loader."""
         if not isinstance(self.full_duplex, bool):
             raise ConfigError("full_duplex must be a boolean")
+        if (
+            not isinstance(self.media_transport, str)
+            or self.media_transport not in SUPPORTED_MEDIA_TRANSPORTS
+        ):
+            raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
+        if self.media_transport == DEVICE_WEBRTC_TRANSPORT and not self.full_duplex:
+            raise ConfigError("device_webrtc media transport requires full_duplex")
 
         legacy_volume_percent = self.aec_test_volume_percent
         if (
@@ -201,16 +213,30 @@ def normalize_wake_phrase(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def realtime_start_message(config: RealtimeConfig) -> dict[str, Any]:
-    """Build the strict v2 start object, omitting unset session preferences."""
-    value: dict[str, Any] = {
-        "type": "start",
-        "protocol_version": 2,
-        "conversation_mode": NATIVE_CONVERSATION_MODE,
-        "audio_transport": "binary",
-        "input_sample_rate": 16_000,
-        "input_channels": 1,
-    }
+def realtime_start_message(
+    config: RealtimeConfig, *, webrtc_sdp: str | None = None
+) -> dict[str, Any]:
+    """Build one strict native start object, omitting unset preferences."""
+    if config.media_transport == DEVICE_WEBRTC_TRANSPORT:
+        if not isinstance(webrtc_sdp, str) or not webrtc_sdp:
+            raise ConfigError("device_webrtc start requires an SDP offer")
+        if "\x00" in webrtc_sdp:
+            raise ConfigError("device_webrtc SDP offer contains NUL")
+        value: dict[str, Any] = {
+            "type": "start",
+            "protocol_version": 3,
+            "conversation_mode": NATIVE_CONVERSATION_MODE,
+            "transport": {"type": "webrtc", "sdp": webrtc_sdp},
+        }
+    else:
+        value = {
+            "type": "start",
+            "protocol_version": 2,
+            "conversation_mode": NATIVE_CONVERSATION_MODE,
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
     if config.voice is not None:
         value["voice"] = config.voice
     if config.prompt is not None:
@@ -303,6 +329,14 @@ def load_config(
     full_duplex = decoded.get("full_duplex", False)
     if not isinstance(full_duplex, bool):
         raise ConfigError("full_duplex must be a boolean")
+    media_transport = decoded.get("media_transport", BRIDGE_PCM_TRANSPORT)
+    if (
+        not isinstance(media_transport, str)
+        or media_transport not in SUPPORTED_MEDIA_TRANSPORTS
+    ):
+        raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
+    if media_transport == DEVICE_WEBRTC_TRANSPORT and not full_duplex:
+        raise ConfigError("device_webrtc media transport requires full_duplex")
     pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
     pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
     pulse_aec_method = _optional_pulse_aec_method(decoded)
@@ -423,6 +457,7 @@ def load_config(
         ),
         max_message_bytes=max_message_bytes,
         full_duplex=full_duplex,
+        media_transport=media_transport,
         voice=voice,
         prompt=prompt,
         pulse_aec_source=pulse_aec_source,
@@ -552,8 +587,18 @@ def _validate_start_message_size(config: RealtimeConfig) -> None:
     # Keep this encoding identical to WebSocketConnection.send_json. The prompt
     # character bound also keeps the worst-case ensure_ascii expansion below
     # that transport's fixed 16 KiB text ceiling.
+    # Reserve enough room for the measured aiortc offer while retaining the
+    # embedded client's fixed 16 KiB JSON ceiling. The exact runtime offer is
+    # checked again by WebSocketConnection.send_json.
+    offer = (
+        "v=0\r\n" + "a=x:" + ("0" * 4_090)
+        if config.media_transport == DEVICE_WEBRTC_TRANSPORT
+        else None
+    )
     encoded = json.dumps(
-        realtime_start_message(config), separators=(",", ":"), ensure_ascii=True
+        realtime_start_message(config, webrtc_sdp=offer),
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode()
     if len(encoded) > config.max_message_bytes:
         raise ConfigError("voice and prompt do not fit within max_message_bytes")

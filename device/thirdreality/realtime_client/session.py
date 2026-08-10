@@ -18,12 +18,24 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from .config import (
+    DEVICE_WEBRTC_TRANSPORT,
     NATIVE_CONVERSATION_MODE,
     RealtimeConfig,
     realtime_start_message,
+)
+from .playback import (
+    PactlSinkVolumeController,
+    PulsePlaybackError,
+    SinkVolumeController,
+)
+from .sidecar import (
+    ControlMessage,
+    PlaybackAudio,
+    SidecarError,
+    WebRtcSidecarClient,
 )
 from .websocket import Message, WebSocketClosed, WebSocketConnection, WebSocketError
 
@@ -51,7 +63,8 @@ _PAPLAY_ARGV = (
     "--process-time-msec=20",
 )
 _NETWORK_TICK_SECONDS = 0.02
-_PLAYER_WRITE_BYTES = 16 * 1024
+_DIRECT_HANDSHAKE_TICK_SECONDS = 0.01
+_PLAYER_WRITE_BYTES = 24_000 * 2 * 20 // 1_000
 _PLAYER_REAP_SECONDS = 0.5
 _CONTROL_EVENTS = frozenset(
     {
@@ -69,6 +82,9 @@ _CONTROL_EVENTS = frozenset(
         "speaking.stopped",
         "turn.created",
         "turn.done",
+        "interrupt.fenced",
+        "media.quiet",
+        "media.started",
     }
 )
 
@@ -79,6 +95,7 @@ class SessionState(Enum):
     NEW = "new"
     CONNECTING = "connecting"
     READY = "ready"
+    INTERRUPTING = "interrupting"
     STOPPING = "stopping"
     STOPPED = "stopped"
     FAILED = "failed"
@@ -98,6 +115,20 @@ class SubmitResult(Enum):
 class _AudioPacket:
     data: bytes
     captured_at: float
+
+
+@dataclass(slots=True)
+class _DirectPlaybackState:
+    """Network-thread-owned generation and playout accounting."""
+
+    active_generation: int | None = None
+    newest_generation: int = 0
+    retired_generation: int = 0
+    expected_sample_index: int | None = None
+    active_response_id: str | None = None
+    response_in_progress: bool = False
+    output_buffer_active: bool = False
+    interruption_pending: bool = False
 
 
 class _BoundedAudioQueue:
@@ -155,6 +186,27 @@ class _AudioPacer:
         return max(0.0, self._next_send_at - now)
 
 
+class _PlayerLike(Protocol):
+    """Playback surface shared by rollback and direct-media sessions."""
+
+    def begin(self, epoch: int) -> None: ...
+
+    def resume(self, epoch: int) -> None: ...
+
+    def prepare(self) -> None: ...
+
+    def enqueue(self, value: bytes) -> None: ...
+
+    def finish(self, epoch: int) -> None: ...
+
+    def abort(self) -> None: ...
+
+    def service(self) -> None: ...
+
+    @property
+    def active(self) -> bool: ...
+
+
 class _PcmPlayer:
     """Own one fixed-argv paplay child and its bounded non-blocking stdin."""
 
@@ -164,24 +216,56 @@ class _PcmPlayer:
         *,
         sink: str | None = None,
         volume_percent: int | None = None,
+        exact_sink_volume: bool = False,
+        volume_controller: SinkVolumeController | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     ) -> None:
         self._maximum_bytes = maximum_bytes
         self._popen = popen
         self._sink = sink
+        self._exact_sink_volume = exact_sink_volume
+        self._volume_percent = volume_percent
+        self._volume_controller = volume_controller or PactlSinkVolumeController()
         self._volume = (
             None
             if volume_percent is None
-            else _PULSE_VOLUME_NORM * volume_percent // 100
+            else (
+                _PULSE_VOLUME_NORM
+                if exact_sink_volume
+                else _PULSE_VOLUME_NORM * volume_percent // 100
+            )
         )
         self._process: subprocess.Popen[bytes] | None = None
         self._stdin: Any = None
         self._pending = bytearray()
         self._finish_when_drained = False
         self._epoch: int | None = None
+        self._volume_prepared = False
+        self._reap_pending: list[subprocess.Popen[bytes]] = []
+
+    def prepare(self) -> None:
+        """Set and verify the dedicated AEC sink before response media."""
+        if not self._exact_sink_volume:
+            return
+        if self._volume_prepared:
+            return
+        if self._sink is None or self._volume_percent is None:
+            raise WebSocketError("direct playback volume is not configured")
+        try:
+            self._volume_controller.set_and_verify(
+                self._sink,
+                self._volume_percent,
+            )
+        except PulsePlaybackError as exc:
+            raise WebSocketError(
+                "direct playback volume could not be prepared"
+            ) from exc
+        self._volume_prepared = True
 
     def begin(self, epoch: int) -> None:
         self.abort()
+        if self._exact_sink_volume and not self._volume_prepared:
+            self.prepare()
         try:
             argv = list(_PAPLAY_ARGV)
             if self._sink is not None:
@@ -194,6 +278,7 @@ class _PcmPlayer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                start_new_session=True,
                 shell=False,
             )
         except Exception as exc:
@@ -213,6 +298,16 @@ class _PcmPlayer:
         self._finish_when_drained = False
         self._epoch = epoch
 
+    def resume(self, epoch: int) -> None:
+        """Advance a media-fenced epoch without discarding audible tail."""
+        if self._process is None or self._stdin is None:
+            self.begin(epoch)
+            return
+        if self._exact_sink_volume and not self._volume_prepared:
+            self.prepare()
+        self._epoch = epoch
+        self._finish_when_drained = False
+
     def enqueue(self, value: bytes) -> None:
         if self._process is None or self._stdin is None or self._epoch is None:
             raise WebSocketError("audio arrived outside a speaking epoch")
@@ -227,6 +322,7 @@ class _PcmPlayer:
         self.service()
 
     def service(self) -> None:
+        self._reap_killed()
         process = self._process
         if process is None:
             return
@@ -260,11 +356,23 @@ class _PcmPlayer:
         self._pending.clear()
         self._finish_when_drained = False
         self._epoch = None
+        if process is not None:
+            with suppress(Exception):
+                process.kill()
+            self._reap_pending.append(process)
         if stdin is not None:
             with suppress(Exception):
                 stdin.close()
-        if process is not None:
-            _terminate_and_reap(process)
+
+    def close(self, timeout: float = _PLAYER_REAP_SECONDS) -> None:
+        """Kill owned playback and reap it within one bounded deadline."""
+        self.abort()
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self._reap_pending and time.monotonic() < deadline:
+            self._reap_killed()
+            if self._reap_pending:
+                time.sleep(0.005)
+        self._reap_killed()
 
     @property
     def active(self) -> bool:
@@ -282,6 +390,19 @@ class _PcmPlayer:
             process.wait(timeout=_PLAYER_REAP_SECONDS)
         except Exception as exc:
             raise WebSocketError("paplay could not be reaped") from exc
+
+    def _reap_killed(self) -> None:
+        remaining: list[subprocess.Popen[bytes]] = []
+        for process in self._reap_pending:
+            try:
+                if process.poll() is None:
+                    remaining.append(process)
+                    continue
+                process.wait(timeout=0)
+            except Exception:  # noqa: BLE001 - SIGKILL already prevents playback.
+                if process.poll() is None:
+                    remaining.append(process)
+        self._reap_pending = remaining
 
 
 def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
@@ -461,6 +582,58 @@ def _pactl_output(arguments: tuple[str, ...], *, timeout: float) -> str:
 
 _SESSIONS: weakref.WeakSet[RealtimeSession] = weakref.WeakSet()
 _SESSIONS_LOCK = threading.Lock()
+_PREWARM_LOCK = threading.Lock()
+_PREWARMED_SIDECAR: WebRtcSidecarClient | None = None
+_SHUTTING_DOWN = False
+
+
+def prewarm_device_webrtc() -> bool:
+    """Keep one isolated peer process warm between direct voice sessions."""
+    global _PREWARMED_SIDECAR  # noqa: PLW0603
+    with _PREWARM_LOCK:
+        if _SHUTTING_DOWN:
+            return False
+        current = _PREWARMED_SIDECAR
+        if current is not None:
+            if not current.closed and current.process.poll() is None:
+                return True
+            with suppress(Exception):
+                current.close()
+            _PREWARMED_SIDECAR = None
+        try:
+            _PREWARMED_SIDECAR = WebRtcSidecarClient.launch()
+        except Exception:  # noqa: BLE001 - optional prewarm fails closed on wake
+            _LOGGER.warning("ThirdReality WebRTC prewarm failed", exc_info=False)
+            return False
+        return True
+
+
+def _take_prewarmed_sidecar() -> WebRtcSidecarClient:
+    """Transfer the warm peer to one session, cold-launching if unavailable."""
+    global _PREWARMED_SIDECAR  # noqa: PLW0603
+    with _PREWARM_LOCK:
+        if _SHUTTING_DOWN:
+            raise SidecarError("device WebRTC process is shutting down")
+        sidecar = _PREWARMED_SIDECAR
+        _PREWARMED_SIDECAR = None
+    if sidecar is not None:
+        if not sidecar.closed and sidecar.process.poll() is None:
+            return sidecar
+        with suppress(Exception):
+            sidecar.close()
+    return WebRtcSidecarClient.launch()
+
+
+def _close_prewarmed_sidecar(*, timeout: float = 1.0) -> None:
+    """Release the idle isolated peer during process shutdown."""
+    global _PREWARMED_SIDECAR, _SHUTTING_DOWN  # noqa: PLW0603
+    with _PREWARM_LOCK:
+        _SHUTTING_DOWN = True
+        sidecar = _PREWARMED_SIDECAR
+        _PREWARMED_SIDECAR = None
+    if sidecar is not None:
+        with suppress(Exception):
+            sidecar.close(timeout=max(0.0, timeout))
 
 
 class RealtimeSession:
@@ -477,6 +650,8 @@ class RealtimeSession:
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         aec_verifier: Callable[[RealtimeConfig], None] | None = None,
         volume_guard: Callable[[RealtimeConfig], None] | None = None,
+        sidecar_factory: Callable[[], WebRtcSidecarClient] | None = None,
+        direct_player_factory: Callable[[int, str], _PlayerLike] | None = None,
     ) -> None:
         """Create an unstarted, single-use session."""
         self._config = config
@@ -489,6 +664,17 @@ class RealtimeSession:
         # check for every new response after the complete startup preflight.
         self._volume_guard = volume_guard or (
             aec_verifier if aec_verifier is not None else _verify_aec_sink_volume
+        )
+        self._uses_global_sidecar = sidecar_factory is None
+        self._sidecar_factory = sidecar_factory or _take_prewarmed_sidecar
+        self._direct_player_factory = direct_player_factory or (
+            lambda maximum_bytes, sink: _PcmPlayer(
+                maximum_bytes,
+                sink=sink,
+                volume_percent=self._config.playback_volume_percent,
+                exact_sink_volume=True,
+                popen=self._popen,
+            )
         )
         self._audio = _BoundedAudioQueue(config.input_queue_bytes)
         self._state = SessionState.NEW
@@ -569,7 +755,11 @@ class RealtimeSession:
         # before opening the bridge socket.
         packet = _AudioPacket(value, self._clock())
         with self._state_lock:
-            if self._state not in {SessionState.CONNECTING, SessionState.READY}:
+            if self._state not in {
+                SessionState.CONNECTING,
+                SessionState.READY,
+                SessionState.INTERRUPTING,
+            }:
                 return SubmitResult.CLOSED
             if self._output_active.is_set() and not self._config.full_duplex:
                 return SubmitResult.GATED
@@ -622,7 +812,7 @@ class RealtimeSession:
 
     def _flush_local_barge_in(
         self,
-        player: _PcmPlayer,
+        player: _PlayerLike,
         *,
         output_epoch: int | None,
         last_output_epoch: int,
@@ -673,8 +863,14 @@ class RealtimeSession:
             else:
                 self._interrupt_preserve_session = preserve_session
             self._interrupt_requested.set()
-            if self._state in {SessionState.CONNECTING, SessionState.READY}:
+            if not self._interrupt_preserve_session:
                 self._state = SessionState.STOPPING
+            elif self._state in {SessionState.CONNECTING, SessionState.READY}:
+                self._state = (
+                    SessionState.INTERRUPTING
+                    if self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
+                    else SessionState.STOPPING
+                )
             self._audio.clear()
             self._reset_local_barge_in_detection()
         self._wake_network.set()
@@ -685,7 +881,11 @@ class RealtimeSession:
             return
         with self._state_lock:
             self._stop_requested.set()
-            if self._state in {SessionState.CONNECTING, SessionState.READY}:
+            if self._state in {
+                SessionState.CONNECTING,
+                SessionState.READY,
+                SessionState.INTERRUPTING,
+            }:
                 self._state = SessionState.STOPPING
             self._audio.clear()
             self._reset_local_barge_in_detection()
@@ -699,7 +899,16 @@ class RealtimeSession:
         thread.join(timeout=max(0.0, timeout))
         return not thread.is_alive()
 
-    def _run(self) -> None:  # noqa: C901 - one bounded protocol state machine
+    def _run(self) -> None:
+        """Select the explicitly configured media transport."""
+        if self._config.media_transport == DEVICE_WEBRTC_TRANSPORT:
+            self._run_device_webrtc()
+            return
+        self._run_bridge_pcm()
+
+    def _run_bridge_pcm(  # noqa: C901
+        self,
+    ) -> None:
         connection: WebSocketConnection | None = None
         player = _PcmPlayer(
             self._config.output_queue_bytes,
@@ -899,6 +1108,603 @@ class RealtimeSession:
                 with _SESSIONS_LOCK:
                     _SESSIONS.discard(self)
 
+    def _run_device_webrtc(  # noqa: C901
+        self,
+    ) -> None:
+        """Terminate WebRTC on the device and keep the bridge signaling-only."""
+        connection: WebSocketConnection | None = None
+        sidecar: WebRtcSidecarClient | None = None
+        player: _PlayerLike | None = None
+        failed = False
+        capture_ages_ms: deque[float] = deque(maxlen=256)
+        try:
+            started_at = self._clock()
+            self._aec_verifier(self._config)
+            sink = self._config.pulse_aec_sink
+            if sink is None:
+                raise WebSocketError(  # noqa: TRY301
+                    "direct WebRTC playback has no AEC sink"
+                )
+            player = self._direct_player_factory(
+                self._config.output_queue_bytes,
+                sink,
+            )
+            # Perform the bounded sink mutation before negotiation. The live
+            # media loop must never block on pactl while it owns VAD, interrupt,
+            # IPC draining, and immediate paplay termination.
+            player.prepare()
+            state = _DirectPlaybackState()
+            sidecar = self._sidecar_factory()
+            handshake_deadline = min(
+                started_at + self._config.max_session_seconds,
+                started_at + self._config.handshake_timeout_seconds,
+            )
+
+            sidecar.request_offer()
+            offer_sdp = self._wait_for_direct_offer(sidecar, handshake_deadline)
+            connection = self._connection_factory(
+                url=self._config.url,
+                connect_address=self._config.connect_address,
+                token=self._config.token,
+                connect_timeout_seconds=self._config.connect_timeout_seconds,
+                io_timeout_seconds=self._config.io_timeout_seconds,
+                max_message_bytes=self._config.max_message_bytes,
+            )
+            connection.send_json(
+                realtime_start_message(self._config, webrtc_sdp=offer_sdp)
+            )
+            answer_sdp = self._wait_for_direct_answer(
+                connection,
+                sidecar,
+                handshake_deadline,
+            )
+            sidecar.set_answer(answer_sdp)
+
+            pacer = _AudioPacer()
+            sample_index = 0
+            ready_states: set[str] = set()
+            required_states = {"answer.applied", "connected", "data.ready"}
+            while not required_states.issubset(ready_states):
+                self._raise_if_direct_startup_cancelled(handshake_deadline)
+                now = self._clock()
+                sample_index, _ = self._send_direct_audio(
+                    sidecar,
+                    pacer,
+                    sample_index=sample_index,
+                    now=now,
+                    capture_ages_ms=capture_ages_ms,
+                )
+                controls, _ = self._drain_direct_sidecar(
+                    sidecar,
+                    player,
+                    state,
+                )
+                for control in controls:
+                    if control.type in required_states:
+                        ready_states.add(control.type)
+                    else:
+                        raise SidecarError(  # noqa: TRY301
+                            "sidecar emitted an unexpected handshake event"
+                        )
+                self._reject_direct_bridge_message_if_ready(connection)
+                self._wait_direct_tick(pacer, now, handshake_deadline)
+
+            connection.send_json({"type": "transport_ready", "protocol_version": 3})
+            while True:
+                self._raise_if_direct_startup_cancelled(handshake_deadline)
+                now = self._clock()
+                sample_index, _ = self._send_direct_audio(
+                    sidecar,
+                    pacer,
+                    sample_index=sample_index,
+                    now=now,
+                    capture_ages_ms=capture_ages_ms,
+                )
+                controls, _ = self._drain_direct_sidecar(sidecar, player, state)
+                if controls:
+                    raise SidecarError(  # noqa: TRY301
+                        "sidecar emitted an unexpected startup event"
+                    )
+                if _socket_readable(connection, 0):
+                    message = connection.receive_message()
+                    if message is None:
+                        continue
+                    if message.kind == "pong":
+                        continue
+                    if message.kind != "text":
+                        raise WebSocketError(  # noqa: TRY301
+                            "direct WebRTC startup received non-JSON data"
+                        )
+                    value = _json_object(message.data)
+                    if value.get("type") == "error":
+                        raise WebSocketError(  # noqa: TRY301
+                            "bridge rejected direct WebRTC startup"
+                        )
+                    _validate_direct_started(value)
+                    break
+                self._wait_direct_tick(pacer, now, handshake_deadline)
+
+            self._ever_ready = True
+            self._ready.set()
+            with self._state_lock:
+                if self._state is SessionState.CONNECTING:
+                    self._state = SessionState.READY
+
+            last_semantic_activity = self._clock()
+            next_ping_at = last_semantic_activity + self._config.ping_interval_seconds
+            pending_ping: bytes | None = None
+            pong_deadline: float | None = None
+
+            while True:
+                now = self._clock()
+                player.service()
+                _check_deadlines(
+                    now,
+                    started_at=started_at,
+                    last_activity=last_semantic_activity,
+                    max_session_seconds=self._config.max_session_seconds,
+                    idle_timeout_seconds=self._config.idle_timeout_seconds,
+                    pending_ping=pending_ping,
+                    pong_deadline=pong_deadline,
+                )
+
+                if self._interrupt_requested.is_set():
+                    player.abort()
+                    self._set_local_output_epoch(None)
+                    if state.active_generation is not None:
+                        state.retired_generation = max(
+                            state.retired_generation,
+                            state.active_generation,
+                        )
+                    with self._state_lock:
+                        preserve_session = self._interrupt_preserve_session
+                        if preserve_session:
+                            self._interrupt_requested.clear()
+                    if not preserve_session:
+                        self._audio.clear()
+                        sidecar.stop()
+                        connection.send_json({"type": "stop"})
+                        return
+                    # The child owns the ordered provider lifecycle and decides
+                    # whether cancel, clear, both, or neither are currently
+                    # valid. Send unconditionally so queued lifecycle cannot
+                    # make a local-state race lose the interruption.
+                    state.interruption_pending = True
+                    sidecar.interrupt_response(state.active_response_id)
+                    state.active_generation = None
+                    last_semantic_activity = now
+                elif self._stop_requested.is_set():
+                    player.abort()
+                    self._set_local_output_epoch(None)
+                    self._audio.clear()
+                    sidecar.stop()
+                    connection.send_json({"type": "stop"})
+                    return
+                else:
+                    previous_generation = state.active_generation
+                    active_generation = self._flush_local_barge_in(
+                        player,
+                        output_epoch=previous_generation,
+                        last_output_epoch=state.newest_generation,
+                    )
+                    if previous_generation is not None and active_generation is None:
+                        state.retired_generation = max(
+                            state.retired_generation,
+                            previous_generation,
+                        )
+                        state.interruption_pending = True
+                        sidecar.interrupt_response(state.active_response_id)
+                        state.active_generation = None
+                        with self._state_lock:
+                            if self._state is SessionState.READY:
+                                self._state = SessionState.INTERRUPTING
+                        last_semantic_activity = now
+
+                sample_index, input_semantic = self._send_direct_audio(
+                    sidecar,
+                    pacer,
+                    sample_index=sample_index,
+                    now=now,
+                    capture_ages_ms=capture_ages_ms,
+                )
+                controls, output_semantic = self._drain_direct_sidecar(
+                    sidecar,
+                    player,
+                    state,
+                )
+                if controls:
+                    raise SidecarError(  # noqa: TRY301
+                        "sidecar emitted an unexpected runtime event"
+                    )
+                if input_semantic or output_semantic:
+                    last_semantic_activity = self._clock()
+
+                if pending_ping is None and now >= next_ping_at:
+                    pending_ping = os.urandom(8)
+                    connection.send_ping(pending_ping)
+                    pong_deadline = now + self._config.pong_timeout_seconds
+                    next_ping_at = now + self._config.ping_interval_seconds
+
+                if _socket_readable(connection, 0):
+                    message = connection.receive_message()
+                    if message is None:
+                        continue
+                    if message.kind == "pong":
+                        if message.data == pending_ping:
+                            pending_ping = None
+                            pong_deadline = None
+                        continue
+                    if message.kind != "text":
+                        raise WebSocketError(  # noqa: TRY301
+                            "direct WebRTC bridge carried unexpected media"
+                        )
+                    value = _json_object(message.data)
+                    message_type = value.get("type")
+                    if message_type == "pong":
+                        continue
+                    if message_type == "stopped":
+                        return
+                    if message_type == "error":
+                        raise WebSocketError(  # noqa: TRY301
+                            "direct WebRTC bridge reported an error"
+                        )
+                    raise WebSocketError(  # noqa: TRY301
+                        "unsupported direct WebRTC bridge control"
+                    )
+
+                ping_wait = (
+                    max(0.0, next_ping_at - now)
+                    if pending_ping is None
+                    else max(0.0, (pong_deadline or now) - now)
+                )
+                timeout = min(
+                    _NETWORK_TICK_SECONDS,
+                    pacer.delay(now) or _NETWORK_TICK_SECONDS,
+                    ping_wait,
+                    max(0.0, started_at + self._config.max_session_seconds - now),
+                    max(
+                        0.0,
+                        last_semantic_activity
+                        + self._config.idle_timeout_seconds
+                        - now,
+                    ),
+                )
+                self._wake_network.wait(timeout)
+                self._wake_network.clear()
+        except (
+            OSError,
+            PulsePlaybackError,
+            SidecarError,
+            TimeoutError,
+            ValueError,
+            WebSocketError,
+        ):
+            failed = not (
+                self._stop_requested.is_set() or self._interrupt_requested.is_set()
+            )
+            if failed:
+                _LOGGER.warning("ThirdReality direct WebRTC session failed")
+        except Exception:  # noqa: BLE001 - never escape the vendor daemon thread
+            failed = True
+            _LOGGER.warning(
+                "ThirdReality direct WebRTC session failed",
+                exc_info=False,
+            )
+        finally:
+            try:
+                self._set_local_output_epoch(None)
+                self._audio.clear()
+                if player is not None:
+                    with suppress(Exception):
+                        player.abort()
+                    close_player = getattr(player, "close", None)
+                    if callable(close_player):
+                        with suppress(Exception):
+                            close_player(timeout=0.5)
+                if sidecar is not None:
+                    with suppress(Exception):
+                        sidecar.stop()
+                    with suppress(Exception):
+                        sidecar.close()
+                if connection is not None:
+                    with suppress(Exception):
+                        connection.send_close()
+                    with suppress(Exception):
+                        connection.close()
+            finally:
+                if capture_ages_ms:
+                    ordered_ages = sorted(capture_ages_ms)
+                    p95_index = max(0, int(len(ordered_ages) * 0.95) - 1)
+                    _LOGGER.info(
+                        "ThirdReality direct capture age: p95_ms=%.1f max_ms=%.1f",
+                        ordered_ages[p95_index],
+                        ordered_ages[-1],
+                    )
+                with self._state_lock:
+                    self._state = (
+                        SessionState.FAILED if failed else SessionState.STOPPED
+                    )
+                self._terminal.set()
+                with _SESSIONS_LOCK:
+                    _SESSIONS.discard(self)
+                if self._uses_global_sidecar:
+                    prewarm_device_webrtc()
+
+    def _wait_for_direct_offer(
+        self,
+        sidecar: WebRtcSidecarClient,
+        deadline: float,
+    ) -> str:
+        """Wait for exactly one content-free sidecar offer."""
+        while True:
+            self._raise_if_direct_startup_cancelled(deadline)
+            if _socket_readable(sidecar, 0):
+                for message in sidecar.drain_messages():
+                    if (
+                        isinstance(message, ControlMessage)
+                        and message.type == "offer"
+                        and isinstance(message.values.get("sdp"), str)
+                    ):
+                        return str(message.values["sdp"])
+                    if isinstance(message, ControlMessage) and message.type == "error":
+                        raise SidecarError("sidecar could not create an offer")
+                    raise SidecarError("sidecar emitted an unexpected offer event")
+            self._wake_network.wait(_DIRECT_HANDSHAKE_TICK_SECONDS)
+            self._wake_network.clear()
+
+    def _wait_for_direct_answer(
+        self,
+        connection: WebSocketConnection,
+        sidecar: WebRtcSidecarClient,
+        deadline: float,
+    ) -> str:
+        """Wait for one strict bridge answer while monitoring the sidecar."""
+        while True:
+            self._raise_if_direct_startup_cancelled(deadline)
+            if _socket_readable(sidecar, 0):
+                messages = sidecar.drain_messages()
+                if messages:
+                    raise SidecarError("sidecar failed while awaiting SDP answer")
+            if _socket_readable(connection, 0):
+                message = connection.receive_message()
+                if message is None:
+                    continue
+                if message.kind == "pong":
+                    continue
+                if message.kind != "text":
+                    raise WebSocketError("direct WebRTC answer must be JSON")
+                value = _json_object(message.data)
+                if value.get("type") == "error":
+                    raise WebSocketError("bridge rejected direct WebRTC startup")
+                return _direct_answer_sdp(value)
+            self._wake_network.wait(_DIRECT_HANDSHAKE_TICK_SECONDS)
+            self._wake_network.clear()
+
+    def _raise_if_direct_startup_cancelled(self, deadline: float) -> None:
+        """Apply the single startup deadline and stop boundary."""
+        if self._stop_requested.is_set() or self._interrupt_requested.is_set():
+            raise WebSocketClosed("direct WebRTC startup was cancelled")
+        if self._clock() >= deadline:
+            raise TimeoutError("direct WebRTC startup timed out")
+
+    def _wait_direct_tick(
+        self,
+        pacer: _AudioPacer,
+        now: float,
+        deadline: float,
+    ) -> None:
+        """Yield a bounded handshake tick without delaying queued microphone PCM."""
+        timeout = min(
+            _DIRECT_HANDSHAKE_TICK_SECONDS,
+            pacer.delay(now) or _DIRECT_HANDSHAKE_TICK_SECONDS,
+            max(0.0, deadline - now),
+        )
+        self._wake_network.wait(timeout)
+        self._wake_network.clear()
+
+    def _reject_direct_bridge_message_if_ready(
+        self,
+        connection: WebSocketConnection,
+    ) -> None:
+        """Fail closed if the bridge speaks before transport readiness."""
+        if not _socket_readable(connection, 0):
+            return
+        message = connection.receive_message()
+        if message is None:
+            return
+        if message.kind == "pong":
+            return
+        if message.kind == "text" and _json_object(message.data).get("type") == "error":
+            raise WebSocketError("bridge rejected direct WebRTC transport")
+        raise WebSocketError("bridge sent an unexpected direct WebRTC message")
+
+    def _send_direct_audio(
+        self,
+        sidecar: WebRtcSidecarClient,
+        pacer: _AudioPacer,
+        *,
+        sample_index: int,
+        now: float,
+        capture_ages_ms: deque[float],
+    ) -> tuple[int, bool]:
+        """Send at most one timestamped frame, preserving bounded startup catch-up."""
+        if not pacer.due(now):
+            return sample_index, False
+        packet, remaining_packets = self._audio.pop()
+        if packet is None:
+            return sample_index, False
+        sidecar.send_audio(
+            packet.data,
+            sample_index=sample_index,
+            capture_monotonic_ns=max(0, int(packet.captured_at * 1_000_000_000)),
+        )
+        capture_ages_ms.append(max(0.0, (now - packet.captured_at) * 1_000))
+        sample_index += len(packet.data) // 2
+        pacer.sent(
+            now,
+            len(packet.data),
+            catching_up=remaining_packets > 0,
+        )
+        return sample_index, _pcm_has_signal(packet.data)
+
+    def _drain_direct_sidecar(
+        self,
+        sidecar: WebRtcSidecarClient,
+        player: _PlayerLike,
+        state: _DirectPlaybackState,
+    ) -> tuple[list[ControlMessage], bool]:
+        """Consume bounded IPC, returning only non-media state messages."""
+        if not _socket_readable(sidecar, 0):
+            return [], False
+        controls: list[ControlMessage] = []
+        semantic = False
+        for message in sidecar.drain_messages(maximum=8):
+            if isinstance(message, PlaybackAudio):
+                self._handle_direct_playback(message, player, state)
+                semantic = True
+                continue
+            if message.type == "error":
+                raise SidecarError("device WebRTC sidecar reported an error")
+            if message.type == "lifecycle":
+                if self._handle_direct_lifecycle(message, sidecar, player, state):
+                    semantic = True
+                continue
+            controls.append(message)
+        return controls, semantic
+
+    def _handle_direct_playback(
+        self,
+        message: PlaybackAudio,
+        player: _PlayerLike,
+        state: _DirectPlaybackState,
+    ) -> None:
+        """Render contiguous PCM only inside a sidecar-proven media epoch."""
+        samples = len(message.pcm) // 2
+        if message.generation < 1:
+            raise SidecarError("playback generation must be positive")
+        if (
+            state.expected_sample_index is not None
+            and message.sample_index != state.expected_sample_index
+        ):
+            raise SidecarError("playback sample sequence is not contiguous")
+        state.expected_sample_index = message.sample_index + samples
+        if state.interruption_pending:
+            return
+        if message.generation <= state.retired_generation:
+            return
+        if message.generation < state.newest_generation:
+            return
+        if message.generation > state.newest_generation:
+            raise SidecarError("playback arrived before its media boundary")
+        if state.active_generation != message.generation:
+            raise SidecarError("playback arrived outside its active media epoch")
+        player.enqueue(message.pcm)
+
+    def _handle_direct_lifecycle(  # noqa: C901 - strict lifecycle state machine
+        self,
+        message: ControlMessage,
+        sidecar: WebRtcSidecarClient,
+        player: _PlayerLike,
+        state: _DirectPlaybackState,
+    ) -> bool:
+        """Apply sanitized provider lifecycle without transcript exposure."""
+        event_type = message.values.get("event_type")
+        generation = message.values.get("generation")
+        if not isinstance(event_type, str) or not isinstance(generation, int):
+            raise SidecarError("sidecar lifecycle metadata is invalid")
+        if generation < 0:
+            raise SidecarError("sidecar lifecycle generation is invalid")
+        response_id = message.values.get("response_id")
+        if response_id is not None and not isinstance(response_id, str):
+            raise SidecarError("sidecar response identifier is invalid")
+
+        if event_type == "media.started":
+            if generation <= 0:
+                raise SidecarError("media generation must be positive")
+            if state.interruption_pending:
+                raise SidecarError("media resumed before its interruption fence")
+            if generation <= state.retired_generation:
+                return False
+            if generation <= state.newest_generation:
+                raise SidecarError("media generation did not advance")
+            if state.active_generation is not None:
+                raise SidecarError("media generation overlapped its predecessor")
+            if player.active:
+                resume = getattr(player, "resume", None)
+                if not callable(resume):
+                    raise SidecarError("playback cannot resume a media epoch")
+                resume(generation)
+            else:
+                player.begin(generation)
+            self._set_local_output_epoch(generation)
+            state.newest_generation = generation
+            state.active_generation = generation
+            self._suppressed_output_epoch = None
+            return True
+
+        if event_type == "media.quiet":
+            if generation == state.active_generation:
+                self._set_local_output_epoch(None)
+                state.retired_generation = max(state.retired_generation, generation)
+                state.active_generation = None
+            return True
+
+        if event_type == "interrupt.fenced":
+            state.interruption_pending = False
+            with self._state_lock:
+                if self._state is SessionState.INTERRUPTING:
+                    self._state = SessionState.READY
+            return True
+
+        if event_type in {"response.created", "response.started"}:
+            state.response_in_progress = True
+            if response_id is not None:
+                state.active_response_id = response_id
+            return True
+
+        if event_type in {
+            "response.cancelled",
+            "response.completed",
+            "response.done",
+        }:
+            if response_id is None or response_id == state.active_response_id:
+                state.response_in_progress = False
+            return True
+
+        if event_type in {"output_audio_buffer.started", "speaking.started"}:
+            state.output_buffer_active = True
+            if response_id is not None:
+                state.active_response_id = response_id
+            return True
+
+        if event_type in {
+            "output_audio_buffer.cleared",
+            "output_audio_buffer.stopped",
+            "speaking.stopped",
+        }:
+            if response_id is None or response_id == state.active_response_id:
+                state.output_buffer_active = False
+            return True
+
+        if event_type == "input_audio_buffer.speech_started":
+            if state.active_generation is not None:
+                state.retired_generation = max(
+                    state.retired_generation,
+                    state.active_generation,
+                )
+            state.interruption_pending = True
+            player.abort()
+            self._set_local_output_epoch(None)
+            state.active_generation = None
+            with self._state_lock:
+                if self._state is SessionState.READY:
+                    self._state = SessionState.INTERRUPTING
+            return True
+
+        if event_type == "error":
+            raise SidecarError("realtime provider reported an error")
+        return event_type in _CONTROL_EVENTS or event_type.startswith("session.")
+
     def _wait_for_started(
         self, connection: WebSocketConnection, deadline: float
     ) -> None:
@@ -1027,11 +1833,22 @@ class RealtimeSession:
 
 def shutdown_all_sessions(timeout: float = 2.0) -> None:
     """Best-effort bounded cleanup for process exit."""
+    global _PREWARMED_SIDECAR, _SHUTTING_DOWN  # noqa: PLW0603
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _PREWARM_LOCK:
+        _SHUTTING_DOWN = True
+        prewarmed = _PREWARMED_SIDECAR
+        _PREWARMED_SIDECAR = None
     with _SESSIONS_LOCK:
         sessions = list(_SESSIONS)
-    deadline = time.monotonic() + max(0.0, timeout)
+    # Signal every active media owner before spending any shared deadline on
+    # the idle prewarm. This guarantees local playback kill/flush begins even
+    # when an isolated child is wedged during process exit.
     for session in sessions:
         session.stop()
+    if prewarmed is not None:
+        with suppress(Exception):
+            prewarmed.close(timeout=max(0.0, deadline - time.monotonic()))
     for session in sessions:
         session.join(max(0.0, deadline - time.monotonic()))
 
@@ -1108,6 +1925,38 @@ def _validate_started(value: dict[str, Any]) -> None:
         raise WebSocketError("bridge returned incompatible cancel semantics")
     if capabilities.get("same_session_interrupt_ack") is not True:
         raise WebSocketError("bridge omitted same-session interrupt acknowledgement")
+
+
+def _direct_answer_sdp(value: dict[str, Any]) -> str:
+    """Validate the distinct protocol-v3 SDP answer without accepting extras."""
+    if set(value) != {"type", "protocol_version", "transport"}:
+        raise WebSocketError("bridge returned an incompatible WebRTC answer")
+    if value.get("type") != "answer" or value.get("protocol_version") != 3:
+        raise WebSocketError("bridge returned an incompatible WebRTC answer")
+    transport = value.get("transport")
+    if not isinstance(transport, dict) or set(transport) != {"type", "sdp"}:
+        raise WebSocketError("bridge returned an incompatible WebRTC transport")
+    sdp = transport.get("sdp")
+    if transport.get("type") != "webrtc" or not isinstance(sdp, str) or not sdp:
+        raise WebSocketError("bridge returned an invalid WebRTC SDP answer")
+    if "\x00" in sdp or not sdp.startswith("v=0"):
+        raise WebSocketError("bridge returned an invalid WebRTC SDP answer")
+    return sdp
+
+
+def _validate_direct_started(value: dict[str, Any]) -> None:
+    """Require the content-free signaling-only protocol-v3 acknowledgement."""
+    expected = {
+        "type": "started",
+        "version": "v3",
+        "protocol_version": 3,
+        "conversation_mode": NATIVE_CONVERSATION_MODE,
+        "transport": "webrtc",
+        "audio_over_bridge": False,
+        "sideband_control": True,
+    }
+    if value != expected:
+        raise WebSocketError("bridge returned an incompatible direct WebRTC protocol")
 
 
 def _output_epoch(value: dict[str, Any]) -> int:

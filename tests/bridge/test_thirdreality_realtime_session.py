@@ -16,6 +16,7 @@ from device.thirdreality.realtime_client.config import (
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
+    DEVICE_WEBRTC_TRANSPORT,
     RealtimeConfig,
 )
 from device.thirdreality.realtime_client.session import (
@@ -31,7 +32,9 @@ from device.thirdreality.realtime_client.session import (
     _validate_started,
     _verify_pulseaudio_aec,
 )
+from device.thirdreality.realtime_client.sidecar import SidecarError
 from device.thirdreality.realtime_client.websocket import Message, WebSocketError
+from device.thirdreality.webrtc_sidecar.protocol import ControlMessage, PlaybackAudio
 
 
 def _config(**overrides: object) -> RealtimeConfig:
@@ -120,6 +123,13 @@ class _RecordingPlayer:
         self._active = True
         self.events.append(("begin", epoch))
 
+    def resume(self, epoch: int) -> None:
+        self._active = True
+        self.events.append(("resume", epoch))
+
+    def prepare(self) -> None:
+        self.events.append(("prepare", None))
+
     def enqueue(self, value: bytes) -> None:
         self.events.append(("audio", value))
 
@@ -146,6 +156,13 @@ class _LoopPlayer:
         self._active = True
         self.events.append(("begin", epoch))
 
+    def resume(self, epoch: int) -> None:
+        self._active = True
+        self.events.append(("resume", epoch))
+
+    def prepare(self) -> None:
+        self.events.append(("prepare", None))
+
     def enqueue(self, value: bytes) -> None:
         self.events.append(("audio", value))
 
@@ -166,6 +183,98 @@ class _LoopPlayer:
     @property
     def active(self) -> bool:
         return self._active
+
+
+class _DirectRecordingPlayer(_LoopPlayer):
+    def finish(self, epoch: int) -> None:
+        self.events.append(("finish", epoch))
+        self._active = False
+
+
+class _FakeSidecar:
+    def __init__(self) -> None:
+        self._incoming: deque[ControlMessage | PlaybackAudio] = deque()
+        self._condition = threading.Condition()
+        self.answers: list[str] = []
+        self.audio: list[tuple[bytes, int, int]] = []
+        self.cancellations: list[str | None] = []
+        self.interruptions: list[str | None] = []
+        self.stop_count = 0
+        self.closed = False
+
+    def wait_readable(self, timeout: float) -> bool:
+        with self._condition:
+            self._condition.wait_for(
+                lambda: bool(self._incoming) or self.closed,
+                timeout=max(0.0, timeout),
+            )
+            return bool(self._incoming)
+
+    def feed(self, message: ControlMessage | PlaybackAudio) -> None:
+        with self._condition:
+            self._incoming.append(message)
+            self._condition.notify_all()
+
+    def request_offer(self) -> None:
+        self.feed(
+            ControlMessage(
+                "offer",
+                {
+                    "sdp": (
+                        "v=0\r\n"
+                        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+                    )
+                },
+            )
+        )
+
+    def set_answer(self, sdp: str) -> None:
+        self.answers.append(sdp)
+        self.feed(ControlMessage("answer.applied", {}))
+        self.feed(ControlMessage("connected", {}))
+        self.feed(ControlMessage("data.ready", {}))
+
+    def send_audio(
+        self,
+        pcm: bytes,
+        *,
+        sample_index: int,
+        capture_monotonic_ns: int,
+    ) -> None:
+        self.audio.append((pcm, sample_index, capture_monotonic_ns))
+
+    def drain_messages(
+        self,
+        *,
+        maximum: int = 64,
+    ) -> list[ControlMessage | PlaybackAudio]:
+        with self._condition:
+            return [
+                self._incoming.popleft()
+                for _ in range(min(maximum, len(self._incoming)))
+            ]
+
+    def cancel_response(self, response_id: str | None = None) -> None:
+        self.cancellations.append(response_id)
+
+    def interrupt_response(self, response_id: str | None = None) -> None:
+        self.interruptions.append(response_id)
+        self.feed(
+            ControlMessage(
+                "lifecycle",
+                {"event_type": "interrupt.fenced", "generation": 0},
+            )
+        )
+
+    def stop(self) -> None:
+        self.stop_count += 1
+
+    def close(self, *, timeout: float = 1.0) -> None:
+        del timeout
+        with self._condition:
+            self.closed = True
+            self._condition.notify_all()
 
 
 class _FakeRealtimeConnection:
@@ -253,6 +362,22 @@ def _wait_for(predicate: Any, timeout: float = 1.0) -> bool:
     return bool(predicate())
 
 
+def test_shutdown_closes_idle_prewarmed_sidecar_and_blocks_rewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = _FakeSidecar()
+    monkeypatch.setattr(session_module, "_PREWARMED_SIDECAR", sidecar)
+    monkeypatch.setattr(session_module, "_SHUTTING_DOWN", False)
+
+    session_module.shutdown_all_sessions(timeout=0.0)
+
+    assert sidecar.closed
+    assert session_module._PREWARMED_SIDECAR is None
+    assert session_module.prewarm_device_webrtc() is False
+    with pytest.raises(SidecarError, match="shutting down"):
+        session_module._take_prewarmed_sidecar()
+
+
 def _install_fake_loop_io(
     monkeypatch: pytest.MonkeyPatch,
     player: _LoopPlayer,
@@ -286,6 +411,251 @@ def _started(*, remote_cancel: bool = False) -> dict[str, object]:
             "same_session_interrupt_ack": True,
         },
     }
+
+
+def _direct_started() -> dict[str, object]:
+    return {
+        "type": "started",
+        "version": "v3",
+        "protocol_version": 3,
+        "conversation_mode": "native",
+        "transport": "webrtc",
+        "audio_over_bridge": False,
+        "sideband_control": True,
+    }
+
+
+def _start_direct_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    RealtimeSession,
+    _FakeRealtimeConnection,
+    _FakeSidecar,
+    _DirectRecordingPlayer,
+]:
+    connection = _FakeRealtimeConnection()
+    sidecar = _FakeSidecar()
+    player = _DirectRecordingPlayer()
+    monkeypatch.setattr(
+        session_module,
+        "_socket_readable",
+        lambda transport, timeout: transport.wait_readable(timeout),
+    )
+    session = RealtimeSession(
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+        aec_verifier=lambda _config: None,
+        volume_guard=lambda _config: None,
+        sidecar_factory=lambda: sidecar,  # type: ignore[arg-type]
+        direct_player_factory=lambda _maximum, _sink: player,
+    )
+    session.start()
+    assert _wait_for(lambda: bool(connection.json_sent))
+    start = connection.json_sent[0]
+    assert start["protocol_version"] == 3
+    assert start["transport"] == {
+        "type": "webrtc",
+        "sdp": (
+            "v=0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+        ),
+    }
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "answer",
+                    "protocol_version": 3,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": (
+                            "v=0\r\n"
+                            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+                        ),
+                    },
+                }
+            ),
+        )
+    )
+    assert connection.wait_for_json({"type": "transport_ready", "protocol_version": 3})
+    connection.feed(Message("text", json.dumps(_direct_started())))
+    assert _wait_for(lambda: session.ready)
+    return session, connection, sidecar, player
+
+
+def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, _player = _start_direct_session(monkeypatch)
+    frame = b"\x01\x00" * 1_024
+
+    assert session.submit_audio(frame) is SubmitResult.ACCEPTED
+    assert _wait_for(lambda: bool(sidecar.audio))
+    sent_pcm, sample_index, captured_ns = sidecar.audio[0]
+    assert sent_pcm == frame
+    assert sample_index == 0
+    assert captured_ns > 0
+    assert not connection.binary_sent
+
+    session.stop()
+    assert session.join(1.0)
+    assert connection.json_sent.count({"type": "stop"}) == 1
+    assert sidecar.stop_count >= 1
+    assert connection.closed
+
+
+def test_direct_webrtc_barge_in_flushes_cancels_and_keeps_same_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, player = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {
+                "event_type": "response.created",
+                "generation": 0,
+                "response_id": "resp_1",
+            },
+        )
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    sidecar.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=b"\x02\x00" * 480,
+        )
+    )
+    assert _wait_for(lambda: ("audio", b"\x02\x00" * 480) in player.events)
+    assert session.output_active
+
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(lambda: sidecar.interruptions == ["resp_1"])
+    assert not session.output_active
+    assert session.ready
+    assert not connection.closed
+
+    old_audio_count = sum(event[0] == "audio" for event in player.events)
+    sidecar.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=480,
+            media_timestamp=480,
+            pcm=b"\x03\x00" * 480,
+        )
+    )
+    time.sleep(0.05)
+    assert sum(event[0] == "audio" for event in player.events) == old_audio_count
+
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {
+                "event_type": "response.created",
+                "generation": 1,
+                "response_id": "resp_2",
+            },
+        )
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 2},
+        )
+    )
+    sidecar.feed(
+        PlaybackAudio(
+            generation=2,
+            sample_index=960,
+            media_timestamp=0,
+            pcm=b"\x04\x00" * 480,
+        )
+    )
+    assert _wait_for(lambda: ("begin", 2) in player.events)
+    assert _wait_for(lambda: ("audio", b"\x04\x00" * 480) in player.events)
+    assert session.ready
+
+    session.stop()
+    assert session.join(1.0)
+
+
+def test_direct_webrtc_explicit_interrupt_resumes_same_data_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, _player = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {
+                "event_type": "response.created",
+                "generation": 0,
+                "response_id": "resp_1",
+            },
+        )
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+
+    session.interrupt()
+
+    assert _wait_for(lambda: sidecar.interruptions == ["resp_1"])
+    assert _wait_for(lambda: session.state is SessionState.READY)
+    assert not connection.closed
+    assert (
+        connection.json_sent.count({"type": "transport_ready", "protocol_version": 3})
+        == 1
+    )
+
+    session.stop()
+    assert session.join(1.0)
+
+
+def test_direct_interrupt_preserves_audio_admitted_after_atomic_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, _connection, sidecar, player = _start_direct_session(monkeypatch)
+    abort_entered = threading.Event()
+    release_abort = threading.Event()
+    original_abort = player.abort
+    first_abort = True
+
+    def blocking_first_abort() -> None:
+        nonlocal first_abort
+        if first_abort:
+            first_abort = False
+            abort_entered.set()
+            assert release_abort.wait(1.0)
+        original_abort()
+
+    player.abort = blocking_first_abort  # type: ignore[method-assign]
+    session.interrupt()
+    assert abort_entered.wait(1.0)
+
+    frame = b"\x05\x00" * 1_024
+    assert session.submit_audio(frame) is SubmitResult.ACCEPTED
+    release_abort.set()
+
+    assert _wait_for(lambda: any(value[0] == frame for value in sidecar.audio))
+    assert _wait_for(lambda: session.state is SessionState.READY)
+
+    session.stop()
+    assert session.join(1.0)
 
 
 def test_startup_audio_pacer_never_bursts_delayed_capture_blocks() -> None:
@@ -399,6 +769,7 @@ def test_paplay_uses_fixed_low_latency_argv_and_reaps_owned_child(
                 "stdout": subprocess.DEVNULL,
                 "stderr": subprocess.DEVNULL,
                 "close_fds": True,
+                "start_new_session": True,
                 "shell": False,
             },
         )
@@ -438,6 +809,51 @@ def test_full_duplex_paplay_routes_only_to_configured_aec_sink(
         ]
     ]
     player.abort()
+
+
+def test_direct_paplay_sets_exact_sink_volume_and_resumes_without_tail_flush(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess()
+    calls: list[list[str]] = []
+
+    class VolumeController:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def set_and_verify(self, sink: str, volume_percent: int) -> None:
+            self.calls.append((sink, volume_percent))
+
+    controller = VolumeController()
+    monkeypatch.setattr("os.set_blocking", lambda _fd, _blocking: None)
+    player = _PcmPlayer(
+        4_096,
+        sink=DEFAULT_PULSE_AEC_SINK,
+        volume_percent=60,
+        exact_sink_volume=True,
+        volume_controller=controller,
+        popen=lambda argv, **_kwargs: calls.append(argv) or process,
+    )
+
+    player.prepare()
+    player.begin(1)
+    player.prepare()
+    player.resume(2)
+
+    assert controller.calls == [
+        (DEFAULT_PULSE_AEC_SINK, 60),
+    ]
+    assert calls == [
+        [
+            *_PAPLAY_ARGV,
+            f"--device={DEFAULT_PULSE_AEC_SINK}",
+            "--volume=65536",
+        ]
+    ]
+    assert player.active
+    assert not process.killed
+    player.abort()
+    assert process.killed
 
 
 def test_full_duplex_preflight_requires_exact_active_pulseaudio_aec_routes(
@@ -833,8 +1249,7 @@ def test_paplay_output_queue_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None
         player.enqueue(b"\0" * 6)
 
     player.abort()
-    assert process.terminated
-    assert process.waited == 1
+    assert process.killed
 
 
 def test_paplay_start_and_stdin_configuration_fail_closed_and_reap(
@@ -865,7 +1280,7 @@ def test_paplay_start_and_stdin_configuration_fail_closed_and_reap(
     assert not player.active
 
 
-def test_paplay_abort_contains_terminate_kill_and_second_wait_failures(
+def test_paplay_abort_uses_immediate_kill_without_waiting_for_stuck_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StubbornProcess(_FakeProcess):
@@ -882,9 +1297,8 @@ def test_paplay_abort_contains_terminate_kill_and_second_wait_failures(
     player.abort()
 
     assert not player.active
-    assert process.terminated
     assert process.killed
-    assert process.waited == 2
+    assert process.waited == 0
 
 
 def test_speaking_epoch_exclusively_controls_playback_and_mic_gate() -> None:

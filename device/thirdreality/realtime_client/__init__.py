@@ -8,6 +8,7 @@ from .config import (
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
+    DEVICE_WEBRTC_TRANSPORT,
     MAX_REALTIME_VOLUME_PERCENT,
     SUPPORTED_PULSE_AEC_METHODS,
     ConfigError,
@@ -19,6 +20,7 @@ from .session import (
     RealtimeSession,
     SessionState,
     SubmitResult,
+    prewarm_device_webrtc,
     shutdown_all_sessions,
 )
 
@@ -30,6 +32,7 @@ __all__ = [
     "DEFAULT_PULSE_AEC_METHOD",
     "DEFAULT_PULSE_AEC_SINK",
     "DEFAULT_PULSE_AEC_SOURCE",
+    "DEVICE_WEBRTC_TRANSPORT",
     "MAX_REALTIME_VOLUME_PERCENT",
     "SUPPORTED_PULSE_AEC_METHODS",
     "ConfigError",
@@ -39,5 +42,6 @@ __all__ = [
     "SubmitResult",
     "load_config",
     "normalize_wake_phrase",
+    "prewarm_device_webrtc",
     "shutdown_all_sessions",
 ]
