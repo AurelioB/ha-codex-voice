@@ -39,7 +39,9 @@ jobs:
             release/thirdreality-realtime/deploy/prepare_pulseaudio_aec.py
           install -m 0644 \
             device/thirdreality/deploy/pulse/codex-echo-cancel.pa \
-            release/thirdreality-realtime/deploy/pulse/codex-echo-cancel.pa
+            device/thirdreality/deploy/pulse/codex-echo-cancel-speex.pa \
+            device/thirdreality/deploy/pulse/codex-echo-cancel-adrian.pa \
+            release/thirdreality-realtime/deploy/pulse/
           install -m 0644 LICENSE release/thirdreality-realtime/LICENSE
           cd release/thirdreality-realtime
           zip -r ../../thirdreality-realtime.zip .

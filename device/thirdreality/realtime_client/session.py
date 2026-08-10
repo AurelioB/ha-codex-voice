@@ -26,6 +26,9 @@ from .websocket import Message, WebSocketClosed, WebSocketConnection, WebSocketE
 _LOGGER = logging.getLogger("linux_voice_assistant.realtime")
 _INPUT_BYTES_PER_SECOND = 16_000 * 2
 _INPUT_ACTIVITY_SIGNAL_PEAK = 256
+_LOCAL_BARGE_IN_SIGNAL_PEAK = 1_024
+_LOCAL_BARGE_IN_SIGNAL_RMS = 384
+_LOCAL_BARGE_IN_FRAMES = 2
 _MAX_INPUT_CATCH_UP_RATE = 2.0
 _PACTL_ARGV = ("/usr/bin/pactl",)
 _PULSE_ECHO_CANCEL_MODULE = "module-echo-cancel"
@@ -313,7 +316,8 @@ def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
         return
     source = config.pulse_aec_source
     sink = config.pulse_aec_sink
-    if source is None or sink is None:
+    method = config.pulse_aec_method
+    if source is None or sink is None or method is None:
         raise WebSocketError("PulseAudio echo cancellation is not configured")
 
     timeout = config.io_timeout_seconds
@@ -323,7 +327,7 @@ def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
         raise WebSocketError("PulseAudio echo cancellation is not active")
 
     modules = _pactl_output(("list", "short", "modules"), timeout=timeout)
-    if not _has_expected_aec_module(modules, source=source, sink=sink):
+    if not _has_expected_aec_module(modules, source=source, sink=sink, method=method):
         raise WebSocketError("PulseAudio echo cancellation is not active")
 
     sources = _pactl_output(("list", "short", "sources"), timeout=timeout)
@@ -353,13 +357,15 @@ def _verify_aec_sink_volume(config: RealtimeConfig) -> None:
         raise WebSocketError("PulseAudio echo cancellation is not active")
 
 
-def _has_expected_aec_module(modules: str, *, source: str, sink: str) -> bool:
+def _has_expected_aec_module(
+    modules: str, *, source: str, sink: str, method: str
+) -> bool:
     expected_arguments = {
         f"source_master={_PULSE_SOURCE_MASTER}",
         f"sink_master={_PULSE_SINK_MASTER}",
         f"source_name={source}",
         f"sink_name={sink}",
-        "aec_method=webrtc",
+        f"aec_method={method}",
         "use_master_format=1",
     }
     for line in modules.splitlines():
@@ -367,10 +373,13 @@ def _has_expected_aec_module(modules: str, *, source: str, sink: str) -> bool:
         if len(fields) != 3 or fields[1] != _PULSE_ECHO_CANCEL_MODULE:
             continue
         try:
-            arguments = set(shlex.split(fields[2], comments=False, posix=True))
+            arguments = shlex.split(fields[2], comments=False, posix=True)
         except ValueError:
             return False
-        if expected_arguments.issubset(arguments):
+        if (
+            len(arguments) == len(expected_arguments)
+            and set(arguments) == expected_arguments
+        ):
             return True
     return False
 
@@ -487,6 +496,10 @@ class RealtimeSession:
         self._interrupt_requested = threading.Event()
         self._interrupt_preserve_session = True
         self._output_active = threading.Event()
+        self._local_output_epoch: int | None = None
+        self._local_barge_in_requested_epoch: int | None = None
+        self._local_barge_in_frames = 0
+        self._local_barge_in_lock = threading.Lock()
         self._suppressed_output_epoch: int | None = None
         self._thread: threading.Thread | None = None
         self._ever_ready = False
@@ -550,15 +563,94 @@ class RealtimeSession:
         # Half-duplex remains the default. Full-duplex construction requires
         # explicit AEC routing, and _run verifies that live PulseAudio topology
         # before opening the bridge socket.
-        if self._output_active.is_set() and not self._config.full_duplex:
-            return SubmitResult.GATED
-        if self.state not in {SessionState.CONNECTING, SessionState.READY}:
-            return SubmitResult.CLOSED
         packet = _AudioPacket(value, self._clock())
-        if not self._audio.put(packet):
-            return SubmitResult.FULL
+        with self._state_lock:
+            if self._state not in {SessionState.CONNECTING, SessionState.READY}:
+                return SubmitResult.CLOSED
+            if self._output_active.is_set() and not self._config.full_duplex:
+                return SubmitResult.GATED
+            if not self._audio.put(packet):
+                return SubmitResult.FULL
+            # Keep admission and detection on the same side of an interrupt or
+            # stop transition. The transition owns the same state lock and can
+            # therefore clear every packet and pending detector result admitted
+            # before it, while later submissions observe STOPPING.
+            self._detect_local_barge_in(value)
         self._wake_network.set()
         return SubmitResult.ACCEPTED
+
+    def _detect_local_barge_in(self, value: bytes) -> None:
+        """Flush local playback quickly after bounded AEC-filtered speech."""
+        if not self._config.full_duplex:
+            return
+        with self._local_barge_in_lock:
+            output_epoch = self._local_output_epoch
+            if output_epoch is None:
+                self._local_barge_in_frames = 0
+                return
+            if self._local_barge_in_requested_epoch is not None:
+                return
+            if _pcm_has_local_barge_in_signal(value):
+                self._local_barge_in_frames += 1
+            else:
+                self._local_barge_in_frames = 0
+            if self._local_barge_in_frames < _LOCAL_BARGE_IN_FRAMES:
+                return
+            self._local_barge_in_frames = 0
+            self._local_barge_in_requested_epoch = output_epoch
+
+    def _set_local_output_epoch(self, output_epoch: int | None) -> None:
+        """Publish one network-thread-owned playback generation to capture."""
+        with self._local_barge_in_lock:
+            self._local_output_epoch = output_epoch
+            self._local_barge_in_requested_epoch = None
+            self._local_barge_in_frames = 0
+            if output_epoch is None:
+                self._output_active.clear()
+            else:
+                self._output_active.set()
+
+    def _reset_local_barge_in_detection(self) -> None:
+        """Discard detector state without changing network-owned playback."""
+        with self._local_barge_in_lock:
+            self._local_barge_in_requested_epoch = None
+            self._local_barge_in_frames = 0
+
+    def _flush_local_barge_in(
+        self,
+        player: _PcmPlayer,
+        *,
+        output_epoch: int | None,
+        last_output_epoch: int,
+    ) -> int | None:
+        """Apply one capture-thread barge request on the player-owning thread."""
+        with self._local_barge_in_lock:
+            requested_epoch = self._local_barge_in_requested_epoch
+            if requested_epoch is None:
+                # Network polls run more frequently than the fixed recorder
+                # callback. No request is not a detector boundary: preserve a
+                # qualifying partial count until the next microphone frame.
+                return output_epoch
+            self._local_barge_in_requested_epoch = None
+            self._local_barge_in_frames = 0
+            matches_current_output = requested_epoch == output_epoch or (
+                output_epoch is None
+                and requested_epoch == last_output_epoch
+                and player.active
+            )
+            if (
+                not matches_current_output
+                or requested_epoch != self._local_output_epoch
+            ):
+                return output_epoch
+            # Disable capture-side detection before the potentially blocking
+            # player reap. Only this network-thread path mutates playback state.
+            self._local_output_epoch = None
+            self._output_active.clear()
+        player.abort()
+        assert requested_epoch is not None
+        self._suppressed_output_epoch = requested_epoch
+        return None
 
     def interrupt(self, *, preserve_session: bool = True) -> None:
         """Flush local output and request bounded provider interruption.
@@ -569,7 +661,6 @@ class RealtimeSession:
         """
         if self._terminal.is_set():
             return
-        self._output_active.clear()
         with self._state_lock:
             if self._interrupt_requested.is_set():
                 self._interrupt_preserve_session = (
@@ -580,14 +671,20 @@ class RealtimeSession:
             self._interrupt_requested.set()
             if self._state in {SessionState.CONNECTING, SessionState.READY}:
                 self._state = SessionState.STOPPING
+            self._audio.clear()
+            self._reset_local_barge_in_detection()
         self._wake_network.set()
 
     def stop(self) -> None:
         """Request bounded normal session shutdown."""
         if self._terminal.is_set():
             return
-        self._stop_requested.set()
-        self._set_stopping()
+        with self._state_lock:
+            self._stop_requested.set()
+            if self._state in {SessionState.CONNECTING, SessionState.READY}:
+                self._state = SessionState.STOPPING
+            self._audio.clear()
+            self._reset_local_barge_in_detection()
         self._wake_network.set()
 
     def join(self, timeout: float) -> bool:
@@ -597,11 +694,6 @@ class RealtimeSession:
             return True
         thread.join(timeout=max(0.0, timeout))
         return not thread.is_alive()
-
-    def _set_stopping(self) -> None:
-        with self._state_lock:
-            if self._state in {SessionState.CONNECTING, SessionState.READY}:
-                self._state = SessionState.STOPPING
 
     def _run(self) -> None:  # noqa: C901 - one bounded protocol state machine
         connection: WebSocketConnection | None = None
@@ -664,9 +756,9 @@ class RealtimeSession:
                 )
 
                 if self._interrupt_requested.is_set():
+                    self._set_local_output_epoch(None)
                     player.abort()
                     self._audio.clear()
-                    self._output_active.clear()
                     if output_epoch is not None:
                         self._suppressed_output_epoch = output_epoch
                     output_epoch = None
@@ -677,14 +769,21 @@ class RealtimeSession:
                     elif interrupt_deadline is not None and now >= interrupt_deadline:
                         return
                 elif self._stop_requested.is_set():
+                    self._set_local_output_epoch(None)
                     player.abort()
                     self._audio.clear()
                     connection.send_json({"type": "stop"})
                     return
+                else:
+                    output_epoch = self._flush_local_barge_in(
+                        player,
+                        output_epoch=output_epoch,
+                        last_output_epoch=last_output_epoch,
+                    )
 
                 player.service()
                 if output_epoch is None and not player.active:
-                    self._output_active.clear()
+                    self._set_local_output_epoch(None)
                 if not interrupt_sent and pacer.due(now):
                     packet, remaining_packets = self._audio.pop()
                     if packet is not None:
@@ -753,6 +852,7 @@ class RealtimeSession:
                 if interrupt_sent and action == "interrupted":
                     return
                 if interrupt_sent and action == "interrupt_resumed":
+                    self._set_local_output_epoch(None)
                     with self._state_lock:
                         preserve_session = self._interrupt_preserve_session
                         if preserve_session:
@@ -777,7 +877,7 @@ class RealtimeSession:
             _LOGGER.warning("ThirdReality realtime session failed", exc_info=False)
         finally:
             try:
-                self._output_active.clear()
+                self._set_local_output_epoch(None)
                 self._audio.clear()
                 with suppress(Exception):
                     player.abort()
@@ -856,8 +956,11 @@ class RealtimeSession:
                 self._suppressed_output_epoch = None
                 if self._config.full_duplex:
                     self._volume_guard(self._config)
+                # Retire any draining predecessor and its pending detector
+                # result before publishing this fresh monotonic generation.
+                self._set_local_output_epoch(None)
                 player.begin(epoch)
-                self._output_active.set()
+                self._set_local_output_epoch(epoch)
                 return None, epoch, epoch, True
             if event_type == "speaking.stopped":
                 epoch = _output_epoch(value)
@@ -878,8 +981,8 @@ class RealtimeSession:
                 if self._config.full_duplex and (
                     output_epoch is not None or player.active
                 ):
+                    self._set_local_output_epoch(None)
                     player.abort()
-                    self._output_active.clear()
                     suppressed_epoch = output_epoch or last_output_epoch
                     if suppressed_epoch > 0:
                         self._suppressed_output_epoch = suppressed_epoch
@@ -888,8 +991,8 @@ class RealtimeSession:
         if message_type == "pong":
             return None, output_epoch, last_output_epoch, False
         if message_type == "stopped":
+            self._set_local_output_epoch(None)
             player.abort()
-            self._output_active.clear()
             reason = value.get("reason")
             if reason == "interrupt":
                 fresh_session_required = value.get("fresh_session_required")
@@ -945,6 +1048,22 @@ def _pcm_has_signal(value: bytes) -> bool:
     return any(
         abs(sample) >= _INPUT_ACTIVITY_SIGNAL_PEAK
         for (sample,) in struct.iter_unpack("<h", value)
+    )
+
+
+def _pcm_has_local_barge_in_signal(value: bytes) -> bool:
+    """Require both a speech-scale peak and sustained frame energy."""
+    sample_count = len(value) // 2
+    if sample_count == 0:
+        return False
+    peak = 0
+    energy = 0
+    for (sample,) in struct.iter_unpack("<h", value):
+        magnitude = abs(sample)
+        peak = max(peak, magnitude)
+        energy += sample * sample
+    return peak >= _LOCAL_BARGE_IN_SIGNAL_PEAK and energy >= (
+        _LOCAL_BARGE_IN_SIGNAL_RMS**2 * sample_count
     )
 
 

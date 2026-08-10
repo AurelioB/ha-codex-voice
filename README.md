@@ -82,12 +82,17 @@ not part of the component-only HACS ZIP.
   the broker, and no tool schema, call, result, or Home Assistant credential is
   exposed on wire v2.
 - Direct mode remains turn-taking by default. Opt-in full duplex requires the
-  reviewed static PulseAudio `module-echo-cancel` topology with WebRTC AEC,
-  exact capture/playback routing, a startup safety preflight, a sink-volume
-  ceiling recheck before every response, and a fixed `paplay` stream volume of
-  at most 25%. Barge-in resumes the same remote session only after the bridge
-  correlates an explicit provider cancellation; timeout or ambiguity tears it
-  down and requires a fresh session.
+  reviewed static PulseAudio `module-echo-cancel` topology with one explicit,
+  allowlisted AEC engine, exact capture/playback routing, a startup safety
+  preflight, a sink-volume ceiling recheck before every response, and a fixed
+  `paplay` stream volume of at most 25%. WebRTC remains the configuration and
+  installer default; neither layer automatically falls back to another engine.
+  The stock ThirdReality v1.1.7 module rejects WebRTC and Speex but loads Adrian,
+  which passed the bounded reference-device echo and barge-in canaries at 25%.
+  Every new installation still requires the documented physical qualification.
+  Barge-in resumes the same remote session only after the bridge correlates an
+  explicit provider cancellation; timeout or ambiguity tears it down and
+  requires a fresh session.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.146.0 or newer.
 
@@ -204,12 +209,19 @@ ThirdReality v1.1.7 client. It contains the guarded `sitecustomize.py`, the
 stdlib-only `realtime_client` package, and a secret-free configuration example.
 Follow the [device deployment, verification, and rollback
 contract](device/thirdreality/README.md). `full_duplex` remains `false` by
-default. Enabling it is fail-closed unless the reviewed static PulseAudio
-WebRTC-AEC topology, exact source/sink routing, current-process capture route,
-and configured 1–25% sink ceiling all pass before the bridge socket opens.
-The sink ceiling is checked again before every response, and full-duplex
-`paplay` is pinned to that AEC sink with a fixed stream volume no greater than
-the configured ceiling.
+default. Enabling it is fail-closed unless the reviewed static PulseAudio AEC
+topology uses the exact configured allowlisted engine, exact source/sink
+routing, current-process capture route, and configured 1–25% sink ceiling.
+WebRTC is the default when `pulse_aec_method` or installer `--aec-method` is
+omitted, with no automatic fallback. The observed stock v1.1.7 image instead
+requires an explicit `adrian` selection; its WebRTC and Speex engines are not
+compiled in and are rejected. The sink ceiling is checked again before every
+response, and full-duplex `paplay` is pinned to that AEC sink with a fixed
+stream volume no greater than the configured ceiling. Adrian creating the
+expected 16 kHz mono endpoints is only a topology canary. The reference device
+passed a bounded 25% echo-residual and staged double-talk canary, but physical
+echo and early/middle/late double-talk tests at no more than 25% must pass on
+each installation before use.
 
 The deployment adds “Okay Computer” alongside “Okay Nabu”; it does not replace
 the standard Assist path. The device configuration is root-owned and mode 0600,
@@ -313,7 +325,10 @@ s at the output format.
 
 The bridge advertises `local_flush: true`, `remote_cancel: false`, and
 `same_session_interrupt_ack: true`. The first two fields still forbid assuming
-that a local flush truncated provider output. On `interrupt`, the bridge asks
+that a local flush truncated provider output. In qualified full duplex, two
+consecutive AEC-filtered speech frames can stop local playback before the
+provider VAD boundary; the provider event independently reinforces that flush.
+On `interrupt`, the bridge asks
 the provider to cancel the active response and permits same-socket continuation
 only after a `response.cancelled` event correlated to that exact response. The
 explicit success acknowledgement has `fresh_session_required: false` and
@@ -454,11 +469,15 @@ opt-in and must never print OAuth tokens or recorded audio.
   add-on/container packaging.
 - The pinned ThirdReality v1.1.7 overlay defaults to direct realtime
   turn-taking. Full duplex is an explicit post-qualification option that
-  requires the repository's static PulseAudio WebRTC-AEC topology, exact
-  process routing, a preflight plus per-response sink ceiling, and a fixed
-  `paplay` stream cap of at most 25%. A syntactically valid topology is not
-  proof of acoustic echo rejection; do not enable it before physical
-  double-talk and rollback canaries pass.
+  requires a repository-reviewed PulseAudio AEC fragment, an exact configured
+  engine match, exact process routing, a preflight plus per-response sink
+  ceiling, and a fixed `paplay` stream cap of at most 25%. WebRTC is the
+  fail-closed default and is never automatically replaced. Stock v1.1.7 rejects
+  WebRTC and Speex and must explicitly select Adrian. The reference device
+  passed bounded echo-residual and staged barge-in canaries at 25%, but a
+  syntactically valid Adrian topology is not proof for another installation;
+  do not enable it there before physical double-talk and rollback canaries pass
+  at no more than 25%.
 - “Okay Computer” remains an untrusted audio/control client. Home Assistant
   control is available only when exactly one Conversation subentry is
   explicitly opted in as realtime authority. Home Assistant—not the device—

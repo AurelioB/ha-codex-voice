@@ -3,8 +3,10 @@
 from .config import (
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
     DEFAULT_CONFIG_PATH,
+    DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
+    SUPPORTED_PULSE_AEC_METHODS,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -20,8 +22,10 @@ from .session import (
 __all__ = [
     "DEFAULT_AEC_TEST_VOLUME_PERCENT",
     "DEFAULT_CONFIG_PATH",
+    "DEFAULT_PULSE_AEC_METHOD",
     "DEFAULT_PULSE_AEC_SINK",
     "DEFAULT_PULSE_AEC_SOURCE",
+    "SUPPORTED_PULSE_AEC_METHODS",
     "ConfigError",
     "RealtimeConfig",
     "RealtimeSession",

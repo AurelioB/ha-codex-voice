@@ -1,0 +1,9 @@
+### BEGIN HA CODEX VOICE AEC (managed)
+# This block must remain after the raw module-alsa-source/sink definitions.
+# .fail makes a missing/broken AEC module fail voice startup instead of
+# permitting an unsafe full-duplex route without echo cancellation.
+.fail
+load-module module-echo-cancel source_master=alsa_input.hw_0_2 sink_master=alsa_output.hw_0_1 source_name=codex_echo_cancel_source sink_name=codex_echo_cancel_sink aec_method=speex use_master_format=1
+set-default-source codex_echo_cancel_source
+set-default-sink codex_echo_cancel_sink
+### END HA CODEX VOICE AEC (managed)

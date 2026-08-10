@@ -1898,9 +1898,13 @@ async def _transcribe_stream_admitted(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - wire errors must never expose internals
+    except Exception as err:  # noqa: BLE001 - wire errors must never expose internals
         # App-server, WebRTC, and unexpected errors can contain private request
         # material. The streaming wire contract deliberately returns no details.
+        LOGGER.warning(
+            "Realtime transcription stream failed: failure_type=%s",
+            type(err).__name__,
+        )
         await _safe_ws_json(
             websocket, {"type": "error", "error": "transcription failed"}
         )
@@ -2327,6 +2331,10 @@ async def _run_live_transcription_attempt(
             thread_start_seconds = time.monotonic() - thread_start_started
 
         session: RealtimeSession | None = None
+        audio_drain_task: asyncio.Task[None] | None = None
+        handoff_boundary_state = (
+            _SpeechHandoffBoundaryState() if retain_voice is not None else None
+        )
         thread_owned = True
         timeout_stage = "handshake"
         try:
@@ -2351,6 +2359,14 @@ async def _run_live_transcription_attempt(
             finally:
                 realtime_handshake_seconds = time.monotonic() - handshake_started
                 overlap_timing.handshake_finished_at = time.monotonic()
+            audio_drain_task = asyncio.create_task(
+                _drain_transcription_audio(
+                    session,
+                    strict_handoff_boundary=retain_voice is not None,
+                    handoff_boundary_state=handoff_boundary_state,
+                ),
+                name="codex-live-transcription-audio-drain",
+            )
 
             timeout_stage = "capture"
             resampler = Pcm16Mono24KhzResampler(live_input.sample_rate)
@@ -2411,9 +2427,6 @@ async def _run_live_transcription_attempt(
             )
             timeout_stage = "transcript"
             transcript_wait_started = time.monotonic()
-            handoff_boundary_state = (
-                _SpeechHandoffBoundaryState() if retain_voice is not None else None
-            )
             try:
                 transcript_timeout = min(
                     state.config.transcript_timeout,
@@ -2426,6 +2439,7 @@ async def _run_live_transcription_attempt(
                     strict_handoff_boundary=retain_voice is not None,
                     handoff_boundary_state=handoff_boundary_state,
                     input_drain_task=drain_task,
+                    audio_drain_task=audio_drain_task,
                     live_fragment_quiet_seconds=live_fragment_quiet_seconds,
                     completion_diagnostics=completion_diagnostics,
                 )
@@ -2434,6 +2448,11 @@ async def _run_live_transcription_attempt(
                 if not drain_task.done():
                     drain_task.cancel()
                 await asyncio.gather(drain_task, return_exceptions=True)
+                await _retire_transcription_audio_drain(
+                    audio_drain_task,
+                    handoff_boundary_state=handoff_boundary_state,
+                )
+                audio_drain_task = None
 
             retained_session: _RetainedSpeechSession | None = None
             if (
@@ -2463,14 +2482,21 @@ async def _run_live_transcription_attempt(
             raise _TranscriptionAttemptTimeout(timeout_stage) from err
         finally:
             try:
-                if session is not None:
-                    session_stop_started = time.monotonic()
-                    try:
-                        await session.stop()
-                    finally:
-                        session_stop_peer_close_seconds = (
-                            time.monotonic() - session_stop_started
+                try:
+                    if audio_drain_task is not None:
+                        await _retire_transcription_audio_drain(
+                            audio_drain_task,
+                            handoff_boundary_state=handoff_boundary_state,
                         )
+                finally:
+                    if session is not None:
+                        session_stop_started = time.monotonic()
+                        try:
+                            await session.stop()
+                        finally:
+                            session_stop_peer_close_seconds = (
+                                time.monotonic() - session_stop_started
+                            )
             finally:
                 if thread_owned:
                     thread_delete_started = time.monotonic()
@@ -2604,6 +2630,10 @@ async def _run_transcription_attempt_when_audio_ready(
             thread_start_seconds = time.monotonic() - thread_start_started
 
         session: RealtimeSession | None = None
+        audio_drain_task: asyncio.Task[None] | None = None
+        handoff_boundary_state = (
+            _SpeechHandoffBoundaryState() if retain_voice is not None else None
+        )
         thread_owned = True
         timeout_stage = "handshake"
         try:
@@ -2632,6 +2662,14 @@ async def _run_transcription_attempt_when_audio_ready(
                     and overlap_timing.handshake_finished_at is None
                 ):
                     overlap_timing.handshake_finished_at = time.monotonic()
+            audio_drain_task = asyncio.create_task(
+                _drain_transcription_audio(
+                    session,
+                    strict_handoff_boundary=retain_voice is not None,
+                    handoff_boundary_state=handoff_boundary_state,
+                ),
+                name="codex-transcription-audio-drain",
+            )
             timeout_stage = "audio_ready"
             prepared_audio = await audio_ready
             pcm = prepared_audio.pcm
@@ -2649,9 +2687,6 @@ async def _run_transcription_attempt_when_audio_ready(
             )
             timeout_stage = "transcript"
             transcript_wait_started = time.monotonic()
-            handoff_boundary_state = (
-                _SpeechHandoffBoundaryState() if retain_voice is not None else None
-            )
             try:
                 # The remote recognizer can stop pulling the trailing silence once it
                 # has emitted a transcript, leaving the local track's drain marker
@@ -2665,6 +2700,7 @@ async def _run_transcription_attempt_when_audio_ready(
                         session,
                         transcript_timeout,
                         fragment_finalization_at=feed_started + duration,
+                        audio_drain_task=audio_drain_task,
                     )
                 else:
                     transcript = await _wait_for_user_transcript(
@@ -2673,12 +2709,18 @@ async def _run_transcription_attempt_when_audio_ready(
                         fragment_finalization_at=feed_started + duration,
                         strict_handoff_boundary=True,
                         handoff_boundary_state=handoff_boundary_state,
+                        audio_drain_task=audio_drain_task,
                     )
             finally:
                 transcript_wait_seconds = time.monotonic() - transcript_wait_started
                 if not drain_task.done():
                     drain_task.cancel()
                 await asyncio.gather(drain_task, return_exceptions=True)
+                await _retire_transcription_audio_drain(
+                    audio_drain_task,
+                    handoff_boundary_state=handoff_boundary_state,
+                )
+                audio_drain_task = None
             retained_session: _RetainedSpeechSession | None = None
             if (
                 retain_voice is not None
@@ -2707,14 +2749,21 @@ async def _run_transcription_attempt_when_audio_ready(
             raise _TranscriptionAttemptTimeout(timeout_stage) from err
         finally:
             try:
-                if session is not None:
-                    session_stop_started = time.monotonic()
-                    try:
-                        await session.stop()
-                    finally:
-                        session_stop_peer_close_seconds = (
-                            time.monotonic() - session_stop_started
+                try:
+                    if audio_drain_task is not None:
+                        await _retire_transcription_audio_drain(
+                            audio_drain_task,
+                            handoff_boundary_state=handoff_boundary_state,
                         )
+                finally:
+                    if session is not None:
+                        session_stop_started = time.monotonic()
+                        try:
+                            await session.stop()
+                        finally:
+                            session_stop_peer_close_seconds = (
+                                time.monotonic() - session_stop_started
+                            )
             finally:
                 if thread_owned:
                     thread_delete_started = time.monotonic()
@@ -4916,7 +4965,42 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 )
 
 
-async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
+async def _drain_transcription_audio(
+    session: RealtimeSession,
+    *,
+    strict_handoff_boundary: bool = False,
+    handoff_boundary_state: _SpeechHandoffBoundaryState | None = None,
+) -> None:
+    """Discard unwanted model audio without hiding unsafe handoff output."""
+    while True:
+        chunk = await session.recv_audio()
+        if not isinstance(chunk, bytes):
+            raise ProtocolError("realtime transcription received invalid audio")
+        if not chunk or not strict_handoff_boundary:
+            continue
+        if handoff_boundary_state is None:
+            raise ProtocolError("retained speech session produced assistant audio")
+        handoff_boundary_state.invalidated = True
+
+
+async def _retire_transcription_audio_drain(
+    task: asyncio.Task[None],
+    *,
+    handoff_boundary_state: _SpeechHandoffBoundaryState | None,
+) -> None:
+    """Stop a transcription audio receiver without offering a failed handoff."""
+    if not task.done():
+        task.cancel()
+    result = (await asyncio.gather(task, return_exceptions=True))[0]
+    if handoff_boundary_state is None or isinstance(result, asyncio.CancelledError):
+        return
+    # The drain loop has no normal return. A transport failure (or an
+    # unexpected normal exit) makes the retained session unusable while the
+    # already-completed transcript remains valid.
+    handoff_boundary_state.invalidated = True
+
+
+async def _wait_for_user_transcript(  # noqa: C901 - realtime event streams
     session: RealtimeSession,
     timeout: float,
     *,
@@ -4924,6 +5008,7 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     strict_handoff_boundary: bool = False,
     handoff_boundary_state: _SpeechHandoffBoundaryState | None = None,
     input_drain_task: asyncio.Task[Any] | None = None,
+    audio_drain_task: asyncio.Task[None] | None = None,
     live_fragment_quiet_seconds: float | None = None,
     completion_diagnostics: dict[str, float | str] | None = None,
 ) -> str:
@@ -4935,6 +5020,16 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     realtime_closed_at: float | None = None
     drained_at: float | None = None
     drain_observed = input_drain_task is None
+    owns_audio_drain = audio_drain_task is None
+    if audio_drain_task is None:
+        audio_drain_task = asyncio.create_task(
+            _drain_transcription_audio(
+                session,
+                strict_handoff_boundary=strict_handoff_boundary,
+                handoff_boundary_state=handoff_boundary_state,
+            ),
+            name="codex-transcription-audio-drain",
+        )
     event_task = asyncio.create_task(session.next_event())
     data_task = asyncio.create_task(session.recv_data_event())
     try:
@@ -4964,6 +5059,11 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                     )
                 quiet_remaining = fragment_ready_at - now
                 if quiet_remaining <= 0:
+                    if audio_drain_task.done():
+                        await audio_drain_task
+                        raise ProtocolError(
+                            "realtime transcription audio drain stopped"
+                        )
                     final_transcript = transcript.strip()
                     _remember_speech_handoff_input(
                         handoff_boundary_state,
@@ -4986,7 +5086,11 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                         "realtime session closed before transcription completed"
                     )
                 remaining = min(remaining, close_remaining)
-            wait_tasks: set[asyncio.Task[Any]] = {event_task, data_task}
+            wait_tasks: set[asyncio.Task[Any]] = {
+                event_task,
+                data_task,
+                audio_drain_task,
+            }
             if input_drain_task is not None and not drain_observed:
                 wait_tasks.add(input_drain_task)
             done, _ = await asyncio.wait(
@@ -5019,6 +5123,11 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                             fragment_ready_at, drained_at + quiet_seconds
                         )
                     if now >= fragment_ready_at:
+                        if audio_drain_task.done():
+                            await audio_drain_task
+                            raise ProtocolError(
+                                "realtime transcription audio drain stopped"
+                            )
                         final_transcript = transcript.strip()
                         _remember_speech_handoff_input(
                             handoff_boundary_state,
@@ -5044,6 +5153,8 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                 ready.add(event_task)
             if data_task.done():
                 ready.add(data_task)
+            if audio_drain_task.done():
+                ready.add(audio_drain_task)
             if (
                 input_drain_task is not None
                 and not drain_observed
@@ -5172,6 +5283,9 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
                     if transcript:
                         terminal_transcript = transcript
                 data_task = asyncio.create_task(session.recv_data_event())
+            if audio_drain_task in ready:
+                await audio_drain_task
+                raise ProtocolError("realtime transcription audio drain stopped")
             if terminal_transcript:
                 _remember_speech_handoff_input(
                     handoff_boundary_state,
@@ -5187,7 +5301,11 @@ async def _wait_for_user_transcript(  # noqa: C901 - dual realtime event streams
     finally:
         event_task.cancel()
         data_task.cancel()
-        await asyncio.gather(event_task, data_task, return_exceptions=True)
+        cleanup_tasks: list[asyncio.Task[Any]] = [event_task, data_task]
+        if owns_audio_drain:
+            audio_drain_task.cancel()
+            cleanup_tasks.append(audio_drain_task)
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
 def _remember_speech_handoff_input(

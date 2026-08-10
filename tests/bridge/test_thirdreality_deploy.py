@@ -5,11 +5,16 @@ from pathlib import Path
 import pytest
 
 from device.thirdreality.deploy.prepare_pulseaudio_aec import (
+    ADRIAN_AEC_BLOCK,
     AEC_BLOCK,
     AEC_SINK_NAME,
     AEC_SOURCE_NAME,
     BEGIN_MARKER,
+    DEFAULT_AEC_METHOD,
+    SPEEX_AEC_BLOCK,
+    SUPPORTED_AEC_METHODS,
     DeploymentError,
+    aec_block,
     render_install,
     render_remove,
 )
@@ -43,6 +48,52 @@ def test_aec_installer_preserves_existing_trailing_newlines_exactly() -> None:
     assert render_remove(installed) == (original, True)
 
 
+@pytest.mark.parametrize("aec_method", SUPPORTED_AEC_METHODS)
+def test_aec_installer_round_trips_pinned_file_without_final_newline(
+    aec_method: str,
+) -> None:
+    original = _PINNED_DEFAULT_PA.rstrip("\n")
+
+    installed, changed = render_install(original, aec_method)
+
+    assert changed
+    assert installed.endswith(f"{aec_block(aec_method)}\n")
+    assert render_remove(installed) == (original, True)
+
+
+@pytest.mark.parametrize("aec_method", SUPPORTED_AEC_METHODS)
+def test_aec_installer_round_trips_each_supported_method(aec_method: str) -> None:
+    installed, changed = render_install(_PINNED_DEFAULT_PA, aec_method)
+
+    assert changed
+    assert installed.endswith(f"{aec_block(aec_method)}\n")
+    assert render_install(installed, aec_method) == (installed, False)
+    assert render_remove(installed) == (_PINNED_DEFAULT_PA, True)
+
+
+@pytest.mark.parametrize("aec_method", ["speex", "adrian"])
+def test_aec_installer_requires_explicit_matching_method(aec_method: str) -> None:
+    installed, _changed = render_install(_PINNED_DEFAULT_PA, aec_method)
+
+    with pytest.raises(DeploymentError, match=rf"{aec_method}, not requested webrtc"):
+        render_install(installed)
+    with pytest.raises(DeploymentError, match=rf"webrtc, not requested {aec_method}"):
+        render_install(render_install(_PINNED_DEFAULT_PA)[0], aec_method)
+
+
+def test_aec_method_allowlist_keeps_webrtc_as_default() -> None:
+    assert DEFAULT_AEC_METHOD == "webrtc"
+    assert SUPPORTED_AEC_METHODS == ("webrtc", "speex", "adrian")
+    assert aec_block() == AEC_BLOCK
+    assert aec_block("speex") == SPEEX_AEC_BLOCK
+    assert aec_block("adrian") == ADRIAN_AEC_BLOCK
+
+    with pytest.raises(DeploymentError, match="unsupported AEC method"):
+        aec_block("null")
+    with pytest.raises(DeploymentError, match="unsupported AEC method"):
+        render_install(_PINNED_DEFAULT_PA, "unknown")
+
+
 @pytest.mark.parametrize(
     "contents",
     [
@@ -57,8 +108,11 @@ def test_aec_installer_refuses_unknown_or_partial_topology(contents: str) -> Non
         render_install(contents)
 
 
-def test_aec_remover_refuses_modified_or_non_tail_managed_block() -> None:
-    installed, _changed = render_install(_PINNED_DEFAULT_PA)
+@pytest.mark.parametrize("aec_method", SUPPORTED_AEC_METHODS)
+def test_aec_remover_refuses_modified_or_non_tail_managed_block(
+    aec_method: str,
+) -> None:
+    installed, _changed = render_install(_PINNED_DEFAULT_PA, aec_method)
 
     with pytest.raises(DeploymentError, match="modified"):
         render_remove(installed.replace(AEC_SINK_NAME, "other_sink", 1))
@@ -68,8 +122,12 @@ def test_aec_remover_refuses_modified_or_non_tail_managed_block() -> None:
 
 def test_reviewable_pulse_fragment_exactly_matches_installer_block() -> None:
     fragment = (_DEPLOY / "pulse" / "codex-echo-cancel.pa").read_text()
+    speex_fragment = (_DEPLOY / "pulse" / "codex-echo-cancel-speex.pa").read_text()
+    adrian_fragment = (_DEPLOY / "pulse" / "codex-echo-cancel-adrian.pa").read_text()
 
     assert fragment == f"{AEC_BLOCK}\n"
+    assert speex_fragment == f"{SPEEX_AEC_BLOCK}\n"
+    assert adrian_fragment == f"{ADRIAN_AEC_BLOCK}\n"
     assert ".fail\nload-module module-echo-cancel " in fragment
     assert f"set-default-source {AEC_SOURCE_NAME}" in fragment
     assert f"set-default-sink {AEC_SINK_NAME}" in fragment

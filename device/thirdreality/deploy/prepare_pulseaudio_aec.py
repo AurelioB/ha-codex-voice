@@ -21,30 +21,67 @@ RAW_SOURCE_DEVICE = "hw:0,2"
 RAW_SINK_DEVICE = "hw:0,1"
 AEC_SOURCE_NAME = "codex_echo_cancel_source"
 AEC_SINK_NAME = "codex_echo_cancel_sink"
-AEC_BLOCK = f"""{BEGIN_MARKER}
+DEFAULT_AEC_METHOD = "webrtc"
+SUPPORTED_AEC_METHODS = (DEFAULT_AEC_METHOD, "speex", "adrian")
+_AEC_BLOCK_TEMPLATE = """{begin_marker}
 # This block must remain after the raw module-alsa-source/sink definitions.
 # .fail makes a missing/broken AEC module fail voice startup instead of
 # permitting an unsafe full-duplex route without echo cancellation.
 .fail
-load-module module-echo-cancel source_master=alsa_input.hw_0_2 sink_master=alsa_output.hw_0_1 source_name={AEC_SOURCE_NAME} sink_name={AEC_SINK_NAME} aec_method=webrtc use_master_format=1
-set-default-source {AEC_SOURCE_NAME}
-set-default-sink {AEC_SINK_NAME}
-{END_MARKER}"""
-
-_MAX_DEFAULT_PA_BYTES = 1024 * 1024
+load-module module-echo-cancel source_master=alsa_input.hw_0_2 sink_master=alsa_output.hw_0_1 source_name={source_name} sink_name={sink_name} aec_method={aec_method} use_master_format=1
+set-default-source {source_name}
+set-default-sink {sink_name}
+{end_marker}"""
 
 
 class DeploymentError(ValueError):
     """Raised when a device file does not meet the guarded deployment contract."""
 
 
-def render_install(contents: str) -> tuple[str, bool]:
+def aec_block(aec_method: str = DEFAULT_AEC_METHOD) -> str:
+    """Return the exact managed block for an explicitly supported AEC method."""
+    if aec_method not in SUPPORTED_AEC_METHODS:
+        raise DeploymentError(f"unsupported AEC method: {aec_method}")
+    return _AEC_BLOCK_TEMPLATE.format(
+        begin_marker=BEGIN_MARKER,
+        end_marker=END_MARKER,
+        source_name=AEC_SOURCE_NAME,
+        sink_name=AEC_SINK_NAME,
+        aec_method=aec_method,
+    )
+
+
+# Keep the default constant as the reviewable WebRTC block for compatibility.
+AEC_BLOCK = aec_block()
+SPEEX_AEC_BLOCK = aec_block("speex")
+ADRIAN_AEC_BLOCK = aec_block("adrian")
+_AEC_BLOCKS = {
+    DEFAULT_AEC_METHOD: AEC_BLOCK,
+    "speex": SPEEX_AEC_BLOCK,
+    "adrian": ADRIAN_AEC_BLOCK,
+}
+
+_MAX_DEFAULT_PA_BYTES = 1024 * 1024
+
+
+def render_install(
+    contents: str, aec_method: str = DEFAULT_AEC_METHOD
+) -> tuple[str, bool]:
     """Return guarded AEC config text and whether installation is needed."""
+    selected_block = aec_block(aec_method)
     begin_count = contents.count(BEGIN_MARKER)
     end_count = contents.count(END_MARKER)
     if begin_count or end_count:
-        if begin_count == 1 and end_count == 1 and contents.endswith(f"{AEC_BLOCK}\n"):
-            return contents, False
+        if begin_count == 1 and end_count == 1:
+            for installed_method, installed_block in _AEC_BLOCKS.items():
+                if not contents.endswith(f"\n{installed_block}\n"):
+                    continue
+                if installed_method == aec_method:
+                    return contents, False
+                raise DeploymentError(
+                    "managed AEC block uses "
+                    f"{installed_method}, not requested {aec_method}"
+                )
         raise DeploymentError("managed AEC block is partial, duplicated, or modified")
     if AEC_SOURCE_NAME in contents or AEC_SINK_NAME in contents:
         raise DeploymentError("unmanaged Codex AEC endpoints already exist")
@@ -53,24 +90,23 @@ def render_install(contents: str) -> tuple[str, bool]:
     sink_line = _find_master_line(contents, "module-alsa-sink", RAW_SINK_DEVICE)
     if source_line is None or sink_line is None:
         raise DeploymentError("pinned raw ALSA master definitions were not found")
-    if not contents.endswith("\n"):
-        raise DeploymentError("default.pa must end with a newline")
-
     # Append, rather than use default.pa.d: the pinned image includes that
     # directory before it defines these two hardware master objects.
-    return f"{contents}\n{AEC_BLOCK}\n", True
+    return f"{contents}\n{selected_block}\n", True
 
 
 def render_remove(contents: str) -> tuple[str, bool]:
-    """Remove only an exact installer-owned tail block."""
+    """Remove only an exact installer-owned tail block for an allowed method."""
     begin_count = contents.count(BEGIN_MARKER)
     end_count = contents.count(END_MARKER)
     if begin_count == 0 and end_count == 0:
         return contents, False
-    suffix = f"\n{AEC_BLOCK}\n"
-    if begin_count != 1 or end_count != 1 or not contents.endswith(suffix):
-        raise DeploymentError("managed AEC block is partial, duplicated, or modified")
-    return contents[: -len(suffix)], True
+    if begin_count == 1 and end_count == 1:
+        for block in _AEC_BLOCKS.values():
+            suffix = f"\n{block}\n"
+            if contents.endswith(suffix):
+                return contents[: -len(suffix)], True
+    raise DeploymentError("managed AEC block is partial, duplicated, or modified")
 
 
 def _find_master_line(contents: str, module: str, device: str) -> int | None:
@@ -222,6 +258,12 @@ def main() -> int:
         default=Path("/data/conf/default.pa.pre-codex-aec"),
     )
     parser.add_argument(
+        "--aec-method",
+        choices=SUPPORTED_AEC_METHODS,
+        default=DEFAULT_AEC_METHOD,
+        help="AEC engine for install/check (default: webrtc)",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
         help="perform the requested mutation; otherwise install/remove are dry runs",
@@ -230,14 +272,16 @@ def main() -> int:
 
     contents, metadata = _read_root_config(arguments.default_pa)
     if arguments.action == "check":
-        _updated, needed = render_install(contents)
+        _updated, needed = render_install(contents, arguments.aec_method)
         print(  # noqa: T201 - intentional CLI status output
             "AEC startup block is ready" if needed else "AEC startup block is installed"
         )
         return 0
 
-    renderer = render_install if arguments.action == "install" else render_remove
-    updated, changed = renderer(contents)
+    if arguments.action == "install":
+        updated, changed = render_install(contents, arguments.aec_method)
+    else:
+        updated, changed = render_remove(contents)
     if not changed:
         print(  # noqa: T201 - intentional CLI status output
             f"AEC startup block already {arguments.action}ed"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from fractions import Fraction
 from types import SimpleNamespace
 from typing import Any
@@ -17,7 +18,9 @@ from bridge.webrtc import RTP_FRAME_SAMPLES, RTP_SAMPLE_RATE, PcmAudioTrack, Web
 def _queue_only_peer(*, audio_queue_size: int = 1) -> WebRtcPeer:
     peer = object.__new__(WebRtcPeer)
     peer.audio = asyncio.Queue(maxsize=audio_queue_size)
+    peer._audio_replay = deque()
     peer.data_events = asyncio.Queue(maxsize=1)
+    peer._data_event_replay = deque()
     peer.closed = False
     peer._transport_failed = asyncio.Event()
     peer._transport_error = None
@@ -188,3 +191,129 @@ async def test_remote_audio_eof_wakes_waiting_consumers_with_error() -> None:
 
     with pytest.raises(ProtocolError, match="remote audio transport ended"):
         await asyncio.wait_for(receiver, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_audio_receive_replays_won_item_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot erase PCM already removed by the inner queue task."""
+    peer = _queue_only_peer(audio_queue_size=2)
+    first = b"first-audio"
+    second = b"second-audio"
+    peer.audio.put_nowait(first)
+    original_wait = asyncio.wait
+    inner_receive_won = asyncio.Event()
+    release_wrapper = asyncio.Event()
+
+    async def pause_after_inner_receive(*args: Any, **kwargs: Any) -> Any:
+        result = await original_wait(*args, **kwargs)
+        inner_receive_won.set()
+        await release_wrapper.wait()
+        return result
+
+    monkeypatch.setattr(webrtc.asyncio, "wait", pause_after_inner_receive)
+    receiver = asyncio.create_task(peer.recv_audio())
+    await asyncio.wait_for(inner_receive_won.wait(), timeout=1)
+    assert peer.audio.empty()
+    peer.audio.put_nowait(second)
+
+    receiver.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receiver
+
+    assert peer.drain_audio_nowait() == [first, second]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["audio", "data"])
+async def test_cancelled_receive_during_cleanup_replays_once_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Cancellation in child cleanup cannot erase or duplicate a won item."""
+    peer = _queue_only_peer(audio_queue_size=2)
+    if kind == "audio":
+        queue = peer.audio
+        receive = peer.recv_audio
+        drain = peer.drain_audio_nowait
+        first: str | bytes = b"first-audio"
+        second: str | bytes = b"second-audio"
+    else:
+        peer.data_events = asyncio.Queue(maxsize=2)
+        queue = peer.data_events
+        receive = peer.recv_data_event
+        drain = peer.drain_data_events_nowait
+        first = "first-data"
+        second = "second-data"
+    queue.put_nowait(first)
+    original_gather = asyncio.gather
+    cleanup_started = asyncio.Event()
+    pause_cleanup = True
+
+    async def pause_first_cleanup(*args: Any, **kwargs: Any) -> Any:
+        nonlocal pause_cleanup
+        result = await original_gather(*args, **kwargs)
+        if pause_cleanup:
+            pause_cleanup = False
+            cleanup_started.set()
+            await asyncio.Future()
+        return result
+
+    monkeypatch.setattr(webrtc.asyncio, "gather", pause_first_cleanup)
+    receiver = asyncio.create_task(receive())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    assert queue.empty()
+    queue.put_nowait(second)
+
+    receiver.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receiver
+
+    assert drain() == [first, second]
+    assert drain() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["audio", "data"])
+async def test_terminal_transport_error_precedes_cancelled_receive_replay(
+    kind: str,
+) -> None:
+    """A terminal fault cannot expose PCM or data retained for cancellation."""
+    peer = _queue_only_peer()
+    if kind == "audio":
+        replay = peer._audio_replay
+        receive = peer.recv_audio
+        drain = peer.drain_audio_nowait
+        stale: str | bytes = b"stale-audio"
+    else:
+        replay = peer._data_event_replay
+        receive = peer.recv_data_event
+        drain = peer.drain_data_events_nowait
+        stale = "stale-data"
+    replay.append(stale)
+    peer._fail_transport("terminal transport failure")
+
+    with pytest.raises(ProtocolError, match="terminal transport failure"):
+        await receive()
+    assert list(replay) == [stale]
+
+    with pytest.raises(ProtocolError, match="terminal transport failure"):
+        drain()
+    assert list(replay) == [stale]
+
+
+def test_replay_counts_toward_transport_queue_bound() -> None:
+    peer = _queue_only_peer(audio_queue_size=1)
+    peer._audio_replay.append(b"replayed")
+
+    accepted = peer._put_transport_item(
+        peer.audio,
+        peer._audio_replay,
+        b"new",
+        overflow_message="WebRTC remote audio buffer overflow",
+    )
+
+    assert not accepted
+    with pytest.raises(ProtocolError, match="remote audio buffer overflow"):
+        peer.drain_audio_nowait()

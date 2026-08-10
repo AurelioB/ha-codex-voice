@@ -252,7 +252,7 @@ untouched.
 
 ```text
 vendor microphone callback (16 kHz PCM16)
-  -> static PulseAudio WebRTC-AEC source when full duplex is enabled
+  -> static PulseAudio source for the configured AEC engine in full duplex
   -> direct-only idle pre-roll (up to 6 × 64 ms / 12 KiB in RAM)
   -> bounded device input/fallback queues (64 KiB / 2.048 s)
   -> paced v2 binary WebSocket (up to 2x while catching up)
@@ -283,17 +283,29 @@ finite STT retains its existing whole-utterance track capacity.
 The client remains turn-taking by default: a speaking epoch gates microphone
 submission until both its queued PCM and playback child have drained. Opt-in
 full duplex requires a statically loaded PulseAudio `module-echo-cancel` with
-`aec_method=webrtc`, the reviewed raw hardware masters, exact default AEC
-source/sink names, and the already-open vendor capture stream routed through
-that source. A startup preflight verifies the topology and configured 1–25%
-sink ceiling before any microphone audio leaves the device. The ceiling is
-rechecked at every `speaking.started`, and every `paplay` child is pinned to
-the AEC sink with a fixed stream volume at or below that ceiling.
+the exact configured allowlisted `aec_method`, the reviewed raw hardware
+masters, exact default AEC source/sink names, and the already-open vendor
+capture stream routed through that source. Allowed methods are `webrtc`,
+`speex`, and `adrian`. WebRTC remains the omitted-value default, and neither the
+installer nor client automatically falls back. The observed stock v1.1.7 build
+rejects WebRTC and Speex but loads Adrian with the exact masters and
+`use_master_format=1`, producing 16 kHz mono endpoints; active stock-device
+configuration therefore explicitly selects Adrian. A startup preflight verifies
+the topology and configured 1–25% sink ceiling before any microphone audio
+leaves the device. The ceiling is rechecked at every `speaking.started`, and
+every `paplay` child is pinned to the AEC sink with a fixed stream volume at or
+below that ceiling. The Adrian topology result does not replace physical
+double-talk qualification for each installation at no more than 25%; the
+reference device passed the bounded 25% echo-residual and staged barge-in
+canaries.
 
 In verified full duplex, provider VAD continues receiving capture during
-playback. `input_audio_buffer.speech_started` immediately flushes local output
-and quarantines late PCM, but does not itself prove provider cancellation. The
-bridge truthfully keeps `remote_cancel: false` and separately advertises
+playback. Two consecutive qualifying AEC-filtered microphone frames request a
+local flush for the exact active output epoch; the network thread aborts the
+player and quarantines late PCM without pausing upstream audio. Provider
+`input_audio_buffer.speech_started` independently reinforces that boundary.
+Neither event itself proves provider cancellation. The bridge truthfully keeps
+`remote_cancel: false` and separately advertises
 `same_session_interrupt_ack: true`. Same-socket continuation occurs only when
 the bridge's explicit cancel request is followed by a provider
 `response.cancelled` event whose response identifier matches the active

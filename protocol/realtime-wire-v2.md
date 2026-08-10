@@ -158,21 +158,27 @@ WebSocket framing overhead is separate, and the minimum carries one fixed
 
 Full duplex is an explicit, fail-closed device option; protocol v2 itself does
 not provide AEC. Before opening the socket, the reference client requires the
-reviewed static PulseAudio `module-echo-cancel` topology with
-`aec_method=webrtc`, exact raw hardware masters and AEC endpoint names, those
-endpoints as defaults, and every current-process native capture stream routed
-through the uncorked AEC source. Every AEC sink channel must be at or below the
-configured `aec_test_volume_percent`, which is limited to 1–25. The same sink
-ceiling is rechecked before every speaking epoch, and `paplay` is pinned to the
-AEC sink with a fixed linear stream volume no greater than that ceiling. The
-sink guard compares raw PulseAudio volume units against the exact linear
-ceiling; it does not trust the rounded displayed percentage.
+reviewed static PulseAudio `module-echo-cancel` topology with the exact
+configured allowlisted `aec_method`, exact raw hardware masters and AEC endpoint
+names, those endpoints as defaults, and every current-process native capture
+stream routed through the uncorked AEC source. The allowlist is `webrtc`,
+`speex`, and `adrian`; omitted configuration defaults to WebRTC and never falls
+back automatically. Every AEC sink channel must be at or below the configured
+`aec_test_volume_percent`, which is limited to 1–25. The same sink ceiling is
+rechecked before every speaking epoch, and `paplay` is pinned to the AEC sink
+with a fixed linear stream volume no greater than that ceiling. The sink guard
+compares raw PulseAudio volume units against the exact linear ceiling; it does
+not trust the rounded displayed percentage. An engine loading and producing
+the expected endpoints does not replace physical echo-rejection and double-talk
+qualification.
 
 Only after those checks does the client keep microphone submission active
-during playback. `input_audio_buffer.speech_started` flushes the local player
-and quarantines late output PCM, but it is only a local barge-in boundary; the
-correlated interrupt acknowledgement below decides whether the remote session
-is safe to resume.
+during playback. A client may use bounded AEC-filtered local speech detection
+to flush the player and quarantine late PCM for the exact output epoch before
+remote VAD arrives. `input_audio_buffer.speech_started` independently reinforces
+that local boundary. Neither event proves cancellation; the correlated
+interrupt acknowledgement below decides whether the remote session is safe to
+resume.
 
 ## JSON control messages
 

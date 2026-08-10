@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from fractions import Fraction
 from typing import Any
 
@@ -158,9 +159,11 @@ class WebRtcPeer:
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=MAX_REMOTE_AUDIO_QUEUE_CHUNKS
         )
+        self._audio_replay: deque[bytes] = deque()
         self.data_events: asyncio.Queue[str | bytes] = asyncio.Queue(
             maxsize=MAX_DATA_EVENT_QUEUE_ITEMS
         )
+        self._data_event_replay: deque[str | bytes] = deque()
         self.connection_state = asyncio.Event()
         self.closed = False
         self._transport_failed = asyncio.Event()
@@ -193,10 +196,12 @@ class WebRtcPeer:
 
         @self.data_channel.on("message")
         def on_message(message: str | bytes) -> None:
-            try:
-                self.data_events.put_nowait(message)
-            except asyncio.QueueFull:
-                self._fail_transport("WebRTC data-channel event buffer overflow")
+            self._put_transport_item(
+                self.data_events,
+                self._data_event_replay,
+                message,
+                overflow_message="WebRTC data-channel event buffer overflow",
+            )
 
         @self.data_channel.on("close")
         def on_data_channel_close() -> None:
@@ -261,7 +266,10 @@ class WebRtcPeer:
 
     def drain_audio_nowait(self) -> list[bytes]:
         """Remove and return already-buffered remote PCM."""
-        chunks: list[bytes] = []
+        if self._transport_error is not None:
+            raise self._transport_error
+        chunks = list(self._audio_replay)
+        self._audio_replay.clear()
         while True:
             try:
                 chunks.append(self.audio.get_nowait())
@@ -270,7 +278,10 @@ class WebRtcPeer:
 
     def drain_data_events_nowait(self) -> list[str | bytes]:
         """Remove and return already-buffered data-channel events."""
-        events: list[str | bytes] = []
+        if self._transport_error is not None:
+            raise self._transport_error
+        events = list(self._data_event_replay)
+        self._data_event_replay.clear()
         while True:
             try:
                 events.append(self.data_events.get_nowait())
@@ -278,12 +289,20 @@ class WebRtcPeer:
                 return events
 
     async def recv_audio(self, timeout: float | None = None) -> bytes:
-        value = await self._recv_transport_queue(self.audio, timeout)
+        value = await self._recv_transport_queue(
+            self.audio,
+            timeout,
+            replay=self._audio_replay,
+        )
         assert isinstance(value, bytes)
         return value
 
     async def recv_data_event(self, timeout: float | None = None) -> str | bytes:
-        value = await self._recv_transport_queue(self.data_events, timeout)
+        value = await self._recv_transport_queue(
+            self.data_events,
+            timeout,
+            replay=self._data_event_replay,
+        )
         assert isinstance(value, (str, bytes))
         return value
 
@@ -335,28 +354,83 @@ class WebRtcPeer:
         self,
         queue: asyncio.Queue[Any],
         timeout: float | None,
+        *,
+        replay: deque[Any],
     ) -> Any:
         if self._transport_error is not None:
             raise self._transport_error
+        if replay:
+            return replay.popleft()
         item_task = asyncio.create_task(queue.get())
         failure_task = asyncio.create_task(self._transport_failed.wait())
         try:
-            done, _ = await asyncio.wait(
-                {item_task, failure_task},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                raise TimeoutError
-            if failure_task in done:
-                assert self._transport_error is not None
-                raise self._transport_error
-            return item_task.result()
-        finally:
+            try:
+                done, _ = await asyncio.wait(
+                    {item_task, failure_task},
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise TimeoutError
+                if failure_task in done:
+                    assert self._transport_error is not None
+                    raise self._transport_error
+                return item_task.result()
+            finally:
+                for task in (item_task, failure_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(item_task, failure_task, return_exceptions=True)
+        except asyncio.CancelledError:
+            # queue.get() may already have removed an item while this wrapper is
+            # still waiting to resume. Preserve that won result so handoff
+            # sanitation cannot mistake cancellation for an empty boundary.
+            self._restore_cancelled_receive(queue, replay, item_task)
             for task in (item_task, failure_task):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(item_task, failure_task, return_exceptions=True)
+            raise
+
+    def _restore_cancelled_receive(
+        self,
+        queue: asyncio.Queue[Any],
+        replay: deque[Any],
+        item_task: asyncio.Task[Any],
+    ) -> None:
+        """Replay one queue item won by a cancelled receive wrapper."""
+        if (
+            not item_task.done()
+            or item_task.cancelled()
+            or item_task.exception() is not None
+        ):
+            return
+        item = item_task.result()
+        combined_size = len(replay) + queue.qsize()
+        if replay or (queue.maxsize > 0 and combined_size >= queue.maxsize):
+            self._fail_transport("WebRTC cancelled receive replay overflow")
+            return
+        replay.appendleft(item)
+
+    def _put_transport_item(
+        self,
+        queue: asyncio.Queue[Any],
+        replay: deque[Any],
+        item: Any,
+        *,
+        overflow_message: str,
+    ) -> bool:
+        """Enqueue within the combined live-queue and cancellation replay bound."""
+        combined_size = len(replay) + queue.qsize()
+        if queue.maxsize > 0 and combined_size >= queue.maxsize:
+            self._fail_transport(overflow_message)
+            return False
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._fail_transport(overflow_message)
+            return False
+        return True
 
     async def _consume_audio(self, track: Any) -> None:
         assert AudioResampler is not None
@@ -393,10 +467,13 @@ class WebRtcPeer:
                     pcm = bytes(converted.planes[0])[:size]
                     if not pcm:
                         continue
-                    if self.audio.full():
-                        self._fail_transport("WebRTC remote audio buffer overflow")
+                    if not self._put_transport_item(
+                        self.audio,
+                        self._audio_replay,
+                        pcm,
+                        overflow_message="WebRTC remote audio buffer overflow",
+                    ):
                         return
-                    self.audio.put_nowait(pcm)
                     if not logged_queue:
                         LOGGER.debug(
                             "Codex WebRTC queued its first PCM chunk (%d bytes)",
