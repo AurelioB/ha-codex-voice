@@ -7,25 +7,29 @@ ThirdReality Assist satellite
   -> Home Assistant Assist pipeline
      -> Wyoming faster-whisper STT entity
      -> Codex Voice Conversation entity
-     -> Codex Voice TTS entity
+     -> Wyoming Piper TTS entity (external host, es_MX-ald-medium)
   -> ThirdReality speaker
 
-Codex Voice Conversation/TTS
+Codex Voice Conversation
   -> authenticated HTTP/WebSocket bridge API
   -> Codex App Server over JSON-RPC/stdio
   -> Codex-managed ChatGPT login
 
 Wyoming STT
   -> local persistent faster-whisper model
+
+Wyoming TTS
+  -> local persistent Piper model
 ```
 
 The component is a normal Home Assistant integration with one parent config
-entry. New entries create Conversation and TTS subentries; Home Assistant's
-native Wyoming integration owns the reliable STT entity. The retained Codex
-STT subentry is an explicit experimental diagnostic because Codex realtime
-conversation does not provide a deterministic finite transcription contract.
-The existing ThirdReality satellite needs no firmware change for this
-turn-based mode.
+entry. New entries create Conversation and subscription-backed TTS subentries;
+Home Assistant's native Wyoming integration owns the reliable STT and
+recommended TTS entities. The retained Codex TTS entity remains an explicit
+experimental option. The retained Codex STT subentry is an explicit
+experimental diagnostic because Codex realtime conversation does not provide a
+deterministic finite transcription contract. The existing ThirdReality
+satellite needs no firmware change for this turn-based mode.
 
 Conversation turns use stable App Server thread and turn methods. Selected Home
 Assistant LLM tools are advertised as dynamic tools. When Codex requests a tool,
@@ -77,11 +81,11 @@ future protocol work. Cached Conversation threads are deleted when retired,
 evicted, or the bridge closes. Deletion unloads the thread immediately instead
 of retaining it for App Server's idle-unload period.
 
-## Subscription audio adapters
+## Experimental subscription audio adapters
 
 Codex App Server does not expose independent subscription-backed STT or TTS
-RPCs. The TTS entity and retained experimental STT entity therefore create
-short-lived realtime-conversation sessions:
+RPCs. The retained Codex TTS entity and experimental STT entity therefore
+create short-lived realtime-conversation sessions:
 
 1. Create an `aiortc` peer with a paced audio track and `oai-events` data
    channel.
@@ -112,11 +116,45 @@ result after capture EOF. This path does not open a Codex thread, consume a
 subscription speech slot, or silently fall back to the experimental adapter.
 
 ```text
-capture -> local Wyoming STT -> transcript -> Codex Conversation -> Codex TTS
+capture -> local Wyoming STT -> transcript -> Codex Conversation
+        -> local Wyoming Piper TTS
 ```
 
 See [reliable local speech-to-text](local-stt.md) for deployment and acceptance
 checks.
+
+## Reliable local TTS boundary
+
+The recommended production pipeline sends the completed Conversation response
+through Home Assistant's native Wyoming integration to a local Piper service.
+For Mexican Spanish, the validated external service pins
+`wyoming-piper==2.3.1`, keeps `es_MX-ald-medium` available, and listens on
+`tcp://HOST:10200` after the operator replaces the loopback default with an
+explicit trusted-LAN bind address.
+
+The external deployment pins that voice to an immutable upstream revision.
+An installer verifies exact sizes and SHA-256 digests before atomic placement,
+and the private service runner verifies them again at startup. The hardened
+unit exposes the model directory read-only and restricts Wyoming requests to
+the single reviewed voice.
+
+```text
+Codex response text -> Home Assistant Wyoming client -> local Piper synthesis
+                    -> PCM audio -> satellite playback
+```
+
+This stage does not create a Codex thread, use the subscription speech lane, or
+send response text to a remote speech provider. The official Home Assistant
+Piper add-on (shown as an app in current UI) is the simplest Home Assistant OS
+path. On affected virtualized
+x86-64 installations its current runtime may require the guest CPU model to
+expose x86-64-v2 instructions; an external Wyoming Piper service is the
+supported fallback when that guest CPU contract cannot be changed. This is a
+bounded virtualization caveat, not a general requirement for every Piper
+deployment or architecture.
+
+See [reliable local text-to-speech](local-tts.md) for both setup paths,
+pipeline selection, measurements, and acceptance checks.
 
 ## Experimental finite subscription adapter
 
@@ -138,7 +176,8 @@ outbound protocol has no response-cancel control.
 ```text
 Experimental Codex STT active
   -> transcript result -> stop session -> delete thread
-  -> TTS -> start fresh session -> stream speech -> stop/delete
+  -> experimental Codex TTS -> start fresh session -> stream speech
+                            -> stop/delete
 ```
 
 The dormant diagnostic handoff protocol uses a 256-bit single-use ticket. Its
@@ -166,9 +205,11 @@ The bridge does not prewarm a remote session before a future wake word. A
 custom STT provider has no reliable Home Assistant callback before wake
 detection, an idle peer continues sending paced silent RTP, and a speculative
 session would occupy the single subscription speech lane without a documented
-quota-neutral idle lifetime. Standard Assist adapter optimization is therefore
-limited to capture overlap and progressive TTS delivery. The direct device mode
-below begins only after its explicit wake; it is not a speculative prewarm. See
+quota-neutral idle lifetime. Experimental Codex adapter optimization is
+therefore limited to capture overlap and progressive TTS delivery. The
+recommended Wyoming providers do not use those remote adapters. The direct
+device mode below begins only after its explicit wake; it is not a speculative
+prewarm. See
 [performance and ThirdReality tuning](performance.md) for the live measurements
 and acceptance criteria.
 

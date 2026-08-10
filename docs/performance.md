@@ -1,8 +1,10 @@
 # Performance and ThirdReality tuning
 
-The production pipeline uses local Wyoming faster-whisper for STT. Remaining
-remote latency comes from the ChatGPT-backed Conversation and experimental TTS
-stages. Treat the figures below as diagnostic reference points, not
+The production pipeline uses local Wyoming faster-whisper for STT and local
+Wyoming Piper for TTS. Its remaining provider-side remote latency comes from
+the ChatGPT-backed Conversation stage. The separate “Okay Computer” route and
+the retained experimental Codex TTS entity still use subscription-backed
+realtime speech. Treat the figures below as diagnostic reference points, not
 service-level guarantees. CPU load, network path, ChatGPT load and quota, Codex
 CLI version, Home Assistant pipeline choices, utterance length, and
 media-player buffering all affect a turn.
@@ -20,15 +22,18 @@ Several enabled optimizations shorten different parts of that path:
 1. Home Assistant streams 16 kHz PCM to its native Wyoming integration. A
    persistent faster-whisper `base` model performs finite STT locally without
    a remote handshake, subscription speech lease, or same-path retry.
-2. Streaming TTS returns an EOF-terminated PCM16 WAV stream as realtime speech
-   frames arrive. Home Assistant can begin serving audio without waiting for
-   the complete rendered response and remote cleanup.
-3. Speech peers use an explicit empty ICE-server list for the
-   subscription-backed TTS/realtime path, avoiding the default public STUN
-   probe. Newly created Conversation profiles default to low reasoning effort
-   and App Server's `priority` service tier to favor response latency. Existing
+2. Home Assistant sends completed response text through native Wyoming to a
+   persistent local Piper `es_MX-ald-medium` model. Production TTS therefore
+   has no remote WebRTC handshake or subscription speech lease.
+3. Newly created Conversation profiles default to low reasoning effort and App
+   Server's `priority` service tier to favor response latency. Existing
    profiles preserve standard usage until reconfigured, and users can select
    `standard` to reduce subscription usage.
+
+The retained experimental Codex TTS entity progressively returns an
+EOF-terminated PCM16 WAV stream and uses an explicit empty ICE-server list.
+Those optimizations remain relevant to diagnostic Codex TTS and direct
+realtime speech, but they are no longer on the recommended Okay Nabu TTS path.
 
 Automatic experimental Codex STT-to-TTS session reuse is not enabled. Live
 validation found that the realtime v3 session can start genuine assistant
@@ -116,7 +121,8 @@ below the prior remote failure tail; it is not a p95 latency claim.
 
 ### Physical local-STT canary
 
-After the production pipeline switch, a 2026-08-09 self-acoustic canary
+After the local-STT production switch, but before the later Piper TTS switch, a
+2026-08-09 self-acoustic canary
 exercised the ThirdReality speaker, microphone, wake detector, Home Assistant
 VAD, local Wyoming STT, Codex Conversation/TTS, and response playback. The
 successful run had these event boundaries:
@@ -133,6 +139,51 @@ Local recognition after VAD end took **0.497 s**. The transcript contained all
 idle. The device log for that run contained no wake-confirmation WAV playback,
 and the Wyoming journal contained only numeric duration/VAD messages—not the
 transcript. This is one controlled physical path check, not a latency guarantee.
+
+## Local Piper TTS measurement
+
+On the measured i5-13600K host, the repository smoke probe used
+`wyoming-piper==2.3.1` with voice `es_MX-ald-medium` and measured time to the
+first non-empty Wyoming `AudioChunk`, not the earlier metadata-only
+`AudioStart`. Across two service restarts, cold first PCM ranged from 0.714 to
+0.956 seconds and complete synthesis from 0.824 to 1.072 seconds. The next five
+warm requests reached first PCM in 0.025, 0.024, 0.044, 0.028, and 0.035
+seconds: a 0.028-second median and 0.044-second maximum. Their median complete
+synthesis time was 0.116 seconds for 2.949 to 3.367 seconds of output audio.
+
+Three controlled Codex TTS requests for the same text reached first audio in
+2.898, 1.671, and 2.025 seconds, a 2.025-second median. Piper's warm median was
+about 72 times faster at this measured host-side provider boundary;
+it does not establish the same difference at the speaker. In a separate
+physical Home Assistant call, the ThirdReality `media_player` entity entered
+`playing` 0.018097 seconds after the call and returned to `idle` at 3.564543
+seconds. Those state transitions do not instrument actual audible onset.
+Home Assistant delivery, satellite buffering, audio-device startup, and
+physical playback therefore remain unmeasured boundaries. See [reliable local
+text-to-speech](local-tts.md) for deployment and acceptance checks.
+
+### Physical Piper pipeline canary
+
+A later controlled self-acoustic Spanish canary exercised the ThirdReality
+speaker and microphone, wake detector, Home Assistant VAD, local
+faster-whisper, Codex Conversation, local Piper, response playback, and return
+to idle. The generated non-sensitive request was recognized with the intended
+words, the response was non-empty with language `es-MX`, and the trace contained
+no errors.
+
+| Interval from pipeline start | Time |
+|---|---:|
+| VAD start | 1.626 s |
+| VAD end | 5.936 s |
+| STT end | 6.590 s |
+| Codex Conversation duration | 1.734 s |
+| Satellite responding | 8.324 s |
+| Satellite idle | 13.919 s |
+
+Local recognition after VAD end took 0.653 seconds. Home Assistant created its
+streaming TTS result in 0.000315 seconds, which is not a first-PCM or audible
+onset measurement; the Wyoming probe above supplies the provider-side PCM
+timing.
 
 ## Historical remote-adapter measurements
 
@@ -245,7 +296,7 @@ ordered non-blocking LED work, newest-state overload handling, explicit worker
 shutdown, and the fail-closed path. See the device overlay README for deployment
 and rollback checks.
 
-### Streaming TTS probe
+### Historical Codex streaming TTS probe
 
 One v0.1.7 live bridge probe of the same synthesis request measured:
 
@@ -255,9 +306,10 @@ One v0.1.7 live bridge probe of the same synthesis request measured:
 | streaming endpoint first PCM | 6.495 s |
 | streaming endpoint complete | 10.457 s |
 
-Streaming exposed the first PCM **4.222 s earlier** than the finite response.
-It did not shorten the remote model's complete rendering by that amount, and
-the figure excludes downstream speaker buffering and playback.
+Streaming exposed the first PCM **4.222 s earlier** than the finite Codex
+response. It did not shorten the remote model's complete rendering by that
+amount, and the figure excludes downstream speaker buffering and playback.
+It is not the Piper comparison above.
 
 ### Streaming STT capture overlap
 
@@ -342,14 +394,15 @@ increased usage. In one paired direct turn, standard produced first text at
 finished at 2.234 s. This single pair proves that both settings work through
 the bridge, not a repeatable latency saving.
 
-### Native TTS output format
+### Experimental Codex TTS output format
 
-The component advertises mono 16-bit WAV at 16 and 24 kHz and forwards Home
-Assistant's selected native tuple to the bridge. The bridge incrementally
-resamples its 24 kHz realtime output when 16 kHz is requested, without waiting
-for the full response. This removes a format mismatch at the provider boundary;
-downstream Home Assistant or media-player conversion and buffering can still
-add latency.
+The Codex Voice TTS entity advertises mono 16-bit WAV at 16 and 24 kHz and
+forwards Home Assistant's selected native tuple to the bridge. The bridge
+incrementally resamples its 24 kHz realtime output when 16 kHz is requested,
+without waiting for the full response. This removes a format mismatch for the
+experimental adapter; downstream Home Assistant or media-player conversion and
+buffering can still add latency. Recommended Piper TTS is owned independently
+by Home Assistant's Wyoming integration.
 
 ### Cold synthesis experiment rejected
 
@@ -382,8 +435,10 @@ running a physical A/B.
 
 Handoff is a dormant diagnostic wire path in the bridge. The bundled Home
 Assistant component never prepares or requests it, and the released bridge
-never retains STT or issues a ticket. Standard Assist STT and TTS therefore
-always use separate realtime threads and sessions. The parser and ownership
+never retains STT or issues a ticket. When the experimental Codex STT and TTS
+entities are selected, they therefore always use separate realtime threads and
+sessions. The recommended faster-whisper and Piper providers are independent
+local Wyoming services and do not use this mechanism. The parser and ownership
 machinery remain covered for future protocol work.
 
 If a future supported implementation enables the path, Home Assistant reads an

@@ -41,6 +41,11 @@ sides of a narrow bridge API.
 - Production STT audio travels only from Home Assistant to the selected local
   Wyoming faster-whisper service. It does not enter Codex App Server or consume
   ChatGPT/OpenAI quota.
+- After Codex returns the Conversation response, Home Assistant sends that text
+  only to the selected local Wyoming Piper service for synthesis. Piper does
+  not receive the ChatGPT credential, bridge bearer, microphone audio, or Home
+  Assistant access token, and synthesis does not consume the subscription
+  speech lane.
 - Device-facing realtime v2 is chat-only. It rejects device-declared tools and
   tool results and never forwards provider tool calls. Home control remains on
   the normal Home Assistant pipeline, where `ChatLog` and the selected LLM API
@@ -75,9 +80,12 @@ rules restrict the bridge port to the Home Assistant host and intended voice
 endpoints. Use HTTPS/WSS through a reverse proxy across any shared or untrusted
 network. Do not expose port 8787 directly to the internet.
 
-Wyoming TCP has no application bearer authentication. Bind port 10300 to an
-explicit trusted-LAN address and restrict it to the Home Assistant host. Never
-expose it to the internet or an untrusted network.
+Wyoming TCP has no application bearer authentication. Bind faster-whisper port
+`10300` and Piper port `10200` only to explicit addresses Home Assistant can
+reach, then restrict both ports to the Home Assistant host. Never expose either
+service to the internet or an untrusted network. The supplied external Piper
+example defaults to loopback and must be deliberately changed for a separate
+Home Assistant host.
 
 Generate unique high-entropy primary and realtime-device tokens. They must
 differ. Do not reuse a Home Assistant token, Codex credential, GitHub token, or
@@ -115,6 +123,17 @@ raises only `wyoming_faster_whisper.dispatch_handler` to WARNING. Do not replace
 that runner with the package's direct console entry point unless transcript
 logging is explicitly acceptable for the deployment.
 
+Treat text sent to Piper as potentially sensitive even though it remains on the
+local Wyoming path. Review the selected runtime's logs before deployment and do
+not enable debug logging or retain synthesized test content unless that is an
+explicit operational choice.
+
+The external Piper path pins the Mexican-Spanish model to an immutable upstream
+revision and verifies exact sizes and SHA-256 digests before atomic
+installation. The service re-verifies the files at every start, exposes the
+model directory read-only, advertises only the locked voice, and refuses
+requests that would download a different model.
+
 ## Experimental subscription transport
 
 Subscription audio uses an under-development Codex App Server WebRTC interface
@@ -126,8 +145,9 @@ Experimental Codex transcription and speech rendering are behaviors of a
 conversational voice model. They are not the separately billed Speech-to-Text
 and Text-to-Speech APIs. A realtime input session may return no transcript, and
 spoken output may paraphrase supplied text. Production STT therefore uses local
-Wyoming faster-whisper. Do not use experimental speech output for
-safety-critical, compliance-sensitive, or legally exact messages.
+Wyoming faster-whisper, and recommended production TTS uses local Wyoming
+Piper. Do not use experimental Codex speech output for safety-critical,
+compliance-sensitive, or legally exact messages.
 
 ## Reporting vulnerabilities
 

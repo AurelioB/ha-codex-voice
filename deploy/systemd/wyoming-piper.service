@@ -1,0 +1,52 @@
+[Unit]
+Description=Local Wyoming Piper service for Home Assistant Assist
+Documentation=https://github.com/OHF-Voice/wyoming-piper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HA_CODEX_TTS_URI=tcp://127.0.0.1:10200
+Environment=HA_CODEX_TTS_VOICE=es_MX-ald-medium
+Environment=HA_CODEX_TTS_THREADS=4
+Environment=HA_CODEX_TTS_MODEL_DIR=%h/.local/share/ha-codex-voice/models/piper
+Environment=HA_CODEX_TTS_MODEL_LOCK=%h/.local/share/ha-codex-voice/wyoming-piper-model.lock.json
+EnvironmentFile=-%h/.config/ha-codex-voice/local-tts.env
+ExecStart=%h/.local/share/ha-codex-voice/wyoming-tts-venv/bin/python \
+  %h/.local/share/ha-codex-voice/wyoming-piper-runner.py \
+  --uri ${HA_CODEX_TTS_URI} \
+  --voice ${HA_CODEX_TTS_VOICE} \
+  --data-dir ${HA_CODEX_TTS_MODEL_DIR} \
+  --download-dir ${HA_CODEX_TTS_MODEL_DIR}
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/share/ha-codex-voice/wyoming-tts-venv
+BindReadOnlyPaths=%h/.local/share/ha-codex-voice/wyoming-piper-runner.py
+BindReadOnlyPaths=%h/.local/share/ha-codex-voice/wyoming-piper-model.lock.json
+BindReadOnlyPaths=%h/.local/share/ha-codex-voice/models/piper
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=default.target
