@@ -12,7 +12,10 @@ from .errors import ProtocolError
 
 LEGACY_PROTOCOL_VERSION = 1
 BINARY_PROTOCOL_VERSION = 2
+DEVICE_WEBRTC_PROTOCOL_VERSION = 3
 BINARY_AUDIO_TRANSPORT = "binary"
+DEVICE_WEBRTC_TRANSPORT = "webrtc"
+MAX_WEBRTC_SDP_BYTES = 16 * 1024
 V2_START_FIELDS = frozenset(
     {
         "audio_transport",
@@ -25,6 +28,21 @@ V2_START_FIELDS = frozenset(
         "type",
         "voice",
     }
+)
+V3_START_FIELDS = frozenset(
+    {
+        "conversation_mode",
+        "conversation_id",
+        "prompt",
+        "protocol_version",
+        "transport",
+        "type",
+        "voice",
+    }
+)
+V3_TRANSPORT_FIELDS = frozenset({"sdp", "type"})
+LEGACY_PCM_START_FIELDS = frozenset(
+    {"audio_transport", "input_channels", "input_sample_rate"}
 )
 
 # These events carry useful lifecycle signals, but their provider payloads may
@@ -73,10 +91,16 @@ class RealtimeWireProtocol:
     input_sample_rate: int
     input_channels: int
     conversation_mode: str | None = None
+    webrtc_offer_sdp: str | None = None
 
     @property
     def uses_binary_audio(self) -> bool:
         return self.version == BINARY_PROTOCOL_VERSION
+
+    @property
+    def uses_direct_webrtc(self) -> bool:
+        """Return whether media flows directly between the device and provider."""
+        return self.version == DEVICE_WEBRTC_PROTOCOL_VERSION
 
     @property
     def requests_native_conversation(self) -> bool:
@@ -88,7 +112,7 @@ class RealtimeWireProtocol:
         """Validate a start object without silently changing wire formats."""
         raw_version = start.get("protocol_version", LEGACY_PROTOCOL_VERSION)
         if not isinstance(raw_version, int) or isinstance(raw_version, bool):
-            raise ProtocolError("protocol_version must be 1 or 2")
+            raise ProtocolError("protocol_version must be 1, 2, or 3")
         if raw_version == LEGACY_PROTOCOL_VERSION:
             if "conversation_mode" in start:
                 raise ProtocolError("conversation_mode requires protocol_version 2")
@@ -104,32 +128,64 @@ class RealtimeWireProtocol:
                 input_channels=1,
                 conversation_mode=None,
             )
-        if raw_version != BINARY_PROTOCOL_VERSION:
-            raise ProtocolError("protocol_version must be 1 or 2")
-        if start.get("audio_transport") != BINARY_AUDIO_TRANSPORT:
-            raise ProtocolError("protocol_version 2 requires audio_transport 'binary'")
-        sample_rate = _required_integer(start, "input_sample_rate")
-        if not MIN_PCM_SAMPLE_RATE <= sample_rate <= MAX_PCM_SAMPLE_RATE:
-            raise ProtocolError(
-                f"input_sample_rate must be between {MIN_PCM_SAMPLE_RATE} and "
-                f"{MAX_PCM_SAMPLE_RATE} Hz"
+        if raw_version == BINARY_PROTOCOL_VERSION:
+            if start.get("audio_transport") != BINARY_AUDIO_TRANSPORT:
+                raise ProtocolError(
+                    "protocol_version 2 requires audio_transport 'binary'"
+                )
+            sample_rate = _required_integer(start, "input_sample_rate")
+            if not MIN_PCM_SAMPLE_RATE <= sample_rate <= MAX_PCM_SAMPLE_RATE:
+                raise ProtocolError(
+                    f"input_sample_rate must be between {MIN_PCM_SAMPLE_RATE} and "
+                    f"{MAX_PCM_SAMPLE_RATE} Hz"
+                )
+            channels = _required_integer(start, "input_channels")
+            if channels != 1:
+                raise ProtocolError("protocol_version 2 requires input_channels 1")
+            _validate_v2_start(start)
+            return cls(
+                version=BINARY_PROTOCOL_VERSION,
+                audio_transport=BINARY_AUDIO_TRANSPORT,
+                input_sample_rate=sample_rate,
+                input_channels=channels,
+                conversation_mode=(
+                    "native" if start.get("conversation_mode") == "native" else None
+                ),
             )
-        channels = _required_integer(start, "input_channels")
-        if channels != 1:
-            raise ProtocolError("protocol_version 2 requires input_channels 1")
-        _validate_v2_start(start)
+        if raw_version != DEVICE_WEBRTC_PROTOCOL_VERSION:
+            raise ProtocolError("protocol_version must be 1, 2, or 3")
+        offer_sdp = _validate_v3_start(start)
         return cls(
-            version=BINARY_PROTOCOL_VERSION,
-            audio_transport=BINARY_AUDIO_TRANSPORT,
-            input_sample_rate=sample_rate,
-            input_channels=channels,
-            conversation_mode=(
-                "native" if start.get("conversation_mode") == "native" else None
-            ),
+            version=DEVICE_WEBRTC_PROTOCOL_VERSION,
+            audio_transport=DEVICE_WEBRTC_TRANSPORT,
+            # Preserve the established typed shape for callers that inspect the
+            # contract. Direct-media callers must branch on uses_direct_webrtc.
+            input_sample_rate=REALTIME_SAMPLE_RATE,
+            input_channels=1,
+            conversation_mode="native",
+            webrtc_offer_sdp=offer_sdp,
         )
+
+    def answer_fields(self, sdp: str) -> dict[str, Any]:
+        """Return fields for the distinct answer message sent to a v3 device."""
+        if not self.uses_direct_webrtc:
+            raise ProtocolError("WebRTC answers require protocol_version 3")
+        answer_sdp = _validated_webrtc_sdp(sdp, description="answer")
+        return {
+            "protocol_version": DEVICE_WEBRTC_PROTOCOL_VERSION,
+            "transport": {"type": DEVICE_WEBRTC_TRANSPORT, "sdp": answer_sdp},
+        }
 
     def started_fields(self) -> dict[str, Any]:
         """Return fields added to the common started acknowledgement."""
+        if self.uses_direct_webrtc:
+            return {
+                "protocol_version": DEVICE_WEBRTC_PROTOCOL_VERSION,
+                "conversation_mode": "native",
+                "transport": DEVICE_WEBRTC_TRANSPORT,
+                "audio_over_bridge": False,
+                "sideband_control": True,
+            }
         if not self.uses_binary_audio:
             return {}
         fields: dict[str, Any] = {
@@ -271,6 +327,71 @@ def _validate_v2_start(start: Mapping[str, Any]) -> None:
     _optional_bounded_text(start, "conversation_id", maximum=128)
     _optional_bounded_text(start, "voice", maximum=64)
     _optional_bounded_text(start, "prompt", maximum=4_096)
+
+
+def _validate_v3_start(start: Mapping[str, Any]) -> str:
+    if start.get("type") != "start":
+        raise ProtocolError("protocol_version 3 requires message type 'start'")
+    if "tools" in start:
+        raise ProtocolError("protocol_version 3 does not accept device tools")
+    legacy_fields = sorted(set(start) & LEGACY_PCM_START_FIELDS)
+    if legacy_fields:
+        raise ProtocolError(
+            "protocol_version 3 does not accept legacy PCM fields: "
+            + ", ".join(legacy_fields)
+        )
+    unsupported = sorted(set(start) - V3_START_FIELDS)
+    if unsupported:
+        raise ProtocolError(
+            "protocol_version 3 start contains unsupported fields: "
+            + ", ".join(unsupported)
+        )
+    if start.get("conversation_mode") != "native":
+        raise ProtocolError("protocol_version 3 requires conversation_mode 'native'")
+    _optional_bounded_text(start, "conversation_id", maximum=128)
+    _optional_bounded_text(start, "voice", maximum=64)
+    _optional_bounded_text(start, "prompt", maximum=4_096)
+
+    transport = start.get("transport")
+    if not isinstance(transport, Mapping):
+        raise ProtocolError("protocol_version 3 requires a WebRTC transport object")
+    unsupported_transport = sorted(set(transport) - V3_TRANSPORT_FIELDS)
+    if unsupported_transport:
+        raise ProtocolError(
+            "protocol_version 3 transport contains unsupported fields: "
+            + ", ".join(unsupported_transport)
+        )
+    if transport.get("type") != DEVICE_WEBRTC_TRANSPORT:
+        raise ProtocolError("protocol_version 3 requires transport type 'webrtc'")
+    return _validated_webrtc_sdp(transport.get("sdp"), description="offer")
+
+
+def _validated_webrtc_sdp(value: object, *, description: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ProtocolError(f"WebRTC {description} SDP must be non-empty text")
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ProtocolError(
+            f"WebRTC {description} SDP must contain valid Unicode text"
+        ) from exc
+    if encoded_size > MAX_WEBRTC_SDP_BYTES:
+        raise ProtocolError(
+            f"WebRTC {description} SDP exceeds {MAX_WEBRTC_SDP_BYTES} bytes"
+        )
+    if "\x00" in value:
+        raise ProtocolError(f"WebRTC {description} SDP must not contain NUL bytes")
+
+    lines = value.splitlines()
+    if not lines or lines[0] != "v=0":
+        raise ProtocolError(f"WebRTC {description} SDP must start with 'v=0'")
+    if not any(line.startswith("m=audio ") for line in lines):
+        raise ProtocolError(f"WebRTC {description} SDP must contain an audio m-line")
+    if not any(line.startswith("m=application ") for line in lines):
+        raise ProtocolError(
+            f"WebRTC {description} SDP must contain an application m-line"
+        )
+    return value
 
 
 def _optional_bounded_text(value: Mapping[str, Any], key: str, *, maximum: int) -> None:

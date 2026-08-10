@@ -6,10 +6,27 @@ import pytest
 
 from bridge.errors import ProtocolError
 from bridge.realtime_wire import (
+    MAX_WEBRTC_SDP_BYTES,
     RealtimeWireProtocol,
     parse_data_control_event,
     sanitized_data_control_event,
 )
+
+VALID_WEBRTC_OFFER = (
+    "v=0\r\n"
+    "o=- 123 2 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+    "a=mid:0\r\n"
+    "a=ice-ufrag:deviceIce\r\n"
+    "a=ice-pwd:deviceEphemeralIcePassword123\r\n"
+    "a=fingerprint:sha-256 00:11:22:33\r\n"
+    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+    "a=mid:1\r\n"
+    "a=sctp-port:5000\r\n"
+)
+VALID_WEBRTC_ANSWER = VALID_WEBRTC_OFFER.replace("o=- 123", "o=- 456")
 
 
 def test_legacy_realtime_wire_defaults_to_json_base64() -> None:
@@ -70,11 +87,63 @@ def test_binary_realtime_wire_retains_and_echoes_native_conversation_mode() -> N
     assert protocol.started_fields()["conversation_mode"] == "native"
 
 
+def test_direct_webrtc_wire_retains_device_offer_and_advertises_direct_media() -> None:
+    protocol = RealtimeWireProtocol.negotiate(
+        {
+            "type": "start",
+            "protocol_version": 3,
+            "conversation_mode": "native",
+            "conversation_id": "living-room",
+            "prompt": "Habla espanol de Mexico.",
+            "voice": "cove",
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        }
+    )
+
+    assert protocol.version == 3
+    assert protocol.audio_transport == "webrtc"
+    assert protocol.input_sample_rate == 24_000
+    assert protocol.input_channels == 1
+    assert protocol.uses_binary_audio is False
+    assert protocol.uses_direct_webrtc is True
+    assert protocol.requests_native_conversation is True
+    assert protocol.webrtc_offer_sdp == VALID_WEBRTC_OFFER
+    assert protocol.started_fields() == {
+        "protocol_version": 3,
+        "conversation_mode": "native",
+        "transport": "webrtc",
+        "audio_over_bridge": False,
+        "sideband_control": True,
+    }
+
+
+def test_direct_webrtc_answer_preserves_ice_but_never_adds_auth_credentials() -> None:
+    protocol = RealtimeWireProtocol.negotiate(
+        {
+            "type": "start",
+            "protocol_version": 3,
+            "conversation_mode": "native",
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        }
+    )
+
+    assert protocol.answer_fields(VALID_WEBRTC_ANSWER) == {
+        "protocol_version": 3,
+        "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_ANSWER},
+    }
+    encoded = json.dumps(protocol.answer_fields(VALID_WEBRTC_ANSWER))
+    assert "ice-ufrag" in encoded
+    assert "ice-pwd" in encoded
+    assert "oauth" not in encoded.casefold()
+    assert "bearer" not in encoded.casefold()
+    assert "call_id" not in encoded
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
-        ({"protocol_version": True}, "protocol_version must be 1 or 2"),
-        ({"protocol_version": 3}, "protocol_version must be 1 or 2"),
+        ({"protocol_version": True}, "protocol_version must be 1, 2, or 3"),
+        ({"protocol_version": 4}, "protocol_version must be 1, 2, or 3"),
         (
             {"protocol_version": 1, "audio_transport": "binary"},
             "protocol_version 1 supports only JSON/base64 audio",
@@ -165,6 +234,186 @@ def test_realtime_wire_rejects_ambiguous_negotiation(
 ) -> None:
     with pytest.raises(ProtocolError, match=error):
         RealtimeWireProtocol.negotiate({"type": "start", **overrides})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"type": "speech"}, "requires message type 'start'"),
+        ({}, "requires conversation_mode 'native'"),
+        ({"conversation_mode": "managed"}, "requires conversation_mode 'native'"),
+        ({"conversation_mode": None}, "requires conversation_mode 'native'"),
+        (
+            {"conversation_mode": "native"},
+            "requires a WebRTC transport object",
+        ),
+        (
+            {"conversation_mode": "native", "transport": "webrtc"},
+            "requires a WebRTC transport object",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "websocket", "sdp": VALID_WEBRTC_OFFER},
+            },
+            "requires transport type 'webrtc'",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc"},
+            },
+            "offer SDP must be non-empty text",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": 7},
+            },
+            "offer SDP must be non-empty text",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {
+                    "type": "webrtc",
+                    "sdp": VALID_WEBRTC_OFFER,
+                    "oauth_token": "must-not-cross-wire",
+                },
+            },
+            "transport contains unsupported fields: oauth_token",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+                "audio_transport": "binary",
+            },
+            "does not accept legacy PCM fields: audio_transport",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+                "input_sample_rate": 16_000,
+                "input_channels": 1,
+            },
+            "does not accept legacy PCM fields: input_channels, input_sample_rate",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+                "tools": [],
+            },
+            "protocol_version 3 does not accept device tools",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+                "model": "device-override",
+            },
+            "protocol_version 3 start contains unsupported fields: model",
+        ),
+        (
+            {
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+                "prompt": "x" * 4_097,
+            },
+            "prompt must be non-empty text up to 4096 characters",
+        ),
+    ],
+)
+def test_direct_webrtc_rejects_ambiguous_negotiation(
+    overrides: dict[str, object], error: str
+) -> None:
+    with pytest.raises(ProtocolError, match=error):
+        RealtimeWireProtocol.negotiate(
+            {"type": "start", "protocol_version": 3, **overrides}
+        )
+
+
+@pytest.mark.parametrize(
+    ("sdp", "error"),
+    [
+        ("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n", "audio m-line"),
+        ("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n", "application m-line"),
+        (
+            (
+                "o=- 123 2 IN IP4 127.0.0.1\r\n"
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            ),
+            "must start with 'v=0'",
+        ),
+        (VALID_WEBRTC_OFFER + "\x00", "must not contain NUL bytes"),
+        (
+            "v=0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            + ("a=x\r\n" * (MAX_WEBRTC_SDP_BYTES // 3)),
+            f"exceeds {MAX_WEBRTC_SDP_BYTES} bytes",
+        ),
+    ],
+)
+def test_direct_webrtc_rejects_malformed_or_oversized_offer(
+    sdp: str, error: str
+) -> None:
+    with pytest.raises(ProtocolError, match=error):
+        RealtimeWireProtocol.negotiate(
+            {
+                "type": "start",
+                "protocol_version": 3,
+                "conversation_mode": "native",
+                "transport": {"type": "webrtc", "sdp": sdp},
+            }
+        )
+
+
+def test_direct_webrtc_accepts_offer_at_exact_byte_limit() -> None:
+    padding_size = MAX_WEBRTC_SDP_BYTES - len(VALID_WEBRTC_OFFER.encode())
+    offer = VALID_WEBRTC_OFFER + ("x" * padding_size)
+
+    protocol = RealtimeWireProtocol.negotiate(
+        {
+            "type": "start",
+            "protocol_version": 3,
+            "conversation_mode": "native",
+            "transport": {"type": "webrtc", "sdp": offer},
+        }
+    )
+
+    assert len(offer.encode()) == MAX_WEBRTC_SDP_BYTES
+    assert protocol.webrtc_offer_sdp == offer
+
+
+def test_webrtc_answer_fields_require_v3_and_validate_answer() -> None:
+    binary = RealtimeWireProtocol.negotiate(
+        {
+            "type": "start",
+            "protocol_version": 2,
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
+    )
+    with pytest.raises(ProtocolError, match="answers require protocol_version 3"):
+        binary.answer_fields(VALID_WEBRTC_ANSWER)
+
+    direct = RealtimeWireProtocol.negotiate(
+        {
+            "type": "start",
+            "protocol_version": 3,
+            "conversation_mode": "native",
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        }
+    )
+    with pytest.raises(ProtocolError, match="answer SDP must contain an audio m-line"):
+        direct.answer_fields(
+            "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+        )
 
 
 def test_data_control_event_is_allowlisted_and_content_free() -> None:

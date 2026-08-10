@@ -50,7 +50,7 @@ from .errors import (
     ProtocolError,
     RpcError,
 )
-from .realtime import RealtimeSession
+from .realtime import RealtimeSession, SignalingRealtimeSession
 from .realtime_wire import (
     RealtimeDataControl,
     RealtimeWireProtocol,
@@ -75,6 +75,7 @@ MAX_AUDIO_BYTES = 24 * 1024 * 1024
 SERVER_WEBSOCKET_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS = 2_250
 REALTIME_MANAGED_STARTUP_TIMEOUT_SECONDS = 5.0
+REALTIME_DEVICE_TRANSPORT_READY_TIMEOUT_SECONDS = 15.0
 MAX_CONVERSATIONS = 128
 CONVERSATION_TTL = 60 * 60
 MAX_HISTORY_CONTEXT_CHARS = 16_000
@@ -4083,7 +4084,9 @@ async def _realtime(request: web.Request) -> web.WebSocketResponse:
 async def _realtime_admitted(
     request: web.Request, state: BridgeState
 ) -> web.WebSocketResponse:
-    websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
+    # Both device protocols own bounded ping/pong deadlines. A second aiohttp
+    # heartbeat adds an independent timer and can race a server-initiated close.
+    websocket = web.WebSocketResponse(max_msg_size=MAX_AUDIO_BYTES)
     await websocket.prepare(request)
     _track_websocket(request, websocket)
     wire_protocol: RealtimeWireProtocol | None = None
@@ -4092,12 +4095,13 @@ async def _realtime_admitted(
         if first.get("type") != "start":
             raise ProtocolError("first realtime message must have type 'start'")
         wire_protocol = RealtimeWireProtocol.negotiate(first)
-        if (
-            request.get(_AUTH_IDENTITY_REQUEST_KEY) == _AUTH_IDENTITY_REALTIME_DEVICE
-            and not wire_protocol.uses_binary_audio
+        if request.get(
+            _AUTH_IDENTITY_REQUEST_KEY
+        ) == _AUTH_IDENTITY_REALTIME_DEVICE and not (
+            wire_protocol.uses_binary_audio or wire_protocol.uses_direct_webrtc
         ):
             raise ProtocolError(
-                "realtime device authentication requires protocol_version 2"
+                "realtime device authentication requires protocol_version 2 or 3"
             )
         broker_snapshot = (
             state.home_assistant_tools.snapshot
@@ -4147,7 +4151,11 @@ async def _realtime_admitted(
                 "type": "error",
                 "error": (
                     "realtime provider request failed"
-                    if wire_protocol is not None and wire_protocol.uses_binary_audio
+                    if wire_protocol is not None
+                    and (
+                        wire_protocol.uses_binary_audio
+                        or wire_protocol.uses_direct_webrtc
+                    )
                     else str(exc)
                 ),
             },
@@ -4163,6 +4171,270 @@ async def _realtime_admitted(
     return websocket
 
 
+async def _serve_direct_webrtc_session(
+    state: BridgeState,
+    websocket: web.WebSocketResponse,
+    first: Mapping[str, Any],
+    wire_protocol: RealtimeWireProtocol,
+) -> None:
+    """Signal one device-owned WebRTC session without proxying its media."""
+    if not wire_protocol.uses_direct_webrtc:
+        raise ProtocolError("direct WebRTC requires protocol_version 3")
+    offer_sdp = wire_protocol.webrtc_offer_sdp
+    if offer_sdp is None:
+        raise ProtocolError("direct WebRTC start omitted its SDP offer")
+
+    session: SignalingRealtimeSession | None = None
+    thread_id: str | None = None
+    startup_abandoned = asyncio.Event()
+
+    async def cleanup_owned_provider(
+        owned_session: SignalingRealtimeSession | None,
+        owned_thread_id: str | None,
+    ) -> None:
+        try:
+            if owned_session is not None:
+                await owned_session.stop()
+        finally:
+            if owned_thread_id is not None:
+                await _dispose_thread(state.rpc, owned_thread_id)
+
+    def start_provider_cleanup() -> asyncio.Task[None] | None:
+        nonlocal session, thread_id
+        owned_session = session
+        owned_thread_id = thread_id
+        session = None
+        thread_id = None
+        if owned_session is None and owned_thread_id is None:
+            return None
+        cleanup_task = asyncio.create_task(
+            cleanup_owned_provider(owned_session, owned_thread_id),
+            name="codex-direct-webrtc-provider-cleanup",
+        )
+        state.track_realtime_provider_cleanup(cleanup_task)
+        return cleanup_task
+
+    async def close_provider() -> None:
+        cleanup_task = start_provider_cleanup()
+        if cleanup_task is not None:
+            await asyncio.shield(cleanup_task)
+
+    answer_sdp: str | None = None
+
+    async def start_provider() -> None:
+        nonlocal answer_sdp, session, thread_id
+        try:
+            thread_payload = dict(first)
+            thread_payload.pop("model", None)
+            thread_payload.pop("transport", None)
+            thread_id = await state.start_thread(
+                thread_payload,
+                tools=[],
+                base_instructions=(
+                    "Act as a natural realtime voice conversation partner. Respond "
+                    "directly in conversational spoken language. Keep answers concise "
+                    "unless the user asks for detail. Never inspect local files or "
+                    "invoke tools."
+                ),
+            )
+            if startup_abandoned.is_set():
+                return
+            session = SignalingRealtimeSession(
+                state.rpc,
+                thread_id,
+                timeout=state.config.request_timeout,
+            )
+            voice = first.get("voice")
+            prompt = first.get("prompt")
+            answer_sdp = await session.start(
+                offer_sdp,
+                prompt=prompt if isinstance(prompt, str) else None,
+                voice=voice.lower() if isinstance(voice, str) and voice else None,
+                include_startup_context=False,
+                client_managed_handoffs=False,
+            )
+        finally:
+            if startup_abandoned.is_set():
+                await close_provider()
+
+    try:
+        LOGGER.info(
+            "Realtime conversation route selected: route=native_direct selection=explicit"
+        )
+        await _start_realtime_provider_or_disconnect(
+            websocket,
+            start_provider(),
+            abandoned=startup_abandoned,
+            thread_pending=lambda: thread_id is None,
+            track_detached=state.track_realtime_startup_cleanup,
+        )
+        assert session is not None
+        assert thread_id is not None
+        assert answer_sdp is not None
+        await _send_realtime_json(
+            websocket,
+            {"type": "answer", **wire_protocol.answer_fields(answer_sdp)},
+        )
+        await _wait_for_direct_transport_ready(websocket, session)
+        await _send_realtime_json(
+            websocket,
+            {
+                "type": "started",
+                "version": "v3",
+                **wire_protocol.started_fields(),
+            },
+        )
+        await _run_direct_realtime_socket(websocket, session)
+    finally:
+        await close_provider()
+
+
+async def _wait_for_direct_transport_ready(
+    websocket: web.WebSocketResponse,
+    session: SignalingRealtimeSession,
+) -> None:
+    """Wait until the device confirms ICE, DTLS, SCTP, and media readiness."""
+    deadline = time.monotonic() + REALTIME_DEVICE_TRANSPORT_READY_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("device WebRTC transport did not become ready")
+        client_task = asyncio.create_task(
+            _receive_realtime_message(websocket, allow_binary=False),
+            name="codex-direct-webrtc-ready-client",
+        )
+        provider_task = asyncio.create_task(
+            session.next_event(timeout=remaining),
+            name="codex-direct-webrtc-ready-provider",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {client_task, provider_task},
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError("device WebRTC transport did not become ready")
+            # Provider termination wins a simultaneous device-ready signal. A
+            # dead provider must never be acknowledged as a usable transport.
+            if provider_task in done:
+                event = provider_task.result()
+                method = event.get("method")
+                if method == "thread/realtime/error":
+                    raise ProtocolError("realtime provider error")
+                if method == "thread/realtime/closed":
+                    raise ProtocolError(
+                        "realtime provider closed during device handshake"
+                    )
+                await _reject_direct_provider_tool_call(session, event)
+            if client_task in done:
+                message = client_task.result()
+                if not isinstance(message, Mapping):
+                    raise ProtocolError(
+                        "device WebRTC transport readiness must be JSON"
+                    )
+                if (
+                    set(message) != {"type", "protocol_version"}
+                    or message.get("type") != "transport_ready"
+                    or message.get("protocol_version") != 3
+                ):
+                    raise ProtocolError(
+                        "expected protocol_version 3 transport_ready acknowledgement"
+                    )
+                return
+        finally:
+            for task in (client_task, provider_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(client_task, provider_task, return_exceptions=True)
+
+
+async def _run_direct_realtime_socket(
+    websocket: web.WebSocketResponse,
+    session: SignalingRealtimeSession,
+) -> None:
+    """Keep the authenticated signaling lifeline open for one direct peer."""
+
+    async def client_controls() -> None:
+        while True:
+            message = await _receive_realtime_message(websocket, allow_binary=False)
+            if not isinstance(message, Mapping):
+                raise ProtocolError("direct WebRTC control must be JSON")
+            message_type = message.get("type")
+            if message_type == "stop":
+                return
+            if message_type == "ping":
+                await _send_realtime_json(websocket, {"type": "pong"})
+                continue
+            raise ProtocolError("unsupported direct WebRTC control")
+
+    async def provider_events() -> None:
+        while True:
+            event = await session.next_event()
+            method = event.get("method")
+            if method == "thread/realtime/error":
+                await _send_realtime_json(
+                    websocket,
+                    {"type": "error", "error": "realtime provider error"},
+                )
+                return
+            if method == "thread/realtime/closed":
+                await _send_realtime_json(
+                    websocket,
+                    {"type": "stopped", "reason": "remote_closed"},
+                )
+                return
+            await _reject_direct_provider_tool_call(session, event)
+
+    client_task = asyncio.create_task(
+        client_controls(), name="codex-direct-webrtc-client-controls"
+    )
+    provider_task = asyncio.create_task(
+        provider_events(), name="codex-direct-webrtc-provider-events"
+    )
+    try:
+        done, _ = await asyncio.wait(
+            {client_task, provider_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            task.result()
+    finally:
+        for task in (client_task, provider_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(client_task, provider_task, return_exceptions=True)
+
+
+async def _reject_direct_provider_tool_call(
+    session: SignalingRealtimeSession,
+    event: Mapping[str, Any],
+) -> bool:
+    """Reject one impossible direct-voice tool request in every lifecycle phase."""
+    if event.get("method") != "item/tool/call":
+        return False
+    request_id = event.get("id")
+    if not isinstance(request_id, (int, str)):
+        raise ProtocolError("direct voice received an invalid tool request")
+    params = event.get("params")
+    values = params if isinstance(params, Mapping) else {}
+    raw_call_id = values.get("callId", request_id)
+    call_id = str(raw_call_id)
+    await _respond_to_tool_result(
+        session.rpc,
+        {
+            "call_id": call_id,
+            "success": False,
+            "result": {
+                "error": "direct_voice_has_no_tools",
+                "do_not_retry": True,
+            },
+        },
+        {call_id: request_id},
+        timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+    )
+    return True
+
+
 async def _serve_realtime_session(
     state: BridgeState,
     websocket: web.WebSocketResponse,
@@ -4174,6 +4446,9 @@ async def _serve_realtime_session(
     managed_interrupt_continuation: bool,
 ) -> None:
     """Start and serve one provider session while its speech lease is held."""
+    if wire_protocol.uses_direct_webrtc:
+        await _serve_direct_webrtc_session(state, websocket, first, wire_protocol)
+        return
     session: RealtimeSession | None = None
     thread_id: str | None = None
     executor_thread_id: str | None = None

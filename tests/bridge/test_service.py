@@ -61,6 +61,27 @@ def _realtime_v2_start(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+_TEST_WEBRTC_SDP = (
+    "v=0\r\n"
+    "o=- 1 2 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+)
+
+
+def _realtime_v3_start(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "start",
+        "protocol_version": 3,
+        "conversation_mode": "native",
+        "transport": {"type": "webrtc", "sdp": _TEST_WEBRTC_SDP},
+    }
+    payload.update(overrides)
+    return payload
+
+
 async def _register_test_realtime_tool_authority(client: Any) -> tuple[Any, str]:
     authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
     await authority.send_json(
@@ -219,6 +240,12 @@ async def _assert_busy(response: Any) -> None:
         "error": "another speech session is already active",
         "code": "busy",
     }
+
+
+async def _wait_for_no_active_websockets(app: web.Application) -> None:
+    async with asyncio.timeout(1):
+        while app[bridge_service.ACTIVE_WEBSOCKETS_KEY]:
+            await asyncio.sleep(0)
 
 
 class FakeSubscription:
@@ -550,9 +577,10 @@ class FakeRpc:
             if self.realtime_start_gate is not None:
                 await self.realtime_start_gate.wait()
             thread_id = values["threadId"]
-            peer = self.peers[-1]
-            peer.thread_id = thread_id
-            peer.managed_realtime = values.get("delegationAckFiller") is False
+            peer = self.peers[-1] if self.peers else None
+            if peer is not None:
+                peer.thread_id = thread_id
+                peer.managed_realtime = values.get("delegationAckFiller") is False
             await self.broadcast(
                 {
                     "method": "thread/realtime/started",
@@ -566,10 +594,17 @@ class FakeRpc:
             await self.broadcast(
                 {
                     "method": "thread/realtime/sdp",
-                    "params": {"threadId": thread_id, "sdp": "v=0\r\nfake-answer\r\n"},
+                    "params": {
+                        "threadId": thread_id,
+                        "sdp": (
+                            "v=0\r\nfake-answer\r\n"
+                            if peer is not None
+                            else _TEST_WEBRTC_SDP.replace("o=- 1", "o=- 2")
+                        ),
+                    },
                 }
             )
-            if values.get("delegationAckFiller") is False:
+            if peer is not None and values.get("delegationAckFiller") is False:
                 peer.data.put_nowait(json.dumps({"type": "session.started"}))
             return {}
         if method == "thread/realtime/stop":
@@ -1691,7 +1726,7 @@ async def test_primary_bearer_remains_valid_for_all_realtime_protocols(
 
 
 @pytest.mark.asyncio
-async def test_realtime_device_token_is_route_scoped_and_v2_only(
+async def test_realtime_device_token_is_route_scoped_and_media_protocol_only(
     aiohttp_client: Any,
     fake_rpc: FakeRpc,
 ) -> None:
@@ -1725,10 +1760,32 @@ async def test_realtime_device_token_is_route_scoped_and_v2_only(
     await legacy.send_json({"type": "start"})
     assert await legacy.receive_json(timeout=1) == {
         "type": "error",
-        "error": "realtime device authentication requires protocol_version 2",
+        "error": "realtime device authentication requires protocol_version 2 or 3",
     }
+    await legacy.receive(timeout=1)
     await legacy.close()
     assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+    direct = await client.ws_connect(
+        "/v1/realtime",
+        headers={"Authorization": "Bearer device-token"},
+    )
+    await direct.send_json(_realtime_v3_start())
+    assert (await direct.receive_json(timeout=1))["type"] == "answer"
+    await direct.send_json({"type": "transport_ready", "protocol_version": 3})
+    started = await direct.receive_json(timeout=1)
+    assert started == {
+        "type": "started",
+        "version": "v3",
+        "protocol_version": 3,
+        "conversation_mode": "native",
+        "transport": "webrtc",
+        "audio_over_bridge": False,
+        "sideband_control": True,
+    }
+    await direct.send_json({"type": "stop"})
+    await direct.receive(timeout=1)
+    await direct.close()
 
     websocket = await client.ws_connect(
         "/v1/realtime",
@@ -1737,7 +1794,9 @@ async def test_realtime_device_token_is_route_scoped_and_v2_only(
     await websocket.send_json(_realtime_v2_start())
     assert (await websocket.receive_json(timeout=1))["type"] == "started"
     await websocket.send_json({"type": "stop"})
+    await websocket.receive(timeout=1)
     await websocket.close()
+    await _wait_for_no_active_websockets(app)
 
 
 @pytest.mark.asyncio
@@ -5165,6 +5224,227 @@ async def test_realtime_v2_composes_server_routing_with_device_preferences(
     await device.send_json({"type": "stop"})
     await device.close()
     await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_relays_device_sdp_without_constructing_bridge_peer(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(
+        _realtime_v3_start(
+            voice="Cove",
+            prompt="Responde en español de México.",
+        )
+    )
+    answer = await device.receive_json(timeout=1)
+
+    assert answer == {
+        "type": "answer",
+        "protocol_version": 3,
+        "transport": {
+            "type": "webrtc",
+            "sdp": _TEST_WEBRTC_SDP.replace("o=- 1", "o=- 2"),
+        },
+    }
+    assert fake_rpc.peers == []
+    realtime_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    )
+    assert realtime_start == {
+        "threadId": "thread-1",
+        "outputModality": "audio",
+        "includeStartupContext": False,
+        "clientManagedHandoffs": False,
+        "transport": {"type": "webrtc", "sdp": _TEST_WEBRTC_SDP},
+        "version": "v3",
+        "prompt": "Responde en español de México.",
+        "voice": "cove",
+    }
+
+    started_receive = asyncio.create_task(device.receive_json(timeout=1))
+    await asyncio.sleep(0)
+    assert not started_receive.done()
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    started = await started_receive
+    assert started["type"] == "started"
+    assert started["protocol_version"] == 3
+    assert started["transport"] == "webrtc"
+    assert started["audio_over_bridge"] is False
+    assert started["sideband_control"] is True
+    assert "sdp" not in started
+    assert "thread_id" not in started
+    assert "realtime_session_id" not in started
+    assert "conversation_id" not in started
+
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rejects_binary_media_and_never_sends_started(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await device.send_bytes(b"\x00\x00")
+    error = await device.receive_json(timeout=1)
+
+    assert error["type"] == "error"
+    assert "binary" in error["error"]
+    assert fake_rpc.peers == []
+    await device.receive(timeout=1)
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_disconnect_after_answer_cleans_remote_once(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await device.close()
+
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    assert sum(method == "thread/realtime/stop" for method, _ in fake_rpc.calls) == 1
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_sanitizes_provider_error_during_device_handshake(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/error",
+            "params": {
+                "threadId": "thread-1",
+                "message": "private upstream credential oauth-secret-value",
+            },
+        }
+    )
+    error = await device.receive_json(timeout=1)
+
+    assert error == {"type": "error", "error": "realtime provider error"}
+    assert "secret" not in json.dumps(error)
+    await device.receive(timeout=1)
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rejects_tool_call_while_waiting_for_transport_ready(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-request-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "callId": "call-1",
+                "tool": "must_not_run",
+                "arguments": {"private": "never forward"},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    assert fake_rpc.responses == [
+        (
+            "provider-request-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": (
+                            '{"error":"direct_voice_has_no_tools","do_not_retry":true}'
+                        ),
+                    }
+                ],
+                "success": False,
+            },
+        )
+    ]
+
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_provider_failure_wins_simultaneous_device_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def receive_ready(_websocket: Any, *, allow_binary: bool) -> dict[str, Any]:
+        assert allow_binary is False
+        await release.wait()
+        return {"type": "transport_ready", "protocol_version": 3}
+
+    class FailedSession:
+        async def next_event(self, timeout: float | None = None) -> dict[str, Any]:
+            assert timeout is not None
+            await release.wait()
+            return {
+                "method": "thread/realtime/error",
+                "params": {"message": "provider unavailable"},
+            }
+
+    monkeypatch.setattr(
+        bridge_service,
+        "_receive_realtime_message",
+        receive_ready,
+    )
+    waiting = asyncio.create_task(
+        bridge_service._wait_for_direct_transport_ready(object(), FailedSession())
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(ProtocolError, match="realtime provider error"):
+        await waiting
 
 
 @pytest.mark.asyncio

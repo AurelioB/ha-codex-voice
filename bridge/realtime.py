@@ -46,6 +46,216 @@ class PeerLike(Protocol):
     async def close(self) -> None: ...
 
 
+class SignalingRealtimeSession:
+    """Negotiate App Server WebRTC for a peer owned by an external device.
+
+    This session owns only the App Server subscription and realtime lifecycle.
+    The caller supplies the device's SDP offer and applies the returned answer;
+    no local ``WebRtcPeer`` or media queue is constructed here.
+    """
+
+    def __init__(
+        self,
+        rpc: Any,
+        thread_id: str,
+        *,
+        timeout: float = 90.0,
+    ) -> None:
+        self.rpc = rpc
+        self.thread_id = thread_id
+        self.timeout = timeout
+        self.subscription = rpc.subscribe()
+        self.realtime_session_id: str | None = None
+        self._answer_sdp: str | None = None
+        self._backlog: deque[dict[str, Any]] = deque(maxlen=_EVENT_BACKLOG_LIMIT)
+        self._start_requested = False
+        self._started = False
+        self._closed = False
+        self._stop_task: asyncio.Task[None] | None = None
+
+    async def start(
+        self,
+        offer_sdp: str,
+        *,
+        prompt: str | None = None,
+        voice: str | None = None,
+        include_startup_context: bool = False,
+        client_managed_handoffs: bool = False,
+    ) -> str:
+        """Start realtime v3 and return App Server's exact SDP answer."""
+        if self._closed:
+            raise ProtocolError("realtime signaling session is closed")
+        if self._start_requested:
+            raise ProtocolError("realtime signaling session has already been started")
+        if not isinstance(offer_sdp, str) or not offer_sdp:
+            raise ProtocolError("device returned an invalid SDP offer")
+
+        deadline = monotonic() + self.timeout
+        params: dict[str, Any] = {
+            "threadId": self.thread_id,
+            "outputModality": "audio",
+            "includeStartupContext": include_startup_context,
+            "clientManagedHandoffs": client_managed_handoffs,
+            "transport": {"type": "webrtc", "sdp": offer_sdp},
+            "version": "v3",
+        }
+        if prompt is not None:
+            params["prompt"] = prompt
+        if voice:
+            params["voice"] = voice
+
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("realtime signaling timed out")
+        # Once this call is attempted its outcome may be unknown. Cleanup must
+        # therefore request a remote stop even when the call or later handshake
+        # observation fails.
+        self._start_requested = True
+        try:
+            async with asyncio.timeout(remaining):
+                await self.rpc.call("thread/realtime/start", params, timeout=remaining)
+        except TimeoutError:
+            raise TimeoutError("realtime signaling timed out") from None
+
+        answer: str | None = None
+        started = False
+        while answer is None or not started:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError("realtime signaling timed out")
+            try:
+                event = await self.subscription.get(timeout=remaining)
+            except TimeoutError:
+                raise TimeoutError("realtime signaling timed out") from None
+            self._raise_if_app_server_exited(event)
+            if not self._belongs_to_thread(event):
+                continue
+            method = event.get("method")
+            raw_params = event.get("params")
+            event_params = raw_params if isinstance(raw_params, Mapping) else {}
+            if method == "thread/realtime/error":
+                raise ProtocolError("realtime provider error")
+            if method == "thread/realtime/started":
+                session_id = event_params.get("realtimeSessionId")
+                self.realtime_session_id = (
+                    session_id if isinstance(session_id, str) else None
+                )
+                started = True
+                self._backlog.append(event)
+                continue
+            if method == "thread/realtime/sdp":
+                candidate = event_params.get("sdp")
+                if not isinstance(candidate, str) or not candidate:
+                    raise ProtocolError("app-server returned an invalid SDP answer")
+                if answer is not None and candidate != answer:
+                    raise ProtocolError("app-server returned conflicting SDP answers")
+                answer = candidate
+                continue
+            self._backlog.append(event)
+
+        self._started = True
+        self._answer_sdp = answer
+        return answer
+
+    async def next_event(self, timeout: float | None = None) -> dict[str, Any]:
+        """Return the next event for this thread, preserving exit detection."""
+        deadline = monotonic() + timeout if timeout is not None else None
+        while True:
+            if self._backlog:
+                event = self._backlog.popleft()
+            else:
+                remaining = None if deadline is None else deadline - monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError
+                try:
+                    event = await self.subscription.get(remaining)
+                except TimeoutError:
+                    raise TimeoutError from None
+            self._raise_if_app_server_exited(event)
+            if self._belongs_to_thread(event):
+                method = event.get("method")
+                if method == "thread/realtime/error":
+                    raise ProtocolError("realtime provider error")
+                if method == "thread/realtime/sdp":
+                    params = event.get("params")
+                    candidate = (
+                        params.get("sdp") if isinstance(params, Mapping) else None
+                    )
+                    if (
+                        not isinstance(candidate, str)
+                        or not candidate
+                        or candidate != self._answer_sdp
+                    ):
+                        raise ProtocolError(
+                            "app-server returned conflicting SDP answers"
+                        )
+                    continue
+                return event
+
+    def drain_app_events_nowait(self) -> list[dict[str, Any]]:
+        """Drain already-buffered thread and App Server exit events."""
+        events = list(self._backlog)
+        self._backlog.clear()
+        while True:
+            try:
+                event = self.subscription.get_nowait()
+            except asyncio.QueueEmpty:
+                return events
+            if event.get(
+                "method"
+            ) == "bridge/appServerExited" or self._belongs_to_thread(event):
+                events.append(event)
+
+    async def stop(self) -> None:
+        """Stop the remote session and close its subscription exactly once."""
+        if self._stop_task is None:
+            self._closed = True
+            self._stop_task = asyncio.create_task(
+                self._stop_once(),
+                name=f"codex-realtime-signaling-stop-{self.thread_id}",
+            )
+        await asyncio.shield(self._stop_task)
+
+    async def _stop_once(self) -> None:
+        cleanup_timeout = max(0.0, min(self.timeout, _STOP_TIMEOUT_SECONDS))
+        try:
+            if self._start_requested:
+                try:
+                    async with asyncio.timeout(cleanup_timeout):
+                        await self.rpc.call(
+                            "thread/realtime/stop",
+                            {"threadId": self.thread_id},
+                            timeout=cleanup_timeout,
+                        )
+                except TimeoutError:
+                    LOGGER.warning(
+                        "Realtime signaling cleanup timed out after %.1f seconds",
+                        cleanup_timeout,
+                    )
+                except Exception as err:  # noqa: BLE001 - cleanup is best effort
+                    LOGGER.warning(
+                        "Realtime signaling cleanup failed (app-server realtime "
+                        "stop): %s",
+                        err,
+                    )
+        finally:
+            self.subscription.close()
+
+    def _belongs_to_thread(self, event: Mapping[str, Any]) -> bool:
+        params = event.get("params")
+        if not isinstance(params, Mapping):
+            return False
+        return params.get("threadId") == self.thread_id
+
+    @staticmethod
+    def _raise_if_app_server_exited(event: Mapping[str, Any]) -> None:
+        if event.get("method") != "bridge/appServerExited":
+            return
+        params = event.get("params")
+        returncode = params.get("returncode") if isinstance(params, Mapping) else None
+        raise AppServerExited(f"codex app-server exited with status {returncode}")
+
+
 class RealtimeSession:
     """Bind one Codex thread, one app-server subscription, and one WebRTC peer."""
 

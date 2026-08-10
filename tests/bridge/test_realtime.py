@@ -7,7 +7,7 @@ import pytest
 
 from bridge import realtime as realtime_module
 from bridge.errors import AppServerExited, ProtocolError
-from bridge.realtime import RealtimeSession
+from bridge.realtime import RealtimeSession, SignalingRealtimeSession
 
 
 class FakeSubscription:
@@ -19,6 +19,9 @@ class FakeSubscription:
         if timeout is None:
             return await self.events.get()
         return await asyncio.wait_for(self.events.get(), timeout)
+
+    def get_nowait(self) -> dict[str, Any]:
+        return self.events.get_nowait()
 
     def close(self) -> None:
         self.closed = True
@@ -262,6 +265,347 @@ class BacklogRpc(SdpFirstRpc):
                 }
             )
         return {}
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_relays_exact_external_offer_and_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def local_peer_must_not_be_created() -> Any:
+        raise AssertionError("signaling-only session constructed a local peer")
+
+    monkeypatch.setattr(realtime_module, "WebRtcPeer", local_peer_must_not_be_created)
+    rpc = SdpFirstRpc()
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    offer = "v=0\r\na=device-owned-offer:exact whitespace \r\n"
+
+    answer = await session.start(
+        offer,
+        prompt="Responde en español de México.",
+        voice="cove",
+    )
+
+    assert answer == "v=0\r\nanswer\r\n"
+    assert session.realtime_session_id == "realtime-sdp-first"
+    assert rpc.calls[0] == (
+        "thread/realtime/start",
+        {
+            "threadId": "thread-1",
+            "outputModality": "audio",
+            "includeStartupContext": False,
+            "clientManagedHandoffs": False,
+            "transport": {"type": "webrtc", "sdp": offer},
+            "version": "v3",
+            "prompt": "Responde en español de México.",
+            "voice": "cove",
+        },
+    )
+    await session.stop()
+    assert rpc.calls[-1] == (
+        "thread/realtime/stop",
+        {"threadId": "thread-1"},
+    )
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_accepts_started_before_sdp_and_preserves_events() -> (
+    None
+):
+    rpc = SdpFirstRpc()
+
+    async def started_first(
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del timeout
+        rpc.calls.append((method, params))
+        if method == "thread/realtime/start":
+            await rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "realtimeSessionId": "realtime-started-first",
+                    },
+                }
+            )
+            await rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/progress",
+                    "params": {"threadId": "other-thread", "sequence": -1},
+                }
+            )
+            await rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/progress",
+                    "params": {"threadId": "thread-1", "sequence": 1},
+                }
+            )
+            await rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/sdp",
+                    "params": {
+                        "threadId": "thread-1",
+                        "sdp": " exact-answer-without-normalization ",
+                    },
+                }
+            )
+        return {}
+
+    rpc.call = started_first  # type: ignore[method-assign]
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+
+    assert await session.start("exact-offer") == (
+        " exact-answer-without-normalization "
+    )
+    assert session.realtime_session_id == "realtime-started-first"
+    assert (await session.next_event())["method"] == "thread/realtime/started"
+    assert (await session.next_event())["params"]["sequence"] == 1
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_rejects_invalid_offer_before_remote_start() -> None:
+    rpc = SdpFirstRpc()
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+
+    with pytest.raises(ProtocolError, match="invalid SDP offer"):
+        await session.start("")
+
+    assert rpc.calls == []
+    await session.stop()
+    assert rpc.calls == []
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_is_single_start_even_after_handshake_failure() -> None:
+    rpc = SdpFirstRpc()
+
+    async def fail_start(
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del params, timeout
+        if method == "thread/realtime/start":
+            raise RuntimeError("unknown remote start outcome")
+        rpc.calls.append((method, {"threadId": "thread-1"}))
+        return {}
+
+    rpc.call = fail_start  # type: ignore[method-assign]
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+
+    with pytest.raises(RuntimeError, match="unknown remote start outcome"):
+        await session.start("offer")
+    with pytest.raises(ProtocolError, match="already been started"):
+        await session.start("offer-again")
+
+    await session.stop()
+    assert rpc.calls == [("thread/realtime/stop", {"threadId": "thread-1"})]
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_rejects_provider_error_and_conflicting_answers() -> (
+    None
+):
+    rpc = SdpFirstRpc()
+
+    async def provider_error(
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del timeout
+        rpc.calls.append((method, params))
+        if method == "thread/realtime/start":
+            await rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/error",
+                    "params": {"threadId": "thread-1", "message": "offer rejected"},
+                }
+            )
+        return {}
+
+    rpc.call = provider_error  # type: ignore[method-assign]
+    failed = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    with pytest.raises(ProtocolError, match="realtime provider error"):
+        await failed.start("offer")
+    await failed.stop()
+
+    conflicting_rpc = SdpFirstRpc()
+
+    async def conflicting_answers(
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del timeout
+        conflicting_rpc.calls.append((method, params))
+        if method == "thread/realtime/start":
+            for answer in ("answer-1", "answer-2"):
+                await conflicting_rpc.subscription.events.put(
+                    {
+                        "method": "thread/realtime/sdp",
+                        "params": {"threadId": "thread-1", "sdp": answer},
+                    }
+                )
+            await conflicting_rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/started",
+                    "params": {"threadId": "thread-1"},
+                }
+            )
+        return {}
+
+    conflicting_rpc.call = conflicting_answers  # type: ignore[method-assign]
+    conflicting = SignalingRealtimeSession(conflicting_rpc, "thread-1", timeout=1)
+    with pytest.raises(ProtocolError, match="conflicting SDP answers"):
+        await conflicting.start("offer")
+    await conflicting.stop()
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_rejects_late_conflicting_answer() -> None:
+    rpc = SdpFirstRpc()
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    await session.start("offer")
+    assert (await session.next_event())["method"] == "thread/realtime/started"
+    await rpc.subscription.events.put(
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "different-answer"},
+        }
+    )
+
+    with pytest.raises(ProtocolError, match="conflicting SDP answers"):
+        await session.next_event()
+
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_uses_one_deadline_across_unrelated_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeMonotonic()
+    monkeypatch.setattr(realtime_module, "monotonic", clock)
+    rpc = DeadlineRpc(clock)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+
+    with pytest.raises(TimeoutError, match="realtime signaling timed out"):
+        await session.start("offer")
+
+    assert rpc.subscription.timeouts == pytest.approx([1.0, 0.6, 0.2])
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_signaling_session_hard_bounds_rpc_that_ignores_timeout() -> None:
+    rpc = SdpFirstRpc()
+    start_cancelled = False
+
+    async def hang_start(
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        nonlocal start_cancelled
+        del params, timeout
+        if method == "thread/realtime/start":
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                start_cancelled = True
+                raise
+        return {}
+
+    rpc.call = hang_start  # type: ignore[method-assign]
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=0.02)
+
+    with pytest.raises(TimeoutError, match="realtime signaling timed out"):
+        await asyncio.wait_for(session.start("offer"), timeout=0.2)
+
+    assert start_cancelled is True
+    await session.stop()
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_next_event_detects_app_server_exit() -> None:
+    rpc = SdpFirstRpc()
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    await session.start("offer")
+    assert (await session.next_event())["method"] == "thread/realtime/started"
+    await rpc.subscription.events.put(
+        {"method": "bridge/appServerExited", "params": {"returncode": 29}}
+    )
+
+    with pytest.raises(AppServerExited, match="status 29"):
+        await session.next_event()
+
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_signaling_next_event_uses_one_deadline_across_unrelated_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeMonotonic()
+    monkeypatch.setattr(realtime_module, "monotonic", clock)
+    rpc = DeadlineRpc(clock)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+
+    with pytest.raises(TimeoutError):
+        await session.next_event(timeout=1)
+
+    assert rpc.subscription.timeouts == pytest.approx([1.0, 0.6, 0.2])
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_signaling_stop_is_idempotent_and_survives_caller_cancellation() -> None:
+    rpc = ControlledStopRpc(block_stop=True)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+    caller = asyncio.create_task(session.stop())
+    await asyncio.wait_for(rpc.stop_started.wait(), timeout=0.2)
+
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert rpc.stop_cancelled is False
+
+    second = asyncio.create_task(session.stop())
+    rpc.release_stop.set()
+    await second
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_stop_bounds_hung_remote_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc(block_stop=True)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+
+    await asyncio.wait_for(session.stop(), timeout=0.5)
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_cancelled is True
+    assert rpc.subscription.closed is True
 
 
 @pytest.mark.asyncio
