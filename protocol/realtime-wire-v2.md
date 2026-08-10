@@ -197,6 +197,15 @@ instructions, and executes correlated calls locally. Its locale defaults to
 ambiguous, stale, disconnected, timed-out, or invalid authority fails closed.
 Legacy v1 keeps its existing device-visible tool exchange for compatibility.
 
+The authority uses Home Assistant's `conversation` exposure namespace, so its
+entity-dependent tool view is the same one used by the official Conversation
+flow. The complete broker write/execution/result exchange is deadline-bound;
+an unknown outcome is returned to the provider with `do_not_retry`, disables
+further authority calls for that session, and is never replayed by the bridge.
+After a result is delivered, assistant output or a terminal provider event must
+arrive within 20 seconds or the session fails closed. These errors remain
+internal/provider-facing; the speaker still receives no tool payload.
+
 An interrupt that is not explicitly confirmed returns the safe fallback before
 the socket closes:
 

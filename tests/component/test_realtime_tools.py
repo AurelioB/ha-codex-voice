@@ -114,6 +114,17 @@ class ConcurrentTool(RecordingTool):
         return {"name": tool_input.tool_args["name"]}
 
 
+class BlockingSendWebSocket:
+    """Simulate an authority transport that never accepts a frame."""
+
+    closed = False
+
+    async def send_str(self, message: str) -> None:
+        """Block forever after retaining no message content."""
+        del message
+        await asyncio.Event().wait()
+
+
 def _entry(
     bridge_url: str,
     *,
@@ -141,6 +152,25 @@ def _entry(
             for index, authority in enumerate(authorities)
         ],
     )
+
+
+async def test_broker_send_is_bounded(hass: HomeAssistant) -> None:
+    """A stalled component-side write cannot retain the broker forever."""
+    entry = _entry("http://127.0.0.1:8787")
+    authority = select_realtime_authority(entry)
+    assert authority is not None
+    broker = RealtimeToolBroker(
+        hass,
+        entry,
+        authority,
+        None,  # type: ignore[arg-type]
+        send_timeout=0.01,
+    )
+
+    with pytest.raises(RealtimeToolBrokerError, match="send timed out"):
+        await broker._async_send_text(  # type: ignore[arg-type]
+            BlockingSendWebSocket(), "{}"
+        )
 
 
 async def test_authenticated_registration_and_generation_scoped_calls(
@@ -238,7 +268,7 @@ async def test_authenticated_registration_and_generation_scoped_calls(
     assert "Respond using language and locale es-MX" in registration["instructions"]
     assert [item["name"] for item in registration["tools"]] == ["HassTurnOn"]
     assert api.contexts[0].platform == DOMAIN
-    assert api.contexts[0].assistant == DOMAIN
+    assert api.contexts[0].assistant == "conversation"
     assert api.contexts[0].language == "es-MX"
     assert api.contexts[0].context is None
 
@@ -442,7 +472,13 @@ async def test_tool_call_timeout_returns_stable_failure(
 
     assert received["call_id"] == "stuck-call"
     assert received["success"] is False
-    assert received["result"]["error"] == "tool_timeout"
+    assert received["result"] == {
+        "error": "tool_timeout",
+        "error_text": (
+            "Home Assistant tool call timed out; outcome is unknown; do not retry"
+        ),
+        "do_not_retry": True,
+    }
     assert [call.id for call in tool.calls] == ["stuck-call"]
 
 

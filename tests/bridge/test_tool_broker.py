@@ -24,6 +24,21 @@ class FakeWebSocket:
         await self.sent.put(value)
 
 
+class BlockingToolCallWebSocket(FakeWebSocket):
+    """Accept registration, then simulate a permanently backpressured write."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._send_count = 0
+
+    async def send_json(self, value: dict[str, Any]) -> None:
+        self._send_count += 1
+        if self._send_count == 1:
+            await super().send_json(value)
+            return
+        await asyncio.Event().wait()
+
+
 def _registration(**overrides: Any) -> dict[str, Any]:
     value: dict[str, Any] = {
         "type": "register",
@@ -81,6 +96,36 @@ async def test_registration_and_correlated_tool_result() -> None:
     result = await call
     assert result.success is True
     assert result.result == {"speech": "Encendí la luz"}
+    health = broker.health()
+    assert health["connected"] is True
+    assert health["tool_count"] == 1
+    assert health["pending_calls"] == 0
+    assert health["calls_started"] == 1
+    assert health["calls_succeeded"] == 1
+    assert health["calls_failed"] == 0
+    assert health["calls_timed_out"] == 0
+    assert isinstance(health["last_call_duration_ms"], int)
+
+
+async def test_tool_deadline_includes_stalled_broker_write() -> None:
+    broker = HomeAssistantToolBroker(timeout=0.01)
+    websocket = BlockingToolCallWebSocket()
+    snapshot = await broker.register(websocket, _registration())  # type: ignore[arg-type]
+    await websocket.sent.get()
+
+    with pytest.raises(ToolBrokerUnavailable, match="outcome unknown"):
+        await asyncio.wait_for(
+            broker.call(snapshot, name="HassTurnOn", arguments={}), timeout=0.2
+        )
+
+    health = broker.health()
+    assert health["pending_calls"] == 0
+    assert health["calls_started"] == 1
+    assert health["calls_succeeded"] == 0
+    assert health["calls_failed"] == 0
+    assert health["calls_timed_out"] == 1
+    assert health["calls_transport_failed"] == 0
+    assert health["calls_cancelled"] == 0
 
 
 async def test_tool_call_fails_closed_for_undeclared_name() -> None:

@@ -70,6 +70,10 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
 | Full-duplex AEC sink ceiling | Configured 1–25%, checked at preflight and every response | Fails closed if any live sink channel is too loud |
+| Home Assistant tool execution + result send | 25 s + 5 s | Bounds the authority action and component transport separately |
+| Bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
+| App Server tool fallback | 45 s | Remains responsible until the result write completes |
+| Post-tool provider continuation | 20 s | Requires output or a terminal response after result delivery |
 | Full-duplex `paplay` stream | Same configured ceiling, never above 25% | Pins each response to the reviewed AEC sink and fixed linear volume |
 
 The pre-roll is included inside the microphone and fallback bounds; it is not

@@ -104,6 +104,12 @@ requires the primary Home Assistant bridge token.
   device. See the
   [v2 wire contract](../protocol/realtime-wire-v2.md).
 
+Authenticated health includes a content-free `home_assistant_tools` object:
+registration/open-transport readiness, locale, tool count, pending calls,
+exclusive process-lifetime outcome counters, and the duration of the most
+recent completed attempt. It never includes authority IDs, tool names,
+schemas, arguments, results, prompts, or conversation content.
+
 Device-facing v2 is the transport used by the pinned ThirdReality v1.1.7
 in-process client. “Okay Computer” enters this direct mode; “Okay Nabu” remains
 on Home Assistant's official Assist flow. The device sends 16 kHz mono PCM16
@@ -242,4 +248,11 @@ schemas, arguments, results, pending calls, and per-session calls are bounded.
 Home Assistant renders the authority instructions, defaults its realtime
 locale to `es-MX`, executes calls through the selected LLM API, and returns
 correlated results. Missing, ambiguous, replaced, disconnected, timed-out, or
-invalid authority fails closed.
+invalid authority fails closed. The component uses the `conversation`
+assistant exposure namespace, matching the official Conversation flow. The
+deadline hierarchy is 25 seconds for tool execution, 5 seconds for component
+result delivery, 35 seconds for the complete bridge broker transaction, 5
+seconds for provider-result delivery, and a 45-second App Server fallback.
+Unknown outcomes carry `do_not_retry`, disable further authority calls in that
+session, and cannot be amplified with fresh provider IDs. A 20-second
+post-result continuation watchdog bounds a provider/App Server wedge.

@@ -67,6 +67,7 @@ async def run_smoke(
             "binary_pcm16": True,
             "local_flush": True,
             "remote_cancel": False,
+            "same_session_interrupt_ack": True,
         }:
             raise RuntimeError("realtime v2 returned incompatible capabilities")
 

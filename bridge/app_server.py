@@ -18,6 +18,7 @@ from .errors import AppServerExited, ProtocolError, RpcError
 LOGGER = logging.getLogger(__name__)
 JsonObject = dict[str, Any]
 MAX_APP_SERVER_LINE_BYTES = 4 * 1024 * 1024
+MAX_RETIRED_SERVER_RESPONSE_IDS = 1024
 
 _MODERN_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
@@ -85,6 +86,8 @@ class CodexAppServer:
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._server_request_timers: dict[int | str, asyncio.Task[None]] = {}
+        self._server_response_states: dict[int | str, _ServerResponseState] = {}
+        self._retired_server_response_ids: dict[int | str, None] = {}
         self._subscriptions: set[RpcSubscription] = set()
         self._write_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -150,7 +153,7 @@ class CodexAppServer:
                         "clientInfo": {
                             "name": "ha_codex_voice",
                             "title": "Home Assistant Codex Voice Bridge",
-                            "version": "0.4.0",
+                            "version": "0.4.1",
                         },
                         "capabilities": {"experimentalApi": True},
                     },
@@ -175,6 +178,8 @@ class CodexAppServer:
             for timer in self._server_request_timers.values():
                 timer.cancel()
             self._server_request_timers.clear()
+            self._server_response_states.clear()
+            self._retired_server_response_ids.clear()
             for subscription in tuple(self._subscriptions):
                 subscription.close()
 
@@ -242,8 +247,7 @@ class CodexAppServer:
     async def respond_result(
         self, request_id: int | str, result: Mapping[str, Any]
     ) -> None:
-        self._cancel_server_request_timeout(request_id)
-        await self._write({"id": request_id, "result": dict(result)})
+        await self._respond(request_id, {"id": request_id, "result": dict(result)})
 
     async def respond_error(
         self,
@@ -252,11 +256,10 @@ class CodexAppServer:
         message: str,
         data: Any | None = None,
     ) -> None:
-        self._cancel_server_request_timeout(request_id)
         error: JsonObject = {"code": code, "message": message}
         if data is not None:
             error["data"] = data
-        await self._write({"id": request_id, "error": error})
+        await self._respond(request_id, {"id": request_id, "error": error})
 
     def subscribe(self, *, maxsize: int = 512) -> RpcSubscription:
         subscription = RpcSubscription(self, maxsize=maxsize)
@@ -280,6 +283,45 @@ class CodexAppServer:
                 await process.stdin.drain()
             except (BrokenPipeError, ConnectionResetError) as exc:
                 raise AppServerExited("codex app-server closed stdin") from exc
+
+    async def _respond(
+        self,
+        request_id: int | str,
+        message: JsonObject,
+        *,
+        state: _ServerResponseState | None = None,
+    ) -> None:
+        state = state or self._server_response_states.get(request_id)
+        if state is None:
+            if request_id in self._retired_server_response_ids:
+                return
+            await self._write(message)
+            return
+        async with state.lock:
+            if state.written:
+                return
+            if self._server_response_states.get(request_id) is not state:
+                return
+            await self._write(message)
+            # A completed _write() is the commit boundary. If stdin buffered
+            # bytes but drain then raised or was cancelled, delivery is
+            # unknowable; leave this state active so one fallback write can
+            # still succeed. This never re-executes the Home Assistant call.
+            state.written = True
+            if self._server_response_states.get(request_id) is state:
+                self._server_response_states.pop(request_id)
+                self._retire_server_response_id(request_id)
+        # The timeout remains responsible until a response write succeeds. If
+        # this task stalls, fails, or is cancelled in _write(), the state stays
+        # uncommitted and the fallback can take ownership of the next attempt.
+        self._cancel_server_request_timeout(request_id, state)
+
+    def _retire_server_response_id(self, request_id: int | str) -> None:
+        retired = self._retired_server_response_ids
+        retired.pop(request_id, None)
+        retired[request_id] = None
+        if len(retired) > MAX_RETIRED_SERVER_RESPONSE_IDS:
+            retired.pop(next(iter(retired)))
 
     async def _read_stdout(self) -> None:
         process = self.process
@@ -351,6 +393,7 @@ class CodexAppServer:
     async def _handle_server_request(self, message: JsonObject) -> None:
         method = message["method"]
         request_id = message["id"]
+        self._retired_server_response_ids.pop(request_id, None)
         if method in _MODERN_APPROVAL_METHODS:
             await self.respond_result(request_id, {"decision": "decline"})
             return
@@ -376,6 +419,8 @@ class CodexAppServer:
                 request_id, -32601, f"Unsupported server request: {method}"
             )
             return
+        state = _ServerResponseState()
+        self._server_response_states[request_id] = state
         delivered = self._broadcast(message)
         if not delivered:
             await self.respond_result(
@@ -391,10 +436,12 @@ class CodexAppServer:
                 },
             )
             return
-        self._server_request_timers[request_id] = asyncio.create_task(
-            self._expire_server_request(request_id),
+        timer = asyncio.create_task(
+            self._expire_server_request(request_id, state),
             name=f"codex-tool-timeout-{request_id}",
         )
+        state.timer = timer
+        self._server_request_timers[request_id] = timer
 
     def _broadcast(self, message: JsonObject) -> int:
         delivered = 0
@@ -406,31 +453,46 @@ class CodexAppServer:
                 LOGGER.error("Dropping app-server event for a slow subscriber")
         return delivered
 
-    async def _expire_server_request(self, request_id: int | str) -> None:
+    async def _expire_server_request(
+        self, request_id: int | str, state: _ServerResponseState
+    ) -> None:
         try:
             await asyncio.sleep(self.tool_timeout)
-            await self.respond_result(
+            await self._respond(
                 request_id,
                 {
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": "Home Assistant tool call timed out",
-                        }
-                    ],
-                    "success": False,
+                    "id": request_id,
+                    "result": {
+                        "contentItems": [
+                            {
+                                "type": "inputText",
+                                "text": (
+                                    '{"error":"home_assistant_tool_outcome_unknown",'
+                                    '"do_not_retry":true}'
+                                ),
+                            }
+                        ],
+                        "success": False,
+                    },
                 },
+                state=state,
             )
         except asyncio.CancelledError:
             pass
         except AppServerExited:
             pass
         finally:
-            self._server_request_timers.pop(request_id, None)
+            if self._server_request_timers.get(request_id) is asyncio.current_task():
+                self._server_request_timers.pop(request_id)
 
-    def _cancel_server_request_timeout(self, request_id: int | str) -> None:
-        timer = self._server_request_timers.pop(request_id, None)
-        if timer is not None and timer is not asyncio.current_task():
+    def _cancel_server_request_timeout(
+        self, request_id: int | str, state: _ServerResponseState
+    ) -> None:
+        timer = state.timer
+        if timer is None or self._server_request_timers.get(request_id) is not timer:
+            return
+        self._server_request_timers.pop(request_id)
+        if timer is not asyncio.current_task():
             timer.cancel()
 
     def _fail_pending(self, error: BaseException) -> None:
@@ -472,6 +534,15 @@ class CodexAppServer:
 class _RpcFailure:
     def __init__(self, error: Any) -> None:
         self.error = error
+
+
+class _ServerResponseState:
+    __slots__ = ("lock", "timer", "written")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.timer: asyncio.Task[None] | None = None
+        self.written = False
 
 
 def _contains_configured_mcp(value: Any) -> bool:
