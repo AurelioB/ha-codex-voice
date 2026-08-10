@@ -1003,6 +1003,17 @@ class RealtimeSession:
                 if fresh_session_required is False and remote_cancelled is True:
                     self._suppressed_output_epoch = None
                     return "interrupt_resumed", None, last_output_epoch, True
+                if (
+                    fresh_session_required is False
+                    and remote_cancelled is False
+                    and value.get("continuation_safe") is True
+                ):
+                    # Broker-managed realtime invalidates the bridge-owned
+                    # executor/output generation locally. The voice transport
+                    # may therefore remain open even when the provider did not
+                    # confirm cancellation of its side-effect-free frontend.
+                    self._suppressed_output_epoch = None
+                    return "interrupt_resumed", None, last_output_epoch, True
                 raise WebSocketError("bridge returned incompatible interrupt semantics")
             return "stop", None, last_output_epoch, True
         if message_type == "error":

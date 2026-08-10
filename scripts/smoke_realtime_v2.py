@@ -8,10 +8,14 @@ import json
 import os
 import time
 import wave
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
 from aiohttp import ClientSession, WSMsgType
+
+_HANDSHAKE_TIMEOUT_SECONDS = 45.0
+_OUTPUT_TIMEOUT_SECONDS = 90.0
 
 
 async def run_smoke(
@@ -45,20 +49,28 @@ async def run_smoke(
     completed_epoch: int | None = None
     controls = 0
 
-    async with (
-        ClientSession(headers=headers) as session,
-        session.ws_connect(f"{url.rstrip('/')}/v1/realtime") as websocket,
-    ):
-        await websocket.send_json(
-            {
-                "type": "start",
-                "protocol_version": 2,
-                "audio_transport": "binary",
-                "input_sample_rate": input_sample_rate,
-                "input_channels": 1,
-            }
+    async with AsyncExitStack() as stack:
+        session = await stack.enter_async_context(ClientSession(headers=headers))
+        handshake_deadline = (
+            asyncio.get_running_loop().time() + _HANDSHAKE_TIMEOUT_SECONDS
         )
-        started = await websocket.receive_json(timeout=45)
+        try:
+            async with asyncio.timeout_at(handshake_deadline):
+                websocket = await stack.enter_async_context(
+                    session.ws_connect(f"{url.rstrip('/')}/v1/realtime")
+                )
+                await websocket.send_json(
+                    {
+                        "type": "start",
+                        "protocol_version": 2,
+                        "audio_transport": "binary",
+                        "input_sample_rate": input_sample_rate,
+                        "input_channels": 1,
+                    }
+                )
+                started = await websocket.receive_json()
+        except TimeoutError:
+            raise TimeoutError("realtime v2 start timed out") from None
         if started.get("type") != "started":
             raise RuntimeError("realtime v2 start failed")
         handshake_at = time.monotonic()
@@ -80,44 +92,55 @@ async def run_smoke(
                 frame = audio_and_tail[offset : offset + frame_bytes]
                 await websocket.send_bytes(frame)
                 await asyncio.sleep(len(frame) / (input_sample_rate * 2))
-        deadline = asyncio.get_running_loop().time() + 90
-        while completed_epoch is None:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TimeoutError("realtime v2 output timed out")
-            message = await websocket.receive(timeout=remaining)
-            if message.type is WSMsgType.BINARY:
-                if active_epoch is None:
-                    raise RuntimeError("binary output arrived outside an epoch")
-                chunk = bytes(message.data)
-                if not chunk or len(chunk) % 2:
-                    raise RuntimeError("realtime v2 returned invalid PCM16")
-                if first_audio_at is None:
-                    first_audio_at = time.monotonic()
-                if output_wav is not None:
-                    audio.extend(chunk)
-                audio_bytes += len(chunk)
-                continue
-            if message.type is not WSMsgType.TEXT:
-                raise RuntimeError("realtime v2 socket closed before output completed")
-            event = json.loads(message.data)
-            if event.get("type") == "error":
-                raise RuntimeError("realtime v2 bridge returned an error")
-            if event.get("type") != "control":
-                continue
-            controls += 1
-            event_type = event.get("event_type")
-            if event_type == "speaking.started":
-                epoch = event.get("output_epoch")
-                if not isinstance(epoch, int) or epoch < 1 or active_epoch is not None:
-                    raise RuntimeError("realtime v2 returned an invalid output epoch")
-                active_epoch = epoch
-            elif event_type == "speaking.stopped":
-                epoch = event.get("output_epoch")
-                if active_epoch is None or epoch != active_epoch:
-                    raise RuntimeError("realtime v2 stopped the wrong output epoch")
-                completed_epoch = active_epoch
-                active_epoch = None
+        output_deadline = asyncio.get_running_loop().time() + _OUTPUT_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout_at(output_deadline):
+                while completed_epoch is None:
+                    message = await websocket.receive()
+                    if message.type is WSMsgType.BINARY:
+                        if active_epoch is None:
+                            raise RuntimeError("binary output arrived outside an epoch")
+                        chunk = bytes(message.data)
+                        if not chunk or len(chunk) % 2:
+                            raise RuntimeError("realtime v2 returned invalid PCM16")
+                        if first_audio_at is None:
+                            first_audio_at = time.monotonic()
+                        if output_wav is not None:
+                            audio.extend(chunk)
+                        audio_bytes += len(chunk)
+                        continue
+                    if message.type is not WSMsgType.TEXT:
+                        raise RuntimeError(
+                            "realtime v2 socket closed before output completed"
+                        )
+                    event = json.loads(message.data)
+                    if event.get("type") == "error":
+                        raise RuntimeError("realtime v2 bridge returned an error")
+                    if event.get("type") != "control":
+                        continue
+                    controls += 1
+                    event_type = event.get("event_type")
+                    if event_type == "speaking.started":
+                        epoch = event.get("output_epoch")
+                        if (
+                            not isinstance(epoch, int)
+                            or epoch < 1
+                            or active_epoch is not None
+                        ):
+                            raise RuntimeError(
+                                "realtime v2 returned an invalid output epoch"
+                            )
+                        active_epoch = epoch
+                    elif event_type == "speaking.stopped":
+                        epoch = event.get("output_epoch")
+                        if active_epoch is None or epoch != active_epoch:
+                            raise RuntimeError(
+                                "realtime v2 stopped the wrong output epoch"
+                            )
+                        completed_epoch = active_epoch
+                        active_epoch = None
+        except TimeoutError:
+            raise TimeoutError("realtime v2 output timed out") from None
 
         await websocket.send_json({"type": "stop"})
 

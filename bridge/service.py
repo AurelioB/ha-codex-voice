@@ -26,7 +26,7 @@ from collections.abc import (
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from .app_server import CodexAppServer
 from .audio import (
@@ -51,7 +51,11 @@ from .errors import (
     RpcError,
 )
 from .realtime import RealtimeSession
-from .realtime_wire import RealtimeWireProtocol, parse_data_control_event
+from .realtime_wire import (
+    RealtimeDataControl,
+    RealtimeWireProtocol,
+    parse_data_control_event,
+)
 from .runtime import IsolatedCodexRuntime, codex_child_environment
 from .tool_broker import (
     MAX_TOOL_BROKER_MESSAGE_BYTES,
@@ -63,16 +67,26 @@ from .webrtc import WebRtcPeer
 
 LOGGER = logging.getLogger(__name__)
 STATE_KEY = "ha_codex_bridge_state"
+ACTIVE_WEBSOCKETS_KEY: web.AppKey[set[web.WebSocketResponse]] = web.AppKey(
+    "ha_codex_bridge_active_websockets",
+    set,
+)
 MAX_AUDIO_BYTES = 24 * 1024 * 1024
+SERVER_WEBSOCKET_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS = 2_250
+REALTIME_MANAGED_STARTUP_TIMEOUT_SECONDS = 5.0
 MAX_CONVERSATIONS = 128
 CONVERSATION_TTL = 60 * 60
 MAX_HISTORY_CONTEXT_CHARS = 16_000
 MAX_CONVERSATION_LANGUAGE_CHARS = 64
 MAX_EARLY_TURN_EVENTS = 64
+MAX_REALTIME_USER_TURN_CORRELATIONS = 64
+REALTIME_MAX_MANAGED_TURNS_PER_SESSION = 1_024
+REALTIME_MANAGED_INTERRUPT_USER_AGENT = "ha-codex-voice-thirdreality/2"
 DEFAULT_CONVERSATION_EFFORT = "low"
 SUPPORTED_CONVERSATION_SERVICE_TIERS = frozenset({"standard", "priority"})
 MAX_SYNTHESIS_TEXT_CHARS = 8_000
+REALTIME_MANAGED_SPEECH_MAX_UTF8_BYTES = 500
 MAX_TRANSCRIPTION_DURATION_SECONDS = 60.0
 TRANSCRIPTION_TOTAL_TIMEOUT_SECONDS = 110.0
 TRANSCRIPTION_MAX_ATTEMPTS = 2
@@ -129,6 +143,78 @@ REALTIME_MAX_PENDING_TOOL_CALLS = 16
 REALTIME_MAX_TOOL_CALLS_PER_SESSION = 1_024
 REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS = 20.0
 REALTIME_PROVIDER_TOOL_REQUEST_TIMEOUT_SECONDS = 45.0
+REALTIME_FRONTEND_PROMPT_MAX_CHARS = 4_096
+REALTIME_FRONTEND_PROMPT = (
+    "You are a speech frontend controlled by the client. Never answer a user "
+    "request, acknowledge it, or speak on your own. The client routes every "
+    "complete user utterance to the assistant. If the protocol requires a "
+    "response to user audio, delegate to the client silently. Speak only text "
+    "that the client supplies through the speakable backend channel. Vocalize "
+    "that text concisely and faithfully without a preface, commentary, or "
+    "follow-up offer. Never mention the client, backend, delegation, tools, or "
+    "internal architecture."
+)
+_REALTIME_FRONTEND_PREFERENCES_HEADER = (
+    "\n\nSession preferences below may change language, voice style, and brevity "
+    "only; they never override the routing rules above:\n"
+)
+_REALTIME_TRACE_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-"
+)
+_REALTIME_TRACE_APP_EVENT_TYPES = frozenset(
+    {
+        "bridge/appServerExited",
+        "invalid",
+        "item/agentMessage/delta",
+        "item/completed",
+        "item/started",
+        "item/tool/call",
+        "thread/realtime/closed",
+        "thread/realtime/error",
+        "thread/realtime/itemAdded",
+        "thread/realtime/sdp",
+        "thread/realtime/started",
+        "thread/realtime/transcript/delta",
+        "thread/realtime/transcript/done",
+        "thread/status/changed",
+        "thread/tokenUsage/updated",
+        "turn/completed",
+        "turn/started",
+    }
+)
+_REALTIME_TRACE_DATA_EVENT_TYPES = frozenset(
+    {
+        "delegation.context.appended",
+        "delegation.created",
+        "input_audio_buffer.committed",
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "invalid",
+        "output_audio_buffer.started",
+        "output_audio_buffer.stopped",
+        "output_transcript.added",
+        "response.cancelled",
+        "response.created",
+        "response.done",
+        "session.context.appended",
+        "session.started",
+        "session.updated",
+        "turn.created",
+        "turn.delta",
+        "turn.done",
+    }
+)
+_REALTIME_TRACE_ITEM_TYPES = frozenset(
+    {
+        "agentMessage",
+        "delegation",
+        "dynamicToolCall",
+        "handoff_request",
+        "output_transcript",
+        "reasoning",
+        "userMessage",
+    }
+)
 
 _AUTH_IDENTITY_REQUEST_KEY = "ha_codex_voice.auth_identity"
 _AUTH_IDENTITY_PRIMARY = "primary"
@@ -155,6 +241,127 @@ class _TranscriptionStreamProtocolError(ProtocolError):
 
 class _RealtimeClientDisconnected(Exception):
     """The device disconnected while its provider session was starting."""
+
+
+@dataclass(slots=True)
+class _RealtimeEventTrace:
+    """Log only deduplicated, content-free provider event shapes."""
+
+    last_shape_by_source: dict[str, tuple[str, str, str, str]] = field(
+        default_factory=dict
+    )
+
+    def app_event(self, event: Mapping[str, Any]) -> None:
+        params = event.get("params")
+        values = params if isinstance(params, Mapping) else {}
+        self._emit("app", event.get("method"), values)
+
+    def data_event(self, raw_event: str | bytes) -> None:
+        try:
+            decoded = json.loads(raw_event)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            self._emit("data", "invalid", {})
+            return
+        if not isinstance(decoded, Mapping):
+            self._emit("data", "invalid", {})
+            return
+        self._emit("data", decoded.get("type"), decoded)
+
+    def _emit(
+        self,
+        source: str,
+        event_type_value: object,
+        values: Mapping[str, Any],
+    ) -> None:
+        item = values.get("item")
+        item_values = item if isinstance(item, Mapping) else {}
+        turn = values.get("turn")
+        turn_values = turn if isinstance(turn, Mapping) else {}
+        event_type = _realtime_trace_token(
+            event_type_value,
+            allowed=(
+                _REALTIME_TRACE_APP_EVENT_TYPES
+                if source == "app"
+                else _REALTIME_TRACE_DATA_EVENT_TYPES
+            ),
+            invalid="invalid",
+        )
+        item_type = _realtime_trace_token(
+            item_values.get("type"), allowed=_REALTIME_TRACE_ITEM_TYPES
+        )
+        role = _realtime_trace_role(values, item_values, turn_values)
+        target = _realtime_trace_target(values, item_values)
+        shape = (event_type, item_type, role, target)
+        if self.last_shape_by_source.get(source) == shape:
+            return
+        self.last_shape_by_source[source] = shape
+        LOGGER.info(
+            "Realtime provider event: source=%s event_type=%s item_type=%s "
+            "role=%s target=%s",
+            source,
+            *shape,
+        )
+
+
+def _realtime_trace_token(
+    value: object,
+    *,
+    allowed: frozenset[str],
+    invalid: str = "none",
+) -> str:
+    if value is None:
+        return "none"
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return invalid
+    if any(character not in _REALTIME_TRACE_TOKEN_CHARS for character in value):
+        return invalid
+    return value if value in allowed else "other"
+
+
+def _realtime_trace_role(*values: Mapping[str, Any]) -> str:
+    for value in values:
+        candidate = value.get("role")
+        if isinstance(candidate, str):
+            normalized = candidate.lower()
+            if normalized in {"assistant", "input", "output", "user"}:
+                return normalized
+            return "other"
+    return "none"
+
+
+def _realtime_trace_target(*values: Mapping[str, Any]) -> str:
+    for value in values:
+        candidate = value.get("target")
+        if isinstance(candidate, str) and candidate:
+            return "client" if candidate.lower() == "client" else "other"
+    return "none"
+
+
+def _realtime_frontend_prompt(
+    device_prompt: str | None,
+    broker_snapshot: ToolBrokerSnapshot | None,
+) -> str:
+    """Compose immutable frontend behavior with bounded voice preferences."""
+    preferences: list[str] = []
+    if broker_snapshot is not None:
+        preferences.append(
+            f"Default response language and locale: {broker_snapshot.language}."
+        )
+    if device_prompt:
+        preferences.append(f"Additional speaking preference: {device_prompt}")
+    if not preferences:
+        return REALTIME_FRONTEND_PROMPT
+    prefix = REALTIME_FRONTEND_PROMPT + _REALTIME_FRONTEND_PREFERENCES_HEADER
+    available = REALTIME_FRONTEND_PROMPT_MAX_CHARS - len(prefix)
+    return prefix + "\n".join(preferences)[:available]
+
+
+def _truncate_utf8_bytes(value: str, maximum: int) -> str:
+    """Return a valid UTF-8 prefix no larger than the provider byte limit."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value
+    return encoded[:maximum].decode("utf-8", errors="ignore").rstrip()
 
 
 def _codex_child_environment() -> dict[str, str]:
@@ -588,6 +795,7 @@ class BridgeState:
         self._speech_session_offer: _SpeechSessionOffer | None = None
         self._speech_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._realtime_startup_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._realtime_provider_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._close_task: asyncio.Task[None] | None = None
 
     async def require_speech_session_available(self) -> None:
@@ -823,6 +1031,17 @@ class BridgeState:
 
         task.add_done_callback(finished)
 
+    def track_realtime_provider_cleanup(self, task: asyncio.Task[None]) -> None:
+        """Keep realtime transport and thread cleanup owned across cancellation."""
+        self._realtime_provider_cleanup_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._realtime_provider_cleanup_tasks.discard(completed)
+            with contextlib.suppress(BaseException):
+                completed.exception()
+
+        task.add_done_callback(finished)
+
     async def start_thread(
         self,
         payload: Mapping[str, Any],
@@ -990,6 +1209,18 @@ class BridgeState:
                         for task in tuple(self._realtime_startup_cleanup_tasks)
                     ),
                     return_exceptions=True,
+                )
+            while self._realtime_provider_cleanup_tasks:
+                provider_cleanup = tuple(self._realtime_provider_cleanup_tasks)
+                await asyncio.gather(
+                    *(asyncio.shield(task) for task in provider_cleanup),
+                    return_exceptions=True,
+                )
+                # Done callbacks are scheduled with call_soon and a gather of
+                # already-finished tasks may not yield to them before this loop
+                # repeats. Retire the completed snapshot synchronously.
+                self._realtime_provider_cleanup_tasks.difference_update(
+                    task for task in provider_cleanup if task.done()
                 )
             for entry in self._conversations.values():
                 entry.turn_state.retired = True
@@ -1523,6 +1754,7 @@ def create_app(
         client_max_size=MAX_AUDIO_BYTES,
     )
     app[STATE_KEY] = state
+    app[ACTIVE_WEBSOCKETS_KEY] = set()
     app.router.add_get("/health", _health)
     app.router.add_get("/v1/conversation", _conversation)
     app.router.add_post("/v1/transcribe", _transcribe)
@@ -1532,8 +1764,59 @@ def create_app(
     app.router.add_post("/v1/speech-session/release", _release_speech_session)
     app.router.add_get("/v1/home-assistant/tools", _home_assistant_tools)
     app.router.add_get("/v1/realtime", _realtime)
+    app.on_shutdown.append(_close_active_websockets)
     app.cleanup_ctx.append(_app_server_lifecycle)
     return app
+
+
+def _track_websocket(request: web.Request, websocket: web.WebSocketResponse) -> None:
+    """Track a prepared server socket until its request handler exits."""
+    request.app[ACTIVE_WEBSOCKETS_KEY].add(websocket)
+
+
+def _untrack_websocket(request: web.Request, websocket: web.WebSocketResponse) -> None:
+    """Remove a server socket from the active shutdown set."""
+    request.app[ACTIVE_WEBSOCKETS_KEY].discard(websocket)
+
+
+async def _close_active_websockets(app: web.Application) -> None:
+    """Bound and parallelize graceful closure of long-lived server sockets."""
+    active_websockets: set[web.WebSocketResponse] = app[ACTIVE_WEBSOCKETS_KEY]
+    websockets = tuple(active_websockets)
+    if not websockets:
+        return
+    tasks = {
+        asyncio.create_task(
+            websocket.close(
+                code=WSCloseCode.GOING_AWAY,
+                message=b"Server shutting down",
+            ),
+            name="codex-server-websocket-close",
+        )
+        for websocket in websockets
+    }
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=SERVER_WEBSOCKET_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    await asyncio.gather(*done, return_exceptions=True)
+    if not pending:
+        return
+    LOGGER.warning(
+        "Server WebSocket shutdown deadline elapsed: pending=%d",
+        len(pending),
+    )
+    for task in pending:
+        task.cancel()
+        task.add_done_callback(_consume_shutdown_task_result)
+
+
+def _consume_shutdown_task_result(task: asyncio.Task[bool]) -> None:
+    """Retrieve a late close task result without extending shutdown."""
+    if task.cancelled():
+        return
+    with contextlib.suppress(Exception):
+        task.result()
 
 
 @web.middleware
@@ -1779,6 +2062,7 @@ async def _transcribe_stream_admitted(
 ) -> web.WebSocketResponse:
     websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
     await websocket.prepare(request)
+    _track_websocket(request, websocket)
     stream_started_at = time.monotonic()
     capture_started_at: float | None = None
     capture_ended_at: float | None = None
@@ -1936,8 +2220,11 @@ async def _transcribe_stream_admitted(
                     await state.close_speech_session_resource(
                         unfinished_outcome.retained_session
                     )
-        if not websocket.closed:
-            await websocket.close()
+        try:
+            if not websocket.closed:
+                await websocket.close()
+        finally:
+            _untrack_websocket(request, websocket)
         ended_at = time.monotonic()
         capture_seconds = (
             max(0.0, capture_ended_at - capture_started_at)
@@ -3335,6 +3622,7 @@ async def _conversation(request: web.Request) -> web.WebSocketResponse:
     state: BridgeState = request.app[STATE_KEY]
     websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=2 * 1024 * 1024)
     await websocket.prepare(request)
+    _track_websocket(request, websocket)
     try:
         first = await _receive_ws_json(websocket, timeout=30)
         if first.get("type") != "start":
@@ -3376,8 +3664,11 @@ async def _conversation(request: web.Request) -> web.WebSocketResponse:
     except (BridgeError, ValueError) as exc:
         await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
     finally:
-        if not websocket.closed:
-            await websocket.close()
+        try:
+            if not websocket.closed:
+                await websocket.close()
+        finally:
+            _untrack_websocket(request, websocket)
     return websocket
 
 
@@ -3732,6 +4023,7 @@ async def _home_assistant_tools(request: web.Request) -> web.WebSocketResponse:
         max_msg_size=MAX_TOOL_BROKER_MESSAGE_BYTES,
     )
     await websocket.prepare(request)
+    _track_websocket(request, websocket)
     try:
         first = await _receive_ws_json(websocket, timeout=30)
         await state.home_assistant_tools.register(websocket, first)
@@ -3768,9 +4060,14 @@ async def _home_assistant_tools(request: web.Request) -> web.WebSocketResponse:
     except (BridgeError, ValueError) as exc:
         await _safe_ws_json(websocket, {"type": "error", "error": str(exc)})
     finally:
-        await state.home_assistant_tools.unregister(websocket)
-        if not websocket.closed:
-            await websocket.close()
+        try:
+            await state.home_assistant_tools.unregister(websocket)
+        finally:
+            try:
+                if not websocket.closed:
+                    await websocket.close()
+            finally:
+                _untrack_websocket(request, websocket)
     return websocket
 
 
@@ -3788,6 +4085,7 @@ async def _realtime_admitted(
 ) -> web.WebSocketResponse:
     websocket = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_AUDIO_BYTES)
     await websocket.prepare(request)
+    _track_websocket(request, websocket)
     wire_protocol: RealtimeWireProtocol | None = None
     try:
         first = await _receive_ws_json(websocket, timeout=30)
@@ -3819,6 +4117,10 @@ async def _realtime_admitted(
                 wire_protocol,
                 configured_tools=configured_tools,
                 broker_snapshot=broker_snapshot,
+                managed_interrupt_continuation=(
+                    request.headers.get("User-Agent")
+                    == REALTIME_MANAGED_INTERRUPT_USER_AGENT
+                ),
             )
     except _RealtimeClientDisconnected:
         pass
@@ -3850,8 +4152,11 @@ async def _realtime_admitted(
     except (BridgeError, ValueError) as exc:
         await _safe_realtime_json(websocket, {"type": "error", "error": str(exc)})
     finally:
-        if not websocket.closed:
-            await websocket.close()
+        try:
+            if not websocket.closed:
+                await websocket.close()
+        finally:
+            _untrack_websocket(request, websocket)
     return websocket
 
 
@@ -3863,10 +4168,12 @@ async def _serve_realtime_session(
     *,
     configured_tools: list[dict[str, Any]],
     broker_snapshot: ToolBrokerSnapshot | None,
+    managed_interrupt_continuation: bool,
 ) -> None:
     """Start and serve one provider session while its speech lease is held."""
     session: RealtimeSession | None = None
     thread_id: str | None = None
+    executor_thread_id: str | None = None
     startup_abandoned = asyncio.Event()
     version = (
         state.config.realtime_version
@@ -3874,30 +4181,76 @@ async def _serve_realtime_session(
         else str(first.get("version", state.config.realtime_version))
     )
 
-    async def close_provider() -> None:
-        nonlocal session, thread_id
+    async def cleanup_owned_provider(
+        owned_session: RealtimeSession | None,
+        owned_thread_id: str | None,
+        owned_executor_thread_id: str | None,
+    ) -> None:
+        """Stop one claimed transport and dispose both owned threads."""
+        try:
+            if owned_session is not None:
+                await owned_session.stop()
+        finally:
+            thread_ids = tuple(
+                dict.fromkeys(
+                    thread
+                    for thread in (owned_thread_id, owned_executor_thread_id)
+                    if thread is not None
+                )
+            )
+            if thread_ids:
+                await asyncio.gather(
+                    *(_dispose_thread(state.rpc, owned) for owned in thread_ids),
+                    return_exceptions=True,
+                )
+
+    def start_provider_cleanup() -> asyncio.Task[None] | None:
+        """Synchronously transfer current provider ownership to a tracked task."""
+        nonlocal executor_thread_id, session, thread_id
         owned_session = session
         owned_thread_id = thread_id
+        owned_executor_thread_id = executor_thread_id
         session = None
         thread_id = None
-        if owned_session is not None:
-            try:
-                await owned_session.stop()
-            finally:
-                if owned_thread_id is not None:
-                    await _dispose_thread(state.rpc, owned_thread_id)
-                    owned_thread_id = None
-        if owned_thread_id is not None:
-            await _dispose_thread(state.rpc, owned_thread_id)
+        executor_thread_id = None
+        if (
+            owned_session is None
+            and owned_thread_id is None
+            and owned_executor_thread_id is None
+        ):
+            return None
+        cleanup_task = asyncio.create_task(
+            cleanup_owned_provider(
+                owned_session,
+                owned_thread_id,
+                owned_executor_thread_id,
+            ),
+            name="codex-realtime-provider-cleanup",
+        )
+        state.track_realtime_provider_cleanup(cleanup_task)
+        return cleanup_task
+
+    async def close_provider() -> None:
+        cleanup_task = start_provider_cleanup()
+        if cleanup_task is not None:
+            await asyncio.shield(cleanup_task)
 
     async def start_provider() -> None:
-        nonlocal session, thread_id
+        nonlocal executor_thread_id, session, thread_id
         try:
             thread_payload = dict(first)
             thread_payload.pop("model", None)
+            bridge_managed_realtime = (
+                wire_protocol.uses_binary_audio
+                and version == "v3"
+                and broker_snapshot is not None
+            )
             base_instructions = (
                 "Act only as a realtime Home Assistant voice agent. Never inspect "
-                "local files or use undeclared tools."
+                "local files or use undeclared tools. Return only the shortest "
+                "natural final result suitable for speech. Do not narrate work, "
+                "send progress acknowledgements, offer follow-up help, or ask what "
+                "else to do unless clarification is required."
             )
             if broker_snapshot is not None:
                 base_instructions += (
@@ -3907,11 +4260,31 @@ async def _serve_realtime_session(
                     f"Language: {broker_snapshot.language}\n"
                     f"{broker_snapshot.instructions}"
                 )
-            thread_id = await state.start_thread(
-                thread_payload,
-                tools=configured_tools,
-                base_instructions=base_instructions,
-            )
+            if bridge_managed_realtime:
+                # Keep the provider-facing thread unable to perform Home Assistant
+                # side effects. App Server v3 may route a native delegation before
+                # a client-managed handoff notification is observable, so the
+                # authoritative executor must live on a separate tool-bearing
+                # thread to preserve exactly-once control semantics.
+                executor_thread_id = await state.start_thread(
+                    thread_payload,
+                    tools=configured_tools,
+                    base_instructions=base_instructions,
+                )
+                thread_id = await state.start_thread(
+                    thread_payload,
+                    tools=[],
+                    base_instructions=(
+                        "Act only as a realtime speech transport. Never inspect "
+                        "local files, invoke tools, or claim that an action ran."
+                    ),
+                )
+            else:
+                thread_id = await state.start_thread(
+                    thread_payload,
+                    tools=configured_tools,
+                    base_instructions=base_instructions,
+                )
             if startup_abandoned.is_set():
                 return
             session = RealtimeSession(
@@ -3926,10 +4299,15 @@ async def _serve_realtime_session(
                     REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS
                 )
             voice = first.get("voice")
+            device_prompt = (
+                first.get("prompt") if isinstance(first.get("prompt"), str) else None
+            )
             await session.start(
-                prompt=first.get("prompt")
-                if isinstance(first.get("prompt"), str)
-                else None,
+                prompt=(
+                    _realtime_frontend_prompt(device_prompt, broker_snapshot)
+                    if bridge_managed_realtime
+                    else device_prompt
+                ),
                 model=(
                     None
                     if wire_protocol.uses_binary_audio
@@ -3939,15 +4317,20 @@ async def _serve_realtime_session(
                 ),
                 voice=voice.lower() if isinstance(voice, str) and voice else None,
                 include_startup_context=(
-                    True
+                    False
+                    if bridge_managed_realtime
+                    else True
                     if wire_protocol.uses_binary_audio
                     else bool(first.get("include_startup_context", True))
                 ),
                 client_managed_handoffs=(
-                    False
+                    True
+                    if bridge_managed_realtime
+                    else False
                     if wire_protocol.uses_binary_audio
                     else bool(first.get("client_managed_handoffs", False))
                 ),
+                delegation_ack_filler=(False if bridge_managed_realtime else None),
                 initial_items=(
                     None
                     if wire_protocol.uses_binary_audio
@@ -3956,6 +4339,8 @@ async def _serve_realtime_session(
                     else None
                 ),
             )
+            if bridge_managed_realtime:
+                await _settle_managed_realtime_startup(session)
         finally:
             if startup_abandoned.is_set():
                 await close_provider()
@@ -3989,9 +4374,31 @@ async def _serve_realtime_session(
             session,
             wire_protocol,
             broker_snapshot=broker_snapshot,
+            executor_thread_id=executor_thread_id,
+            managed_interrupt_continuation=managed_interrupt_continuation,
         )
     finally:
         await close_provider()
+
+
+async def _settle_managed_realtime_startup(session: RealtimeSession) -> None:
+    """Consume the ordered startup data burst before admitting managed turns."""
+    deadline = time.monotonic() + REALTIME_MANAGED_STARTUP_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProtocolError("realtime startup data boundary timed out")
+        try:
+            raw_event = await session.recv_data_event(timeout=remaining)
+        except TimeoutError:
+            raise ProtocolError("realtime startup data boundary timed out") from None
+        control = parse_data_control_event(raw_event)
+        if control is not None and control.event_type == "session.started":
+            break
+    # Audio produced before device admission is not owned by an executor
+    # render. Empty both decoded queues once more at the quiet boundary.
+    session.drain_audio_nowait()
+    session.drain_data_events_nowait()
 
 
 async def _start_realtime_provider_or_disconnect(
@@ -4062,7 +4469,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     wire_protocol: RealtimeWireProtocol,
     *,
     broker_snapshot: ToolBrokerSnapshot | None,
+    executor_thread_id: str | None = None,
+    managed_interrupt_continuation: bool = False,
 ) -> None:
+    bridge_managed_realtime = executor_thread_id is not None
+    executor_subscription = state.rpc.subscribe() if bridge_managed_realtime else None
     send_lock = asyncio.Lock()
     stop = asyncio.Event()
     tool_requests: dict[str, int | str] = {}
@@ -4102,14 +4513,54 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     pending_cancel_confirmation: asyncio.Future[None] | None = None
     pending_cancel_response_id: str | None = None
     active_response_id: str | None = None
+    active_background_turn_id: str | None = None
+    active_background_turn_generation: int | None = None
+    active_background_turn_had_tool = False
+    active_background_turn_interrupting = False
+    active_background_terminal: asyncio.Future[None] | None = None
+    background_generation = 0
+    background_turn_lock = asyncio.Lock()
+    background_watchdog_tasks: set[asyncio.Task[None]] = set()
+    background_turn_starting = False
+    early_background_events: dict[str, list[dict[str, Any]]] = {}
+    background_agent_messages: dict[str, tuple[str | None, str]] = {}
+    background_agent_order: list[str] = []
+    queued_background_request: tuple[int, str] | None = None
+    user_transcript_handled = False
+    input_speech_active = False
+    pending_managed_speech_generation: int | None = None
+    managed_user_turn_generations: OrderedDict[str, int] = OrderedDict()
+    claimed_managed_turn_ids: set[str] = set()
+    backend_render_generation: int | None = None
+    backend_render_context_acknowledged = False
+    backend_render_started = False
+    backend_render_response_id: str | None = None
+    backend_render_turn_id: str | None = None
+    backend_render_terminal_seen = False
+    backend_render_cancel_requested = False
+    backend_render_retired: asyncio.Future[None] | None = None
+    backend_render_quiet_until = 0.0
+    backend_output_generation: int | None = None
+    event_trace = _RealtimeEventTrace()
 
     async def send(value: Mapping[str, Any]) -> None:
         await _send_realtime_json(websocket, value, send_lock=send_lock)
 
-    async def send_audio(chunk: bytes) -> None:
+    async def send_audio(
+        chunk: bytes, expected_backend_generation: int | None = None
+    ) -> bool:
         if wire_protocol.uses_binary_audio:
-            await _send_realtime_binary(websocket, chunk, send_lock=send_lock)
-            return
+            guard = (
+                None
+                if expected_backend_generation is None
+                else lambda: (
+                    backend_output_generation == expected_backend_generation
+                    and background_generation == expected_backend_generation
+                )
+            )
+            return await _send_realtime_binary(
+                websocket, chunk, send_lock=send_lock, guard=guard
+            )
         await send(
             {
                 "type": "audio",
@@ -4118,6 +4569,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 "channels": 1,
             }
         )
+        return True
 
     async def run_control(operation: Awaitable[None], name: str) -> None:
         try:
@@ -4126,7 +4578,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         except TimeoutError as exc:
             raise ProtocolError(f"realtime {name} timed out") from exc
 
-    async def begin_output_locked() -> None:
+    async def begin_output_locked(
+        expected_backend_generation: int | None = None,
+    ) -> None:
         nonlocal output_armed, output_arm_task, output_epoch
         nonlocal output_last_pcm_at, output_preroll_bytes, output_speaking
         if output_speaking or stop.is_set():
@@ -4144,10 +4598,20 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 "output_epoch": output_epoch,
             }
         )
+        if expected_backend_generation is not None and (
+            backend_output_generation != expected_backend_generation
+            or background_generation != expected_backend_generation
+        ):
+            output_preroll.clear()
+            output_preroll_bytes = 0
+            return
         prune_output_preroll_locked()
         if output_preroll:
             output_last_pcm_at = output_preroll[-1][1]
-            await send_audio(b"".join(entry[2] for entry in output_preroll))
+            await send_audio(
+                b"".join(entry[2] for entry in output_preroll),
+                expected_backend_generation,
+            )
             output_preroll.clear()
             output_preroll_bytes = 0
 
@@ -4161,7 +4625,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         ):
             output_preroll_bytes -= len(output_preroll.popleft()[2])
 
-    async def arm_output() -> None:
+    async def arm_output(expected_backend_generation: int | None = None) -> None:
         nonlocal output_armed, output_arm_generation, output_arm_task
         nonlocal output_preroll_bytes
 
@@ -4176,6 +4640,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 output_preroll_bytes = 0
 
         async with output_state_lock:
+            if expected_backend_generation is not None and (
+                backend_output_generation != expected_backend_generation
+                or background_generation != expected_backend_generation
+            ):
+                return
             if output_speaking or stop.is_set():
                 return
             if output_armed:
@@ -4187,7 +4656,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             if output_arm_task is not None:
                 output_arm_task.cancel()
             if output_preroll:
-                await begin_output_locked()
+                await begin_output_locked(expected_backend_generation)
                 return
             output_arm_task = asyncio.create_task(
                 expire_arm(output_arm_generation),
@@ -4203,9 +4672,20 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         expected_epoch: int | None = None
         terminal_at = time.monotonic()
         if after_tail:
+            armed_without_media = False
             async with output_state_lock:
                 if output_speaking:
                     expected_epoch = output_epoch
+                else:
+                    armed_without_media = output_armed
+            if armed_without_media:
+                # Data-channel terminal events can overtake the first media
+                # frame. Give the already-authorized arm one short scheduling
+                # window so valid PCM is not mistaken for late stale output.
+                await asyncio.sleep(REALTIME_OUTPUT_TAIL_SECONDS)
+                async with output_state_lock:
+                    if output_speaking:
+                        expected_epoch = output_epoch
             if expected_epoch is not None:
                 hard_deadline = terminal_at + REALTIME_OUTPUT_TAIL_HARD_CAP_SECONDS
                 while True:
@@ -4430,6 +4910,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         *,
         success: bool,
         result: object,
+        background_turn_generation: int | None = None,
     ) -> None:
         """Attempt exactly one App Server response for a provider request id."""
         if request_id in claimed_tool_responses:
@@ -4441,11 +4922,16 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             "Delivering realtime Home Assistant tool result correlation=%s",
             correlation,
         )
-        # App Server can emit the continuation as soon as it accepts the
-        # response, before this coroutine is scheduled again after the write.
-        # Establish the generation first; the undelivered request keeps the
-        # watchdog itself disarmed until the write completes.
-        require_tool_continuation(correlation)
+        require_continuation = not bridge_managed_realtime or (
+            background_turn_generation is not None
+            and background_turn_generation == background_generation
+        )
+        if require_continuation:
+            # App Server can emit the continuation as soon as it accepts the
+            # response, before this coroutine is scheduled again after the
+            # write. Establish the generation first; the undelivered request
+            # keeps the watchdog itself disarmed until the write completes.
+            require_tool_continuation(correlation)
         await _respond_to_tool_result(
             state.rpc,
             {
@@ -4461,13 +4947,15 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             correlation,
         )
         delivered_tool_responses.add(request_id)
-        arm_pending_tool_continuation_watchdog()
+        if require_continuation:
+            arm_pending_tool_continuation_watchdog()
 
     async def execute_home_assistant_tool_call(
         request_id: int | str,
         call_id: str,
         name: object,
         arguments: object,
+        background_turn_generation: int | None,
     ) -> None:
         """Execute one provider call through the captured HA authority only."""
         nonlocal tool_authority_failed_closed
@@ -4535,6 +5023,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             call_id,
             success=success,
             result=result,
+            background_turn_generation=background_turn_generation,
         )
 
     def start_home_assistant_tool_call(event: Mapping[str, Any]) -> None:
@@ -4554,6 +5043,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         cancel_tool_continuation_watchdog()
         name = params.get("tool")
         arguments = params.get("arguments", {})
+        owned_background_generation = (
+            active_background_turn_generation if bridge_managed_realtime else None
+        )
 
         rejection: object | None = None
         session_limit_exceeded = (
@@ -4590,6 +5082,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         call_id,
                         success=False,
                         result=rejection,
+                        background_turn_generation=owned_background_generation,
                     )
                 else:
                     await execute_home_assistant_tool_call(
@@ -4597,6 +5090,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         call_id,
                         name,
                         arguments,
+                        owned_background_generation,
                     )
             except asyncio.CancelledError:
                 raise
@@ -4628,7 +5122,614 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     async def raise_tool_call_failure() -> None:
         raise await tool_call_failures.get()
 
+    def bridge_output_authorized() -> bool:
+        return not bridge_managed_realtime or (
+            backend_output_generation == background_generation
+        )
+
+    def invalidate_bridge_output() -> None:
+        """Tombstone provider output that was not explicitly rendered by the bridge."""
+        nonlocal backend_output_generation
+        backend_output_generation = None
+        cancel_tool_continuation_watchdog()
+
+    def request_provider_cancel_best_effort() -> None:
+        try:
+            session.request_response_cancel()
+        except Exception:  # noqa: BLE001 - the local gate remains authoritative.
+            LOGGER.info("Realtime provider response cancel was unavailable")
+
+    def request_backend_render_cancel_best_effort() -> None:
+        """Cancel only a started bridge-owned render, never an idle session."""
+        nonlocal backend_render_cancel_requested
+        if backend_render_generation is None or not backend_render_started:
+            return
+        if backend_render_cancel_requested:
+            return
+        backend_render_cancel_requested = True
+        request_provider_cancel_best_effort()
+
+    def begin_background_generation() -> int:
+        nonlocal background_generation
+        background_generation += 1
+        invalidate_bridge_output()
+        return background_generation
+
+    async def authorize_backend_output(generation: int) -> None:
+        nonlocal backend_output_generation
+        if generation != background_generation:
+            return
+        backend_output_generation = generation
+        announce_tool_continuation_output()
+        await arm_output(generation)
+
+    def maybe_retire_backend_render() -> None:
+        """Release one render slot only after its ack and terminal boundary."""
+        nonlocal backend_render_cancel_requested
+        nonlocal backend_render_context_acknowledged, backend_render_generation
+        nonlocal backend_render_quiet_until, backend_render_retired
+        nonlocal backend_render_response_id, backend_render_started
+        nonlocal backend_render_terminal_seen, backend_render_turn_id
+        if (
+            backend_render_generation is None
+            or not backend_render_context_acknowledged
+            or not backend_render_terminal_seen
+        ):
+            return
+        retired = backend_render_retired
+        backend_render_generation = None
+        backend_render_context_acknowledged = False
+        backend_render_started = False
+        backend_render_response_id = None
+        backend_render_turn_id = None
+        backend_render_terminal_seen = False
+        backend_render_cancel_requested = False
+        backend_render_retired = None
+        backend_render_quiet_until = max(
+            backend_render_quiet_until,
+            time.monotonic() + REALTIME_OUTPUT_TAIL_SECONDS,
+        )
+        session.drain_audio_nowait()
+        if retired is not None and not retired.done():
+            retired.set_result(None)
+
+    def mark_backend_render_started(
+        response_id: str | None = None, turn_id: str | None = None
+    ) -> bool:
+        """Bind a post-ack provider start to the sole bridge-owned render."""
+        nonlocal backend_render_response_id, backend_render_started
+        nonlocal backend_render_turn_id
+        if (
+            backend_render_generation is None
+            or not backend_render_context_acknowledged
+            or (response_id is None and turn_id is None)
+        ):
+            return False
+        if (
+            response_id is not None
+            and backend_render_response_id is not None
+            and backend_render_response_id != response_id
+        ):
+            return False
+        if (
+            turn_id is not None
+            and backend_render_turn_id is not None
+            and backend_render_turn_id != turn_id
+        ):
+            return False
+        if response_id is not None:
+            backend_render_response_id = response_id
+        if turn_id is not None:
+            backend_render_turn_id = turn_id
+        backend_render_started = True
+        return True
+
+    def claim_managed_turn_id(turn_id: str) -> bool:
+        """Claim one provider turn ID for the lifetime of this socket."""
+        if turn_id in claimed_managed_turn_ids:
+            return False
+        if len(claimed_managed_turn_ids) >= REALTIME_MAX_MANAGED_TURNS_PER_SESSION:
+            raise ProtocolError("realtime provider exceeded the managed-turn limit")
+        claimed_managed_turn_ids.add(turn_id)
+        return True
+
+    def backend_render_terminal_matches(
+        response_id: str | None = None, turn_id: str | None = None
+    ) -> bool:
+        """Return whether a terminal is correlated to the bridge-owned render."""
+        if (
+            backend_render_generation is None
+            or not backend_render_context_acknowledged
+            or not backend_render_started
+            or (response_id is None and turn_id is None)
+        ):
+            return False
+        if response_id is not None and (
+            backend_render_response_id is None
+            or backend_render_response_id != response_id
+        ):
+            return False
+        if turn_id is not None and (
+            backend_render_turn_id is None or backend_render_turn_id != turn_id
+        ):
+            return False
+        return True
+
+    def mark_backend_render_terminal(
+        response_id: str | None = None, turn_id: str | None = None
+    ) -> None:
+        """Record only a terminal correlated to the bridge-owned render."""
+        nonlocal backend_render_terminal_seen
+        if not backend_render_terminal_matches(response_id, turn_id):
+            return
+        backend_render_terminal_seen = True
+        maybe_retire_backend_render()
+
+    async def interrupt_active_background_turn_locked() -> bool:
+        """Interrupt a side-effect-free executor turn and await its terminal event."""
+        nonlocal active_background_turn_interrupting
+        turn_id = active_background_turn_id
+        terminal = active_background_terminal
+        if turn_id is None:
+            return True
+        if active_background_turn_had_tool:
+            return False
+        # Tombstone the side-effect-free turn before yielding to App Server.
+        # A late tool request for this turn must never cross the HA authority
+        # boundary after barge-in has committed to interruption.
+        active_background_turn_interrupting = True
+        assert executor_thread_id is not None
+        await state.rpc.call(
+            "turn/interrupt",
+            {"threadId": executor_thread_id, "turnId": turn_id},
+            timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+        )
+        if terminal is not None and not terminal.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(terminal),
+                    timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise ProtocolError(
+                    "interrupted realtime executor turn did not terminate"
+                ) from exc
+        return True
+
+    def active_background_turn_owner() -> tuple[str | None, int | None]:
+        """Snapshot the executor owner at an interrupt linearization point."""
+        return active_background_turn_id, active_background_turn_generation
+
+    async def interrupt_active_background_turn(
+        expected_owner: tuple[str | None, int | None],
+    ) -> None:
+        async with background_turn_lock:
+            if active_background_turn_owner() != expected_owner:
+                return
+            await interrupt_active_background_turn_locked()
+
+    def arm_background_turn_watchdog(
+        turn_id: str,
+        generation: int,
+        terminal: asyncio.Future[None],
+    ) -> None:
+        """Bound one executor turn and fail the device closed on lost completion."""
+
+        async def expire() -> None:
+            nonlocal active_background_turn_interrupting
+            try:
+                async with asyncio.timeout(state.config.request_timeout):
+                    await asyncio.shield(terminal)
+            except TimeoutError:
+                pass
+            else:
+                return
+
+            async with background_turn_lock:
+                if (
+                    active_background_turn_owner() != (turn_id, generation)
+                    or terminal.done()
+                ):
+                    return
+                active_background_turn_interrupting = True
+                # The timeout is fatal for the whole socket, not only this
+                # executor generation. Invalidate a newer queued request too,
+                # before the interrupted turn's terminal can start it.
+                begin_background_generation()
+                try:
+                    await state.rpc.call(
+                        "turn/interrupt",
+                        {"threadId": executor_thread_id, "turnId": turn_id},
+                        timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                    )
+                except Exception:  # noqa: BLE001 - timeout still closes the socket.
+                    LOGGER.warning(
+                        "Could not interrupt timed-out realtime executor turn"
+                    )
+                if not terminal.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(terminal),
+                            timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                        )
+                    except TimeoutError:
+                        LOGGER.warning(
+                            "Timed-out realtime executor turn did not terminate"
+                        )
+            if tool_call_failures.empty():
+                tool_call_failures.put_nowait(
+                    ProtocolError("assistant request timed out")
+                )
+
+        task = asyncio.create_task(
+            expire(), name="codex-realtime-executor-turn-timeout"
+        )
+        background_watchdog_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            background_watchdog_tasks.discard(completed)
+            with contextlib.suppress(BaseException):
+                completed.exception()
+
+        task.add_done_callback(finished)
+
+    async def append_background_speech(text: str, generation: int) -> None:
+        """Render one completed executor answer through the isolated voice thread."""
+        nonlocal backend_render_cancel_requested
+        nonlocal backend_render_context_acknowledged, backend_render_generation
+        nonlocal backend_render_quiet_until, backend_render_retired
+        nonlocal backend_render_response_id, backend_render_started
+        nonlocal backend_render_terminal_seen, backend_render_turn_id
+        if generation != background_generation:
+            return
+        spoken = _truncate_utf8_bytes(
+            text.strip(), REALTIME_MANAGED_SPEECH_MAX_UTF8_BYTES
+        )
+        if not spoken:
+            await send(
+                {"type": "error", "error": "assistant returned no final response"}
+            )
+            return
+        previous_retired = backend_render_retired
+        if backend_render_generation is not None:
+            request_backend_render_cancel_best_effort()
+            if previous_retired is None:
+                raise ProtocolError("realtime render ownership is inconsistent")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(previous_retired),
+                    timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise ProtocolError(
+                    "interrupted realtime render did not terminate"
+                ) from exc
+        # Provider terminal controls can overtake their final RTP frames. Keep
+        # the gate closed through the retired render's quiet tail even when it
+        # retired before this executor answer became ready.
+        quiet_remaining = backend_render_quiet_until - time.monotonic()
+        if quiet_remaining > 0:
+            await asyncio.sleep(quiet_remaining)
+        session.drain_audio_nowait()
+        if generation != background_generation:
+            return
+        await end_output(after_tail=False)
+        if generation != background_generation:
+            return
+        backend_render_generation = generation
+        backend_render_context_acknowledged = False
+        backend_render_started = False
+        backend_render_response_id = None
+        backend_render_turn_id = None
+        backend_render_terminal_seen = False
+        backend_render_cancel_requested = False
+        retired = asyncio.get_running_loop().create_future()
+        backend_render_retired = retired
+        try:
+            await run_control(
+                session.append_speech(spoken),
+                "background speech",
+            )
+        except BaseException:
+            if backend_render_generation == generation:
+                backend_render_generation = None
+                backend_render_context_acknowledged = False
+                backend_render_started = False
+                backend_render_response_id = None
+                backend_render_turn_id = None
+                backend_render_terminal_seen = False
+                backend_render_cancel_requested = False
+                backend_render_retired = None
+                if not retired.done():
+                    retired.set_result(None)
+            raise
+
+    def clear_background_agent_messages() -> None:
+        background_agent_messages.clear()
+        background_agent_order.clear()
+
+    def executor_event_turn_id(params: Mapping[str, Any]) -> str | None:
+        direct = params.get("turnId")
+        if isinstance(direct, str) and direct:
+            return direct
+        turn = params.get("turn")
+        nested = turn.get("id") if isinstance(turn, Mapping) else None
+        return nested if isinstance(nested, str) and nested else None
+
+    def remember_background_agent_message(
+        params: Mapping[str, Any], *, authoritative: bool
+    ) -> None:
+        if params.get("turnId") != active_background_turn_id:
+            return
+        item = params.get("item")
+        item_values = item if isinstance(item, Mapping) else {}
+        if authoritative and item_values.get("type") != "agentMessage":
+            return
+        raw_item_id = item_values.get("id") if authoritative else params.get("itemId")
+        item_id = (
+            raw_item_id if isinstance(raw_item_id, str) and raw_item_id else "turn"
+        )
+        if item_id not in background_agent_messages:
+            background_agent_order.append(item_id)
+            background_agent_messages[item_id] = (None, "")
+        previous_phase, previous_text = background_agent_messages[item_id]
+        if authoritative:
+            phase_value = item_values.get("phase")
+            phase = phase_value if isinstance(phase_value, str) else None
+            text_value = item_values.get("text")
+            text = text_value if isinstance(text_value, str) else previous_text
+            background_agent_messages[item_id] = (
+                phase,
+                text[:MAX_SYNTHESIS_TEXT_CHARS],
+            )
+            return
+        delta = params.get("delta")
+        if isinstance(delta, str) and delta:
+            background_agent_messages[item_id] = (
+                previous_phase,
+                (previous_text + delta)[:MAX_SYNTHESIS_TEXT_CHARS],
+            )
+
+    def completed_background_text() -> str | None:
+        candidates = [
+            (phase, text.strip())
+            for item_id in background_agent_order
+            for phase, text in [background_agent_messages[item_id]]
+            if text.strip()
+        ]
+        for phase, text in reversed(candidates):
+            if phase == "final_answer":
+                return text
+        for phase, text in reversed(candidates):
+            if phase != "commentary":
+                return text
+        return None
+
+    async def reject_all_early_background_tool_calls() -> None:
+        buffered = [
+            event
+            for events_for_turn in early_background_events.values()
+            for event in events_for_turn
+        ]
+        early_background_events.clear()
+        for event in buffered:
+            if event.get("method") == "item/tool/call":
+                await reject_unowned_tool_call(event)
+
+    async def start_background_turn(text: str, generation: int) -> None:
+        """Route one canonical request to the isolated Home Assistant executor."""
+        nonlocal active_background_terminal, active_background_turn_generation
+        nonlocal active_background_turn_had_tool, active_background_turn_id
+        nonlocal active_background_turn_interrupting
+        nonlocal background_turn_starting, queued_background_request
+        assert executor_thread_id is not None
+        async with background_turn_lock:
+            if generation != background_generation:
+                return
+            if active_background_turn_id is not None:
+                if active_background_turn_had_tool:
+                    queued_background_request = (generation, text)
+                    return
+                await interrupt_active_background_turn_locked()
+            if generation != background_generation:
+                return
+            clear_background_agent_messages()
+            queued_background_request = None
+            background_turn_starting = True
+            early_background_events.clear()
+            try:
+                response = await state.rpc.call(
+                    "turn/start",
+                    {
+                        "threadId": executor_thread_id,
+                        "input": [{"type": "text", "text": text}],
+                        "approvalPolicy": "never",
+                        "cwd": state.runtime_cwd,
+                        "effort": DEFAULT_CONVERSATION_EFFORT,
+                    },
+                    timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                )
+            except BaseException:
+                background_turn_starting = False
+                await reject_all_early_background_tool_calls()
+                raise
+            turn = response.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, Mapping) else None
+            if not isinstance(turn_id, str) or not turn_id:
+                background_turn_starting = False
+                await reject_all_early_background_tool_calls()
+                raise ProtocolError("turn/start returned an invalid realtime turn id")
+            if generation != background_generation:
+                background_turn_starting = False
+                await reject_all_early_background_tool_calls()
+                await state.rpc.call(
+                    "turn/interrupt",
+                    {"threadId": executor_thread_id, "turnId": turn_id},
+                    timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                )
+                return
+            active_background_turn_id = turn_id
+            active_background_turn_generation = generation
+            active_background_turn_had_tool = False
+            active_background_turn_interrupting = False
+            active_background_terminal = asyncio.get_running_loop().create_future()
+            arm_background_turn_watchdog(
+                turn_id,
+                generation,
+                active_background_terminal,
+            )
+            buffered = early_background_events.pop(turn_id, [])
+            foreign = [
+                event
+                for events_for_turn in early_background_events.values()
+                for event in events_for_turn
+            ]
+            early_background_events.clear()
+            background_turn_starting = False
+            for event in foreign:
+                if event.get("method") == "item/tool/call":
+                    await reject_unowned_tool_call(event)
+            for event in buffered:
+                await handle_executor_event(event)
+
+    async def complete_background_turn(params: Mapping[str, Any]) -> None:
+        nonlocal active_background_terminal, active_background_turn_generation
+        nonlocal active_background_turn_had_tool, active_background_turn_id
+        nonlocal active_background_turn_interrupting
+        nonlocal queued_background_request
+        turn = params.get("turn")
+        turn_values = turn if isinstance(turn, Mapping) else {}
+        turn_id = executor_event_turn_id(params)
+        if turn_id != active_background_turn_id:
+            return
+        generation = active_background_turn_generation
+        final_text = completed_background_text()
+        status = turn_values.get("status", params.get("status"))
+        terminal = active_background_terminal
+        active_background_turn_id = None
+        active_background_turn_generation = None
+        active_background_turn_had_tool = False
+        active_background_turn_interrupting = False
+        active_background_terminal = None
+        clear_background_agent_messages()
+        if terminal is not None and not terminal.done():
+            terminal.set_result(None)
+        queued = queued_background_request
+        queued_background_request = None
+        if generation is not None and generation == background_generation:
+            if status != "completed":
+                raise ProtocolError("assistant failed to complete the request")
+            if final_text is None:
+                await send(
+                    {"type": "error", "error": "assistant returned no final response"}
+                )
+            else:
+                await append_background_speech(final_text, generation)
+        if queued is not None and queued[0] == background_generation:
+            await start_background_turn(queued[1], queued[0])
+
+    async def handle_executor_event(event: Mapping[str, Any]) -> None:
+        """Reduce one already-filtered executor event into the active turn."""
+        nonlocal active_background_turn_had_tool
+        method = event.get("method")
+        raw_params = event.get("params")
+        params = raw_params if isinstance(raw_params, Mapping) else {}
+        if method == "item/tool/call" and "id" in event:
+            if (
+                params.get("turnId") != active_background_turn_id
+                or active_background_turn_interrupting
+                or active_background_turn_generation != background_generation
+            ):
+                await reject_unowned_tool_call(event)
+                return
+            active_background_turn_had_tool = True
+            start_home_assistant_tool_call(event)
+            return
+        if method == "item/agentMessage/delta":
+            remember_background_agent_message(params, authoritative=False)
+            return
+        if method == "item/completed":
+            remember_background_agent_message(params, authoritative=True)
+            return
+        if method == "turn/completed":
+            await complete_background_turn(params)
+
+    async def remember_managed_user_turn(turn_id: str) -> None:
+        """Bind a raw provider user turn to the current speech generation."""
+        nonlocal input_speech_active, pending_managed_speech_generation
+        nonlocal user_transcript_handled
+        if not claim_managed_turn_id(turn_id):
+            return
+        generation = pending_managed_speech_generation
+        if generation is not None and generation == background_generation:
+            pending_managed_speech_generation = None
+        else:
+            interrupted_owner = active_background_turn_owner()
+            generation = begin_background_generation()
+            input_speech_active = True
+            user_transcript_handled = False
+            request_backend_render_cancel_best_effort()
+            await end_output(after_tail=False)
+            await interrupt_active_background_turn(interrupted_owner)
+        managed_user_turn_generations[turn_id] = generation
+        managed_user_turn_generations.move_to_end(turn_id)
+        while len(managed_user_turn_generations) > MAX_REALTIME_USER_TURN_CORRELATIONS:
+            managed_user_turn_generations.popitem(last=False)
+
+    async def complete_managed_user_turn(control: RealtimeDataControl) -> None:
+        """Dispatch only a transcript correlated to the current raw user turn."""
+        nonlocal input_speech_active, user_transcript_handled
+        turn_id = control.turn_id
+        generation = (
+            managed_user_turn_generations.pop(turn_id, None)
+            if turn_id is not None
+            else None
+        )
+        if (
+            generation is None
+            or generation != background_generation
+            or user_transcript_handled
+        ):
+            return
+        user_transcript_handled = True
+        input_speech_active = False
+        text = control.transcript
+        if not isinstance(text, str) or not text.strip():
+            return
+        if len(text) > MAX_HISTORY_CONTEXT_CHARS:
+            await send(
+                {
+                    "type": "error",
+                    "error": "realtime transcript exceeds its size limit",
+                }
+            )
+            return
+        request_backend_render_cancel_best_effort()
+        await end_output(after_tail=False)
+        await run_control(
+            start_background_turn(text.strip(), generation),
+            "background turn",
+        )
+
+    async def handle_managed_user_control(control: RealtimeDataControl) -> None:
+        if control.event_type == "turn.created":
+            if control.turn_id is not None:
+                await remember_managed_user_turn(control.turn_id)
+            return
+        if (
+            control.turn_id is not None
+            and control.turn_id not in managed_user_turn_generations
+        ):
+            # Tombstone a terminal that arrived without an owned user start.
+            # A later assistant start must not be able to reuse this ID and
+            # steal the bridge-owned render slot.
+            claim_managed_turn_id(control.turn_id)
+            return
+        await complete_managed_user_turn(control)
+
     async def receive() -> None:
+        nonlocal input_speech_active, pending_managed_speech_generation
+        nonlocal user_transcript_handled
         while not stop.is_set():
             message = await _receive_realtime_message(
                 websocket, allow_binary=wire_protocol.uses_binary_audio
@@ -4662,14 +5763,30 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     raise ProtocolError(
                         "protocol_version 2 text must be a bounded user message"
                     )
-                await run_control(
-                    session.append_text(text, role),
-                    "text control",
-                )
+                if bridge_managed_realtime:
+                    generation = begin_background_generation()
+                    input_speech_active = False
+                    pending_managed_speech_generation = None
+                    user_transcript_handled = True
+                    request_backend_render_cancel_best_effort()
+                    await end_output(after_tail=False)
+                    await run_control(
+                        start_background_turn(text, generation),
+                        "background turn",
+                    )
+                else:
+                    await run_control(
+                        session.append_text(text, role),
+                        "text control",
+                    )
             elif message_type == "speech":
                 text = message.get("text")
                 if not isinstance(text, str) or not text:
                     raise ProtocolError("speech text must be a non-empty string")
+                if bridge_managed_realtime:
+                    raise ProtocolError(
+                        "broker-managed realtime does not accept device speech"
+                    )
                 if (
                     wire_protocol.uses_binary_audio
                     and len(text) > MAX_SYNTHESIS_TEXT_CHARS
@@ -4690,6 +5807,39 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
                 )
             elif message_type == "interrupt":
+                if bridge_managed_realtime:
+                    interrupted_owner = active_background_turn_owner()
+                    begin_background_generation()
+                    input_speech_active = False
+                    pending_managed_speech_generation = None
+                    user_transcript_handled = True
+                    request_backend_render_cancel_best_effort()
+                    await end_output(after_tail=False)
+                    await run_control(
+                        interrupt_active_background_turn(interrupted_owner),
+                        "background interrupt",
+                    )
+                    if not managed_interrupt_continuation:
+                        await send(
+                            {
+                                "type": "stopped",
+                                "reason": "interrupt",
+                                "fresh_session_required": True,
+                                "remote_cancelled": False,
+                            }
+                        )
+                        stop.set()
+                        return
+                    await send(
+                        {
+                            "type": "stopped",
+                            "reason": "interrupt",
+                            "fresh_session_required": False,
+                            "remote_cancelled": False,
+                            "continuation_safe": True,
+                        }
+                    )
+                    continue
                 if wire_protocol.uses_binary_audio:
                     await end_output(after_tail=False)
                     remote_cancelled = await request_remote_response_cancel()
@@ -4730,14 +5880,46 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     }
                 )
 
+    async def reject_unowned_tool_call(event: Mapping[str, Any]) -> None:
+        """Answer an unowned App Server request without touching Home Assistant."""
+        request_id = event.get("id")
+        params = event.get("params")
+        values = params if isinstance(params, Mapping) else {}
+        if (
+            not isinstance(request_id, (int, str))
+            or request_id in claimed_tool_responses
+        ):
+            return
+        call_id = str(values.get("callId", request_id))
+        claimed_tool_responses.add(request_id)
+        await _respond_to_tool_result(
+            state.rpc,
+            {
+                "call_id": call_id,
+                "success": False,
+                "result": {
+                    "error": "unowned_home_assistant_tool_call",
+                    "do_not_retry": True,
+                },
+            },
+            {call_id: request_id},
+            timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+        )
+        delivered_tool_responses.add(request_id)
+
     async def events() -> None:
         while not stop.is_set():
             event = await session.next_event()
+            event_trace.app_event(event)
             method = event.get("method")
-            params = event.get("params", {})
+            raw_params = event.get("params")
+            params = raw_params if isinstance(raw_params, Mapping) else {}
             if method == "item/tool/call" and "id" in event:
                 if wire_protocol.uses_binary_audio:
-                    start_home_assistant_tool_call(event)
+                    if bridge_managed_realtime:
+                        await reject_unowned_tool_call(event)
+                    else:
+                        start_home_assistant_tool_call(event)
                     continue
                 call_id = str(params.get("callId", event["id"]))
                 tool_requests[call_id] = event["id"]
@@ -4753,14 +5935,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 )
             elif method == "thread/realtime/transcript/delta":
                 if wire_protocol.uses_binary_audio:
+                    role = str(params.get("role", "")).lower()
                     if (
-                        str(params.get("role", "")).lower()
-                        in {
-                            "assistant",
-                            "output",
-                        }
+                        role in {"assistant", "output"}
+                        and not bridge_managed_realtime
                         and pending_tool_continuation_correlation is None
                     ):
+                        announce_tool_continuation_output()
                         await arm_output()
                     continue
                 await send(
@@ -4772,14 +5953,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 )
             elif method == "thread/realtime/transcript/done":
                 if wire_protocol.uses_binary_audio:
-                    if (
-                        str(params.get("role", "")).lower()
-                        in {
-                            "assistant",
-                            "output",
-                        }
-                        and pending_tool_continuation_correlation is None
-                    ):
+                    role = str(params.get("role", "")).lower()
+                    if role == "user" and bridge_managed_realtime:
+                        continue
+                    if role in {"assistant", "output"} and not bridge_managed_realtime:
                         await end_output(after_tail=True)
                     continue
                 await send(
@@ -4819,6 +5996,49 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     continue
                 await send({"type": "event", "method": method, "params": params})
 
+    async def executor_events() -> None:
+        """Consume only events from the isolated, tool-bearing executor thread."""
+        if executor_subscription is None or executor_thread_id is None:
+            await asyncio.Future()
+            return
+        # Teardown keeps this consumer alive after ``stop`` is set so it can
+        # reject late tools and observe the forced executor terminal. The
+        # socket owner cancels it only after that bounded boundary.
+        while True:
+            event = await executor_subscription.get()
+            method = event.get("method")
+            if method == "bridge/appServerExited":
+                params = event.get("params")
+                values = params if isinstance(params, Mapping) else {}
+                raise AppServerExited(
+                    f"Codex App Server exited with status {values.get('returncode')}"
+                )
+            raw_params = event.get("params")
+            params = raw_params if isinstance(raw_params, Mapping) else {}
+            if params.get("threadId") != executor_thread_id:
+                continue
+            event_trace.app_event(event)
+            turn_id = executor_event_turn_id(params)
+            if (
+                background_turn_starting
+                and active_background_turn_id is None
+                and turn_id is not None
+            ):
+                buffered_count = sum(map(len, early_background_events.values()))
+                if buffered_count < MAX_EARLY_TURN_EVENTS:
+                    early_background_events.setdefault(turn_id, []).append(dict(event))
+                else:
+                    if method == "item/tool/call":
+                        await reject_unowned_tool_call(event)
+                    if tool_call_failures.empty():
+                        tool_call_failures.put_nowait(
+                            ProtocolError(
+                                "realtime executor exceeded the early-event limit"
+                            )
+                        )
+                continue
+            await handle_executor_event(event)
+
     async def audio() -> None:
         nonlocal output_last_pcm_at
         while not stop.is_set():
@@ -4826,71 +6046,178 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             if not wire_protocol.uses_binary_audio:
                 await send_audio(chunk)
                 continue
+            expected_backend_generation = (
+                backend_output_generation if bridge_managed_realtime else None
+            )
+            if bridge_managed_realtime and (
+                expected_backend_generation is None
+                or expected_backend_generation != background_generation
+            ):
+                # Media has no bridge generation identifier. Never buffer
+                # pre-ack PCM: after barge-in it could belong to a retired
+                # render and later be mistaken for the next response.
+                continue
             delivered_output = False
             async with output_state_lock:
+                if bridge_managed_realtime and (
+                    expected_backend_generation is None
+                    or backend_output_generation != expected_backend_generation
+                    or background_generation != expected_backend_generation
+                ):
+                    continue
                 if output_speaking:
                     output_last_pcm_at = time.monotonic()
-                    await send_audio(chunk)
-                    delivered_output = _realtime_pcm_has_signal(chunk)
+                    sent = await send_audio(chunk, expected_backend_generation)
+                    delivered_output = sent and _realtime_pcm_has_signal(chunk)
                 else:
                     quarantine_output(chunk)
                     if output_armed and output_preroll:
-                        await begin_output_locked()
+                        await begin_output_locked(expected_backend_generation)
                         delivered_output = output_speaking
             if delivered_output:
                 complete_tool_continuation_after_output()
 
-    async def data_events() -> None:
+    async def handle_managed_backend_terminal(
+        control: RealtimeDataControl, *, cancelled: bool
+    ) -> None:
+        """Apply a provider terminal only after render-identity validation."""
+        nonlocal active_response_id, backend_output_generation
+        if not backend_render_terminal_matches(control.response_id, control.turn_id):
+            return
+        owned_output = bridge_output_authorized()
+        complete_tool_continuation_after_terminal(
+            control.event_type, control.response_id
+        )
+        await end_output(after_tail=owned_output and not cancelled)
+        if control.response_id == active_response_id:
+            active_response_id = None
+        if owned_output:
+            backend_output_generation = None
+        mark_backend_render_terminal(control.response_id, control.turn_id)
+        if owned_output and not cancelled:
+            await send(control.wire_value())
+
+    def control_starts_output(control: RealtimeDataControl) -> bool:
+        return control.event_type in {
+            "output_audio_buffer.started",
+            "response.created",
+        } or (
+            control.event_type == "turn.created"
+            and control.role in {"assistant", "output"}
+        )
+
+    def control_ends_output(control: RealtimeDataControl) -> bool:
+        return control.event_type in {
+            "output_audio_buffer.stopped",
+            "response.done",
+        } or (
+            control.event_type == "turn.done"
+            and (
+                control.role in {"assistant", "output"}
+                or (not bridge_managed_realtime and output_speaking)
+            )
+        )
+
+    async def handle_cancelled_response(control: RealtimeDataControl) -> None:
         nonlocal active_response_id
+        if bridge_managed_realtime:
+            return
+        complete_tool_continuation_after_terminal(
+            control.event_type, control.response_id
+        )
+        await end_output(after_tail=False)
+        waiter = pending_cancel_confirmation
+        if (
+            waiter is not None
+            and not waiter.done()
+            and pending_cancel_response_id is not None
+            and control.response_id == pending_cancel_response_id
+        ):
+            waiter.set_result(None)
+        if control.response_id == active_response_id:
+            active_response_id = None
+        await send(control.wire_value())
+
+    async def data_events() -> None:
+        nonlocal active_response_id, backend_output_generation
+        nonlocal backend_render_context_acknowledged, input_speech_active
+        nonlocal pending_managed_speech_generation
+        nonlocal user_transcript_handled
         while not stop.is_set():
             raw_event = await session.recv_data_event()
+            event_trace.data_event(raw_event)
             control = parse_data_control_event(raw_event)
             if control is None or not wire_protocol.uses_binary_audio:
                 continue
+            if control.event_type == "session.context.appended":
+                if bridge_managed_realtime and backend_render_generation is not None:
+                    backend_render_context_acknowledged = True
+                    maybe_retire_backend_render()
+                continue
+            if (
+                bridge_managed_realtime
+                and control.role == "user"
+                and control.event_type in {"turn.created", "turn.done"}
+            ):
+                await handle_managed_user_control(control)
+                continue
             if control.event_type == "input_audio_buffer.speech_started":
-                # Local playback must stop on the first provider VAD signal. The
-                # provider owns automatic interruption; this event alone does not
-                # prove that it cancelled the response.
+                managed_barge_started = False
+                interrupted_owner: tuple[str | None, int | None] | None = None
+                if (
+                    bridge_managed_realtime
+                    and pending_managed_speech_generation is None
+                ):
+                    interrupted_owner = active_background_turn_owner()
+                    pending_managed_speech_generation = begin_background_generation()
+                    input_speech_active = True
+                    user_transcript_handled = False
+                    request_backend_render_cancel_best_effort()
+                    managed_barge_started = True
+                # Commit the generation tombstone above before either socket
+                # or output cleanup can yield to a late executor tool event.
                 await send(control.wire_value())
                 await end_output(after_tail=False)
+                if managed_barge_started and interrupted_owner is not None:
+                    await interrupt_active_background_turn(interrupted_owner)
                 continue
             if control.response_cancelled:
-                complete_tool_continuation_after_terminal(
-                    control.event_type, control.response_id
-                )
-                await end_output(after_tail=False)
-                waiter = pending_cancel_confirmation
-                if (
-                    waiter is not None
-                    and not waiter.done()
-                    and pending_cancel_response_id is not None
-                    and control.response_id == pending_cancel_response_id
-                ):
-                    waiter.set_result(None)
-                if control.response_id == active_response_id:
-                    active_response_id = None
-                await send(control.wire_value())
+                await handle_cancelled_response(control)
                 continue
-            if control.event_type in {
-                "output_audio_buffer.started",
-                "response.created",
-            } or (
-                control.event_type == "turn.created"
-                and control.role in {"assistant", "output"}
-            ):
+            if control_starts_output(control):
+                if bridge_managed_realtime:
+                    if control.event_type != "turn.created" or control.turn_id is None:
+                        continue
+                    if not claim_managed_turn_id(control.turn_id):
+                        continue
+                    if not mark_backend_render_started(turn_id=control.turn_id):
+                        continue
+                    render_generation = backend_render_generation
+                    if (
+                        render_generation is None
+                        or render_generation != background_generation
+                    ):
+                        request_backend_render_cancel_best_effort()
+                        await end_output(after_tail=False)
+                        continue
+                    await authorize_backend_output(render_generation)
+                    await send(control.wire_value())
+                    continue
                 if control.event_type == "response.created":
                     active_response_id = control.response_id
                 announce_tool_continuation_output(control.response_id)
                 await arm_output()
                 await send(control.wire_value())
                 continue
-            if control.event_type in {
-                "output_audio_buffer.stopped",
-                "response.done",
-            } or (
-                control.event_type == "turn.done"
-                and (control.role in {"assistant", "output"} or output_speaking)
-            ):
+            if control_ends_output(control):
+                if bridge_managed_realtime:
+                    if control.event_type != "turn.done" or control.turn_id is None:
+                        continue
+                    if not backend_render_terminal_matches(turn_id=control.turn_id):
+                        claim_managed_turn_id(control.turn_id)
+                        continue
+                    await handle_managed_backend_terminal(control, cancelled=False)
+                    continue
                 if (
                     control.event_type == "response.done"
                     and control.response_id == active_response_id
@@ -4904,6 +6231,56 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 continue
             await send(control.wire_value())
 
+    def tombstone_background_for_shutdown() -> tuple[str | None, int | None]:
+        """Reject late executor work before teardown yields to cleanup."""
+        nonlocal active_background_turn_interrupting, queued_background_request
+        owner = active_background_turn_owner()
+        queued_background_request = None
+        if owner[0] is not None:
+            active_background_turn_interrupting = True
+        # A queued request can already be inside ``start_background_turn``
+        # after its previous owner cleared but before turn/start returned.
+        # Tombstone every captured generation, including that ownerless gap.
+        begin_background_generation()
+        return owner
+
+    async def interrupt_background_for_shutdown(
+        expected_owner: tuple[str | None, int | None],
+    ) -> None:
+        """Bound termination while the executor event consumer is still alive."""
+        turn_id, _generation = expected_owner
+        if executor_thread_id is None:
+            return
+        # Always acquire the lock, even without a captured turn id. This waits
+        # for an in-flight stale turn/start path to interrupt the turn it just
+        # created before the event consumer is cancelled and threads deleted.
+        async with background_turn_lock:
+            if turn_id is None:
+                return
+            if active_background_turn_owner() != expected_owner:
+                return
+            terminal = active_background_terminal
+            if terminal is not None and terminal.done():
+                return
+            try:
+                await state.rpc.call(
+                    "turn/interrupt",
+                    {"threadId": executor_thread_id, "turnId": turn_id},
+                    timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - teardown remains bounded.
+                LOGGER.warning("Could not interrupt realtime executor during teardown")
+            if terminal is not None and not terminal.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(terminal),
+                        timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    LOGGER.warning(
+                        "Realtime executor did not terminate before teardown"
+                    )
+
     tasks = {
         asyncio.create_task(receive(), name="codex-realtime-receiver"),
         asyncio.create_task(events(), name="codex-realtime-events"),
@@ -4913,6 +6290,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             raise_tool_call_failure(), name="codex-realtime-tool-failure"
         ),
     }
+    executor_event_task: asyncio.Task[None] | None = None
+    if executor_subscription is not None:
+        executor_event_task = asyncio.create_task(
+            executor_events(), name="codex-realtime-executor-events"
+        )
+        tasks.add(executor_event_task)
     try:
         while not stop.is_set():
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -4923,18 +6306,24 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 stop.set()
     finally:
         stop.set()
+        shutdown_background_owner = tombstone_background_for_shutdown()
         auxiliary_tasks = tuple(output_aux_tasks)
+        background_timeouts = tuple(background_watchdog_tasks)
         pending_tool_calls = tuple(tool_call_tasks)
         for task in auxiliary_tasks:
+            task.cancel()
+        for task in background_timeouts:
             task.cancel()
         for request_id, (_call_id, task) in tuple(active_tool_calls.items()):
             if request_id not in claimed_tool_responses:
                 task.cancel()
-        for task in tasks:
+        other_tasks = tuple(task for task in tasks if task is not executor_event_task)
+        for task in other_tasks:
             task.cancel()
         await asyncio.gather(
-            *tasks,
+            *other_tasks,
             *auxiliary_tasks,
+            *background_timeouts,
             *pending_tool_calls,
             return_exceptions=True,
         )
@@ -4963,6 +6352,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 LOGGER.warning(
                     "Timed out closing realtime Home Assistant tool requests"
                 )
+        await interrupt_background_for_shutdown(shutdown_background_owner)
+        if executor_event_task is not None:
+            executor_event_task.cancel()
+            await asyncio.gather(executor_event_task, return_exceptions=True)
+        if executor_subscription is not None:
+            executor_subscription.close()
 
 
 async def _drain_transcription_audio(
@@ -5639,7 +7034,8 @@ async def _receive_ws_json(
     websocket: web.WebSocketResponse,
     timeout: float | None = None,
 ) -> dict[str, Any]:
-    message = await websocket.receive(timeout=timeout)
+    async with asyncio.timeout(timeout):
+        message = await websocket.receive()
     if message.type == WSMsgType.TEXT:
         try:
             value = json.loads(message.data)
@@ -5706,8 +7102,11 @@ async def _send_realtime_binary(
     value: bytes,
     *,
     send_lock: asyncio.Lock,
-) -> None:
-    await _send_realtime_frame(websocket, value, send_lock=send_lock, binary=True)
+    guard: Callable[[], bool] | None = None,
+) -> bool:
+    return await _send_realtime_frame(
+        websocket, value, send_lock=send_lock, binary=True, guard=guard
+    )
 
 
 async def _send_realtime_frame(
@@ -5716,7 +7115,8 @@ async def _send_realtime_frame(
     *,
     send_lock: asyncio.Lock | None,
     binary: bool,
-) -> None:
+    guard: Callable[[], bool] | None = None,
+) -> bool:
     async def send() -> None:
         if binary:
             assert isinstance(value, bytes)
@@ -5728,14 +7128,20 @@ async def _send_realtime_frame(
     try:
         async with asyncio.timeout(REALTIME_WEBSOCKET_SEND_TIMEOUT_SECONDS):
             if send_lock is None:
+                if guard is not None and not guard():
+                    return False
                 await send()
             else:
                 async with send_lock:
+                    if guard is not None and not guard():
+                        return False
                     await send()
     except TimeoutError as exc:
         raise ProtocolError("realtime WebSocket send timed out") from exc
     except (ConnectionError, RuntimeError) as exc:
         raise ProtocolError("realtime WebSocket send failed") from exc
+    else:
+        return True
 
 
 async def _safe_realtime_json(

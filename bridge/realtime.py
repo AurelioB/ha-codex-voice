@@ -80,6 +80,7 @@ class RealtimeSession:
         voice: str | None = None,
         include_startup_context: bool = False,
         client_managed_handoffs: bool = True,
+        delegation_ack_filler: bool | None = None,
         initial_items: list[dict[str, str]] | None = None,
     ) -> None:
         handshake_started = monotonic()
@@ -95,6 +96,12 @@ class RealtimeSession:
             "transport": {"type": "webrtc", "sdp": offer},
             "version": self.version,
         }
+        if delegation_ack_filler is not None:
+            if self.version != "v3":
+                raise ProtocolError(
+                    "delegation acknowledgement control requires version v3"
+                )
+            params["delegationAckFiller"] = delegation_ack_filler
         if prompt is not None:
             params["prompt"] = prompt
         if model:
