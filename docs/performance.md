@@ -90,12 +90,12 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge v2 WebRTC input track | 2,250 ms | Limits only live device lag; finite STT retains its whole-utterance capacity |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | Bounds a stalled downstream consumer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds PCM waiting for non-blocking `paplay` input |
-| Full-duplex AEC sink ceiling | Configured 1–25%, checked at preflight and every response | Fails closed if any live sink channel is too loud |
+| Full-duplex AEC sink ceiling | Configured 1–60% (25% default), checked at preflight and every response | Fails closed if any live sink channel is too loud |
 | Home Assistant tool execution + result send | 25 s + 5 s | Bounds the authority action and component transport separately |
 | Bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
 | App Server tool fallback | 45 s | Remains responsible until the result write completes |
 | Post-tool provider continuation | 20 s | Requires output or a terminal response after result delivery |
-| Full-duplex `paplay` stream | Same configured ceiling, never above 25% | Pins each response to the reviewed AEC sink and fixed linear volume |
+| Full-duplex `paplay` stream | Independently configured 1–60% (25% default), never above the sink ceiling | Pins each response to the reviewed AEC sink and fixed linear volume |
 
 The pre-roll is included inside the microphone and fallback bounds; it is not
 additional queue capacity. It is transferred only for Okay Computer. Okay Nabu
@@ -123,7 +123,7 @@ the microphone gate stays closed from `speaking.started` until the
 corresponding PCM has drained from both the local queue and playback child.
 Opt-in full duplex requires a reviewed static PulseAudio AEC topology using the
 exact configured allowlisted engine, exact current-process capture and playback
-routing, and a configured sink ceiling from 1–25%. WebRTC is the omitted-value
+routing, and a configured sink ceiling from 1–60% with a 25% default. WebRTC is the omitted-value
 default and never automatically falls back. The stock v1.1.7 build rejects
 WebRTC and Speex, so active stock-device deployments explicitly select Adrian.
 The client checks that topology, method, and ceiling before opening the bridge
@@ -166,7 +166,7 @@ preemption,
 pre-ready fallback, stop-word latency, first-audio latency, queue failures,
 repeated turns, memory stability, player cleanup, and recovery after bridge and
 Wi-Fi loss. Full-duplex acceptance must additionally cover early/middle/late
-double-talk at no more than 25%, self-echo rejection, per-response volume
+double-talk at the configured sink and stream values, self-echo rejection, per-response volume
 failure, `paplay` device/stream pinning, and both correlated-resume and
 fresh-session cancellation outcomes. It must also verify TCP ADB port 5555
 before and after every device restart or reboot; the overlay never changes the
@@ -608,9 +608,10 @@ active acoustic echo cancellation, so listening during either audible cue
 would also capture the device's own acknowledgement. The optional static
 PulseAudio AEC path is qualified for full-duplex response playback, not used as
 a reason to restore the wake cue. The stock v1.1.7 reference device passed its
-bounded Adrian canaries at 25%, but each installation remains unqualified until
-its own physical double-talk and echo-rejection canaries pass at no more than
-25%.
+bounded Adrian canaries at 25%, but each installation and every increase above
+its previously qualified values remains unqualified until its own physical
+double-talk and echo-rejection canaries pass at the configured values (up to
+the explicit 60% maximum).
 
 The pinned overlay therefore skips audible-cue playback and uses the listening
 LED as best-effort visual acknowledgement. This avoids both self-audio and the

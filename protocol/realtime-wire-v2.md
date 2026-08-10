@@ -211,9 +211,13 @@ names, those endpoints as defaults, and every current-process native capture
 stream routed through the uncorked AEC source. The allowlist is `webrtc`,
 `speex`, and `adrian`; omitted configuration defaults to WebRTC and never falls
 back automatically. Every AEC sink channel must be at or below the configured
-`aec_test_volume_percent`, which is limited to 1–25. The same sink ceiling is
-rechecked before every speaking epoch, and `paplay` is pinned to the AEC sink
-with a fixed linear stream volume no greater than that ceiling. The sink guard
+`aec_sink_volume_ceiling_percent`, which defaults to 25 and is limited to
+1–60. The same sink ceiling is rechecked before every speaking epoch, and
+`paplay` is pinned to the AEC sink with the independently configured fixed
+linear `playback_volume_percent`, also defaulting to 25 and limited to 1–60.
+Configuration is rejected when playback exceeds the sink ceiling.
+The legacy `aec_test_volume_percent` key maps to both values only when neither
+explicit key is present. The sink guard
 compares raw PulseAudio volume units against the exact linear ceiling; it does
 not trust the rounded displayed percentage. An engine loading and producing
 the expected endpoints does not replace physical echo-rejection and double-talk

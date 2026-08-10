@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from device.thirdreality.realtime_client.config import (
+    DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_PLAYBACK_VOLUME_PERCENT,
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
+    MAX_REALTIME_VOLUME_PERCENT,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -50,6 +54,11 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
     assert config.pulse_aec_method is None
+    assert (
+        config.aec_sink_volume_ceiling_percent
+        == DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT
+    )
+    assert config.playback_volume_percent == DEFAULT_PLAYBACK_VOLUME_PERCENT
     assert config.aec_test_volume_percent == DEFAULT_AEC_TEST_VOLUME_PERCENT
     assert config.input_queue_bytes == 64 * 1024
     assert config.fallback_buffer_bytes == 64 * 1024
@@ -108,7 +117,9 @@ def test_config_accepts_explicit_turn_taking_and_one_recorder_frame(
     assert config.max_message_bytes == 2_048
 
 
-def test_config_accepts_explicit_bounded_aec_full_duplex(tmp_path: Path) -> None:
+def test_config_migrates_legacy_bounded_aec_volume_to_both_controls(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "realtime.json"
     _write_config(
         path,
@@ -129,7 +140,94 @@ def test_config_accepts_explicit_bounded_aec_full_duplex(tmp_path: Path) -> None
     assert config.pulse_aec_source == DEFAULT_PULSE_AEC_SOURCE
     assert config.pulse_aec_sink == DEFAULT_PULSE_AEC_SINK
     assert config.pulse_aec_method == "speex"
+    assert config.aec_sink_volume_ceiling_percent == 12
+    assert config.playback_volume_percent == 12
     assert config.aec_test_volume_percent == 12
+
+
+def test_config_accepts_explicit_sixty_percent_aec_and_playback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "aec_sink_volume_ceiling_percent": MAX_REALTIME_VOLUME_PERCENT,
+            "playback_volume_percent": MAX_REALTIME_VOLUME_PERCENT,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.aec_sink_volume_ceiling_percent == 60
+    assert config.playback_volume_percent == 60
+
+
+def test_config_accepts_playback_below_aec_sink_ceiling(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "aec_sink_volume_ceiling_percent": 60,
+            "playback_volume_percent": 40,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.aec_sink_volume_ceiling_percent == 60
+    assert config.playback_volume_percent == 40
+    assert config.aec_test_volume_percent == 40
+
+
+def test_config_rejects_playback_above_aec_sink_ceiling(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "aec_sink_volume_ceiling_percent": 40,
+            "playback_volume_percent": 60,
+        },
+    )
+
+    with pytest.raises(ConfigError, match="must not exceed"):
+        load_config(path, expected_uid=os.getuid())
+
+
+def test_legacy_direct_constructor_argument_still_couples_both_controls(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+
+    legacy_config = replace(config, aec_test_volume_percent=60)
+
+    assert legacy_config.aec_sink_volume_ceiling_percent == 60
+    assert legacy_config.playback_volume_percent == 60
+    assert legacy_config.aec_test_volume_percent == 60
+
+
+def test_direct_config_rejects_volume_above_sixty_percent(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+
+    with pytest.raises(ConfigError, match=r"playback_volume_percent.*1 through 60"):
+        replace(config, playback_volume_percent=61)
 
 
 def test_full_duplex_defaults_to_existing_webrtc_aec_contract(tmp_path: Path) -> None:
@@ -212,7 +310,21 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ),
         ({"aec_test_volume_percent": True}, "must be an integer"),
         ({"aec_test_volume_percent": 0}, "outside its supported range"),
-        ({"aec_test_volume_percent": 26}, "outside its supported range"),
+        ({"aec_test_volume_percent": 61}, "outside its supported range"),
+        ({"playback_volume_percent": True}, "must be an integer"),
+        ({"playback_volume_percent": 0}, "outside its supported range"),
+        ({"playback_volume_percent": 61}, "outside its supported range"),
+        (
+            {"aec_sink_volume_ceiling_percent": 61},
+            "outside its supported range",
+        ),
+        (
+            {
+                "aec_test_volume_percent": DEFAULT_AEC_TEST_VOLUME_PERCENT,
+                "playback_volume_percent": DEFAULT_PLAYBACK_VOLUME_PERCENT,
+            },
+            "cannot be combined",
+        ),
     ],
 )
 def test_config_rejects_unsafe_or_ambiguous_values(

@@ -329,7 +329,7 @@ when App Server v3 and a Home Assistant broker snapshot are captured
 authorized provider audio (48 kHz WebRTC)
   -> bridge downmix/resample and content-free epoch gate (24 kHz PCM16)
   -> bounded device playback queue (48 KiB / about 1.024 s)
-  -> fixed-argument paplay child pinned to the AEC sink and <=25% stream volume
+  -> fixed-argument paplay child pinned to the AEC sink and configured 1–60% stream volume (25% default)
 ```
 
 The recorder callback runs before local wake-model activation. The overlay
@@ -358,13 +358,13 @@ installer nor client automatically falls back. The observed stock v1.1.7 build
 rejects WebRTC and Speex but loads Adrian with the exact masters and
 `use_master_format=1`, producing 16 kHz mono endpoints; active stock-device
 configuration therefore explicitly selects Adrian. A startup preflight verifies
-the topology and configured 1–25% sink ceiling before any microphone audio
+the topology and configured 1–60% sink ceiling (25% default) before any microphone audio
 leaves the device. The ceiling is rechecked at every `speaking.started`, and
 every `paplay` child is pinned to the AEC sink with a fixed stream volume at or
 below that ceiling. The Adrian topology result does not replace physical
-double-talk qualification for each installation at no more than 25%; the
-reference device passed the bounded 25% echo-residual and staged barge-in
-canaries.
+double-talk qualification for each installation at its configured sink and
+stream values; the reference device passed the bounded 25% echo-residual and
+staged barge-in canaries, which do not qualify an explicit increase up to 60%.
 
 In verified full duplex, provider VAD continues receiving capture during
 playback. Two consecutive qualifying AEC-filtered microphone frames request a

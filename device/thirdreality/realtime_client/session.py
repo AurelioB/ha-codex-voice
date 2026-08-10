@@ -352,7 +352,7 @@ def _verify_aec_sink_volume(config: RealtimeConfig) -> None:
         ("get-sink-volume", sink), timeout=config.io_timeout_seconds
     )
     if not _sink_volume_within_ceiling(
-        sink_volume, ceiling=config.aec_test_volume_percent
+        sink_volume, ceiling=config.aec_sink_volume_ceiling_percent
     ):
         raise WebSocketError("PulseAudio echo cancellation is not active")
 
@@ -701,7 +701,7 @@ class RealtimeSession:
             self._config.output_queue_bytes,
             sink=(self._config.pulse_aec_sink if self._config.full_duplex else None),
             volume_percent=(
-                self._config.aec_test_volume_percent
+                self._config.playback_volume_percent
                 if self._config.full_duplex
                 else None
             ),

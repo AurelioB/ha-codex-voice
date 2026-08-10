@@ -8,5 +8,6 @@
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
   "max_message_bytes": 65536,
   "full_duplex": false,
-  "aec_test_volume_percent": 25
+  "aec_sink_volume_ceiling_percent": 25,
+  "playback_volume_percent": 25
 }

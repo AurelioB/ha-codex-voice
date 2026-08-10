@@ -170,12 +170,13 @@ handshake or provider response generation disappear.
 The device mode is turn-taking by default. Opt-in full duplex is a device-side
 contract: the pinned client must verify the reviewed static PulseAudio
 `module-echo-cancel` topology with the exact configured allowlisted AEC engine,
-exact source/sink and capture-process routing, and a 1–25% sink ceiling before
+exact source/sink and capture-process routing, and a configured 1–60% sink
+ceiling (25% by default) before
 it opens this route. WebRTC is the default when no method is supplied; there is
 no automatic fallback. The stock ThirdReality v1.1.7 module rejects WebRTC and
 Speex, so its qualified configuration must explicitly select Adrian. The client
 rechecks the ceiling before every response and pins `paplay` to the AEC sink
-with the same fixed stream-volume ceiling.
+with a fixed configured stream volume that cannot exceed the sink ceiling.
 
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises
