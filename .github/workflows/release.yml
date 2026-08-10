@@ -22,12 +22,22 @@ jobs:
         run: |
           mkdir -p release/thirdreality-realtime/latency_sitecustomize
           mkdir -p release/thirdreality-realtime/realtime_client
+          mkdir -p release/thirdreality-realtime/webrtc_sidecar
           mkdir -p release/thirdreality-realtime/deploy/pulse
           install -m 0644 \
             device/thirdreality/latency_sitecustomize/sitecustomize.py \
             release/thirdreality-realtime/latency_sitecustomize/sitecustomize.py
           install -m 0644 device/thirdreality/realtime_client/*.py \
             release/thirdreality-realtime/realtime_client/
+          install -m 0644 device/thirdreality/webrtc_sidecar/*.py \
+            release/thirdreality-realtime/webrtc_sidecar/
+          install -m 0644 \
+            device/thirdreality/webrtc-runtime.in \
+            device/thirdreality/webrtc-runtime.lock.txt \
+            device/thirdreality/webrtc-runtime.md \
+            release/thirdreality-realtime/
+          install -m 0644 scripts/install_thirdreality_webrtc_runtime.py \
+            release/thirdreality-realtime/install_thirdreality_webrtc_runtime.py
           install -m 0644 \
             device/thirdreality/codex-realtime.example.json \
             release/thirdreality-realtime/codex-realtime.example.json
