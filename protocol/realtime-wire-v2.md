@@ -8,6 +8,12 @@ deliberately grants the device only audio and bounded lifecycle-control
 authority; optional Home Assistant tools use a separate primary-token broker
 that is invisible to this wire.
 
+When strict v2 runs with App Server realtime v3 and a captured Home Assistant
+broker snapshot, the bridge uses a managed two-thread implementation: a
+tool-free speech frontend plus an isolated tool-bearing executor. This is an
+internal bridge policy, not additional device authority. Without all three
+conditions, the bridge retains its native realtime implementation.
+
 Version 1 remains supported for existing clients. A start message with no
 `protocol_version` selects v1 and continues to use JSON objects containing
 base64 audio. V2 never guesses or silently switches framing.
@@ -21,6 +27,13 @@ provider/thread startup. The primary bridge token remains valid for legacy v1
 compatibility whether or not a device token is configured. Use WSS through a
 trusted reverse proxy outside a source-restricted trusted LAN; this protocol
 does not make plaintext bearer authentication safe on an untrusted network.
+
+The current reference client also sends the exact WebSocket handshake header
+`User-Agent: ha-codex-voice-thirdreality/2`. This negotiates support for the
+managed `continuation_safe` interrupt acknowledgement described below. It does
+not change authentication or grant access to the Home Assistant broker. An
+older client without that exact value remains valid but receives the
+fresh-session fallback after a managed interrupt.
 
 ## Start and negotiation
 
@@ -86,10 +99,13 @@ input/output shapes and capabilities:
 it interrupts playback. `remote_cancel: false` is intentionally explicit: a
 client may never infer remote cancellation from a local flush or VAD event.
 `same_session_interrupt_ack: true` means the bridge can separately acknowledge
-one cancellation after it observes a provider `response.cancelled` event whose
-response identifier matches the active response. The bridge never claims that
-already-played audio was unheard or that an uncorrelated response was
-truncated.
+whether one interrupt may continue on this socket. On the native path, that
+requires a provider `response.cancelled` event whose identifier matches the
+active response. On the managed two-thread path, a `/2` client can instead
+receive `continuation_safe: true` after the bridge invalidates its owned
+executor/output generation. The latter explicitly keeps
+`remote_cancelled: false`. The bridge never claims that already-played audio
+was unheard or that an uncorrelated response was truncated.
 
 Invalid or ambiguous negotiation produces a JSON `error` and closes the
 socket before a Codex thread is created.
@@ -128,11 +144,12 @@ queue is 48 KiB, about 1.024 seconds at 24 kHz mono PCM16.
 
 The provider WebRTC track can contain continuous silence even when the
 assistant is not answering. The bridge drains that track but does not proxy
-pre-response silence. It quarantines at most 200 ms of non-silent leading audio
-and arms output only after an allowlisted provider lifecycle signal. The gate
-opens after both that signal and non-silent PCM; an arm with no audio or
-terminal event expires after a bounded timeout. Every output epoch begins
-before its first binary frame:
+pre-response silence. PCM received before an allowlisted provider lifecycle
+signal is dropped. That signal authorizes and arms output; it does not begin a
+speaking epoch by itself. After authorization, the bridge retains at most 200
+ms of non-silent leading audio, and the first authorized non-silent PCM begins
+the epoch. An arm with no audio or terminal event expires after a bounded
+timeout. Every output epoch begins before its first binary frame:
 
 ```json
 {"type":"control","event_type":"speaking.started","output_epoch":1}
@@ -148,6 +165,36 @@ It ends after the terminal boundary and a bounded tail:
 client must gate playback from these controls and must not infer that any bare
 binary frame starts a new response. After `speaking.stopped`, PCM for that
 epoch is no longer forwarded.
+
+The managed two-thread path adds a stricter bridge-owned authorization gate:
+
+```text
+identified raw v3 user turn (or bounded v2 user text)
+  -> isolated executor turn and optional Home Assistant broker calls
+  -> completed executor final
+  -> one <=500-byte UTF-8 appendSpeech on the tool-free frontend
+  -> session.context.appended for the current generation
+  -> unique assistant turn.created -> authorize and arm frontend PCM
+  -> first authorized non-silent PCM -> begin a speaking epoch
+  -> matching assistant turn.done -> retire the serialized render slot
+```
+
+The bridge starts the frontend with immutable routing instructions,
+`clientManagedHandoffs: true`, and `delegationAckFiller: false`; this requires
+Codex CLI 0.147.0 or newer. It disables unrelated repository startup context
+and drops all frontend PCM received before the context append and identified
+assistant turn agree with the same generation. Managed v3 accepts only its
+identified `turn.created`/`turn.done` lifecycle for render ownership; response
+and output-buffer aliases are ignored. Direct, replayed, or unsolicited
+frontend answers, provider acknowledgement filler, and late output from an old
+generation therefore cannot reach the device. Provider cancellation is best
+effort; generation matching is the authoritative local gate.
+
+The isolated executor must complete within the bridge request timeout. A
+failed terminal or missing completion produces a generic `error` and closes
+the session. During stop or disconnect, the bridge tombstones and interrupts
+an active executor turn before closing its event subscription and disposing
+both owned threads.
 
 The reference v1.1.7 client remains turn-taking by default: with
 `full_duplex: false`, it gates microphone submission from `speaking.started`
@@ -184,8 +231,13 @@ resume.
 
 The following client-to-bridge controls remain JSON:
 
-- `text`: append non-empty text with an optional `role`.
-- `speech`: request speech from non-empty text.
+- `text`: submit a non-empty, length-bounded **user** message. `role` may be
+  omitted (it defaults to `user`) or must be exactly `user`; v2 does not accept
+  assistant/output text roles. In the managed path this starts an isolated
+  executor turn; on the native path it is appended to the realtime session.
+- `speech`: request speech from non-empty, length-bounded text on the native
+  path. The managed path rejects this control because only an executor final
+  may enter its frontend rendering channel.
 - `ping`: request `{"type":"pong"}`.
 - `stop`: end the session normally.
 - `interrupt`: flush local output and request cancellation of the active
@@ -212,8 +264,49 @@ After a result is delivered, assistant output or a terminal provider event must
 arrive within 20 seconds or the session fails closed. These errors remain
 internal/provider-facing; the speaker still receives no tool payload.
 
-An interrupt that is not explicitly confirmed returns the safe fallback before
-the socket closes:
+With strict v2, App Server v3, and a captured authority snapshot, selected
+tools exist only on a separate executor thread. The WebRTC speech frontend is
+started with an empty tool list. A frontend, foreign, stale, or post-interrupt
+tool request is answered internally with
+`unowned_home_assistant_tool_call` and `do_not_retry: true` and is never sent to
+Home Assistant. App Server v3 may route native delegation before notifying the
+bridge, so this thread boundary—not frontend prompt compliance—is what prevents
+side effects.
+
+Every interrupt flushes the device's local playback and revokes the bridge's
+current output epoch. The acknowledgement then depends on the internal route
+and negotiated client behavior.
+
+For a broker-managed session from the exact `/2` User-Agent, the bridge
+advances its executor/output generation and asks the tool-free frontend
+provider to cancel only if an identified assistant render has started. Idle
+and merely pending frontend sessions are never cancelled. If the executor has
+not dispatched a Home Assistant tool, the bridge tombstones the turn before `turn/interrupt`, waits
+for its terminal event, and rejects any late tool request. Once a tool has been
+dispatched, it does not interrupt or replay that potentially side-effecting
+turn; it lets the result settle, suppresses the stale final, and, if barge-in
+produces another transcript, runs the newest queued transcript afterward. The
+acknowledgement is:
+
+```json
+{
+  "type": "stopped",
+  "reason": "interrupt",
+  "fresh_session_required": false,
+  "remote_cancelled": false,
+  "continuation_safe": true
+}
+```
+
+The client may continue on the same WebSocket. `continuation_safe` means that
+the bridge invalidated the owned executor/output generation and will not pass
+stale PCM; it does **not** mean the provider confirmed cancellation. The
+frontend is tool-free, so an unconfirmed provider response cannot dispatch a
+Home Assistant action.
+
+A broker-managed session from an older client does not opt into that local
+continuation contract. The bridge returns the established safe fallback and
+closes the socket:
 
 ```json
 {
@@ -224,14 +317,14 @@ the socket closes:
 }
 ```
 
-The device should flush its local playback queue on receipt. Continuing after
-an interrupt requires a new WebSocket and therefore a fresh remote realtime
-session. This is session teardown, not a claim that the provider truncated a
-response.
+The next wake uses a fresh WebSocket, frontend, and executor. This preserves
+backward compatibility: an older deployed client need not understand the new
+field or coordinatedly upgrade with the bridge.
 
-If and only if the bridge receives a provider `response.cancelled` event whose
-response identifier matches the response active when the request was sent, it
-returns:
+On the native (non-managed) v2 path, same-socket continuation remains tied to
+remote cancellation. If and only if the bridge receives a provider
+`response.cancelled` event whose response identifier matches the response
+active when the request was sent, it returns:
 
 ```json
 {
@@ -244,8 +337,9 @@ returns:
 
 The client may then continue on the same WebSocket. A cancellation event for a
 different response, a completion event, send failure, or the bounded
-confirmation timeout cannot produce this acknowledgement and falls back to
-fresh-session teardown.
+confirmation timeout cannot produce this acknowledgement; the bridge instead
+returns the same `fresh_session_required: true` /
+`remote_cancelled: false` fallback above and closes the socket.
 
 Control RPCs and WebSocket sends have finite deadlines. A failure is returned
 as an `error` when the socket remains writable, followed by exactly-once

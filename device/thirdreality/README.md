@@ -20,10 +20,12 @@ the vendor owner flushes local playback and tears down the remote session. A
 later wake after any such teardown creates a fresh WebSocket and realtime
 session. In opt-in full-duplex mode, bounded local AEC-filtered speech detection
 can flush playback before provider VAD for natural barge-in without releasing
-that owner. An explicit interrupt preserves
-the same socket only when the bridge returns an authoritative acknowledgement
-that remote cancellation succeeded; timeout or ambiguous cancellation closes
-the session.
+that owner. The client identifies its managed-interrupt support with
+`User-Agent: ha-codex-voice-thirdreality/2`. In a broker-managed session, the
+bridge can preserve the socket with an explicit `continuation_safe`
+acknowledgement even though provider cancellation is unconfirmed. Native
+sessions still require correlated remote cancellation; older clients in the
+managed path retain the fresh-session fallback.
 
 ## Realtime behavior and bounds
 
@@ -35,6 +37,18 @@ microphone frames are gated for as long as remote or locally buffered output
 can still be audible. Opt-in full duplex keeps microphone submission continuous
 only after a startup preflight verifies the exact echo-cancel source, sink, and
 loaded PulseAudio module.
+
+The bridge's managed implementation is conditional on strict wire v2, App
+Server realtime v3, and a captured Home Assistant broker snapshot. In that
+case, the device still sees only audio and content-free controls: a tool-free
+speech frontend produces an identified raw v3 user turn, an isolated executor
+owns the selected Home Assistant tools, and at most 500 UTF-8 bytes of its
+completed final answer return in one `thread/realtime/appendSpeech`. Frontend
+PCM is dropped until `session.context.appended` and a session-unique assistant
+turn identify that request for the current bridge generation; only then may a
+bounded current-generation preroll be retained. The speaker receives none of
+the transcript, executor, tool, or acknowledgement payloads. The managed bridge
+host requires Codex CLI 0.147.0 or newer.
 
 The default input and pre-ready fallback buffers are each 64 KiB: 2.048 seconds
 at 16 kHz mono PCM16. Once a cold handshake completes, queued input is sent at
@@ -94,10 +108,20 @@ PCM for that exact output epoch. A provider
 `input_audio_buffer.speech_started` event independently reinforces the same
 local boundary. Neither signal itself claims remote cancellation or tears down
 the session. The client separately negotiates
-`same_session_interrupt_ack: true`, accepts the bridge's sanitized
-`response.cancelled` event, and reuses the socket only for the explicit
-`fresh_session_required: false` / `remote_cancelled: true` stopped
-acknowledgement. The older safe fallback acknowledgement still closes it.
+`same_session_interrupt_ack: true` and accepts exactly two same-socket stopped
+acknowledgements: native correlated cancellation uses
+`fresh_session_required: false` / `remote_cancelled: true`; broker-managed
+generation invalidation uses `fresh_session_required: false` /
+`remote_cancelled: false` / `continuation_safe: true`. The latter says stale
+bridge-owned output cannot pass the generation gate, not that the provider
+cancelled its tool-free frontend. The older safe fallback acknowledgement
+still closes the socket.
+
+On managed barge-in before Home Assistant tool dispatch, the bridge tombstones
+and interrupts the executor turn, and a late tool request is rejected. After a
+tool has crossed the broker boundary, the bridge lets that action settle
+without cancellation or replay, suppresses the old final, and queues the newest
+transcript. The device's immediate playback flush is identical in both cases.
 
 The observed stock `1.01.07`/v1.1.7 PulseAudio build rejects both WebRTC and
 Speex because those engines are not compiled in. Adrian loads with the pinned
@@ -187,6 +211,9 @@ put the token in the archive, repository, shell history, or diagnostics. The
 device token is accepted only by `/v1/realtime` after a valid v2 negotiation;
 it cannot enter legacy v1 or `/v1/home-assistant/tools`. Do not reuse the Home
 Assistant bridge token, a Home Assistant access token, or Codex `auth.json`.
+The packaged client emits `User-Agent: ha-codex-voice-thirdreality/2`
+automatically. Removing or changing it does not bypass safety; a managed
+interrupt instead receives the legacy fresh-session fallback.
 
 The device never receives tool schemas, tool calls, results, or a Home
 Assistant credential. Realtime home control is disabled by default. To enable
@@ -337,7 +364,8 @@ discard, 32 KiB live headroom, normal-wake preemption, pre-ready fallback and
 replay, strict v2 framing, bounded pacing and queues, output-epoch playback,
 PulseAudio AEC preflight and explicit sink routing, continuous full-duplex
 capture, speech-start local flush and late-frame quarantine, authoritative
-same-socket interrupt acknowledgement, guarded static-AEC installation and
+native and managed same-socket interrupt acknowledgements, legacy-client
+fresh-session fallback, guarded static-AEC installation and
 rollback, interrupt cleanup, timer interruption, serialized non-blocking LED
 execution, newest-state overload coalescing, DBus timeout/nonzero handling,
 explicit worker shutdown, and the atomic unknown-bytecode fail-closed path.
@@ -364,10 +392,17 @@ On the physical device, verify these independently:
    Raising any AEC sink channel above the configured ceiling between responses
    must fail the next response, and the spawned `paplay` stream must remain
    pinned at or below 25%.
-8. A deliberately missing AEC module or mismatched default source/sink must fail
+8. With realtime authority enabled, exercise barge-in once before any Home
+   Assistant tool dispatch and once after a reviewed test action is dispatched.
+   The first executor turn must be interrupted without a late action; the
+   second action must settle once without replay, its stale answer must remain
+   inaudible, and the newest request must run afterward. The `/2` client must
+   keep the socket with `continuation_safe: true`; a client without that header
+   must receive the fresh-session fallback.
+9. A deliberately missing AEC module or mismatched default source/sink must fail
    direct startup before sending microphone audio, while Okay Nabu remains
    usable after rollback to `full_duplex: false`.
-9. TCP ADB remains reachable on port 5555 before deployment, after the service
+10. TCP ADB remains reachable on port 5555 before deployment, after the service
    restart, and after any reboot. The overlay and its procedures must never
    stop `adbd`, blank its TCP-port setting, or remove that recovery path.
 
