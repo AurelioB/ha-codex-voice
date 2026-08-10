@@ -45,32 +45,26 @@ The pinned v1.1.7 device overlay adds a second, explicitly separate route:
 ```text
 "Okay Nabu" -> stock satellite protocol -> Home Assistant Assist/tools
 "Okay Computer" -> in-process stdlib client -> realtime wire v2 -> bridge
-                 -> native realtime when managed conditions are absent
-                 -> managed when App Server v3 + authority snapshot:
-                    -> tool-free speech frontend (WebRTC)
-                    -> completed transcript -> isolated executor thread
-                    -> completed final -> appendSpeech -> acknowledged PCM
+                 -> conversation_mode: native
+                 -> one native App Server WebRTC voice thread
                  -> local device playback
 
-one explicitly opted-in Conversation subentry
-  -> Home Assistant LLM API snapshot
-  -> primary-token /v1/home-assistant/tools broker -> bridge
-  -> [managed v3 branch] dynamic tools for the isolated executor only
+No Home Assistant broker snapshot, transcript executor, or appendSpeech render
+handoff participates in the Okay Computer session.
 ```
 
 The direct device remains an untrusted audio/control endpoint. It never
 receives a Home Assistant credential, advertises tools, sends tool results, or
-receives provider tool calls or transcript content. Realtime home control is
-disabled by default. If an operator explicitly designates exactly one
-Conversation subentry as authority, the Home Assistant integration opens the
-separate broker with the primary bridge token, registers only that subentry's
-selected and bounded LLM API view, executes correlated calls locally, and
-returns results to the bridge. The route-scoped device token cannot open the
-broker. A normal Okay Nabu wake can preempt direct mode and regain the
-microphone on the same vendor capture thread.
+receives provider tool calls or transcript content. The current reference
+client always requests native mode. The bridge ignores any registered realtime
+authority for that session, so Okay Computer is tool-free; Okay Nabu owns Home
+Assistant Assist and entity control. Qualified device AEC makes Okay Computer
+the full-duplex/barge-in route. A normal Okay Nabu wake can preempt direct
+mode and regain the microphone on the same vendor capture thread.
 
-The authority is selected from Conversation config subentries, not from a
-device message. Zero or multiple opted-in subentries disable registration; the
+For legacy auto/managed compatibility, authority is selected from Conversation
+config subentries, not from a device message. Zero or multiple opted-in
+subentries disable registration; the
 configuration flow also rejects a second authority. A successful registration
 captures one immutable generation containing the rendered Home Assistant
 instructions, an `es-MX`-by-default locale, and no more than 128 selected tools.
@@ -80,13 +74,20 @@ an authority replacement, disconnect, timeout, correlation mismatch, or
 undeclared provider tool fails closed without exposing the broker exchange to
 the device.
 
-## Broker-managed realtime isolation
+## Legacy auto/managed realtime compatibility
 
-The two-thread route is conditional. It activates only when all three inputs
-are present: strict device wire v2, App Server realtime version v3, and a
-captured Home Assistant broker snapshot. A session without any one of those
-conditions keeps the native single-thread realtime behavior. Codex CLI 0.147.0
-or newer is required because this route explicitly disables App Server's
+The current ThirdReality client does not enter this route. It sends
+`conversation_mode: "native"`, requires the bridge to echo that selection, and
+therefore gets exactly one native App Server WebRTC voice thread. A native
+session does not wait for a transcript, create an executor, or call
+`thread/realtime/appendSpeech`.
+
+The two-thread route remains for older strict-v2 clients that omit
+`conversation_mode`. Under that compatibility policy it activates only when
+all three inputs are present: App Server realtime version v3, a captured Home
+Assistant broker snapshot, and an omitted conversation mode. A session without
+all three inputs keeps native single-thread behavior. Codex CLI 0.147.0 or newer
+is required because the managed route explicitly disables App Server's
 delegation acknowledgement filler.
 
 For the managed route, the bridge creates a tool-free realtime speech frontend
@@ -154,8 +155,9 @@ copied into Home Assistant or the repository.
 Threads start with `ephemeral: false`, but their persistence is confined to the
 temporary profile. This is intentional: App Server cannot apply
 `thread/delete` to an ephemeral thread. The bridge deletes one-shot STT, TTS,
-and realtime threads as soon as their session ends. A broker-managed realtime
-session owns both a frontend and executor thread, and its cleanup disposes both
+and realtime threads as soon as their session ends. A native device session
+owns one realtime thread. A legacy broker-managed session owns both a frontend
+and executor thread, and its cleanup disposes both
 even if stopping or deleting the other resource fails. The bundled Home
 Assistant component does not retain STT sessions for TTS, and the released
 bridge never issues a handoff ticket. Dormant validation and ownership
@@ -188,6 +190,12 @@ App Server's raw realtime WebSocket route is not used. In the pinned release it
 requires API-key authentication, while the WebRTC call-creation path works with
 Codex-managed ChatGPT OAuth and consumes ChatGPT subscription availability,
 not OpenAI Platform API quota.
+
+This App Server realtime surface is experimental and is not the documented
+OpenAI Realtime API. Its methods, events, admission behavior, and latency may
+change with Codex CLI/App Server. A native direct wake still performs cold
+thread creation and WebRTC negotiation; single-thread routing removes the
+bridge-created turn pipeline, not those startup costs.
 
 ## Reliable finite STT boundary
 
@@ -318,13 +326,8 @@ vendor microphone callback (16 kHz PCM16)
   -> bounded device input/fallback queues (64 KiB / 2.048 s)
   -> paced v2 binary WebSocket (up to 2x while catching up)
   -> bridge v2-only WebRTC input cap (2,250 ms)
-  -> Codex App Server realtime v3 speech frontend
-
-when App Server v3 and a Home Assistant broker snapshot are captured
-  -> identified raw user turn -> isolated App Server executor turn
-  -> selected tool calls/results -> primary-token Home Assistant broker
-  -> completed final -> one-frame frontend appendSpeech
-  -> context acknowledgement + identified assistant turn lifecycle
+  -> conversation_mode: native
+  -> one Codex App Server realtime v3 WebRTC voice thread
 
 authorized provider audio (48 kHz WebRTC)
   -> bridge downmix/resample and content-free epoch gate (24 kHz PCM16)
@@ -339,6 +342,12 @@ before official Assist starts. Stop, mute, disconnect, and teardown clear it,
 and no copy is written to disk or logs. Pre-roll remains inside the configured
 queue bounds and is trimmed or omitted to reserve at least 32 KiB (1.024 s) of
 live post-wake capacity in both the direct input and pre-ready fallback queues.
+
+The reference client requires `conversation_mode: "native"` in the bridge's
+`started` acknowledgement. The bridge ignores any Home Assistant broker
+snapshot for that session, so the diagram contains no transcript boundary,
+executor turn, or `appendSpeech` render handoff. Omitted mode retains the legacy
+automatic managed branch for older strict-v2 clients only.
 
 The 2× transfer is bounded catch-up, not burst replay: it runs only while more
 than one captured frame is queued and returns to capture cadence at the live
@@ -380,8 +389,9 @@ Neither event itself proves provider cancellation. The bridge truthfully keeps
 `remote_cancel: false` and separately advertises
 `same_session_interrupt_ack: true`.
 
-In the broker-managed two-thread path, every new speech boundary or accepted
-user message advances the bridge generation and revokes prior output. The
+In the legacy broker-managed two-thread compatibility path, every new speech
+boundary or accepted user message advances the bridge generation and revokes
+prior output. The
 bridge requests frontend cancellation only if an identified assistant render
 has actually started. If the active executor turn has not
 dispatched a Home Assistant tool, the bridge tombstones it before sending
@@ -391,14 +401,15 @@ or retry that potentially side-effecting turn. It lets the result settle,
 suppresses the stale final, and runs the newest queued request afterward.
 
 The current client advertises support with the exact HTTP header
-`User-Agent: ha-codex-voice-thirdreality/2`. For that client, managed
-interruption returns `fresh_session_required: false`,
+`User-Agent: ha-codex-voice-thirdreality/2`. If an older omitted-mode client
+selects managed behavior, that header enables an interruption response with
+`fresh_session_required: false`,
 `remote_cancelled: false`, and `continuation_safe: true`: continuation is safe
 because the bridge invalidated its executor/output generation, not because the
 provider confirmed cancellation of the tool-free frontend. An older client
 does not advertise that contract, so the bridge returns the established
 fresh-session fallback, closes the socket, and disposes both owned threads.
-Outside the managed path, same-socket continuation still requires a provider
+The current native path requires a provider
 `response.cancelled` event whose identifier matches the active response;
 timeout, mismatch, completion, or ambiguity tears the session down.
 

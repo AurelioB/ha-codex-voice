@@ -5,6 +5,29 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-10
+
+### Added
+
+- Add an explicit `conversation_mode: "native"` device-wire selection for a
+  single, tool-free Codex realtime speech session with provider VAD and
+  interruption.
+
+### Changed
+
+- Make the ThirdReality realtime client always request native conversation and
+  require the bridge to echo that selection before microphone audio can flow.
+- Keep the Home Assistant tool broker available for the standard Assist route
+  while ignoring it for explicitly native device conversations.
+
+### Fixed
+
+- Prevent an attached Home Assistant tool authority from silently converting
+  ThirdReality native voice into transcript, executor turn, and
+  `appendSpeech` stages.
+- Reject the legacy device `speech` control in explicit native mode so no
+  synthetic `appendSpeech` operation can enter that route.
+
 ## [0.5.4] - 2026-08-10
 
 ### Added

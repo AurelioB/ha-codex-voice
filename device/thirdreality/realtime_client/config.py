@@ -23,6 +23,7 @@ DEFAULT_PULSE_AEC_SOURCE = "codex_echo_cancel_source"
 DEFAULT_PULSE_AEC_SINK = "codex_echo_cancel_sink"
 DEFAULT_PULSE_AEC_METHOD = "webrtc"
 SUPPORTED_PULSE_AEC_METHODS = frozenset({"adrian", "speex", "webrtc"})
+NATIVE_CONVERSATION_MODE = "native"
 DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
 MAX_REALTIME_VOLUME_PERCENT = 60
@@ -205,6 +206,7 @@ def realtime_start_message(config: RealtimeConfig) -> dict[str, Any]:
     value: dict[str, Any] = {
         "type": "start",
         "protocol_version": 2,
+        "conversation_mode": NATIVE_CONVERSATION_MODE,
         "audio_transport": "binary",
         "input_sample_rate": 16_000,
         "input_channels": 1,

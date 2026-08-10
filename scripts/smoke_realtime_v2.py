@@ -64,6 +64,7 @@ async def run_smoke(
                         "type": "start",
                         "protocol_version": 2,
                         "audio_transport": "binary",
+                        "conversation_mode": "native",
                         "input_sample_rate": input_sample_rate,
                         "input_channels": 1,
                     }
@@ -73,6 +74,8 @@ async def run_smoke(
             raise TimeoutError("realtime v2 start timed out") from None
         if started.get("type") != "started":
             raise RuntimeError("realtime v2 start failed")
+        if started.get("conversation_mode") != "native":
+            raise RuntimeError("realtime v2 did not select native conversation mode")
         handshake_at = time.monotonic()
         capabilities = started.get("capabilities")
         if not isinstance(capabilities, dict) or capabilities != {
@@ -154,6 +157,7 @@ async def run_smoke(
             wav.writeframes(audio)
     return {
         "protocol_version": started.get("protocol_version"),
+        "conversation_mode": started.get("conversation_mode"),
         "output_sample_rate": started.get("output_sample_rate"),
         "output_channels": started.get("output_channels"),
         "audio_bytes": audio_bytes,

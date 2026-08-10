@@ -18,8 +18,17 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
-- Direct realtime tool authority is disabled by default and never comes from a
-  device message. Exactly one explicitly opted-in Conversation subentry may
+- The current ThirdReality client explicitly requests
+  `conversation_mode: "native"`. The bridge ignores any Home Assistant broker
+  snapshot for that session and creates one tool-free native App Server WebRTC
+  voice thread. Okay Computer therefore has no Home Assistant control
+  authority; Okay Nabu retains the official Assist/tool route.
+- The bridge echoes an accepted explicit mode in `started`; the reference
+  client requires `conversation_mode: "native"` and fails closed if the echo is
+  absent or different. Native audio never crosses the legacy completed-
+  transcript, executor, or `thread/realtime/appendSpeech` boundaries.
+- Legacy automatic realtime tool authority never comes from a device message.
+  Exactly one explicitly opted-in Conversation subentry may
   open `/v1/home-assistant/tools` with the primary bridge token. It registers
   an immutable, generation-scoped snapshot of that subentry's rendered
   instructions, `es-MX`-by-default locale, and selected LLM API tools. Zero or
@@ -29,8 +38,9 @@ sides of a narrow bridge API.
   independently reject undeclared tools, duplicate or stale correlation,
   oversized/non-JSON values, replacement, disconnect, and timeout. An unknown
   outcome is never retried implicitly.
-- Only a strict wire-v2, App Server v3 session with a captured broker snapshot
-  enters the managed two-thread route. Its provider-facing speech frontend is
+- Only a strict wire-v2 request that **omits** `conversation_mode`, uses App
+  Server v3, and captures a broker snapshot enters the compatibility managed
+  two-thread route. Its provider-facing speech frontend is
   created with no tools; a separate executor thread alone receives the
   immutable Home Assistant instructions and tool view. Other realtime modes
   retain their native behavior. Codex CLI 0.147.0 or newer is required for the
@@ -58,8 +68,9 @@ sides of a narrow bridge API.
   if a local or managed layer still configures an MCP server.
 - Threads are deliberately non-ephemeral inside that isolated home so App
   Server can delete them immediately with `thread/delete`. Experimental Codex
-  STT, TTS, and realtime threads are deleted when their session ends. A
-  managed realtime session owns two threads, and cleanup independently deletes
+  STT, TTS, and realtime threads are deleted when their session ends. A native
+  device session owns one realtime thread. A legacy managed session owns two
+  threads, and cleanup independently deletes
   both its tool-free frontend and its executor. Reusable Conversation threads
   are deleted when retired, evicted, or the bridge shuts down.
 - Production STT audio travels only from Home Assistant to the selected local
@@ -72,12 +83,13 @@ sides of a narrow bridge API.
   speech lane.
 - Device-facing realtime v2 remains audio/control only. It rejects
   device-declared tools and device tool results, and never exposes provider
-  tool calls or Home Assistant results to the speaker. When the separate
-  authority is present, the bridge sends provider calls only to the captured
-  Home Assistant generation; Home Assistant's selected LLM API retains
-  exposed-entity policy and execution authority.
-- In the managed path, only a session-unique, identified raw v3 user turn or
-  bounded v2 user `text` control can start an executor turn. Only the completed
+  tool calls or Home Assistant results to the speaker. Explicit native mode
+  ignores a separately registered authority. In the legacy automatic managed
+  route, the bridge sends provider calls only to the captured Home Assistant
+  generation; Home Assistant's selected LLM API retains exposed-entity policy
+  and execution authority.
+- In the legacy managed path, only a session-unique, identified raw v3 user
+  turn or bounded v2 user `text` control can start an executor turn. Only the completed
   executor final is returned through a single, at-most-500-byte
   `thread/realtime/appendSpeech`; frontend PCM is dropped until both
   `session.context.appended` and a session-unique assistant turn identify and
@@ -89,8 +101,8 @@ sides of a narrow bridge API.
   teardown the active turn is tombstoned and interrupted before its event
   consumer closes, and provider/thread cleanup remains tracked and shielded
   from request-handler cancellation.
-- “Okay Computer” selects the v2 route, but its weaker device credential gains
-  no Home Assistant authority. “Okay Nabu” selects the official Assist path;
+- “Okay Computer” selects explicit native v2 and gains no Home Assistant
+  authority. “Okay Nabu” selects the official Assist path;
   a normal wake can preempt a direct session and reclaim the microphone.
 - The device retains at most six idle microphone frames for the direct wake:
   384 ms, or 12 KiB of PCM16, in process memory only. Okay Computer atomically
@@ -124,16 +136,16 @@ sides of a narrow bridge API.
   stream values; the reference device's bounded 25% pass is not transferable
   evidence for another device or for an increase up to the explicit 60% maximum.
 - Local playback flush or provider VAD is not evidence of remote cancellation.
-  On the native v2 path, resume still requires a sanitized provider
+  On the current native v2 path, resume still requires a sanitized provider
   `response.cancelled` event correlated to the exact active response. On the
-  broker-managed path, a new utterance invalidates the bridge generation and
-  best-effort cancellation cannot reopen the local output gate. Before Home
+  legacy broker-managed path, a new utterance invalidates the bridge generation
+  and best-effort cancellation cannot reopen the local output gate. Before Home
   Assistant tool dispatch, the bridge tombstones and interrupts the executor;
   after dispatch it lets the potentially side-effecting call settle without
   cancellation or replay, suppresses the stale final, and queues the newest
   request.
-- Managed same-socket continuation is enabled only for the exact negotiated
-  `User-Agent: ha-codex-voice-thirdreality/2`. Its acknowledgement sets
+- Legacy managed same-socket continuation is enabled only for the exact
+  negotiated `User-Agent: ha-codex-voice-thirdreality/2`. Its acknowledgement sets
   `fresh_session_required: false`, `remote_cancelled: false`, and
   `continuation_safe: true`; safety refers to bridge-owned generation
   invalidation, not confirmed provider cancellation. Older clients receive the
@@ -221,7 +233,9 @@ requests that would download a different model.
 
 Subscription audio uses an under-development Codex App Server WebRTC interface
 and consumes ChatGPT subscription availability rather than OpenAI Platform API
-quota. It must never silently fall back to an OpenAI Platform API key. The
+quota. It is not the documented OpenAI Realtime API, has no project-level
+latency or availability guarantee, and can change with Codex CLI/App Server.
+It must never silently fall back to an OpenAI Platform API key. The
 supported minimum is Codex CLI 0.147.0 because managed realtime disables
 delegation acknowledgement filler explicitly. Upgrade Codex only after running
 the local contract tests and the opt-in WebRTC probe.

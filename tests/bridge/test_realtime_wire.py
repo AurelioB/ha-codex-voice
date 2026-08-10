@@ -18,6 +18,8 @@ def test_legacy_realtime_wire_defaults_to_json_base64() -> None:
     assert protocol.version == 1
     assert protocol.audio_transport == "json_base64"
     assert protocol.uses_binary_audio is False
+    assert protocol.conversation_mode is None
+    assert protocol.requests_native_conversation is False
     assert protocol.started_fields() == {}
 
 
@@ -33,6 +35,8 @@ def test_binary_realtime_wire_negotiates_explicit_pcm_shape() -> None:
     )
 
     assert protocol.uses_binary_audio is True
+    assert protocol.conversation_mode is None
+    assert protocol.requests_native_conversation is False
     assert protocol.started_fields() == {
         "protocol_version": 2,
         "audio_transport": "binary",
@@ -49,6 +53,23 @@ def test_binary_realtime_wire_negotiates_explicit_pcm_shape() -> None:
     }
 
 
+def test_binary_realtime_wire_retains_and_echoes_native_conversation_mode() -> None:
+    protocol = RealtimeWireProtocol.negotiate(
+        {
+            "type": "start",
+            "protocol_version": 2,
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+            "conversation_mode": "native",
+        }
+    )
+
+    assert protocol.conversation_mode == "native"
+    assert protocol.requests_native_conversation is True
+    assert protocol.started_fields()["conversation_mode"] == "native"
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
@@ -57,6 +78,10 @@ def test_binary_realtime_wire_negotiates_explicit_pcm_shape() -> None:
         (
             {"protocol_version": 1, "audio_transport": "binary"},
             "protocol_version 1 supports only JSON/base64 audio",
+        ),
+        (
+            {"conversation_mode": "native"},
+            "conversation_mode requires protocol_version 2",
         ),
         (
             {"protocol_version": 2},
@@ -102,6 +127,26 @@ def test_binary_realtime_wire_negotiates_explicit_pcm_shape() -> None:
                 "tools": [],
             },
             "protocol_version 2 does not accept device tools",
+        ),
+        (
+            {
+                "protocol_version": 2,
+                "audio_transport": "binary",
+                "input_sample_rate": 16_000,
+                "input_channels": 1,
+                "conversation_mode": "managed",
+            },
+            "conversation_mode must be 'native'",
+        ),
+        (
+            {
+                "protocol_version": 2,
+                "audio_transport": "binary",
+                "input_sample_rate": 16_000,
+                "input_channels": 1,
+                "conversation_mode": None,
+            },
+            "conversation_mode must be 'native'",
         ),
         (
             {

@@ -19,6 +19,7 @@ def _started_event(*, protocol_version: int) -> dict[str, Any]:
     return {
         "type": "started",
         "protocol_version": 2,
+        "conversation_mode": "native",
         "output_sample_rate": 24_000,
         "output_channels": 1,
         "capabilities": {

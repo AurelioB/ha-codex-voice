@@ -101,6 +101,8 @@ requires the primary Home Assistant bridge token.
   controls, filters continuous WebRTC silence, gates output with monotonic
   epochs, and supports negotiated same-session interruption. It does not expose
   transcripts, provider payloads, tool calls, or tool results to the device.
+  The optional strict-v2 `conversation_mode` currently accepts only `native`;
+  an accepted value is echoed in `started`.
   A v2 `text` control is a bounded user message; its role must be omitted or
   exactly `user`. See the
   [v2 wire contract](../protocol/realtime-wire-v2.md).
@@ -115,20 +117,25 @@ Device-facing v2 is the transport used by the pinned ThirdReality v1.1.7
 in-process client. “Okay Computer” enters this direct mode; “Okay Nabu” remains
 on Home Assistant's official Assist flow. The device sends 16 kHz mono PCM16
 and receives 24 kHz mono PCM16. It remains an untrusted audio/control endpoint:
-it cannot declare tools or send tool results. When exactly one Conversation
-subentry is explicitly opted in, the Home Assistant component separately
-registers that subentry's selected, bounded tool view with the primary token;
-the bridge snapshots it for the v2 provider session. When strict wire v2,
-realtime version v3, and that snapshot are all present, the bridge starts two
-Codex threads: a tool-free realtime speech frontend and an isolated executor
-that alone receives the selected tools. A completed frontend user transcript,
-or a valid v2 user `text` control, starts an executor turn; each accepted
-executor tool call is returned to Home Assistant for execution. Other protocol,
-version, or authority combinations retain the native single-thread route. The
-bridge applies a 2,250 ms input-track limit only to v2 live sessions; finite STT
-keeps its existing whole-utterance input capacity.
+it cannot declare tools or send tool results. The current reference client
+always sends `conversation_mode: "native"` and requires that value in the
+`started` acknowledgement. For that session, the bridge does not capture the
+Home Assistant broker snapshot. It creates exactly one tool-free native App
+Server WebRTC voice thread and relays its speech directly; no completed
+transcript, executor thread, or `thread/realtime/appendSpeech` operation is in
+the audio path. With qualified device AEC, this is the full-duplex/barge-in
+route. The bridge applies a 2,250 ms input-track limit only to v2 live
+sessions; finite STT keeps its existing whole-utterance input capacity.
 
-The managed frontend starts with immutable routing instructions,
+Strict-v2 clients that omit `conversation_mode` retain compatibility with the
+previous automatic policy. When exactly one Conversation subentry is opted in,
+App Server realtime v3 and its captured broker snapshot select a managed
+two-thread route: a tool-free speech frontend and an isolated executor that
+alone receives the selected tools. Without all of those conditions, an
+omitted-mode session remains native. The reference ThirdReality client does
+not use this compatibility route.
+
+The legacy managed frontend starts with immutable routing instructions,
 `clientManagedHandoffs: true`, and `delegationAckFiller: false`. App Server v3
 can route native delegation before a notification is observable, so the
 separate tool-bearing thread—not the prompt alone—is the authority boundary.
@@ -184,8 +191,9 @@ ceiling; runtime restore state alone is not treated as reboot evidence.
 
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises
-`same_session_interrupt_ack: true`. The current ThirdReality client negotiates
-the managed policy with `User-Agent: ha-codex-voice-thirdreality/2`. On a
+`same_session_interrupt_ack: true`. The current ThirdReality client sends
+`User-Agent: ha-codex-voice-thirdreality/2`; that header retains compatibility
+with the managed interrupt policy but does not select it. On a legacy
 broker-managed interrupt, the bridge invalidates the executor/output generation
 and asks the frontend provider to cancel only when an identified assistant
 render is active; it never cancels an idle or pending frontend. Before Home
@@ -195,9 +203,9 @@ newest request when its transcript arrives.
 It then returns `fresh_session_required: false`, `remote_cancelled: false`, and
 `continuation_safe: true`; the local generation gate makes continuation safe
 without claiming remote cancellation. A legacy client gets the established
-fresh-session fallback and socket teardown. On the native path, same-socket
-continuation still requires a sanitized `response.cancelled` event correlated
-to the active provider response.
+fresh-session fallback and socket teardown. On the current native path,
+same-socket continuation still requires a sanitized `response.cancelled` event
+correlated to the active provider response.
 
 Audio uses Codex app-server's experimental WebRTC v3 path by default. The peer
 creates a real paced outbound audio track and `oai-events` data channel before
@@ -206,6 +214,13 @@ notifications. Codex 0.147.0 or newer is required for the managed frontend's
 delegation acknowledgement control. This is the subscription-compatible path.
 Raw Realtime v2 WebSockets require API-key authentication and are intentionally
 not used.
+
+This App Server realtime surface is experimental and not the documented OpenAI
+Realtime API. Native selection removes the bridge-created transcript/executor/
+render sequence, but a new direct wake still pays for cold Codex thread
+creation, App Server/WebRTC negotiation, service admission, network latency,
+and provider response generation. The bridge does not claim parity with an
+already-open ChatGPT voice session.
 
 The subscription realtime voice is conversational, not a verbatim
 text-to-speech API. `/v1/synthesize` sends a tightly constrained text turn but
@@ -297,7 +312,7 @@ verify overlap without recording content.
 Interactive approvals, permission requests, and unsupported server-initiated
 requests fail closed. Only explicitly declared dynamic Home Assistant tools are
 relayed to the official Conversation WebSocket, a legacy v1 realtime client,
-or the isolated executor of a managed v2 session bound to the current Home
+or the isolated executor of a legacy auto-selected managed v2 session bound to the current Home
 Assistant broker generation. The managed speech frontend has no tools and its
 unexpected requests are explicitly rejected. V2 devices never declare,
 receive, or answer tool calls themselves. Exactly one

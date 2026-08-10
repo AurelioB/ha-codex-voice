@@ -5,14 +5,27 @@ This document defines the authenticated device-facing WebSocket contract at
 LAN audio endpoint and the host bridge. The bridge remains the only Codex App
 Server/WebRTC peer and the device never receives ChatGPT credentials. V2
 deliberately grants the device only audio and bounded lifecycle-control
-authority; optional Home Assistant tools use a separate primary-token broker
-that is invisible to this wire.
+authority.
 
-When strict v2 runs with App Server realtime v3 and a captured Home Assistant
-broker snapshot, the bridge uses a managed two-thread implementation: a
-tool-free speech frontend plus an isolated tool-bearing executor. This is an
-internal bridge policy, not additional device authority. Without all three
-conditions, the bridge retains its native realtime implementation.
+The current reference client explicitly requests
+`conversation_mode: "native"`. That selection is session-scoped and forces one
+native Codex App Server WebRTC voice thread. The bridge ignores any captured
+Home Assistant broker snapshot for that session: it does not wait for a
+completed transcript, start an executor thread, or render text with
+`thread/realtime/appendSpeech`.
+
+For compatibility, a strict-v2 client may omit `conversation_mode`. Omission
+retains the previous automatic policy: App Server realtime v3 plus a captured
+Home Assistant broker snapshot selects the managed two-thread implementation;
+otherwise the bridge selects native realtime. This legacy auto/managed route
+is an internal bridge policy, not additional device authority. New clients
+should request their intended mode explicitly.
+
+The upstream Codex App Server realtime surface used behind this wire is
+experimental and is not the documented OpenAI Realtime API. Native mode removes
+the bridge-created turn pipeline, but every fresh socket still incurs cold
+thread creation, WebRTC negotiation, service admission, network, and provider
+response latency.
 
 Version 1 remains supported for existing clients. A start message with no
 `protocol_version` selects v1 and continues to use JSON objects containing
@@ -30,10 +43,10 @@ does not make plaintext bearer authentication safe on an untrusted network.
 
 The current reference client also sends the exact WebSocket handshake header
 `User-Agent: ha-codex-voice-thirdreality/2`. This negotiates support for the
-managed `continuation_safe` interrupt acknowledgement described below. It does
-not change authentication or grant access to the Home Assistant broker. An
-older client without that exact value remains valid but receives the
-fresh-session fallback after a managed interrupt.
+legacy managed `continuation_safe` interrupt acknowledgement described below.
+It does not change authentication or grant access to the Home Assistant
+broker. An older client without that exact value remains valid but receives
+the fresh-session fallback after a managed interrupt.
 
 ## Start and negotiation
 
@@ -43,6 +56,7 @@ The first WebSocket frame is UTF-8 JSON:
 {
   "type": "start",
   "protocol_version": 2,
+  "conversation_mode": "native",
   "audio_transport": "binary",
   "input_sample_rate": 16000,
   "input_channels": 1,
@@ -55,21 +69,25 @@ The first WebSocket frame is UTF-8 JSON:
 `audio_transport` must be `binary`. `input_sample_rate` is an integer from
 8,000 through 192,000 Hz; the ThirdReality client uses 16,000 Hz.
 `input_channels` must be `1`. Samples are signed little-endian PCM16.
-V2 rejects unknown start fields, device `tools`, model or realtime-version
-overrides, startup-context/handoff overrides, and `initial_items`. The bridge
-selects those App Server policies. Optional `conversation_id`, `voice`, and
-`prompt` values are length-bounded before any thread is created.
+`conversation_mode`, when present, must be exactly `native`; `managed`, `null`,
+and other values are rejected. A native request ignores Home Assistant broker
+availability and selects a single App Server realtime voice thread. Omitting
+the field preserves legacy automatic route selection. V2 rejects unknown start
+fields, device `tools`, model or realtime-version overrides,
+startup-context/handoff overrides, and `initial_items`. The bridge selects
+those App Server policies. Optional `conversation_id`, `voice`, and `prompt`
+values are length-bounded before any thread is created.
 
-The reference ThirdReality client omits `voice` and `prompt` unless they are
-explicitly configured. It accepts a safe 1–64 character ASCII voice name that
-starts with a letter and a printable prompt of at most 1,024 characters (within
-the bridge's 4,096
-character wire limit), then verifies the actual compact, ASCII-escaped start
-frame fits its configured `max_message_bytes`. Language and accent are separate
-prompt policies: for Mexican Spanish, specify Spanish as the response language
-unless the user explicitly requests another language, independently request a
-stable natural Mexican accent, and do not switch language based only on the
-user's accent.
+The reference ThirdReality client always sends `conversation_mode: "native"`;
+this is not a device configuration option. It omits `voice` and `prompt` unless
+they are explicitly configured. It accepts a safe 1–64 character ASCII voice
+name that starts with a letter and a printable prompt of at most 1,024
+characters (within the bridge's 4,096-character wire limit), then verifies the
+actual compact, ASCII-escaped start frame fits its configured
+`max_message_bytes`. Language and accent are separate prompt policies: for
+Mexican Spanish, specify Spanish as the response language unless the user
+explicitly requests another language, independently request a stable natural
+Mexican accent, and do not switch language based only on the user's accent.
 
 The server acknowledges a successful negotiation with JSON. The legacy
 `sample_rate` and `channels` fields remain present, while v2 adds explicit
@@ -79,6 +97,7 @@ input/output shapes and capabilities:
 {
   "type": "started",
   "protocol_version": 2,
+  "conversation_mode": "native",
   "audio_transport": "binary",
   "input_sample_rate": 16000,
   "input_channels": 1,
@@ -95,13 +114,19 @@ input/output shapes and capabilities:
 }
 ```
 
+When the start request includes `conversation_mode`, the acknowledgement must
+echo the accepted value. The current reference client requires
+`conversation_mode: "native"` in `started` and fails closed if it is absent or
+different. For a legacy strict-v2 request that omits the field, the bridge also
+omits it from `started`.
+
 `local_flush` means the device is expected to discard queued speaker PCM when
 it interrupts playback. `remote_cancel: false` is intentionally explicit: a
 client may never infer remote cancellation from a local flush or VAD event.
 `same_session_interrupt_ack: true` means the bridge can separately acknowledge
 whether one interrupt may continue on this socket. On the native path, that
 requires a provider `response.cancelled` event whose identifier matches the
-active response. On the managed two-thread path, a `/2` client can instead
+active response. On the legacy managed two-thread path, a `/2` client can instead
 receive `continuation_safe: true` after the bridge invalidates its owned
 executor/output generation. The latter explicitly keeps
 `remote_cancelled: false`. The bridge never claims that already-played audio
@@ -166,7 +191,20 @@ client must gate playback from these controls and must not infer that any bare
 binary frame starts a new response. After `speaking.stopped`, PCM for that
 epoch is no longer forwarded.
 
-The managed two-thread path adds a stricter bridge-owned authorization gate:
+An explicit native session has no transcript/executor/render handoff in its
+media path:
+
+```text
+paced microphone PCM -> one App Server WebRTC voice thread
+                     -> provider audio -> speaking epoch -> device playback
+```
+
+Provider speech is the direct output of that same realtime thread. The bridge
+does not require a user transcript to complete, does not create a second Codex
+thread, and does not call `thread/realtime/appendSpeech`.
+
+The legacy auto-selected managed two-thread path adds a stricter bridge-owned
+authorization gate:
 
 ```text
 identified raw v3 user turn (or bounded v2 user text)
@@ -242,10 +280,12 @@ The following client-to-bridge controls remain JSON:
 
 - `text`: submit a non-empty, length-bounded **user** message. `role` may be
   omitted (it defaults to `user`) or must be exactly `user`; v2 does not accept
-  assistant/output text roles. In the managed path this starts an isolated
-  executor turn; on the native path it is appended to the realtime session.
-- `speech`: request speech from non-empty, length-bounded text on the native
-  path. The managed path rejects this control because only an executor final
+  assistant/output text roles. In a legacy auto-selected managed path this
+  starts an isolated executor turn; on the native path it is appended to the
+  one realtime session.
+- `speech`: legacy compatibility control for an omitted-mode native session.
+  Explicit native rejects it so `thread/realtime/appendSpeech` cannot enter the
+  route; a legacy managed path also rejects it because only an executor final
   may enter its frontend rendering channel.
 - `ping`: request `{"type":"pong"}`.
 - `stop`: end the session normally.
@@ -254,9 +294,11 @@ The following client-to-bridge controls remain JSON:
 
 The v2 device remains audio/control only. A v2 start containing `tools` or an
 incoming device `tool_result` is rejected. Provider tool calls and Home
-Assistant results are never forwarded to the speaker. Realtime home control is
-disabled unless exactly one Home Assistant Conversation subentry is explicitly
-opted in as authority. That subentry opens the separate
+Assistant results are never forwarded to the speaker. An explicit native
+session is tool-free even if a Home Assistant realtime authority is currently
+registered. Legacy auto-selected realtime home control is disabled unless
+exactly one Home Assistant Conversation subentry is explicitly opted in as
+authority. That subentry opens the separate
 `/v1/home-assistant/tools` WebSocket with the primary bridge token, registers a
 bounded snapshot of its selected Home Assistant LLM API tools and rendered
 instructions, and executes correlated calls locally. Its locale defaults to
@@ -273,9 +315,10 @@ After a result is delivered, assistant output or a terminal provider event must
 arrive within 20 seconds or the session fails closed. These errors remain
 internal/provider-facing; the speaker still receives no tool payload.
 
-With strict v2, App Server v3, and a captured authority snapshot, selected
-tools exist only on a separate executor thread. The WebRTC speech frontend is
-started with an empty tool list. A frontend, foreign, stale, or post-interrupt
+For a strict-v2 request that **omits** `conversation_mode`, App Server v3 plus a
+captured authority snapshot selects the compatibility managed route. Selected
+tools then exist only on a separate executor thread. The WebRTC speech frontend
+is started with an empty tool list. A frontend, foreign, stale, or post-interrupt
 tool request is answered internally with
 `unowned_home_assistant_tool_call` and `do_not_retry: true` and is never sent to
 Home Assistant. App Server v3 may route native delegation before notifying the
@@ -286,16 +329,16 @@ Every interrupt flushes the device's local playback and revokes the bridge's
 current output epoch. The acknowledgement then depends on the internal route
 and negotiated client behavior.
 
-For a broker-managed session from the exact `/2` User-Agent, the bridge
+For a legacy broker-managed session from the exact `/2` User-Agent, the bridge
 advances its executor/output generation and asks the tool-free frontend
 provider to cancel only if an identified assistant render has started. Idle
 and merely pending frontend sessions are never cancelled. If the executor has
-not dispatched a Home Assistant tool, the bridge tombstones the turn before `turn/interrupt`, waits
-for its terminal event, and rejects any late tool request. Once a tool has been
-dispatched, it does not interrupt or replay that potentially side-effecting
-turn; it lets the result settle, suppresses the stale final, and, if barge-in
-produces another transcript, runs the newest queued transcript afterward. The
-acknowledgement is:
+not dispatched a Home Assistant tool, the bridge tombstones the turn before
+`turn/interrupt`, waits for its terminal event, and rejects any late tool
+request. Once a tool has been dispatched, it does not interrupt or replay that
+potentially side-effecting turn; it lets the result settle, suppresses the
+stale final, and, if barge-in produces another transcript, runs the newest
+queued transcript afterward. The acknowledgement is:
 
 ```json
 {
@@ -313,9 +356,9 @@ stale PCM; it does **not** mean the provider confirmed cancellation. The
 frontend is tool-free, so an unconfirmed provider response cannot dispatch a
 Home Assistant action.
 
-A broker-managed session from an older client does not opt into that local
-continuation contract. The bridge returns the established safe fallback and
-closes the socket:
+A legacy broker-managed session from an older client does not opt into that
+local continuation contract. The bridge returns the established safe fallback
+and closes the socket:
 
 ```json
 {
@@ -328,12 +371,12 @@ closes the socket:
 
 The next wake uses a fresh WebSocket, frontend, and executor. This preserves
 backward compatibility: an older deployed client need not understand the new
-field or coordinatedly upgrade with the bridge.
+field or upgrade in lockstep with the bridge.
 
-On the native (non-managed) v2 path, same-socket continuation remains tied to
-remote cancellation. If and only if the bridge receives a provider
-`response.cancelled` event whose response identifier matches the response
-active when the request was sent, it returns:
+On the native v2 path used by the current reference client, same-socket
+continuation remains tied to remote cancellation. If and only if the bridge
+receives a provider `response.cancelled` event whose response identifier
+matches the response active when the request was sent, it returns:
 
 ```json
 {
@@ -391,3 +434,9 @@ frames, negotiation fields, and sanitized data-channel controls are not sent
 to a v1 client. V1 also retains its existing transcript, item, and generic RPC
 event behavior for backward compatibility; those content-bearing messages are
 never emitted on v2.
+
+Strict-v2 clients deployed before `conversation_mode` remain wire-compatible:
+omission selects the legacy automatic native/managed policy and receives no
+mode field in `started`. This compatibility rule must not be mistaken for the
+current reference client's behavior; it always requests and verifies native
+mode.

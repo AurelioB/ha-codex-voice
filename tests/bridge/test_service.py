@@ -5214,6 +5214,112 @@ async def test_realtime_v2_preserves_native_frontend_without_tool_authority(
 
 
 @pytest.mark.asyncio
+async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    authority, _ = await _register_test_realtime_tool_authority(client)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="bridge.service"):
+            await device.send_json(_realtime_v2_start(conversation_mode="native"))
+            started = await device.receive_json(timeout=1)
+
+        assert started["type"] == "started"
+        assert started["conversation_mode"] == "native"
+        thread_starts = [
+            params for method, params in fake_rpc.calls if method == "thread/start"
+        ]
+        assert len(thread_starts) == 1
+        assert "dynamicTools" not in thread_starts[0]
+        assert "Home Assistant" not in thread_starts[0]["baseInstructions"]
+        realtime_starts = [
+            params
+            for method, params in fake_rpc.calls
+            if method == "thread/realtime/start"
+        ]
+        assert len(realtime_starts) == 1
+        realtime_start = realtime_starts[0]
+        assert realtime_start["threadId"] == started["thread_id"]
+        assert realtime_start["includeStartupContext"] is False
+        assert realtime_start["clientManagedHandoffs"] is False
+        assert "delegationAckFiller" not in realtime_start
+        assert (
+            "Realtime conversation route selected: route=native selection=explicit"
+            in caplog.text
+        )
+
+        streamed_audio = b"\x00\x02" * 48
+        peer = fake_rpc.peers[-1]
+        peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+        assert await device.receive_json(timeout=1) == {
+            "type": "control",
+            "event_type": "output_audio_buffer.started",
+        }
+        peer.audio.put_nowait(streamed_audio)
+        assert await device.receive_json(timeout=1) == {
+            "type": "control",
+            "event_type": "speaking.started",
+            "output_epoch": 1,
+        }
+        audio = await device.receive(timeout=1)
+        assert audio.type is WSMsgType.BINARY
+        assert audio.data == streamed_audio
+
+        peer.data.put_nowait(json.dumps({"type": "input_audio_buffer.speech_started"}))
+        assert await device.receive_json(timeout=1) == {
+            "type": "control",
+            "event_type": "input_audio_buffer.speech_started",
+        }
+        assert await device.receive_json(timeout=1) == {
+            "type": "control",
+            "event_type": "speaking.stopped",
+            "output_epoch": 1,
+        }
+        await device.send_bytes(b"\x01\x00" * 160)
+        await asyncio.wait_for(fake_rpc.transcript_started.wait(), timeout=1)
+        await device.send_json({"type": "ping"})
+        assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+        assert peer.sent_data_events == []
+        assert not any(method == "turn/start" for method, _ in fake_rpc.calls)
+        assert not any(
+            method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls
+        )
+    finally:
+        if not device.closed:
+            await device.send_json({"type": "stop"})
+            await device.close()
+        await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_explicit_native_rejects_append_speech_control(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await device.send_json({"type": "speech", "text": "Do not synthesize this"})
+    assert await device.receive_json(timeout=1) == {
+        "type": "error",
+        "error": "native realtime does not accept device speech",
+    }
+    assert not any(
+        method == "thread/realtime/appendSpeech" for method, _ in fake_rpc.calls
+    )
+    await device.close()
+
+
+@pytest.mark.asyncio
 async def test_realtime_v1_preserves_client_prompt_semantics(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:

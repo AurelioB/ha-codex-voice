@@ -11,7 +11,7 @@ The two wake phrases deliberately have different authority:
 | Wake phrase | Route | Capability |
 |---|---|---|
 | Okay Nabu | Official Home Assistant Assist satellite flow | Local/remote STT, Conversation, TTS, and Home Assistant controls |
-| Okay Computer | Direct realtime wire v2 to the Codex Voice bridge | Subscription voice over untrusted audio/control wire; optional Home Assistant tools only through a separate HA-owned broker |
+| Okay Computer | Explicit native realtime wire v2 to the Codex Voice bridge | Tool-free, single-thread subscription voice; full duplex when the AEC safety contract is enabled |
 
 Okay Nabu can preempt an active direct session and immediately reclaim the
 microphone for the normal Home Assistant path. Saying the configured stop word,
@@ -20,12 +20,12 @@ the vendor owner flushes local playback and tears down the remote session. A
 later wake after any such teardown creates a fresh WebSocket and realtime
 session. In opt-in full-duplex mode, bounded local AEC-filtered speech detection
 can flush playback before provider VAD for natural barge-in without releasing
-that owner. The client identifies its managed-interrupt support with
-`User-Agent: ha-codex-voice-thirdreality/2`. In a broker-managed session, the
-bridge can preserve the socket with an explicit `continuation_safe`
-acknowledgement even though provider cancellation is unconfirmed. Native
-sessions still require correlated remote cancellation; older clients in the
-managed path retain the fresh-session fallback.
+that owner. The client always requests `conversation_mode: "native"` and
+requires the bridge to echo it. It also identifies compatibility interrupt
+support with `User-Agent: ha-codex-voice-thirdreality/2`, but that header does
+not select the legacy managed route. Native sessions require correlated remote
+cancellation for same-socket continuation; otherwise they use the
+fresh-session fallback.
 
 ## Realtime behavior and bounds
 
@@ -38,17 +38,14 @@ can still be audible. Opt-in full duplex keeps microphone submission continuous
 only after a startup preflight verifies the exact echo-cancel source, sink, and
 loaded PulseAudio module.
 
-The bridge's managed implementation is conditional on strict wire v2, App
-Server realtime v3, and a captured Home Assistant broker snapshot. In that
-case, the device still sees only audio and content-free controls: a tool-free
-speech frontend produces an identified raw v3 user turn, an isolated executor
-owns the selected Home Assistant tools, and at most 500 UTF-8 bytes of its
-completed final answer return in one `thread/realtime/appendSpeech`. Frontend
-PCM is dropped until `session.context.appended` and a session-unique assistant
-turn identify that request for the current bridge generation; only then may a
-bounded current-generation preroll be retained. The speaker receives none of
-the transcript, executor, tool, or acknowledgement payloads. The managed bridge
-host requires Codex CLI 0.147.0 or newer.
+The reference client sends `conversation_mode: "native"` in every start frame.
+The bridge ignores any Home Assistant broker snapshot for that session and
+starts one native App Server WebRTC voice thread. Microphone audio and provider
+speech remain on that thread; there is no completed-transcript wait, isolated
+executor, or `thread/realtime/appendSpeech` render. A `started` acknowledgement
+without the exact native mode is incompatible and fails closed. Older
+strict-v2 clients that omit the field retain the legacy automatic
+native/managed policy, but the packaged client cannot silently select it.
 
 The default input and pre-ready fallback buffers are each 64 KiB: 2.048 seconds
 at 16 kHz mono PCM16. Once a cold handshake completes, queued input is sent at
@@ -113,15 +110,16 @@ local boundary. Neither signal itself claims remote cancellation or tears down
 the session. The client separately negotiates
 `same_session_interrupt_ack: true` and accepts exactly two same-socket stopped
 acknowledgements: native correlated cancellation uses
-`fresh_session_required: false` / `remote_cancelled: true`; broker-managed
-generation invalidation uses `fresh_session_required: false` /
+`fresh_session_required: false` / `remote_cancelled: true`; the retained legacy
+broker-managed generation acknowledgement uses `fresh_session_required: false` /
 `remote_cancelled: false` / `continuation_safe: true`. The latter says stale
 bridge-owned output cannot pass the generation gate, not that the provider
 cancelled its tool-free frontend. The older safe fallback acknowledgement
 still closes the socket.
 
-On managed barge-in before Home Assistant tool dispatch, the bridge tombstones
-and interrupts the executor turn, and a late tool request is rejected. After a
+For an older omitted-mode client, managed barge-in before Home Assistant tool
+dispatch tombstones and interrupts the executor turn, and a late tool request
+is rejected. After a
 tool has crossed the broker boundary, the bridge lets that action settle
 without cancellation or replay, suppresses the old final, and queues the newest
 transcript. The device's immediate playback flush is identical in both cases.
@@ -216,18 +214,17 @@ device token is accepted only by `/v1/realtime` after a valid v2 negotiation;
 it cannot enter legacy v1 or `/v1/home-assistant/tools`. Do not reuse the Home
 Assistant bridge token, a Home Assistant access token, or Codex `auth.json`.
 The packaged client emits `User-Agent: ha-codex-voice-thirdreality/2`
-automatically. Removing or changing it does not bypass safety; a managed
-interrupt instead receives the legacy fresh-session fallback.
+automatically and hardcodes `conversation_mode: "native"` in the start frame.
+Neither value is user-configurable. Removing or changing the User-Agent does
+not bypass safety; it only changes compatibility interrupt handling.
 
 The device never receives tool schemas, tool calls, results, or a Home
-Assistant credential. Realtime home control is disabled by default. To enable
-it, explicitly select **Provide Home Assistant tools to realtime voice** on
-exactly one Codex Voice Conversation subentry and choose only the Home Assistant
-LLM APIs that should be exposed. The integration uses its primary bridge token
-to maintain a separate broker connection, defaults that authority's response
-locale to `es-MX`, and executes every correlated call inside Home Assistant.
-Zero, multiple, disconnected, or changed authorities fail closed; nothing is
-added to the device configuration or v2 frames.
+Assistant credential. Okay Computer is always native and tool-free; use Okay
+Nabu for Home Assistant control. **Provide Home Assistant tools to realtime
+voice** applies only to older strict-v2 clients that omit `conversation_mode`.
+The integration may maintain that compatibility broker, but its presence does
+not affect a reference-client session and adds nothing to device configuration
+or v2 frames.
 
 Treat `PYTHONPATH` as root-process code execution. Copy only the reviewed file
 and package from a pinned repository commit or release asset, verify SHA-256
@@ -400,10 +397,10 @@ On the physical device, verify these independently:
    reconnects, and repeated wakes.
 2. Okay Computer starts direct voice, speaks a response, returns to listening,
    and responds to the stop word without replaying its own output.
-3. With realtime authority disabled, Okay Computer cannot control Home
-   Assistant. With exactly one deliberately opted-in Conversation authority,
-   it can invoke only a reviewed test entity from the selected LLM API, while
-   the device still receives no tool schema, call, result, or primary token.
+3. Okay Computer cannot control Home Assistant even when a compatibility
+   realtime authority is registered. Its start and `started` frames both carry
+   `conversation_mode: "native"`. Okay Nabu can invoke only the reviewed
+   entities exposed through its official Assist pipeline.
 4. A normal wake can preempt direct mode and then control Home Assistant.
 5. A forced pre-ready connection failure enters the official Assist fallback
    without clipping the retained command prefix.
@@ -416,13 +413,10 @@ On the physical device, verify these independently:
    Raising any AEC sink channel above the configured ceiling between responses
    must fail the next response, and the spawned `paplay` stream must remain
    pinned to its configured value, never above the 60% hard maximum.
-8. With realtime authority enabled, exercise barge-in once before any Home
-   Assistant tool dispatch and once after a reviewed test action is dispatched.
-   The first executor turn must be interrupted without a late action; the
-   second action must settle once without replay, its stale answer must remain
-   inaudible, and the newest request must run afterward. The `/2` client must
-   keep the socket with `continuation_safe: true`; a client without that header
-   must receive the fresh-session fallback.
+8. During native speech, exercise early, middle, and late barge-in. Local
+   playback must flush immediately. A correlated provider cancellation may
+   preserve the socket; timeout, mismatch, or ambiguity must close it and make
+   the next utterance start a fresh native session.
 9. A deliberately missing AEC module or mismatched default source/sink must fail
    direct startup before sending microphone audio, while Okay Nabu remains
    usable after rollback to `full_duplex: false`.
