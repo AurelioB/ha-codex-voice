@@ -35,6 +35,13 @@ variables. Startup and every new thread fail closed unless that profile is
 available and active. Startup also audits App Server's effective configuration
 layers and rejects any configured MCP server.
 
+If the installed `codex` launcher depends on a Node.js interpreter that is not
+available to the service, set `HA_CODEX_BINARY` to the absolute native Codex
+executable. This replaces only the first executable in the default command and
+preserves every hardened argument above. A complete
+`CODEX_APP_SERVER_COMMAND` override takes precedence and remains responsible
+for reproducing all required hardening.
+
 Finite STT keeps a two-second fragment-quiet fallback by default. A deployment
 that has passed short, long, paused, number, and name transcription trials may
 set `HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS` between `0.5` and `2.0`.

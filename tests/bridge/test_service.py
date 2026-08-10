@@ -17,7 +17,7 @@ import pytest
 from aiohttp import WSMsgType, WSServerHandshakeError, web
 
 from bridge import service as bridge_service
-from bridge.config import BridgeConfig
+from bridge.config import DEFAULT_CODEX_COMMAND, BridgeConfig
 from bridge.errors import AppServerExited, BridgeBusyError, ProtocolError
 from bridge.runtime import IsolatedCodexRuntime
 from bridge.service import BridgeState, _codex_child_environment, create_app
@@ -532,6 +532,32 @@ def test_realtime_device_token_is_optional_and_loaded_from_env(
 
     monkeypatch.setenv("HA_CODEX_REALTIME_DEVICE_TOKEN", "device-token")
     assert BridgeConfig.from_env().realtime_device_token == "device-token"
+
+
+def test_config_can_replace_only_the_codex_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "bridge-token")
+    monkeypatch.setenv("HA_CODEX_BINARY", "/opt/codex/bin/codex")
+    monkeypatch.delenv("CODEX_APP_SERVER_COMMAND", raising=False)
+
+    command = BridgeConfig.from_env().codex_command
+
+    assert command == ("/opt/codex/bin/codex", *DEFAULT_CODEX_COMMAND[1:])
+
+
+def test_full_app_server_command_takes_precedence_over_binary_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "bridge-token")
+    monkeypatch.setenv("HA_CODEX_BINARY", "/opt/codex/bin/codex")
+    monkeypatch.setenv("CODEX_APP_SERVER_COMMAND", "custom-codex app-server --stdio")
+
+    assert BridgeConfig.from_env().codex_command == (
+        "custom-codex",
+        "app-server",
+        "--stdio",
+    )
 
 
 def test_realtime_device_token_must_be_separate() -> None:
