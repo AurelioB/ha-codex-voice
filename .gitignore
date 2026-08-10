@@ -11,6 +11,9 @@ build/
 dist/
 htmlcov/
 
+# Disposable Home Assistant configuration used by the local development loop.
+.ha-dev/
+
 # Bridge runtime state and credentials must never be committed.
 .bridge-token
 .codex-voice/

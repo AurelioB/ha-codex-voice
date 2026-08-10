@@ -96,11 +96,13 @@ not part of the component-only HACS ZIP.
   reviewed static PulseAudio `module-echo-cancel` topology with one explicit,
   allowlisted AEC engine, exact capture/playback routing, a startup safety
   preflight, a sink-volume ceiling recheck before every response, and a fixed
-  `paplay` stream volume of at most 25%. WebRTC remains the configuration and
+  `paplay` stream volume with a safe 25% default and explicit 60% hard maximum.
+  WebRTC remains the configuration and
   installer default; neither layer automatically falls back to another engine.
   The stock ThirdReality v1.1.7 module rejects WebRTC and Speex but loads Adrian,
   which passed the bounded reference-device echo and barge-in canaries at 25%.
-  Every new installation still requires the documented physical qualification.
+  Every new installation—and every increase above a previously qualified
+  level—still requires the documented physical qualification.
   In broker-managed sessions, barge-in interrupts an executor turn only before
   it dispatches a Home Assistant tool. After dispatch, the bridge lets that
   side effect settle once, queues the newest request, and suppresses the stale
@@ -225,7 +227,7 @@ Follow the [device deployment, verification, and rollback
 contract](device/thirdreality/README.md). `full_duplex` remains `false` by
 default. Enabling it is fail-closed unless the reviewed static PulseAudio AEC
 topology uses the exact configured allowlisted engine, exact source/sink
-routing, current-process capture route, and configured 1–25% sink ceiling.
+routing, current-process capture route, and configured 1–60% sink ceiling.
 WebRTC is the default when `pulse_aec_method` or installer `--aec-method` is
 omitted, with no automatic fallback. The observed stock v1.1.7 image instead
 requires an explicit `adrian` selection; its WebRTC and Speex engines are not
@@ -233,9 +235,10 @@ compiled in and are rejected. The sink ceiling is checked again before every
 response, and full-duplex `paplay` is pinned to that AEC sink with a fixed
 stream volume no greater than the configured ceiling. Adrian creating the
 expected 16 kHz mono endpoints is only a topology canary. The reference device
-passed a bounded 25% echo-residual and staged double-talk canary, but physical
-echo and early/middle/late double-talk tests at no more than 25% must pass on
-each installation before use.
+passed a bounded 25% echo-residual and staged double-talk canary. The sink and
+stream controls default to 25% and permit an explicit maximum of 60%; physical
+echo and early/middle/late double-talk tests must pass at the configured
+operational values on each installation before use or after an increase.
 
 The deployment adds “Okay Computer” alongside “Okay Nabu”; it does not replace
 the standard Assist path. The device configuration is root-owned and mode 0600,
@@ -476,6 +479,9 @@ fallback behavior, safe device settings, and the firmware canary decision.
 
 ## Development
 
+See the [development workflow](docs/development.md) for the focused pytest,
+disposable local Home Assistant, and staged production SSH deployment loops.
+
 ```bash
 uv sync --extra test --extra lint
 uv run ruff check .
@@ -526,13 +532,15 @@ opt-in and must never print OAuth tokens or recorded audio.
   turn-taking. Full duplex is an explicit post-qualification option that
   requires a repository-reviewed PulseAudio AEC fragment, an exact configured
   engine match, exact process routing, a preflight plus per-response sink
-  ceiling, and a fixed `paplay` stream cap of at most 25%. WebRTC is the
+  ceiling, and a fixed `paplay` stream cap with a 25% default and 60% hard
+  maximum. WebRTC is the
   fail-closed default and is never automatically replaced. Stock v1.1.7 rejects
   WebRTC and Speex and must explicitly select Adrian. The reference device
   passed bounded echo-residual and staged barge-in canaries at 25%, but a
   syntactically valid Adrian topology is not proof for another installation;
   do not enable it there before physical double-talk and rollback canaries pass
-  at no more than 25%.
+  at the configured sink and stream values. Values above the previously
+  qualified 25% reference require new physical evidence, up to the 60% maximum.
 - “Okay Computer” remains an untrusted audio/control client. Home Assistant
   control is available only when exactly one Conversation subentry is
   explicitly opted in as realtime authority. Home Assistant—not the device—
