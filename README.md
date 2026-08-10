@@ -94,7 +94,8 @@ not part of the component-only HACS ZIP.
   tool-free frontend.
 - Direct mode remains turn-taking by default. Opt-in full duplex requires the
   reviewed static PulseAudio `module-echo-cancel` topology with one explicit,
-  allowlisted AEC engine, exact capture/playback routing, a startup safety
+  allowlisted AEC engine, exact capture/playback routing, an explicit startup
+  sink value aligned with the vendor media-player preference, a startup safety
   preflight, a sink-volume ceiling recheck before every response, and a fixed
   `paplay` stream volume with a safe 25% default and explicit 60% hard maximum.
   WebRTC remains the configuration and
@@ -233,7 +234,11 @@ omitted, with no automatic fallback. The observed stock v1.1.7 image instead
 requires an explicit `adrian` selection; its WebRTC and Speex engines are not
 compiled in and are rejected. The sink ceiling is checked again before every
 response, and full-duplex `paplay` is pinned to that AEC sink with a fixed
-stream volume no greater than the configured ceiling. Adrian creating the
+stream volume no greater than the configured ceiling. The guarded installer
+writes the chosen 1–60% sink value into the static PulseAudio block after the
+AEC sink is created. The stock voice process later reapplies its persistent
+Home Assistant media-player preference, so that setting must match; deferred
+PulseAudio restore state alone is not reboot evidence. Adrian creating the
 expected 16 kHz mono endpoints is only a topology canary. The reference device
 passed a bounded 25% echo-residual and staged double-talk canary. The sink and
 stream controls default to 25% and permit an explicit maximum of 60%; physical

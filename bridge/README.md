@@ -176,7 +176,11 @@ it opens this route. WebRTC is the default when no method is supplied; there is
 no automatic fallback. The stock ThirdReality v1.1.7 module rejects WebRTC and
 Speex, so its qualified configuration must explicitly select Adrian. The client
 rechecks the ceiling before every response and pins `paplay` to the AEC sink
-with a fixed configured stream volume that cannot exceed the sink ceiling.
+with a fixed configured stream volume that cannot exceed the sink ceiling. The
+guarded device installer writes the matching raw sink value in the static
+PulseAudio startup block. The stock voice process later reapplies the persistent
+Home Assistant media-player preference, which must match the configured
+ceiling; runtime restore state alone is not treated as reboot evidence.
 
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises

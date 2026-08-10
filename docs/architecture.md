@@ -359,7 +359,12 @@ rejects WebRTC and Speex but loads Adrian with the exact masters and
 `use_master_format=1`, producing 16 kHz mono endpoints; active stock-device
 configuration therefore explicitly selects Adrian. A startup preflight verifies
 the topology and configured 1–60% sink ceiling (25% default) before any microphone audio
-leaves the device. The ceiling is rechecked at every `speaking.started`, and
+leaves the device. The guarded installer also places the matching raw sink
+value immediately after AEC sink creation in the static PulseAudio startup
+block. The stock voice process later reapplies the persistent Home Assistant
+media-player preference, so deployments keep that later writer at the same
+value and do not depend on deferred device-restore state. The ceiling is
+rechecked at every `speaking.started`, and
 every `paplay` child is pinned to the AEC sink with a fixed stream volume at or
 below that ceiling. The Adrian topology result does not replace physical
 double-talk qualification for each installation at its configured sink and

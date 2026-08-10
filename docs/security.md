@@ -115,7 +115,11 @@ sides of a narrow bridge API.
   sink channel before each response, and starts `paplay` on that sink with a
   fixed stream volume no greater than the ceiling. The guard compares raw
   PulseAudio units to the exact linear ceiling rather than trusting rounded
-  display percentages. A successfully loaded Adrian topology still requires a
+  display percentages. The installer writes the matching raw setpoint in the
+  static startup block immediately after sink creation. The stock voice process
+  later applies its persistent Home Assistant media-player preference, which
+  must match; deferred PulseAudio restore state alone is not trusted across
+  reboot. A successfully loaded Adrian topology still requires a
   physical double-talk canary on each installation at its configured sink and
   stream values; the reference device's bounded 25% pass is not transferable
   evidence for another device or for an increase up to the explicit 60% maximum.

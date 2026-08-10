@@ -216,6 +216,11 @@ back automatically. Every AEC sink channel must be at or below the configured
 `paplay` is pinned to the AEC sink with the independently configured fixed
 linear `playback_volume_percent`, also defaulting to 25 and limited to 1–60.
 Configuration is rejected when playback exceeds the sink ceiling.
+The reference deployment helper writes the matching raw sink setpoint in the
+static PulseAudio startup block after AEC sink creation. On the stock device,
+the later vendor media-player preference must be persisted at the same value.
+These deployment properties complement the runtime protocol guard; they do not
+weaken or replace the per-response recheck.
 The legacy `aec_test_volume_percent` key maps to both values only when neither
 explicit key is present. The sink guard
 compares raw PulseAudio volume units against the exact linear ceiling; it does

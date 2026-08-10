@@ -5,6 +5,30 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-08-10
+
+### Added
+
+- Add a gateway-only development bridge path on port 18787 so the disposable
+  Home Assistant container can exercise the checkout end to end without HACS,
+  GitHub, or LAN exposure.
+- Add authenticated local Core lifecycle verification with a dedicated
+  development token while retaining an honest frontend-only onboarding mode.
+
+### Changed
+
+- Write the qualified ThirdReality AEC sink volume into the static PulseAudio
+  block and require it to match the later vendor media-player preference.
+- Recognize released method-only AEC blocks for explicit remove-and-reinstall
+  migration while keeping method and volume changes fail-closed.
+
+### Fixed
+
+- Wait for Home Assistant `/api/config` to report `RUNNING` after production
+  deployment restarts instead of accepting an early API response.
+- Treat a restart POST disconnect as ambiguous and require an observed
+  unavailable/non-running transition before accepting recovery.
+
 ## [0.5.3] - 2026-08-10
 
 ### Added
