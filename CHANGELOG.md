@@ -5,6 +5,17 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-10
+
+### Fixed
+
+- Defer the realtime Home Assistant tool snapshot until
+  `EVENT_HOMEASSISTANT_STARTED` through Home Assistant's supported
+  `async_at_started` lifecycle helper. A full boot can no longer capture the
+  Assist LLM API before its lazy tool providers finish registering; unloading
+  during startup cancels the pending one-shot listener, while runtime reloads
+  still start immediately.
+
 ## [0.5.0] - 2026-08-09
 
 ### Fixed
