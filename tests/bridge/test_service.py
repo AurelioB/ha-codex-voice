@@ -60,6 +60,29 @@ def _realtime_v2_start(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+async def _register_test_realtime_tool_authority(client: Any) -> tuple[Any, str]:
+    authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
+    await authority.send_json(
+        {
+            "type": "register",
+            "protocol_version": 1,
+            "authority_id": "conversation-profile",
+            "language": "es-MX",
+            "instructions": "Controla solo las entidades expuestas.",
+            "tools": [
+                {
+                    "name": "HassTurnOn",
+                    "description": "Enciende una entidad expuesta",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+    )
+    registered = await authority.receive_json(timeout=1)
+    assert registered["type"] == "registered"
+    return authority, registered["generation"]
+
+
 def _quiet_speech_pcm(sample_rate: int, *, ambient_level: int = 0) -> bytes:
     """Build low-RMS, high-crest PCM matching the measured device envelope."""
     frame_samples = sample_rate * bridge_service.TRANSCRIPTION_TRIM_FRAME_MS // 1_000
@@ -1273,6 +1296,19 @@ async def test_health_requires_bearer_and_reports_ready(
             "initialized": True,
             "auth_mode": "chatgpt",
             "plan_type": "plus",
+        },
+        "home_assistant_tools": {
+            "connected": False,
+            "language": None,
+            "tool_count": 0,
+            "pending_calls": 0,
+            "calls_started": 0,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
+            "calls_timed_out": 0,
+            "calls_transport_failed": 0,
+            "calls_cancelled": 0,
+            "last_call_duration_ms": None,
         },
     }
 
@@ -5590,7 +5626,10 @@ async def test_realtime_v2_never_forwards_provider_tool_calls(
                 "contentItems": [
                     {
                         "type": "inputText",
-                        "text": '{"error":"home_assistant_tool_unavailable"}',
+                        "text": (
+                            '{"error":"home_assistant_tool_unavailable",'
+                            '"do_not_retry":true}'
+                        ),
                     }
                 ],
                 "success": False,
@@ -5601,6 +5640,270 @@ async def test_realtime_v2_never_forwards_provider_tool_calls(
         await websocket.receive_json(timeout=0.02)
     await websocket.send_json({"type": "ping"})
     assert await websocket.receive_json(timeout=1) == {"type": "pong"}
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_bounds_missing_post_tool_continuation(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service, "REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS", 0.01
+    )
+    monkeypatch.setattr(bridge_service, "REALTIME_OUTPUT_ARM_TIMEOUT_SECONDS", 0.001)
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json(_realtime_v2_start())
+    started = await websocket.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "current"}})
+    )
+    assert (await websocket.receive_json(timeout=1))["event_type"] == "response.created"
+    await asyncio.sleep(0.01)
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-tool-without-continuation",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "provider-call-without-continuation",
+                "tool": "UnexpectedTool",
+                "arguments": {},
+            },
+        }
+    )
+
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    # A stale normalized transcript must not arm late media from an earlier
+    # output epoch or satisfy the post-tool continuation deadline.
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "assistant",
+                "delta": "stale",
+            },
+        }
+    )
+    peer.audio.put_nowait(b"\x11\x01" * 480)
+    peer.data.put_nowait(
+        json.dumps({"type": "response.cancelled", "response": {"id": "stale"}})
+    )
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "response.cancelled",
+    }
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "error",
+        "error": "realtime provider tool continuation timed out",
+    }
+    assert (await websocket.receive(timeout=1)).type is WSMsgType.CLOSE
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_retains_terminal_emitted_during_tool_result_write(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service, "REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS", 0.01
+    )
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json(_realtime_v2_start())
+    started = await websocket.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "current"}})
+    )
+    assert (await websocket.receive_json(timeout=1))["event_type"] == "response.created"
+
+    original_respond_result = fake_rpc.respond_result
+
+    async def respond_result_with_immediate_terminal(
+        request_id: int | str, result: Mapping[str, Any]
+    ) -> None:
+        await original_respond_result(request_id, result)
+        peer.data.put_nowait(
+            json.dumps({"type": "response.done", "response": {"id": "current"}})
+        )
+        # Let the data-channel consumer observe the terminal before the tool
+        # response coroutine resumes and marks its write as delivered.
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(
+        fake_rpc, "respond_result", respond_result_with_immediate_terminal
+    )
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-tool-immediate-terminal",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "provider-call-immediate-terminal",
+                "tool": "UnexpectedTool",
+                "arguments": {},
+            },
+        }
+    )
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "response.done",
+    }
+    await asyncio.sleep(0.03)
+    await websocket.send_json({"type": "ping"})
+    assert await websocket.receive_json(timeout=1) == {"type": "pong"}
+    await websocket.send_json({"type": "stop"})
+    await websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_tool_timeout_result_trips_session_circuit(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    authority, generation = await _register_test_realtime_tool_authority(client)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start())
+    started = await device.receive_json(timeout=1)
+
+    def provider_call(index: int) -> dict[str, Any]:
+        return {
+            "id": f"provider-timeout-{index}",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": f"semantic-timeout-{index}",
+                "tool": "HassTurnOn",
+                "arguments": {"name": "Cocina"},
+            },
+        }
+
+    await fake_rpc.broadcast(provider_call(1))
+    first = await authority.receive_json(timeout=1)
+    await authority.send_json(
+        {
+            "type": "tool_result",
+            "generation": generation,
+            "call_id": first["call_id"],
+            "success": False,
+            "result": {
+                "error": "tool_timeout",
+                "error_text": "outcome is unknown; do not retry",
+                "do_not_retry": True,
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while len(fake_rpc.responses) < 1:
+            await asyncio.sleep(0)
+
+    await fake_rpc.broadcast(provider_call(2))
+    async with asyncio.timeout(1):
+        while len(fake_rpc.responses) < 2:
+            await asyncio.sleep(0)
+    assert fake_rpc.responses[-1] == (
+        "provider-timeout-2",
+        {
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": (
+                        '{"error":"home_assistant_tool_session_unavailable",'
+                        '"do_not_retry":true}'
+                    ),
+                }
+            ],
+            "success": False,
+        },
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await authority.receive_json(timeout=0.02)
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_waits_for_parallel_tool_batch_before_continuation_timeout(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service, "REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS", 0.02
+    )
+    client = await aiohttp_client(bridge_app)
+    authority, generation = await _register_test_realtime_tool_authority(client)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start())
+    started = await device.receive_json(timeout=1)
+
+    for index in range(2):
+        await fake_rpc.broadcast(
+            {
+                "id": f"provider-parallel-{index}",
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": started["thread_id"],
+                    "callId": f"semantic-parallel-{index}",
+                    "tool": "HassTurnOn",
+                    "arguments": {"name": f"Entity {index}"},
+                },
+            }
+        )
+    delivered = [await authority.receive_json(timeout=1) for _ in range(2)]
+    await authority.send_json(
+        {
+            "type": "tool_result",
+            "generation": generation,
+            "call_id": delivered[0]["call_id"],
+            "success": True,
+            "result": {"speech": "first"},
+        }
+    )
+    async with asyncio.timeout(1):
+        while len(fake_rpc.responses) < 1:
+            await asyncio.sleep(0)
+    await asyncio.sleep(0.04)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    await authority.send_json(
+        {
+            "type": "tool_result",
+            "generation": generation,
+            "call_id": delivered[1]["call_id"],
+            "success": True,
+            "result": {"speech": "second"},
+        }
+    )
+    async with asyncio.timeout(1):
+        while len(fake_rpc.responses) < 2:
+            await asyncio.sleep(0)
+    peer = fake_rpc.peers[-1]
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "continuation"}})
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    peer.data.put_nowait(
+        json.dumps({"type": "response.done", "response": {"id": "continuation"}})
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.done"
+    await asyncio.sleep(0.04)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await authority.close()
 
 
 @pytest.mark.asyncio
@@ -5693,8 +5996,32 @@ async def test_realtime_v2_executes_only_captured_home_assistant_tools(
             "success": True,
         },
     )
-    with pytest.raises(asyncio.TimeoutError):
-        await device.receive_json(timeout=0.02)
+    peer = fake_rpc.peers[-1]
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "output_audio_buffer.started",
+    }
+    pcm = b"\x11\x01" * 480
+    peer.audio.put_nowait(pcm)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == pcm
+    peer.data.put_nowait(
+        json.dumps({"type": "turn.done", "turn": {"role": "assistant"}})
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 1,
+    }
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "turn.done",
+    }
     await device.send_json({"type": "ping"})
     assert await device.receive_json(timeout=1) == {"type": "pong"}
     await device.send_json({"type": "stop"})
@@ -5763,7 +6090,10 @@ async def test_pending_home_assistant_tool_does_not_block_provider_close(
             "contentItems": [
                 {
                     "type": "inputText",
-                    "text": '{"error":"home_assistant_tool_outcome_unknown"}',
+                    "text": (
+                        '{"error":"home_assistant_tool_outcome_unknown",'
+                        '"do_not_retry":true}'
+                    ),
                 }
             ],
             "success": False,
@@ -5852,7 +6182,10 @@ async def test_realtime_home_assistant_tools_deduplicate_provider_call_ids(
             "contentItems": [
                 {
                     "type": "inputText",
-                    "text": '{"error":"duplicate_home_assistant_tool_call"}',
+                    "text": (
+                        '{"error":"duplicate_home_assistant_tool_call",'
+                        '"do_not_retry":true}'
+                    ),
                 }
             ],
             "success": False,
@@ -5923,7 +6256,10 @@ async def test_realtime_home_assistant_tool_burst_is_bounded(
                 "contentItems": [
                     {
                         "type": "inputText",
-                        "text": '{"error":"too_many_home_assistant_tool_calls"}',
+                        "text": (
+                            '{"error":"too_many_home_assistant_tool_calls",'
+                            '"do_not_retry":true}'
+                        ),
                     }
                 ],
                 "success": False,

@@ -18,6 +18,9 @@ from aiohttp import (
     WSMsgType,
     WSServerHandshakeError,
 )
+from homeassistant.components.conversation.const import (
+    DOMAIN as CONVERSATION_DOMAIN,
+)
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.const import CONF_LLM_HASS_API, CONF_PROMPT
 from homeassistant.core import HomeAssistant, callback
@@ -64,6 +67,7 @@ _MAX_PENDING_TOOL_CALLS: Final = 16
 _MAX_CALLS_PER_GENERATION: Final = 1024
 _REGISTRATION_TIMEOUT: Final = 10.0
 _TOOL_CALL_TIMEOUT: Final = 25.0
+_SEND_TIMEOUT: Final = 5.0
 _INITIAL_RECONNECT_DELAY: Final = 1.0
 _MAX_RECONNECT_DELAY: Final = 60.0
 _TOOL_NAME: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,255}\Z")
@@ -164,6 +168,7 @@ class RealtimeToolBroker:
         max_reconnect_delay: float = _MAX_RECONNECT_DELAY,
         registration_timeout: float = _REGISTRATION_TIMEOUT,
         tool_call_timeout: float = _TOOL_CALL_TIMEOUT,
+        send_timeout: float = _SEND_TIMEOUT,
     ) -> None:
         """Initialize the outbound broker."""
         self._hass = hass
@@ -182,6 +187,9 @@ class RealtimeToolBroker:
         if tool_call_timeout <= 0:
             raise ValueError("tool_call_timeout must be positive")
         self._tool_call_timeout = tool_call_timeout
+        if send_timeout <= 0:
+            raise ValueError("send_timeout must be positive")
+        self._send_timeout = send_timeout
         self._stopped = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._connected = False
@@ -305,7 +313,11 @@ class RealtimeToolBroker:
             platform=DOMAIN,
             context=None,
             language=language,
-            assistant=DOMAIN,
+            # Entity exposure is keyed by the assistant that owns the request.
+            # Home Assistant currently supports the built-in "conversation"
+            # assistant here; using our integration domain produced an empty
+            # exposure set and silently omitted entity-dependent tools.
+            assistant=CONVERSATION_DOMAIN,
             device_id=None,
         )
         api_instance = await llm.async_get_api(
@@ -608,10 +620,14 @@ class RealtimeToolBroker:
             raise
         except TimeoutError:
             _LOGGER.warning("Realtime Home Assistant tool call timed out")
-            result = _tool_error(
-                "tool_timeout",
-                "Home Assistant tool call timed out; outcome is unknown; do not retry",
-            )
+            result = {
+                "error": "tool_timeout",
+                "error_text": (
+                    "Home Assistant tool call timed out; outcome is unknown; "
+                    "do not retry"
+                ),
+                "do_not_retry": True,
+            }
             success = False
         except Exception:
             # Third-party/custom LLM tools are not required to normalize their
@@ -664,12 +680,18 @@ class RealtimeToolBroker:
         message: str,
     ) -> None:
         """Serialize concurrent result and keepalive writes per connection."""
-        async with self._send_lock:
-            if websocket.closed:
-                raise RealtimeToolBrokerError(
-                    "Realtime Home Assistant tool broker disconnected"
-                )
-            await websocket.send_str(message)
+        try:
+            async with asyncio.timeout(self._send_timeout):
+                async with self._send_lock:
+                    if websocket.closed:
+                        raise RealtimeToolBrokerError(
+                            "Realtime Home Assistant tool broker disconnected"
+                        )
+                    await websocket.send_str(message)
+        except TimeoutError as err:
+            raise RealtimeToolBrokerError(
+                "Realtime Home Assistant tool broker send timed out"
+            ) from err
 
 
 def _tool_error(code: str, message: str) -> dict[str, str]:

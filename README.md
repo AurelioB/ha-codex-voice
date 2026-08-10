@@ -252,6 +252,15 @@ size-bounded calls to Home Assistant and fails closed if the authority changes,
 disconnects, times out, or returns an invalid result. The device token cannot
 use this route, and the device wire remains audio/control only.
 
+The broker uses Home Assistant's supported `conversation` assistant exposure
+namespace, so its entity-dependent tools match the entities exposed to the
+official Conversation flow. Tool execution and every transport layer have
+nested deadlines. Unknown outcomes are explicitly marked `do_not_retry`, trip
+a session circuit breaker, and are never retried by the bridge. If the provider
+does not produce audible output or a correctly correlated terminal lifecycle
+event within 20 seconds after accepting a tool result, the realtime session
+terminates instead of remaining stuck.
+
 Codex threads use a required named permission profile that exposes only minimal
 runtime paths. The default bridge command also disables shell, web, plugins,
 apps, MCP servers, hooks, command-environment inheritance, and interactive

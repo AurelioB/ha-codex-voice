@@ -5,6 +5,36 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-09
+
+### Fixed
+
+- Use Home Assistant's supported `conversation` exposure namespace for the
+  realtime Assist LLM context. Entity-dependent tools such as
+  `HassListAddItem` are now registered for the same exposed entities as the
+  official Conversation flow instead of silently receiving an empty exposure
+  set under the integration domain.
+- Apply nested deadlines to the complete realtime tool transaction: 25 seconds
+  for Home Assistant execution, 5 seconds for component result delivery, 35
+  seconds for the bridge request/write/result exchange, 5 seconds for provider
+  result delivery, and a 45-second App Server backstop. WebSocket send-lock and
+  write stalls can no longer bypass the broker deadline.
+- Preserve App Server fallback ownership until a tool response is actually
+  written, retain `outcome_unknown` / `do_not_retry` semantics across the
+  provider boundary, and trip a session circuit breaker after ambiguous
+  authority failures so fresh provider IDs cannot amplify retries.
+- Require audible provider output or a correctly correlated terminal lifecycle
+  event within 20 seconds after a tool result is delivered. A wedged post-tool
+  continuation now terminates with a bounded error instead of pinning the
+  realtime socket indefinitely.
+
+### Added
+
+- Report content-free realtime tool readiness and transaction counters from
+  authenticated bridge health, and log short one-way correlation labels for
+  provider call, Home Assistant result, and provider delivery stages without
+  recording tool names, arguments, results, or conversation content.
+
 ## [0.4.0] - 2026-08-09
 
 ### Added

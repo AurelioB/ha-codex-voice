@@ -127,6 +127,8 @@ REALTIME_OUTPUT_SIGNAL_PEAK = 256
 REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS = 0.5
 REALTIME_MAX_PENDING_TOOL_CALLS = 16
 REALTIME_MAX_TOOL_CALLS_PER_SESSION = 1_024
+REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS = 20.0
+REALTIME_PROVIDER_TOOL_REQUEST_TIMEOUT_SECONDS = 45.0
 
 _AUTH_IDENTITY_REQUEST_KEY = "ha_codex_voice.auth_identity"
 _AUTH_IDENTITY_PRIMARY = "primary"
@@ -567,6 +569,7 @@ class BridgeState:
                     env=self._isolated_runtime.environment,
                     inherit_env=False,
                     request_timeout=config.request_timeout,
+                    tool_timeout=REALTIME_PROVIDER_TOOL_REQUEST_TIMEOUT_SECONDS,
                 )
             except BaseException:
                 if self._temporary_cwd is not None:
@@ -1604,7 +1607,11 @@ async def _health(request: web.Request) -> web.Response:
     health = _public_health(state.rpc.health())
     ready = bool(health.get("running")) and health.get("auth_mode") == "chatgpt"
     return web.json_response(
-        {"status": "ok" if ready else "unavailable", "app_server": health},
+        {
+            "status": "ok" if ready else "unavailable",
+            "app_server": health,
+            "home_assistant_tools": state.home_assistant_tools.health(),
+        },
         status=200 if ready else 503,
     )
 
@@ -3846,7 +3853,8 @@ async def _serve_realtime_session(
             if broker_snapshot is not None:
                 base_instructions += (
                     "\n\nTrusted Home Assistant context follows. The available tools "
-                    "and entity exposure are authoritative for this session.\n"
+                    "and entity exposure are authoritative for this session. Never "
+                    "retry a tool result marked do_not_retry or outcome unknown.\n"
                     f"Language: {broker_snapshot.language}\n"
                     f"{broker_snapshot.instructions}"
                 )
@@ -4032,7 +4040,16 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     seen_tool_request_ids: set[int | str] = set()
     seen_tool_call_ids: set[str] = set()
     claimed_tool_responses: set[int | str] = set()
+    delivered_tool_responses: set[int | str] = set()
     tool_call_failures: asyncio.Queue[BaseException] = asyncio.Queue(maxsize=1)
+    tool_continuation_task: asyncio.Task[None] | None = None
+    tool_continuation_generation = 0
+    pending_tool_continuation_correlation: str | None = None
+    pending_tool_continuation_response_id: str | None = None
+    pending_tool_continuation_output_announced = False
+    pending_tool_continuation_output_delivered = False
+    pending_tool_continuation_terminal = False
+    tool_authority_failed_closed = False
     pending_cancel_confirmation: asyncio.Future[None] | None = None
     pending_cancel_response_id: str | None = None
     active_response_id: str | None = None
@@ -4231,6 +4248,133 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             if not waiter.done():
                 waiter.cancel()
 
+    def tool_correlation(request_id: int | str, call_id: str) -> str:
+        """Return a content-free label for one provider request/call pair."""
+        material = f"{request_id}\0{call_id}".encode()
+        return hashlib.sha256(material).hexdigest()[:12]
+
+    def cancel_tool_continuation_watchdog(*, clear_pending: bool = True) -> None:
+        """Invalidate the current post-tool continuation generation."""
+        nonlocal pending_tool_continuation_correlation
+        nonlocal pending_tool_continuation_output_announced
+        nonlocal pending_tool_continuation_output_delivered
+        nonlocal pending_tool_continuation_response_id
+        nonlocal pending_tool_continuation_terminal
+        nonlocal tool_continuation_generation
+        nonlocal tool_continuation_task
+        tool_continuation_generation += 1
+        if clear_pending:
+            pending_tool_continuation_correlation = None
+            pending_tool_continuation_response_id = None
+            pending_tool_continuation_output_announced = False
+            pending_tool_continuation_output_delivered = False
+            pending_tool_continuation_terminal = False
+        task = tool_continuation_task
+        tool_continuation_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def arm_pending_tool_continuation_watchdog() -> None:
+        """Arm once every accepted call in the current provider batch has settled."""
+        nonlocal tool_continuation_task
+        correlation = pending_tool_continuation_correlation
+        has_unsettled_call = any(
+            request_id not in delivered_tool_responses
+            for request_id in active_tool_calls
+        )
+        if correlation is None or has_unsettled_call or stop.is_set():
+            return
+        if tool_continuation_task is not None and not tool_continuation_task.done():
+            return
+        if (
+            pending_tool_continuation_output_delivered
+            or pending_tool_continuation_terminal
+        ):
+            cancel_tool_continuation_watchdog()
+            return
+        cancel_tool_continuation_watchdog(clear_pending=False)
+        generation = tool_continuation_generation
+
+        async def expire() -> None:
+            await asyncio.sleep(REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS)
+            if stop.is_set() or generation != tool_continuation_generation:
+                return
+            LOGGER.warning(
+                "Realtime provider tool continuation timed out correlation=%s",
+                correlation,
+            )
+            if tool_call_failures.empty():
+                tool_call_failures.put_nowait(
+                    ProtocolError("realtime provider tool continuation timed out")
+                )
+
+        task = asyncio.create_task(
+            expire(), name="codex-realtime-tool-continuation-timeout"
+        )
+        tool_continuation_task = task
+        output_aux_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            nonlocal tool_continuation_task
+            output_aux_tasks.discard(completed)
+            if tool_continuation_task is completed:
+                tool_continuation_task = None
+
+        task.add_done_callback(finished)
+
+    def require_tool_continuation(correlation: str) -> None:
+        """Record a delivered result and await output after the complete tool batch."""
+        nonlocal pending_tool_continuation_output_announced
+        nonlocal pending_tool_continuation_output_delivered
+        nonlocal pending_tool_continuation_correlation
+        nonlocal pending_tool_continuation_response_id
+        nonlocal pending_tool_continuation_terminal
+        pending_tool_continuation_correlation = correlation
+        pending_tool_continuation_response_id = active_response_id
+        pending_tool_continuation_output_announced = False
+        pending_tool_continuation_output_delivered = False
+        pending_tool_continuation_terminal = False
+        arm_pending_tool_continuation_watchdog()
+
+    def announce_tool_continuation_output(response_id: str | None = None) -> None:
+        """Bind later audible PCM to output announced after the current result."""
+        nonlocal pending_tool_continuation_output_announced
+        nonlocal pending_tool_continuation_response_id
+        if pending_tool_continuation_correlation is None:
+            return
+        pending_tool_continuation_output_announced = True
+        if response_id is not None:
+            pending_tool_continuation_response_id = response_id
+
+    def complete_tool_continuation_after_output() -> None:
+        """Complete the deadline only after announced PCM crossed the device wire."""
+        nonlocal pending_tool_continuation_output_delivered
+        if (
+            pending_tool_continuation_correlation is not None
+            and pending_tool_continuation_output_announced
+        ):
+            pending_tool_continuation_output_delivered = True
+            cancel_tool_continuation_watchdog()
+
+    def complete_tool_continuation_after_terminal(
+        event_type: str, response_id: str | None
+    ) -> None:
+        """Accept only a correlated terminal for the current post-tool response."""
+        nonlocal pending_tool_continuation_terminal
+        if pending_tool_continuation_correlation is None:
+            return
+        if event_type in {"response.cancelled", "response.done"}:
+            matches = (
+                response_id is not None
+                and response_id == pending_tool_continuation_response_id
+            )
+        else:
+            matches = pending_tool_continuation_output_announced
+        if not matches:
+            return
+        pending_tool_continuation_terminal = True
+        cancel_tool_continuation_watchdog()
+
     async def respond_to_provider_tool_once(
         request_id: int | str,
         call_id: str,
@@ -4241,8 +4385,18 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         """Attempt exactly one App Server response for a provider request id."""
         if request_id in claimed_tool_responses:
             return
+        correlation = tool_correlation(request_id, call_id)
         claimed_tool_responses.add(request_id)
         tool_requests = {call_id: request_id}
+        LOGGER.info(
+            "Delivering realtime Home Assistant tool result correlation=%s",
+            correlation,
+        )
+        # App Server can emit the continuation as soon as it accepts the
+        # response, before this coroutine is scheduled again after the write.
+        # Establish the generation first; the undelivered request keeps the
+        # watchdog itself disarmed until the write completes.
+        require_tool_continuation(correlation)
         await _respond_to_tool_result(
             state.rpc,
             {
@@ -4253,6 +4407,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             tool_requests,
             timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
         )
+        LOGGER.info(
+            "Delivered realtime Home Assistant tool result correlation=%s",
+            correlation,
+        )
+        delivered_tool_responses.add(request_id)
+        arm_pending_tool_continuation_watchdog()
 
     async def execute_home_assistant_tool_call(
         request_id: int | str,
@@ -4261,8 +4421,18 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         arguments: object,
     ) -> None:
         """Execute one provider call through the captured HA authority only."""
+        nonlocal tool_authority_failed_closed
+        correlation = tool_correlation(request_id, call_id)
+        started_at = time.monotonic()
+        LOGGER.info(
+            "Realtime Home Assistant tool call started correlation=%s",
+            correlation,
+        )
         success = False
-        result: object = {"error": "home_assistant_tool_unavailable"}
+        result: object = {
+            "error": "home_assistant_tool_unavailable",
+            "do_not_retry": True,
+        }
         if (
             broker_snapshot is not None
             and isinstance(name, str)
@@ -4274,14 +4444,43 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     name=name,
                     arguments=arguments,
                 )
-            except (ToolBrokerUnavailable, ProtocolError):
+            except ToolBrokerUnavailable:
+                tool_authority_failed_closed = True
+                result = {
+                    "error": "home_assistant_tool_outcome_unknown",
+                    "do_not_retry": True,
+                }
                 LOGGER.warning(
-                    "Realtime Home Assistant tool call failed closed",
+                    "Realtime Home Assistant tool call outcome is unknown "
+                    "correlation=%s",
+                    correlation,
+                    exc_info=True,
+                )
+            except ProtocolError:
+                tool_authority_failed_closed = True
+                LOGGER.warning(
+                    "Realtime Home Assistant tool call failed closed correlation=%s",
+                    correlation,
                     exc_info=True,
                 )
             else:
                 success = broker_result.success
                 result = broker_result.result
+                if (
+                    not success
+                    and isinstance(result, Mapping)
+                    and result.get("do_not_retry") is True
+                ):
+                    tool_authority_failed_closed = True
+        else:
+            tool_authority_failed_closed = True
+        LOGGER.info(
+            "Realtime Home Assistant tool call returned correlation=%s success=%s "
+            "duration_ms=%d",
+            correlation,
+            success,
+            round((time.monotonic() - started_at) * 1_000),
+        )
         await respond_to_provider_tool_once(
             request_id,
             call_id,
@@ -4303,6 +4502,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             return
         seen_tool_request_ids.add(request_id)
         call_id = str(params.get("callId", request_id))
+        cancel_tool_continuation_watchdog()
         name = params.get("tool")
         arguments = params.get("arguments", {})
 
@@ -4310,12 +4510,26 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         session_limit_exceeded = (
             len(seen_tool_request_ids) > REALTIME_MAX_TOOL_CALLS_PER_SESSION
         )
-        if session_limit_exceeded:
-            rejection = {"error": "home_assistant_tool_session_limit"}
+        if tool_authority_failed_closed:
+            rejection = {
+                "error": "home_assistant_tool_session_unavailable",
+                "do_not_retry": True,
+            }
+        elif session_limit_exceeded:
+            rejection = {
+                "error": "home_assistant_tool_session_limit",
+                "do_not_retry": True,
+            }
         elif call_id in seen_tool_call_ids:
-            rejection = {"error": "duplicate_home_assistant_tool_call"}
+            rejection = {
+                "error": "duplicate_home_assistant_tool_call",
+                "do_not_retry": True,
+            }
         elif len(active_tool_calls) >= REALTIME_MAX_PENDING_TOOL_CALLS:
-            rejection = {"error": "too_many_home_assistant_tool_calls"}
+            rejection = {
+                "error": "too_many_home_assistant_tool_calls",
+                "do_not_retry": True,
+            }
         else:
             seen_tool_call_ids.add(call_id)
 
@@ -4354,6 +4568,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 and request_id in claimed_tool_responses
             ):
                 active_tool_calls.pop(request_id, None)
+                arm_pending_tool_continuation_watchdog()
 
         task.add_done_callback(finished)
         if session_limit_exceeded and tool_call_failures.empty():
@@ -4489,10 +4704,14 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 )
             elif method == "thread/realtime/transcript/delta":
                 if wire_protocol.uses_binary_audio:
-                    if str(params.get("role", "")).lower() in {
-                        "assistant",
-                        "output",
-                    }:
+                    if (
+                        str(params.get("role", "")).lower()
+                        in {
+                            "assistant",
+                            "output",
+                        }
+                        and pending_tool_continuation_correlation is None
+                    ):
                         await arm_output()
                     continue
                 await send(
@@ -4504,10 +4723,14 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 )
             elif method == "thread/realtime/transcript/done":
                 if wire_protocol.uses_binary_audio:
-                    if str(params.get("role", "")).lower() in {
-                        "assistant",
-                        "output",
-                    }:
+                    if (
+                        str(params.get("role", "")).lower()
+                        in {
+                            "assistant",
+                            "output",
+                        }
+                        and pending_tool_continuation_correlation is None
+                    ):
                         await end_output(after_tail=True)
                     continue
                 await send(
@@ -4522,6 +4745,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     continue
                 await send({"type": "item", "item": params.get("item")})
             elif method == "thread/realtime/error":
+                cancel_tool_continuation_watchdog()
                 await send(
                     {
                         "type": "error",
@@ -4533,6 +4757,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     }
                 )
             elif method == "thread/realtime/closed":
+                cancel_tool_continuation_watchdog()
                 if wire_protocol.uses_binary_audio:
                     await end_output(after_tail=False)
                     await send({"type": "stopped", "reason": "remote_closed"})
@@ -4552,14 +4777,19 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             if not wire_protocol.uses_binary_audio:
                 await send_audio(chunk)
                 continue
+            delivered_output = False
             async with output_state_lock:
                 if output_speaking:
                     output_last_pcm_at = time.monotonic()
                     await send_audio(chunk)
+                    delivered_output = _realtime_pcm_has_signal(chunk)
                 else:
                     quarantine_output(chunk)
                     if output_armed and output_preroll:
                         await begin_output_locked()
+                        delivered_output = output_speaking
+            if delivered_output:
+                complete_tool_continuation_after_output()
 
     async def data_events() -> None:
         nonlocal active_response_id
@@ -4576,6 +4806,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 await end_output(after_tail=False)
                 continue
             if control.response_cancelled:
+                complete_tool_continuation_after_terminal(
+                    control.event_type, control.response_id
+                )
                 await end_output(after_tail=False)
                 waiter = pending_cancel_confirmation
                 if (
@@ -4598,6 +4831,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             ):
                 if control.event_type == "response.created":
                     active_response_id = control.response_id
+                announce_tool_continuation_output(control.response_id)
                 await arm_output()
                 await send(control.wire_value())
                 continue
@@ -4613,6 +4847,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     and control.response_id == active_response_id
                 ):
                     active_response_id = None
+                complete_tool_continuation_after_terminal(
+                    control.event_type, control.response_id
+                )
                 await end_output(after_tail=True)
                 await send(control.wire_value())
                 continue
@@ -4663,7 +4900,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     request_id,
                     call_id,
                     success=False,
-                    result={"error": "home_assistant_tool_outcome_unknown"},
+                    result={
+                        "error": "home_assistant_tool_outcome_unknown",
+                        "do_not_retry": True,
+                    },
                 )
                 for request_id, call_id in unresolved
             ]

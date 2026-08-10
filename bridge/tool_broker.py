@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import secrets
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -27,7 +29,7 @@ MAX_TOOL_RESULT_BYTES = 64 * 1024
 MAX_TOOL_BROKER_MESSAGE_BYTES = 256 * 1024
 MAX_PENDING_TOOL_CALLS = 16
 MAX_RETIRED_TOOL_CALLS = 128
-DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+DEFAULT_TOOL_TIMEOUT_SECONDS = 35.0
 _TOOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,255}\Z")
 
 
@@ -74,11 +76,38 @@ class HomeAssistantToolBroker:
         self._snapshot: ToolBrokerSnapshot | None = None
         self._pending: dict[str, _PendingCall] = {}
         self._retired: OrderedDict[str, str] = OrderedDict()
+        self._calls_started = 0
+        self._calls_succeeded = 0
+        self._calls_failed = 0
+        self._calls_timed_out = 0
+        self._calls_transport_failed = 0
+        self._calls_cancelled = 0
+        self._last_call_duration_ms: int | None = None
 
     @property
     def snapshot(self) -> ToolBrokerSnapshot | None:
         """Return the current immutable authority snapshot, if registered."""
         return self._snapshot
+
+    def health(self) -> dict[str, bool | int | str | None]:
+        """Return content-free broker readiness and transaction counters."""
+        snapshot = self._snapshot
+        websocket = self._websocket
+        return {
+            "connected": bool(
+                snapshot is not None and websocket is not None and not websocket.closed
+            ),
+            "language": snapshot.language if snapshot is not None else None,
+            "tool_count": len(snapshot.tools) if snapshot is not None else 0,
+            "pending_calls": len(self._pending),
+            "calls_started": self._calls_started,
+            "calls_succeeded": self._calls_succeeded,
+            "calls_failed": self._calls_failed,
+            "calls_timed_out": self._calls_timed_out,
+            "calls_transport_failed": self._calls_transport_failed,
+            "calls_cancelled": self._calls_cancelled,
+            "last_call_duration_ms": self._last_call_duration_ms,
+        }
 
     async def register(
         self,
@@ -217,20 +246,26 @@ class HomeAssistantToolBroker:
             asyncio.get_running_loop().create_future()
         )
         self._pending[call_id] = _PendingCall(snapshot.generation, future)
+        self._calls_started += 1
+        started_at = time.monotonic()
         completed = False
         try:
-            await self._send_json(
-                websocket,
-                {
-                    "type": "tool_call",
-                    "generation": snapshot.generation,
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": normalized_arguments,
-                },
-            )
             try:
                 async with asyncio.timeout(self._timeout):
+                    # The deadline covers lock acquisition and the WebSocket
+                    # write as well as Home Assistant execution. Starting it
+                    # after send_json allowed a backpressured authority socket
+                    # to hold a realtime provider request forever.
+                    await self._send_json(
+                        websocket,
+                        {
+                            "type": "tool_call",
+                            "generation": snapshot.generation,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": normalized_arguments,
+                        },
+                    )
                     # asyncio.timeout cancels the current task at its
                     # deadline. Shield the correlation future so a result
                     # arriving on that boundary cannot make handle_message()
@@ -239,12 +274,24 @@ class HomeAssistantToolBroker:
                     # cancels the now-unreachable future deterministically.
                     result = await asyncio.shield(future)
                     completed = True
+                    if result.success:
+                        self._calls_succeeded += 1
+                    else:
+                        self._calls_failed += 1
                     return result
             except TimeoutError as exc:
+                self._calls_timed_out += 1
                 raise ToolBrokerUnavailable(
                     "Home Assistant tool call timed out; outcome unknown, do not retry"
                 ) from exc
+            except asyncio.CancelledError:
+                self._calls_cancelled += 1
+                raise
+            except Exception:
+                self._calls_transport_failed += 1
+                raise
         finally:
+            self._last_call_duration_ms = round((time.monotonic() - started_at) * 1_000)
             self._pending.pop(call_id, None)
             current = self._snapshot
             if (
@@ -258,6 +305,12 @@ class HomeAssistantToolBroker:
                     self._retired.popitem(last=False)
             if not future.done():
                 future.cancel()
+            elif not completed and not future.cancelled():
+                # A disconnect can complete the shielded future at the same
+                # boundary as our outer deadline. Consume that now-unreachable
+                # exception without changing the fail-closed outcome.
+                with contextlib.suppress(BaseException):
+                    future.exception()
 
     async def _send_json(
         self,
