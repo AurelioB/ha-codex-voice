@@ -91,14 +91,17 @@ the expected raw hardware masters, endpoint names, configured method, and
 master format. It also requires an uncorked native capture stream owned by the
 current voice-process PID—including the already-open vendor recorder—to use
 that AEC source, and requires every live AEC sink channel to be at or below
-`aec_test_volume_percent`; output `paplay` is pinned to the same sink. A failed
+`aec_sink_volume_ceiling_percent`; output `paplay` is pinned to the same sink.
+A failed
 or mismatched check ends startup before any microphone audio leaves the device.
-Every full-duplex `paplay` child also receives a fixed linear stream-volume cap
-derived from that percentage, so a new response cannot start above the canary
-ceiling established by configuration. The sink-volume check runs again before
-every `speaking.started`, not only during startup; a raised channel fails the
-response closed. The guard compares raw PulseAudio units to the exact linear
-ceiling rather than trusting the rounded displayed percent.
+Every full-duplex `paplay` child also receives the fixed linear
+`playback_volume_percent`, so a new response cannot inherit an ambient stream
+volume. Both controls default to 25 and require explicit configuration above
+that value, with an absolute maximum of 60; configuration is rejected if the
+playback value exceeds the sink ceiling. The sink-volume check runs again
+before every `speaking.started`, not only during startup; a raised channel fails
+the response closed. The guard compares raw PulseAudio units to the exact
+linear ceiling rather than trusting the rounded displayed percent.
 
 While verified full duplex is active, capture remains continuous during
 playback. Two consecutive 64 ms AEC-filtered microphone frames that meet the
@@ -131,11 +134,12 @@ Speex because those engines are not compiled in. Adrian loads with the pinned
 microphone frames (maximum peak 2 and integer RMS 0), while staged double-talk
 stopped local output in 141 ms and continued on the same session. That result
 does not qualify another installation. Install and qualify the static
-PulseAudio AEC assets in [`deploy`](deploy) first. The initial acoustic canary must use the
-configured `aec_test_volume_percent`, which defaults to 25 and is hard-limited
-to 1–25. Do not exceed 25% until echo rejection and early, middle, and late
-double-talk barge-in pass on that physical device. Speex is available only on
-a different firmware build that actually compiles that engine.
+PulseAudio AEC assets in [`deploy`](deploy) first. The initial acoustic canary
+must use the configured sink ceiling and playback volume. Both default to 25
+and are hard-limited to 1–60. Do not increase either value above a previously
+qualified level until echo rejection and early, middle, and late double-talk
+barge-in pass at the new values on that physical device. Speex is available
+only on a different firmware build that actually compiles that engine.
 
 ## Wake-latency patch
 
@@ -267,7 +271,8 @@ replace the documentation address and placeholder token, then explicitly set
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
   "full_duplex": false,
-  "aec_test_volume_percent": 25
+  "aec_sink_volume_ceiling_percent": 25,
+  "playback_volume_percent": 25
 }
 ```
 
@@ -291,7 +296,7 @@ exact fail-closed block after the `hw:0,2` capture and `hw:0,1` playback
 masters. Its `--aec-method` allowlist is `webrtc`, `speex`, and `adrian`; an
 omitted flag means WebRTC and never triggers a fallback. The stock v1.1.7 image
 must use `--aec-method adrian`. The helper never restarts services, changes
-volume, or changes ADB. Once its static and physical canaries pass, add all five
+volume, or changes ADB. Once its static and physical canaries pass, add all six
 settings together:
 
 ```json
@@ -300,15 +305,22 @@ settings together:
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_test_volume_percent": 25
+  "aec_sink_volume_ceiling_percent": 25,
+  "playback_volume_percent": 25
 }
 ```
+
+To run this device at 60%, set both volume values to `60`, set the live AEC
+sink to 60%, and repeat the complete physical qualification before normal use.
+The legacy `aec_test_volume_percent` key remains accepted as an alias that sets
+both values, but it cannot be combined with either explicit key.
 
 PulseAudio object names must start with an ASCII letter, contain only ASCII
 letters, digits, `.` or `_`, and be at most 128 characters. Supplying an AEC
 route or method while full duplex is disabled, omitting either route while it
-is enabled, selecting a method outside the three-value allowlist, or setting the
-canary volume outside 1–25 fails configuration loading. Omitting the method in
+is enabled, selecting a method outside the three-value allowlist, combining the
+legacy and explicit volume keys, or setting either volume outside 1–60 fails
+configuration loading. Omitting the method in
 full duplex selects WebRTC rather than detecting or substituting an available
 engine. The shipped disabled configuration example intentionally omits the AEC
 routes and method so changing only `enabled` cannot activate unqualified full
@@ -385,13 +397,13 @@ On the physical device, verify these independently:
    without clipping the retained command prefix.
 6. Repeated direct and standard turns leave one stable voice process, no
    `paplay` child or LED/duck state behind, and bounded memory.
-7. At no more than the configured 25% canary volume, speak over early, middle,
+7. At the configured and previously qualified sink and stream volumes, speak over early, middle,
    and late response audio from near and far positions. Playback must stop at
    speech detection, the command must be recognized once, and response audio
    must not appear as user speech. Repeat after an idle gap and reconnect.
    Raising any AEC sink channel above the configured ceiling between responses
    must fail the next response, and the spawned `paplay` stream must remain
-   pinned at or below 25%.
+   pinned to its configured value, never above the 60% hard maximum.
 8. With realtime authority enabled, exercise barge-in once before any Home
    Assistant tool dispatch and once after a reviewed test action is dispatched.
    The first executor turn must be interrupted without a late action; the

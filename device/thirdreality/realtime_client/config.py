@@ -9,7 +9,7 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import SplitResult, urlsplit
 
 DEFAULT_CONFIG_PATH = Path("/data/conf/codex-realtime.json")
@@ -23,7 +23,14 @@ DEFAULT_PULSE_AEC_SOURCE = "codex_echo_cancel_source"
 DEFAULT_PULSE_AEC_SINK = "codex_echo_cancel_sink"
 DEFAULT_PULSE_AEC_METHOD = "webrtc"
 SUPPORTED_PULSE_AEC_METHODS = frozenset({"adrian", "speex", "webrtc"})
-DEFAULT_AEC_TEST_VOLUME_PERCENT = 25
+DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
+DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
+MAX_REALTIME_VOLUME_PERCENT = 60
+# Retained for source compatibility. JSON configurations may also keep using
+# ``aec_test_volume_percent`` as an unambiguous legacy alias for both new
+# settings.
+DEFAULT_AEC_TEST_VOLUME_PERCENT = DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT
+_VOLUME_UNSET = object()
 _PULSE_AEC_METHOD_ERROR = "pulse_aec_method must be 'adrian', 'speex', or 'webrtc'"
 _ALLOWED_KEYS = frozenset(
     {
@@ -50,6 +57,8 @@ _ALLOWED_KEYS = frozenset(
         "pulse_aec_sink",
         "pulse_aec_method",
         "aec_test_volume_percent",
+        "aec_sink_volume_ceiling_percent",
+        "playback_volume_percent",
     }
 )
 
@@ -83,20 +92,80 @@ class RealtimeConfig:
     pulse_aec_source: str | None = None
     pulse_aec_sink: str | None = None
     pulse_aec_method: str | None = None
+    # Keep the original constructor argument and readable attribute compatible.
+    # The two explicit controls are appended with private sentinels so older
+    # callers that pass only ``aec_test_volume_percent`` still couple both.
     aec_test_volume_percent: int = DEFAULT_AEC_TEST_VOLUME_PERCENT
+    aec_sink_volume_ceiling_percent: int = field(default=cast(int, _VOLUME_UNSET))
+    playback_volume_percent: int = field(default=cast(int, _VOLUME_UNSET))
 
     def __post_init__(self) -> None:
         """Keep direct construction as strict as the root-only JSON loader."""
         if not isinstance(self.full_duplex, bool):
             raise ConfigError("full_duplex must be a boolean")
+
+        legacy_volume_percent = self.aec_test_volume_percent
         if (
-            isinstance(self.aec_test_volume_percent, bool)
-            or not isinstance(self.aec_test_volume_percent, int)
-            or not 1 <= self.aec_test_volume_percent <= DEFAULT_AEC_TEST_VOLUME_PERCENT
+            isinstance(legacy_volume_percent, bool)
+            or not isinstance(legacy_volume_percent, int)
+            or not 1 <= legacy_volume_percent <= MAX_REALTIME_VOLUME_PERCENT
         ):
             raise ConfigError(
-                "aec_test_volume_percent must be an integer from 1 through 25"
+                "aec_test_volume_percent must be an integer from 1 through "
+                f"{MAX_REALTIME_VOLUME_PERCENT}"
             )
+
+        sink_volume_unset = self.aec_sink_volume_ceiling_percent is _VOLUME_UNSET
+        playback_volume_unset = self.playback_volume_percent is _VOLUME_UNSET
+        if sink_volume_unset and playback_volume_unset:
+            sink_volume_percent = legacy_volume_percent
+            playback_volume_percent = legacy_volume_percent
+        elif legacy_volume_percent != DEFAULT_AEC_TEST_VOLUME_PERCENT:
+            # A non-default legacy constructor argument remains authoritative.
+            # JSON configurations reject mixing legacy and explicit keys before
+            # construction, so this branch exists only for source compatibility.
+            sink_volume_percent = legacy_volume_percent
+            playback_volume_percent = legacy_volume_percent
+        else:
+            sink_volume_percent = (
+                DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT
+                if sink_volume_unset
+                else self.aec_sink_volume_ceiling_percent
+            )
+            playback_volume_percent = (
+                DEFAULT_PLAYBACK_VOLUME_PERCENT
+                if playback_volume_unset
+                else self.playback_volume_percent
+            )
+        for key, volume_percent in (
+            (
+                "aec_sink_volume_ceiling_percent",
+                sink_volume_percent,
+            ),
+            ("playback_volume_percent", playback_volume_percent),
+        ):
+            if (
+                isinstance(volume_percent, bool)
+                or not isinstance(volume_percent, int)
+                or not 1 <= volume_percent <= MAX_REALTIME_VOLUME_PERCENT
+            ):
+                raise ConfigError(
+                    f"{key} must be an integer from 1 through "
+                    f"{MAX_REALTIME_VOLUME_PERCENT}"
+                )
+        if playback_volume_percent > sink_volume_percent:
+            raise ConfigError(
+                "playback_volume_percent must not exceed "
+                "aec_sink_volume_ceiling_percent"
+            )
+        object.__setattr__(
+            self,
+            "aec_sink_volume_ceiling_percent",
+            sink_volume_percent,
+        )
+        object.__setattr__(self, "playback_volume_percent", playback_volume_percent)
+        # The legacy readable attribute reflects the effective playback value.
+        object.__setattr__(self, "aec_test_volume_percent", playback_volume_percent)
         for key, candidate in (
             ("pulse_aec_source", self.pulse_aec_source),
             ("pulse_aec_sink", self.pulse_aec_sink),
@@ -235,6 +304,44 @@ def load_config(
     pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
     pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
     pulse_aec_method = _optional_pulse_aec_method(decoded)
+    legacy_volume_present = "aec_test_volume_percent" in decoded
+    explicit_volume_present = any(
+        key in decoded
+        for key in (
+            "aec_sink_volume_ceiling_percent",
+            "playback_volume_percent",
+        )
+    )
+    if legacy_volume_present and explicit_volume_present:
+        raise ConfigError(
+            "aec_test_volume_percent cannot be combined with the explicit "
+            "volume settings"
+        )
+    if legacy_volume_present:
+        legacy_volume_percent = _bounded_int(
+            decoded,
+            "aec_test_volume_percent",
+            default=DEFAULT_AEC_TEST_VOLUME_PERCENT,
+            minimum=1,
+            maximum=MAX_REALTIME_VOLUME_PERCENT,
+        )
+        aec_sink_volume_ceiling_percent = legacy_volume_percent
+        playback_volume_percent = legacy_volume_percent
+    else:
+        aec_sink_volume_ceiling_percent = _bounded_int(
+            decoded,
+            "aec_sink_volume_ceiling_percent",
+            default=DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
+            minimum=1,
+            maximum=MAX_REALTIME_VOLUME_PERCENT,
+        )
+        playback_volume_percent = _bounded_int(
+            decoded,
+            "playback_volume_percent",
+            default=DEFAULT_PLAYBACK_VOLUME_PERCENT,
+            minimum=1,
+            maximum=MAX_REALTIME_VOLUME_PERCENT,
+        )
     if full_duplex and (pulse_aec_source is None or pulse_aec_sink is None):
         raise ConfigError(
             "full_duplex requires explicit pulse_aec_source and pulse_aec_sink"
@@ -319,13 +426,8 @@ def load_config(
         pulse_aec_source=pulse_aec_source,
         pulse_aec_sink=pulse_aec_sink,
         pulse_aec_method=pulse_aec_method,
-        aec_test_volume_percent=_bounded_int(
-            decoded,
-            "aec_test_volume_percent",
-            default=DEFAULT_AEC_TEST_VOLUME_PERCENT,
-            minimum=1,
-            maximum=DEFAULT_AEC_TEST_VOLUME_PERCENT,
-        ),
+        aec_sink_volume_ceiling_percent=aec_sink_volume_ceiling_percent,
+        playback_volume_percent=playback_volume_percent,
     )
     _validate_start_message_size(config)
     return config

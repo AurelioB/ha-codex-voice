@@ -11,7 +11,8 @@ import pytest
 
 from device.thirdreality.realtime_client import session as session_module
 from device.thirdreality.realtime_client.config import (
-    DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
+    DEFAULT_PLAYBACK_VOLUME_PERCENT,
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
@@ -56,7 +57,8 @@ def _config(**overrides: object) -> RealtimeConfig:
         "pulse_aec_source": None,
         "pulse_aec_sink": None,
         "pulse_aec_method": None,
-        "aec_test_volume_percent": DEFAULT_AEC_TEST_VOLUME_PERCENT,
+        "aec_sink_volume_ceiling_percent": (DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT),
+        "playback_volume_percent": DEFAULT_PLAYBACK_VOLUME_PERCENT,
     }
     values.update(overrides)
     return RealtimeConfig(**values)
@@ -421,7 +423,7 @@ def test_full_duplex_paplay_routes_only_to_configured_aec_sink(
     player = _PcmPlayer(
         4_096,
         sink=DEFAULT_PULSE_AEC_SINK,
-        volume_percent=25,
+        volume_percent=40,
         popen=lambda argv, **_kwargs: calls.append(argv) or process,
     )
 
@@ -431,7 +433,7 @@ def test_full_duplex_paplay_routes_only_to_configured_aec_sink(
         [
             *_PAPLAY_ARGV,
             f"--device={DEFAULT_PULSE_AEC_SINK}",
-            "--volume=16384",
+            "--volume=26214",
         ]
     ]
     player.abort()
@@ -789,19 +791,35 @@ def test_full_duplex_preflight_rejects_capture_bypass_or_excess_volume(
     monkeypatch.setattr(session_module.os, "getpid", lambda: 4242)
 
     with pytest.raises(WebSocketError, match="echo cancellation is not active"):
-        _verify_pulseaudio_aec(_duplex_config(aec_test_volume_percent=ceiling))
+        _verify_pulseaudio_aec(
+            _duplex_config(
+                aec_sink_volume_ceiling_percent=ceiling,
+                playback_volume_percent=min(
+                    DEFAULT_PLAYBACK_VOLUME_PERCENT,
+                    ceiling,
+                ),
+            )
+        )
 
 
 @pytest.mark.parametrize(
-    ("raw_volume", "expected"),
-    [(16_384, True), (16_385, False)],
+    ("raw_volume", "ceiling", "expected"),
+    [
+        (16_384, 25, True),
+        (16_385, 25, False),
+        (39_321, 60, True),
+        (39_322, 60, False),
+    ],
 )
 def test_sink_volume_ceiling_uses_exact_raw_pulseaudio_units(
-    raw_volume: int, expected: bool
+    raw_volume: int, ceiling: int, expected: bool
 ) -> None:
-    displayed = f"Volume: mono: {raw_volume} / 25% / -36.12 dB\n"
+    displayed = f"Volume: mono: {raw_volume} / {ceiling}% / -36.12 dB\n"
 
-    assert session_module._sink_volume_within_ceiling(displayed, ceiling=25) is expected
+    assert (
+        session_module._sink_volume_within_ceiling(displayed, ceiling=ceiling)
+        is expected
+    )
 
 
 def test_paplay_output_queue_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1177,10 +1195,18 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
 
 def test_full_duplex_rechecks_volume_ceiling_before_every_response() -> None:
     checks: list[int] = []
+    config = _duplex_config(
+        aec_sink_volume_ceiling_percent=60,
+        playback_volume_percent=40,
+    )
+    assert config.aec_sink_volume_ceiling_percent == 60
+    assert config.playback_volume_percent == 40
     session = RealtimeSession(
-        _duplex_config(),
+        config,
         aec_verifier=lambda _config: None,
-        volume_guard=lambda config: checks.append(config.aec_test_volume_percent),
+        volume_guard=lambda config: checks.append(
+            config.aec_sink_volume_ceiling_percent
+        ),
     )
     player = _RecordingPlayer()
 
@@ -1212,7 +1238,7 @@ def test_full_duplex_rechecks_volume_ceiling_before_every_response() -> None:
         last_output_epoch=last_epoch,
     )
 
-    assert checks == [25, 25]
+    assert checks == [60, 60]
     assert player.events == [("begin", 1), ("finish", 1), ("begin", 2)]
 
 

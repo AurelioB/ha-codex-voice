@@ -110,13 +110,15 @@ sides of a narrow bridge API.
   and client never probe or automatically downgrade to another engine. Stock
   v1.1.7 must explicitly select Adrian because its module rejects the uncompiled
   WebRTC and Speex engines. The client checks the exact method before opening
-  the bridge socket, enforces a configured 1–25% sink ceiling, rechecks every
+  the bridge socket, enforces a configured 1–60% sink ceiling with a safe 25%
+  default, rechecks every
   sink channel before each response, and starts `paplay` on that sink with a
   fixed stream volume no greater than the ceiling. The guard compares raw
   PulseAudio units to the exact linear ceiling rather than trusting rounded
   display percentages. A successfully loaded Adrian topology still requires a
-  physical double-talk canary on each installation at no more than 25%; the
-  reference device's bounded pass is not transferable evidence.
+  physical double-talk canary on each installation at its configured sink and
+  stream values; the reference device's bounded 25% pass is not transferable
+  evidence for another device or for an increase up to the explicit 60% maximum.
 - Local playback flush or provider VAD is not evidence of remote cancellation.
   On the native v2 path, resume still requires a sanitized provider
   `response.cancelled` event correlated to the exact active response. On the

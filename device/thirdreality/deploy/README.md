@@ -69,10 +69,10 @@ engine instead of falling back. It additionally requires an uncorked
 `protocol-native.c` capture stream owned by its exact process PID (the vendor
 recorder that was opened before wake) to reference the AEC source index, and
 requires every reported AEC sink channel to be no louder than
-`aec_test_volume_percent`. It fails closed if any route or channel is wrong.
-Playback is additionally pinned to the AEC sink, and each full-duplex `paplay`
-stream starts with a fixed linear volume no greater than that configured
-percentage. Before every `speaking.started`, the client re-reads all AEC sink
+`aec_sink_volume_ceiling_percent`. It fails closed if any route or channel is
+wrong. Playback is additionally pinned to the AEC sink, and each full-duplex
+`paplay` stream starts with the fixed linear `playback_volume_percent`. Before
+every `speaking.started`, the client re-reads all AEC sink
 channels and fails the response closed if any exceeds the same ceiling; the
 startup preflight alone is not treated as a lasting volume claim. It compares
 PulseAudio's raw channel units with the exact linear ceiling
@@ -81,10 +81,12 @@ Operators must not raise a live sink or stream during the canary.
 
 Loading Adrian and observing its 16 kHz mono endpoints verifies topology, not
 acoustic echo cancellation. For the first physical double-talk canary, read
-`aec_test_volume_percent` from the reviewed root-only realtime config and set
-the AEC sink to that percentage. The setting defaults to 25 and configuration
-validation enforces an absolute range of 1–25; never exceed 25% during AEC
-qualification. Lower it for a quiet room or near-field test. Record the
+`aec_sink_volume_ceiling_percent` and `playback_volume_percent` from the
+reviewed root-only realtime config and set the AEC sink to the former. Both
+settings default to 25 and configuration validation enforces an absolute range
+of 1–60 while rejecting playback above the sink ceiling. Never increase either
+value above a previously qualified level without repeating AEC qualification at
+the new values. Lower them for a quiet room or near-field test. Record the
 pre-test volume separately and restore it only after echo-rejection,
 early/middle/late barge-in, wake, normal Assist, and repeated-turn tests pass.
 The helper intentionally does not automate volume changes.
@@ -95,8 +97,9 @@ For the default canary value, the explicit device-side volume command is:
 pactl set-sink-volume codex_echo_cancel_sink 25%
 ```
 
-Use a lower validated percentage when configured; never substitute a value
-above 25 during qualification.
+Use the exact configured ceiling. A 60% deployment must explicitly configure
+60, run the sink command with 60%, and pass the complete no-user echo plus
+early/middle/late double-talk canaries before normal use.
 
 Only after the static topology and acoustic canary pass should the root-only
 realtime configuration enable:
@@ -107,7 +110,8 @@ realtime configuration enable:
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_test_volume_percent": 25
+  "aec_sink_volume_ceiling_percent": 25,
+  "playback_volume_percent": 25
 }
 ```
 

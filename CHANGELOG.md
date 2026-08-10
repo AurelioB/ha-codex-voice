@@ -5,6 +5,21 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-10
+
+### Added
+
+- Add a fast, localhost-only Docker workflow for checking and restarting the
+  custom component against the pinned Home Assistant release.
+- Add a hardened SSH deployment helper with bounded packaging, checksum-bound
+  staging, rollback on installation failure, and a recoverable previous backup.
+
+### Changed
+
+- Make the ThirdReality realtime AEC sink ceiling and playback stream volume
+  independently configurable, retaining safe 25% defaults with an explicit
+  hard maximum of 60%.
+
 ## [0.5.2] - 2026-08-10
 
 ### Added
