@@ -115,8 +115,7 @@ _AEC_BLOCKS = {
     )
 }
 _LEGACY_AEC_BLOCKS = {
-    aec_method: _legacy_aec_block(aec_method)
-    for aec_method in SUPPORTED_AEC_METHODS
+    aec_method: _legacy_aec_block(aec_method) for aec_method in SUPPORTED_AEC_METHODS
 }
 
 _MAX_DEFAULT_PA_BYTES = 1024 * 1024
@@ -350,7 +349,7 @@ def main() -> int:
         default=DEFAULT_AEC_SINK_VOLUME_PERCENT,
         metavar="PERCENT",
         help=(
-            "persistent AEC sink startup volume from "
+            "initial AEC sink startup volume from "
             f"{MIN_AEC_SINK_VOLUME_PERCENT} through "
             f"{MAX_AEC_SINK_VOLUME_PERCENT} percent (default: "
             f"{DEFAULT_AEC_SINK_VOLUME_PERCENT})"
@@ -362,6 +361,7 @@ def main() -> int:
         help="perform the requested mutation; otherwise install/remove are dry runs",
     )
     arguments = parser.parse_args()
+    past_tense = {"install": "installed", "remove": "removed"}
 
     contents, metadata = _read_root_config(arguments.default_pa)
     if arguments.action == "check":
@@ -385,19 +385,19 @@ def main() -> int:
         updated, changed = render_remove(contents)
     if not changed:
         print(  # noqa: T201 - intentional CLI status output
-            f"AEC startup block already {arguments.action}ed"
+            f"AEC startup block already {past_tense[arguments.action]}"
         )
         return 0
     if not arguments.apply:
         print(  # noqa: T201 - intentional CLI status output
-            f"dry run: AEC startup block would be {arguments.action}ed"
+            f"dry run: AEC startup block would be {past_tense[arguments.action]}"
         )
         return 0
     if arguments.action == "install":
         _create_backup(arguments.backup, contents.encode("utf-8"))
     _atomic_replace(arguments.default_pa, updated, metadata)
     print(  # noqa: T201 - intentional CLI status output
-        f"AEC startup block {arguments.action}ed; no service was restarted"
+        f"AEC startup block {past_tense[arguments.action]}; no service was restarted"
     )
     return 0
 

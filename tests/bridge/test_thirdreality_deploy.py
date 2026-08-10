@@ -209,9 +209,7 @@ def test_aec_sink_volume_cli_accepts_and_propagates_supported_values(
     )
     cli_arguments = ["prepare_pulseaudio_aec.py", "check"]
     if volume_percent != DEFAULT_AEC_SINK_VOLUME_PERCENT:
-        cli_arguments.extend(
-            ["--aec-sink-volume-percent", str(volume_percent)]
-        )
+        cli_arguments.extend(["--aec-sink-volume-percent", str(volume_percent)])
     monkeypatch.setattr(sys, "argv", cli_arguments)
 
     assert prepare_pulseaudio_aec.main() == 0
@@ -272,6 +270,22 @@ def test_aec_legacy_block_requires_remove_then_reinstall_migration(
         match=r"legacy.*remove it, then reinstall it to migrate",
     ):
         prepare_pulseaudio_aec.main()
+
+
+def test_aec_cli_reports_remove_dry_run_with_correct_past_tense(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installed, _changed = render_install(_PINNED_DEFAULT_PA)
+    monkeypatch.setattr(
+        prepare_pulseaudio_aec,
+        "_read_root_config",
+        lambda _path: (installed, None),
+    )
+    monkeypatch.setattr(sys, "argv", ["prepare_pulseaudio_aec.py", "remove"])
+
+    assert prepare_pulseaudio_aec.main() == 0
+    assert capsys.readouterr().out == ("dry run: AEC startup block would be removed\n")
 
 
 def test_reviewable_pulse_fragment_exactly_matches_installer_block() -> None:

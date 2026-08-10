@@ -298,7 +298,9 @@ omitted flag means WebRTC and never triggers a fallback. The stock v1.1.7 image
 must use `--aec-method adrian`. The helper never restarts services, changes
 the live volume, or changes ADB. It requires an explicit 1–60% startup sink
 value (`--aec-sink-volume-percent`, default 25) and writes its exact raw
-PulseAudio value into the managed block after sink creation. Once its static
+PulseAudio value into the managed block after sink creation. The stock vendor
+voice process subsequently applies its Home Assistant media-player preference,
+which must be set to the same value and verified after restart. Once its static
 and physical canaries pass, add all six settings together:
 
 ```json
@@ -315,11 +317,13 @@ and physical canaries pass, add all six settings together:
 To run this device at 60%, install the static block with
 `--aec-sink-volume-percent 60`, set both realtime volume values to `60`, set the
 live AEC sink to 60% for the immediate canary, and repeat the complete physical
-qualification before normal use. The resulting startup line uses raw `39321`
-and keeps the selected value across a service restart or reboot. Existing
-released blocks without a startup-volume line must be explicitly removed and
-then reinstalled; the helper will not silently rewrite a different managed
-block.
+qualification before normal use. Also set the device's official Home Assistant
+media-player entity to `0.6`; its persisted `sound.json` value is the later
+post-startup writer and must remain `60`. The startup line uses raw `39321` as
+the initial setpoint, and both layers must agree across restart or reboot.
+Existing released blocks without a startup-volume line must be explicitly
+removed and then reinstalled; the helper will not silently rewrite a different
+managed block.
 The legacy `aec_test_volume_percent` key remains accepted as an alias that sets
 both values, but it cannot be combined with either explicit key.
 

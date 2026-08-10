@@ -5,7 +5,11 @@ These assets are an opt-in preparation step for the pinned ThirdReality
 never restarts PulseAudio or the voice service, never changes the running
 speaker volume, and never changes or disables TCP ADB on port 5555. It does
 write the explicitly selected AEC sink volume into the managed PulseAudio
-startup block so the reviewed value survives a service restart or reboot.
+startup block so the reviewed value is applied when the AEC sink is created.
+On the stock device, the vendor voice process later reapplies the separate
+media-player preference from `/data/conf/sound.json`; that authoritative
+preference must be set to the same value through Home Assistant and verified
+after every restart or reboot.
 
 The device starts PulseAudio with `--disallow-module-loading`. Its
 `/etc/pulse/default.pa` includes `default.pa.d` **before** the two raw ALSA
@@ -76,10 +80,12 @@ The source and sink must be `codex_echo_cancel_source` and
 `module-echo-cancel` instance must use `aec_method=adrian` and
 `use_master_format=1` with the reviewed raw masters. The root-only realtime
 configuration must name the same method and its sink ceiling must match the
-managed startup value. At 60%, `pactl get-sink-volume` must report raw `39321`
-for every channel; 25% is raw `16384`. The realtime client repeats these checks
-before opening the bridge socket and refuses a mismatched or unsupported engine
-instead of falling back. It additionally requires an uncorked
+managed startup value and the device's Home Assistant media-player volume. At
+60%, the media-player entity must report `volume_level: 0.6`, its vendor
+preference must report `"volume": 60`, and `pactl get-sink-volume` must report
+raw `39321` for every channel; 25% is raw `16384`. The realtime client repeats
+these checks before opening the bridge socket and refuses a mismatched or
+unsupported engine instead of falling back. It additionally requires an uncorked
 `protocol-native.c` capture stream owned by its exact process PID (the vendor
 recorder that was opened before wake) to reference the AEC source index, and
 requires every reported AEC sink channel to be no louder than
@@ -114,11 +120,13 @@ pactl set-sink-volume codex_echo_cancel_sink 25%
 ```
 
 Use the exact configured ceiling. A 60% deployment must explicitly configure
-60 in both the installer and root-only realtime configuration, run the sink
-command with 60% for an immediate canary before restart, and pass the complete
-no-user echo plus early/middle/late double-talk canaries before normal use. The
-static raw startup command, rather than PulseAudio's deferred restore database,
-is the reboot-persistence authority.
+60 in the installer and root-only realtime configuration, set the official
+Home Assistant media-player entity to 60%, run the sink command with 60% for an
+immediate canary before restart, and pass the complete no-user echo plus
+early/middle/late double-talk canaries before normal use. The static command
+provides the initial setpoint; the vendor media-player preference is the later
+writer and reboot-persistence authority. They must agree. PulseAudio's deferred
+restore database is not sufficient evidence.
 
 Only after the static topology and acoustic canary pass should the root-only
 realtime configuration enable:
