@@ -4224,14 +4224,18 @@ async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
     captured_deadline: float | None = None
     captured_timeout: float | None = None
     wait_called_at: float | None = None
+    captured_audio_drain_task: asyncio.Task[None] | None = None
 
     async def capture_finalization(
         _session: Any,
         timeout: float,
         *,
         fragment_finalization_at: float | None = None,
+        audio_drain_task: asyncio.Task[None] | None = None,
     ) -> str:
+        nonlocal captured_audio_drain_task
         nonlocal captured_deadline, captured_timeout, wait_called_at
+        captured_audio_drain_task = audio_drain_task
         captured_deadline = fragment_finalization_at
         captured_timeout = timeout
         wait_called_at = asyncio.get_running_loop().time()
@@ -4267,6 +4271,8 @@ async def test_transcribe_fragment_finalization_uses_meaningful_pcm_end(
     )
     assert wait_called_at is not None
     assert captured_deadline - wait_called_at == pytest.approx(duration, abs=0.02)
+    assert captured_audio_drain_task is not None
+    assert captured_audio_drain_task.cancelled()
     assert len(fake_rpc.peers[-1].fed) == len(pcm) + len(
         bridge_service.silence_pcm16(1_000)
     )
@@ -6400,6 +6406,127 @@ async def test_transcription_uses_v3_data_channel_final() -> None:
     )
 
     assert transcript == "The front door is locked."
+
+
+@pytest.mark.asyncio
+async def test_transcription_drains_unwanted_audio_before_terminal_event() -> None:
+    """Audio output cannot overflow while finite STT waits for its transcript."""
+    session = FakeCollectorSession()
+    session.audio = asyncio.Queue(maxsize=1)
+
+    async def produce() -> None:
+        for chunk in (b"one", b"two", b"three"):
+            await session.audio.put(chunk)
+        await session.data.put(
+            json.dumps(
+                {
+                    "type": "turn.done",
+                    "turn": {"role": "user", "transcript": "Open the blinds."},
+                }
+            )
+        )
+
+    producer = asyncio.create_task(produce())
+    try:
+        transcript = await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(session, 1.0), timeout=0.2
+        )
+    finally:
+        await producer
+
+    assert transcript == "Open the blinds."
+    assert session.audio.empty()
+
+
+@pytest.mark.asyncio
+async def test_handoff_transcription_rejects_untracked_assistant_audio() -> None:
+    session = FakeCollectorSession()
+    session.audio.put_nowait(b"assistant-audio")
+
+    with pytest.raises(ProtocolError, match="produced assistant audio"):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session, 1.0, strict_handoff_boundary=True
+            ),
+            timeout=0.2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_handoff_terminal_cannot_hide_ready_untracked_audio() -> None:
+    session = FakeCollectorSession()
+    session.audio.put_nowait(b"assistant-audio")
+    session.events.put_nowait(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "text": "Open the blinds.",
+            },
+        }
+    )
+
+    with pytest.raises(ProtocolError, match="produced assistant audio"):
+        await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session, 1.0, strict_handoff_boundary=True
+            ),
+            timeout=0.2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_handoff_transcription_preserves_stt_and_invalidates_on_audio() -> None:
+    session = FakeCollectorSession()
+    boundary_state = bridge_service._SpeechHandoffBoundaryState()
+
+    async def produce() -> None:
+        await session.audio.put(b"assistant-audio")
+        while not boundary_state.invalidated:
+            await asyncio.sleep(0)
+        await session.data.put(
+            json.dumps(
+                {
+                    "type": "turn.done",
+                    "turn": {"role": "user", "transcript": "Open the blinds."},
+                }
+            )
+        )
+
+    producer = asyncio.create_task(produce())
+    try:
+        transcript = await asyncio.wait_for(
+            bridge_service._wait_for_user_transcript(
+                session,
+                1.0,
+                strict_handoff_boundary=True,
+                handoff_boundary_state=boundary_state,
+            ),
+            timeout=0.2,
+        )
+    finally:
+        await producer
+
+    assert transcript == "Open the blinds."
+    assert boundary_state.invalidated
+
+
+@pytest.mark.asyncio
+async def test_handoff_drain_failure_invalidates_session_reuse() -> None:
+    async def fail_drain() -> None:
+        raise ProtocolError("private transport failure")
+
+    boundary_state = bridge_service._SpeechHandoffBoundaryState()
+    task = asyncio.create_task(fail_drain())
+    await asyncio.sleep(0)
+
+    await bridge_service._retire_transcription_audio_drain(
+        task,
+        handoff_boundary_state=boundary_state,
+    )
+
+    assert boundary_state.invalidated
 
 
 @pytest.mark.asyncio
