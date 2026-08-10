@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .config import RealtimeConfig, realtime_start_message
+from .config import (
+    NATIVE_CONVERSATION_MODE,
+    RealtimeConfig,
+    realtime_start_message,
+)
 from .websocket import Message, WebSocketClosed, WebSocketConnection, WebSocketError
 
 _LOGGER = logging.getLogger("linux_voice_assistant.realtime")
@@ -1082,6 +1086,7 @@ def _validate_started(value: dict[str, Any]) -> None:
     expected = {
         "type": "started",
         "protocol_version": 2,
+        "conversation_mode": NATIVE_CONVERSATION_MODE,
         "audio_transport": "binary",
         "input_sample_rate": 16_000,
         "input_channels": 1,

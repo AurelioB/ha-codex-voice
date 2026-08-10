@@ -16,6 +16,7 @@ BINARY_AUDIO_TRANSPORT = "binary"
 V2_START_FIELDS = frozenset(
     {
         "audio_transport",
+        "conversation_mode",
         "conversation_id",
         "input_channels",
         "input_sample_rate",
@@ -71,10 +72,16 @@ class RealtimeWireProtocol:
     audio_transport: str
     input_sample_rate: int
     input_channels: int
+    conversation_mode: str | None = None
 
     @property
     def uses_binary_audio(self) -> bool:
         return self.version == BINARY_PROTOCOL_VERSION
+
+    @property
+    def requests_native_conversation(self) -> bool:
+        """Return whether the client explicitly selected native realtime voice."""
+        return self.conversation_mode == "native"
 
     @classmethod
     def negotiate(cls, start: Mapping[str, Any]) -> RealtimeWireProtocol:
@@ -83,6 +90,8 @@ class RealtimeWireProtocol:
         if not isinstance(raw_version, int) or isinstance(raw_version, bool):
             raise ProtocolError("protocol_version must be 1 or 2")
         if raw_version == LEGACY_PROTOCOL_VERSION:
+            if "conversation_mode" in start:
+                raise ProtocolError("conversation_mode requires protocol_version 2")
             transport = start.get("audio_transport")
             if transport not in {None, "json_base64"}:
                 raise ProtocolError(
@@ -93,6 +102,7 @@ class RealtimeWireProtocol:
                 audio_transport="json_base64",
                 input_sample_rate=REALTIME_SAMPLE_RATE,
                 input_channels=1,
+                conversation_mode=None,
             )
         if raw_version != BINARY_PROTOCOL_VERSION:
             raise ProtocolError("protocol_version must be 1 or 2")
@@ -113,13 +123,16 @@ class RealtimeWireProtocol:
             audio_transport=BINARY_AUDIO_TRANSPORT,
             input_sample_rate=sample_rate,
             input_channels=channels,
+            conversation_mode=(
+                "native" if start.get("conversation_mode") == "native" else None
+            ),
         )
 
     def started_fields(self) -> dict[str, Any]:
         """Return fields added to the common started acknowledgement."""
         if not self.uses_binary_audio:
             return {}
-        return {
+        fields: dict[str, Any] = {
             "protocol_version": self.version,
             "audio_transport": self.audio_transport,
             "input_sample_rate": self.input_sample_rate,
@@ -133,6 +146,9 @@ class RealtimeWireProtocol:
                 "same_session_interrupt_ack": True,
             },
         }
+        if self.conversation_mode is not None:
+            fields["conversation_mode"] = self.conversation_mode
+        return fields
 
 
 def sanitized_data_control_event(value: str | bytes) -> dict[str, str] | None:
@@ -250,6 +266,8 @@ def _validate_v2_start(start: Mapping[str, Any]) -> None:
             "protocol_version 2 start contains unsupported fields: "
             + ", ".join(unsupported)
         )
+    if "conversation_mode" in start and start.get("conversation_mode") != "native":
+        raise ProtocolError("conversation_mode must be 'native'")
     _optional_bounded_text(start, "conversation_id", maximum=128)
     _optional_bounded_text(start, "voice", maximum=64)
     _optional_bounded_text(start, "prompt", maximum=4_096)

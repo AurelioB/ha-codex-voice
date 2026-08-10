@@ -273,6 +273,7 @@ def _started(*, remote_cancel: bool = False) -> dict[str, object]:
     return {
         "type": "started",
         "protocol_version": 2,
+        "conversation_mode": "native",
         "audio_transport": "binary",
         "input_sample_rate": 16_000,
         "input_channels": 1,
@@ -1301,6 +1302,20 @@ def test_stale_output_epoch_is_quarantined() -> None:
     assert not player.events
 
 
+def test_started_requires_explicit_native_conversation_mode() -> None:
+    _validate_started(_started())
+
+    without_mode = _started()
+    without_mode.pop("conversation_mode")
+    with pytest.raises(WebSocketError, match="incompatible realtime protocol"):
+        _validate_started(without_mode)
+
+    wrong_mode = _started()
+    wrong_mode["conversation_mode"] = "managed"
+    with pytest.raises(WebSocketError, match="incompatible realtime protocol"):
+        _validate_started(wrong_mode)
+
+
 def test_started_requires_local_only_cancel_semantics() -> None:
     _validate_started(_started())
 
@@ -1400,6 +1415,7 @@ def test_network_thread_runs_v2_audio_turn_and_drains_before_stop(
     start = {
         "type": "start",
         "protocol_version": 2,
+        "conversation_mode": "native",
         "audio_transport": "binary",
         "input_sample_rate": 16_000,
         "input_channels": 1,
@@ -1486,6 +1502,7 @@ def test_network_thread_sends_optional_voice_and_prompt_only_when_configured(
         {
             "type": "start",
             "protocol_version": 2,
+            "conversation_mode": "native",
             "audio_transport": "binary",
             "input_sample_rate": 16_000,
             "input_channels": 1,
@@ -1540,6 +1557,7 @@ def test_interrupt_waits_for_bridge_ack_then_closes_fresh_session(
         {
             "type": "start",
             "protocol_version": 2,
+            "conversation_mode": "native",
             "audio_transport": "binary",
             "input_sample_rate": 16_000,
             "input_channels": 1,
@@ -1587,6 +1605,7 @@ def test_confirmed_remote_interrupt_resumes_same_socket_and_microphone(
         {
             "type": "start",
             "protocol_version": 2,
+            "conversation_mode": "native",
             "audio_transport": "binary",
             "input_sample_rate": 16_000,
             "input_channels": 1,
@@ -1644,6 +1663,7 @@ def test_detached_owner_closes_after_confirmed_remote_interrupt(
         {
             "type": "start",
             "protocol_version": 2,
+            "conversation_mode": "native",
             "audio_transport": "binary",
             "input_sample_rate": 16_000,
             "input_channels": 1,
@@ -1737,6 +1757,7 @@ def test_interrupt_ack_timeout_is_bounded_and_not_reported_as_failure(
         {
             "type": "start",
             "protocol_version": 2,
+            "conversation_mode": "native",
             "audio_transport": "binary",
             "input_sample_rate": 16_000,
             "input_channels": 1,
@@ -1773,6 +1794,7 @@ def test_cleanup_failure_cannot_prevent_terminal_state(
         {
             "type": "start",
             "protocol_version": 2,
+            "conversation_mode": "native",
             "audio_transport": "binary",
             "input_sample_rate": 16_000,
             "input_channels": 1,

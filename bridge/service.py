@@ -4101,7 +4101,10 @@ async def _realtime_admitted(
             )
         broker_snapshot = (
             state.home_assistant_tools.snapshot
-            if wire_protocol.uses_binary_audio
+            if (
+                wire_protocol.uses_binary_audio
+                and not wire_protocol.requests_native_conversation
+            )
             else None
         )
         configured_tools = normalize_dynamic_tools(
@@ -4245,12 +4248,28 @@ async def _serve_realtime_session(
                 and version == "v3"
                 and broker_snapshot is not None
             )
+            LOGGER.info(
+                "Realtime conversation route selected: route=%s selection=%s",
+                "managed" if bridge_managed_realtime else "native",
+                (
+                    "explicit"
+                    if wire_protocol.requests_native_conversation
+                    else "legacy_auto"
+                ),
+            )
             base_instructions = (
-                "Act only as a realtime Home Assistant voice agent. Never inspect "
-                "local files or use undeclared tools. Return only the shortest "
-                "natural final result suitable for speech. Do not narrate work, "
-                "send progress acknowledgements, offer follow-up help, or ask what "
-                "else to do unless clarification is required."
+                "Act as a natural realtime voice conversation partner. Respond "
+                "directly in conversational spoken language. Keep answers concise "
+                "unless the user asks for detail. Never inspect local files or "
+                "invoke tools."
+                if wire_protocol.requests_native_conversation
+                else (
+                    "Act only as a realtime Home Assistant voice agent. Never inspect "
+                    "local files or use undeclared tools. Return only the shortest "
+                    "natural final result suitable for speech. Do not narrate work, "
+                    "send progress acknowledgements, offer follow-up help, or ask what "
+                    "else to do unless clarification is required."
+                )
             )
             if broker_snapshot is not None:
                 base_instructions += (
@@ -4318,7 +4337,10 @@ async def _serve_realtime_session(
                 voice=voice.lower() if isinstance(voice, str) and voice else None,
                 include_startup_context=(
                     False
-                    if bridge_managed_realtime
+                    if (
+                        bridge_managed_realtime
+                        or wire_protocol.requests_native_conversation
+                    )
                     else True
                     if wire_protocol.uses_binary_audio
                     else bool(first.get("include_startup_context", True))
@@ -5780,6 +5802,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         "text control",
                     )
             elif message_type == "speech":
+                if wire_protocol.requests_native_conversation:
+                    raise ProtocolError("native realtime does not accept device speech")
                 text = message.get("text")
                 if not isinstance(text, str) or not text:
                     raise ProtocolError("speech text must be a non-empty string")

@@ -15,6 +15,7 @@ from device.thirdreality.realtime_client.config import (
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
     MAX_REALTIME_VOLUME_PERCENT,
+    NATIVE_CONVERSATION_MODE,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -90,6 +91,27 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert config.voice == "cove"
     assert config.prompt == private_prompt
     assert private_prompt not in repr(config)
+
+
+def test_realtime_start_message_hardcodes_native_conversation_mode(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert realtime_start_message(config)["conversation_mode"] == (
+        NATIVE_CONVERSATION_MODE
+    )
+
+
+def test_conversation_mode_is_not_a_user_configurable_setting(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, {**_valid_config(), "conversation_mode": "managed"})
+
+    with pytest.raises(ConfigError, match="unsupported settings"):
+        load_config(path, expected_uid=os.getuid())
 
 
 def test_explicitly_disabled_secure_config_needs_no_credentials(tmp_path: Path) -> None:
