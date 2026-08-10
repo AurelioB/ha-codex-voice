@@ -44,6 +44,7 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 MAX_MANIFEST_BYTES = 128 * 1024
+MAX_HASS_CONFIG_BYTES = 256 * 1024
 
 UPLOAD_TIMEOUT_SECONDS = 120.0
 DEPLOY_TIMEOUT_SECONDS = 120.0
@@ -782,27 +783,79 @@ def _request_status(home_assistant_request: request.Request, timeout: float) -> 
         return int(status_code)
 
 
-def _is_home_assistant_ready(base_url: str, token: str, timeout: float) -> bool:
-    api_request = request.Request(
-        f"{base_url}/api/",
+def _request_config_state(
+    base_url: str,
+    token: str,
+    timeout: float,
+) -> tuple[int, str | None]:
+    config_request = request.Request(
+        f"{base_url}/api/config",
         headers={"Authorization": f"Bearer {token}"},
         method="GET",
     )
+    with request.urlopen(config_request, timeout=timeout) as response:
+        status_code = getattr(response, "status", None)
+        if status_code is None:
+            status_code = response.getcode()
+        if not 200 <= status_code < 300:
+            return int(status_code), None
+        contents = response.read(MAX_HASS_CONFIG_BYTES + 1)
+
+    if len(contents) > MAX_HASS_CONFIG_BYTES:
+        return int(status_code), None
     try:
-        status_code = _request_status(api_request, timeout)
+        config = json.loads(contents.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return int(status_code), None
+    if not isinstance(config, dict):
+        return int(status_code), None
+    state = config.get("state")
+    if not isinstance(state, str):
+        return int(status_code), None
+    return int(status_code), state
+
+
+def _require_home_assistant_running(base_url: str, token: str, timeout: float) -> None:
+    try:
+        status_code, state = _request_config_state(base_url, token, timeout)
     except error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            raise DeploymentError(
-                "Home Assistant rejected HASS_TOKEN while waiting for restart"
-            ) from None
-        if 400 <= exc.code < 500:
-            raise DeploymentError(
-                f"Home Assistant readiness endpoint returned HTTP {exc.code}"
-            ) from None
-        return False
+        status_code = exc.code
+        state = None
+    except (error.URLError, TimeoutError, OSError):
+        raise DeploymentError(
+            "Home Assistant preflight config request failed"
+        ) from None
+
+    if status_code in {401, 403}:
+        raise DeploymentError("Home Assistant rejected HASS_TOKEN")
+    if not 200 <= status_code < 300:
+        raise DeploymentError(
+            f"Home Assistant preflight config endpoint returned HTTP {status_code}"
+        )
+    if state != "RUNNING":
+        raise DeploymentError(
+            "Home Assistant must report lifecycle state RUNNING before restart"
+        )
+
+
+def _is_home_assistant_ready(base_url: str, token: str, timeout: float) -> bool:
+    try:
+        status_code, state = _request_config_state(base_url, token, timeout)
+    except error.HTTPError as exc:
+        status_code = exc.code
+        state = None
     except (error.URLError, TimeoutError, OSError):
         return False
-    return 200 <= status_code < 300
+
+    if status_code in {401, 403}:
+        raise DeploymentError(
+            "Home Assistant rejected HASS_TOKEN while waiting for restart"
+        )
+    if 400 <= status_code < 500:
+        raise DeploymentError(
+            f"Home Assistant readiness endpoint returned HTTP {status_code}"
+        )
+    return 200 <= status_code < 300 and state == "RUNNING"
 
 
 def restart_home_assistant(
@@ -815,8 +868,20 @@ def restart_home_assistant(
     """Request a Home Assistant restart and wait boundedly for API readiness."""
     base_url = _validate_hass_url(base_url)
     token = _validate_hass_token(token)
-    if wait_timeout <= 0 or poll_interval <= 0:
+    if (
+        not math.isfinite(wait_timeout)
+        or not math.isfinite(poll_interval)
+        or wait_timeout <= 0
+        or poll_interval <= 0
+    ):
         raise DeploymentError("restart wait settings must be positive")
+
+    initial_request_timeout = min(HTTP_REQUEST_TIMEOUT_SECONDS, wait_timeout)
+    _require_home_assistant_running(
+        base_url,
+        token,
+        initial_request_timeout,
+    )
 
     restart_request = request.Request(
         f"{base_url}/api/services/homeassistant/restart",
@@ -827,10 +892,11 @@ def restart_home_assistant(
         },
         method="POST",
     )
+    restart_response_received = True
     try:
         restart_status = _request_status(
             restart_request,
-            min(HTTP_REQUEST_TIMEOUT_SECONDS, wait_timeout),
+            initial_request_timeout,
         )
     except error.HTTPError as exc:
         if exc.code in {401, 403}:
@@ -838,9 +904,14 @@ def restart_home_assistant(
         raise DeploymentError(
             f"Home Assistant restart request returned HTTP {exc.code}"
         ) from None
-    except (error.URLError, TimeoutError, OSError) as exc:
-        raise DeploymentError("Home Assistant restart request failed") from exc
-    if not 200 <= restart_status < 300:
+    except (error.URLError, TimeoutError, OSError):
+        restart_response_received = False
+        restart_status = None
+    if restart_status in {401, 403}:
+        raise DeploymentError("Home Assistant rejected HASS_TOKEN")
+    if restart_status is None:
+        pass
+    elif not 200 <= restart_status < 300:
         raise DeploymentError(
             f"Home Assistant restart request returned HTTP {restart_status}"
         )
@@ -855,12 +926,12 @@ def restart_home_assistant(
             break
         time.sleep(min(poll_interval, remaining))
         remaining = deadline - time.monotonic()
-        request_timeout = max(
-            0.1,
-            min(HTTP_REQUEST_TIMEOUT_SECONDS, max(remaining, 0.1)),
-        )
+        if remaining <= 0:
+            break
+        request_timeout = min(HTTP_REQUEST_TIMEOUT_SECONDS, remaining)
         ready = _is_home_assistant_ready(base_url, token, request_timeout)
-        if ready and (saw_unavailable or attempt * poll_interval >= grace_seconds):
+        grace_elapsed = attempt * poll_interval >= grace_seconds
+        if ready and (saw_unavailable or (restart_response_received and grace_elapsed)):
             return
         if not ready:
             saw_unavailable = True

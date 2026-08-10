@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import tarfile
+from email.message import Message
 from pathlib import Path
 from urllib import error
 
@@ -64,11 +65,14 @@ def test_archive_contains_only_safe_integration_files(tmp_path: Path) -> None:
         assert all(
             not member.issym() and not member.islnk() for member in archive.getmembers()
         )
-        combined = b"".join(
-            archive.extractfile(member).read()
-            for member in archive.getmembers()
-            if member.isfile() and archive.extractfile(member) is not None
-        )
+        extracted_files: list[bytes] = []
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            extracted_file = archive.extractfile(member)
+            assert extracted_file is not None
+            extracted_files.append(extracted_file.read())
+        combined = b"".join(extracted_files)
     assert b"do-not-package" not in combined
 
 
@@ -291,17 +295,30 @@ def test_restart_uses_supported_rest_endpoint_and_waits_for_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = "rest-api-secret-token"
-    requests: list[object] = []
+    config_requests: list[tuple[str, float]] = []
+    restart_requests: list[tuple[deploy.request.Request, float]] = []
+    request_order: list[str] = []
+    config_states = iter(["RUNNING", "NOT_RUNNING", "RUNNING"])
 
-    def request_status(home_assistant_request: object, _timeout: float) -> int:
-        requests.append(home_assistant_request)
-        if len(requests) == 1:
-            return 200
-        if len(requests) == 2:
-            raise error.URLError("restarting")
-        return 200
+    def request_config_state(
+        base_url: str,
+        _token: str,
+        timeout: float,
+    ) -> tuple[int, str | None]:
+        request_order.append("config")
+        config_requests.append((f"{base_url}/api/config", timeout))
+        return 200, next(config_states)
 
-    monkeypatch.setattr(deploy, "_request_status", request_status)
+    def disconnect_restart(
+        home_assistant_request: deploy.request.Request,
+        timeout: float,
+    ) -> int:
+        request_order.append("restart")
+        restart_requests.append((home_assistant_request, timeout))
+        raise error.URLError("connection closed during restart")
+
+    monkeypatch.setattr(deploy, "_request_config_state", request_config_state)
+    monkeypatch.setattr(deploy, "_request_status", disconnect_restart)
     monkeypatch.setattr(deploy.time, "sleep", lambda _seconds: None)
 
     deploy.restart_home_assistant(
@@ -311,23 +328,127 @@ def test_restart_uses_supported_rest_endpoint_and_waits_for_readiness(
         poll_interval=0.1,
     )
 
-    restart_request = requests[0]
+    restart_request = restart_requests[0][0]
     assert restart_request.full_url.endswith("/api/services/homeassistant/restart")
     assert restart_request.method == "POST"
     assert restart_request.data == b"{}"
     assert restart_request.headers["Authorization"] == f"Bearer {token}"
-    assert requests[-1].full_url.endswith("/api/")
+    assert request_order == ["config", "restart", "config", "config"]
+    assert all(url.endswith("/api/config") for url, _ in config_requests)
+    assert all(
+        0 < timeout <= deploy.HTTP_REQUEST_TIMEOUT_SECONDS
+        for _, timeout in [*config_requests, *restart_requests]
+    )
+
+
+def test_ambiguous_restart_without_observed_transition_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        deploy,
+        "_request_config_state",
+        lambda _base_url, _token, _timeout: (200, "RUNNING"),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_request_status",
+        lambda _request, _timeout: (_ for _ in ()).throw(error.URLError("closed")),
+    )
+    monkeypatch.setattr(deploy.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(deploy.DeploymentError, match="did not become ready"):
+        deploy.restart_home_assistant(
+            "http://homeassistant.local:8123",
+            "token",
+            wait_timeout=0.3,
+            poll_interval=0.1,
+        )
+
+
+@pytest.mark.parametrize(
+    "config_body",
+    [
+        b"not-json",
+        b"x" * (deploy.MAX_HASS_CONFIG_BYTES + 1),
+        b'{"state":"NOT_RUNNING"}',
+    ],
+)
+def test_restart_preflight_rejects_invalid_or_non_running_config(
+    config_body: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ConfigResponse(io.BytesIO):
+        status = 200
+
+        def getcode(self) -> int:
+            return self.status
+
+    restart_called = False
+
+    def config_response(_request: object, *, timeout: float) -> ConfigResponse:
+        assert 0 < timeout <= deploy.HTTP_REQUEST_TIMEOUT_SECONDS
+        return ConfigResponse(config_body)
+
+    def unexpected_restart(_request: object, _timeout: float) -> int:
+        nonlocal restart_called
+        restart_called = True
+        return 200
+
+    monkeypatch.setattr(deploy.request, "urlopen", config_response)
+    monkeypatch.setattr(deploy, "_request_status", unexpected_restart)
+
+    with pytest.raises(deploy.DeploymentError, match="state RUNNING"):
+        deploy.restart_home_assistant(
+            "http://homeassistant.local:8123",
+            "token",
+        )
+
+    assert restart_called is False
+
+
+def test_successful_restart_response_can_use_grace_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_requests = 0
+
+    def running_config(
+        _base_url: str,
+        _token: str,
+        _timeout: float,
+    ) -> tuple[int, str | None]:
+        nonlocal config_requests
+        config_requests += 1
+        return 200, "RUNNING"
+
+    monkeypatch.setattr(deploy, "_request_config_state", running_config)
+    monkeypatch.setattr(deploy, "_request_status", lambda _request, _timeout: 200)
+    monkeypatch.setattr(deploy.time, "sleep", lambda _seconds: None)
+
+    deploy.restart_home_assistant(
+        "http://homeassistant.local:8123",
+        "token",
+        wait_timeout=0.2,
+        poll_interval=0.1,
+    )
+
+    assert config_requests == 2
 
 
 def test_restart_failure_does_not_expose_token(monkeypatch: pytest.MonkeyPatch) -> None:
     token = "never-print-this-token"
+
+    monkeypatch.setattr(
+        deploy,
+        "_request_config_state",
+        lambda _base_url, _token, _timeout: (200, "RUNNING"),
+    )
 
     def unauthorized(_request: object, _timeout: float) -> int:
         raise error.HTTPError(
             "http://homeassistant.local:8123/api/services/homeassistant/restart",
             401,
             f"unauthorized {token}",
-            hdrs=None,
+            hdrs=Message(),
             fp=None,
         )
 
@@ -337,6 +458,45 @@ def test_restart_failure_does_not_expose_token(monkeypatch: pytest.MonkeyPatch) 
         deploy.restart_home_assistant("http://homeassistant.local:8123", token)
 
     assert token not in str(raised.value)
+
+
+def test_restart_readiness_auth_failure_does_not_expose_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "never-print-this-readiness-token"
+    config_calls = 0
+
+    def readiness_unauthorized(
+        _base_url: str,
+        _token: str,
+        _timeout: float,
+    ) -> tuple[int, str | None]:
+        nonlocal config_calls
+        config_calls += 1
+        if config_calls == 1:
+            return 200, "RUNNING"
+        raise error.HTTPError(
+            "http://homeassistant.local:8123/api/config",
+            401,
+            f"unauthorized {token}",
+            hdrs=Message(),
+            fp=None,
+        )
+
+    monkeypatch.setattr(deploy, "_request_config_state", readiness_unauthorized)
+    monkeypatch.setattr(deploy, "_request_status", lambda _request, _timeout: 200)
+    monkeypatch.setattr(deploy.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(deploy.DeploymentError) as raised:
+        deploy.restart_home_assistant(
+            "http://homeassistant.local:8123",
+            token,
+            wait_timeout=0.2,
+            poll_interval=0.1,
+        )
+
+    assert token not in str(raised.value)
+    assert "rejected HASS_TOKEN" in str(raised.value)
 
 
 def test_subprocess_failure_is_sanitized_and_stops_deployment(
