@@ -1,10 +1,12 @@
 # Codex Voice for Home Assistant
 
 Codex Voice is an unofficial Home Assistant integration that exposes a
-Conversation agent, text-to-speech, an experimental speech-to-text adapter,
-and an experimental realtime turn-taking transport backed by a user's existing
-ChatGPT/Codex login. The reliable Assist configuration composes those providers
-with local Whisper STT through Home Assistant's native Wyoming integration.
+Conversation agent, an experimental text-to-speech adapter, an experimental
+speech-to-text adapter, and an experimental realtime turn-taking transport
+backed by a user's existing ChatGPT/Codex login. The recommended Assist
+configuration uses Home Assistant's native Wyoming integration for local
+faster-whisper STT and local Piper TTS, with Codex Voice providing the
+Conversation stage between them.
 
 > [!WARNING]
 > This project relies on experimental Codex App Server interfaces. It can
@@ -23,7 +25,7 @@ ThirdReality: "Okay Nabu"
   -> Home Assistant Assist pipeline
      -> Wyoming faster-whisper STT (local)
      -> Codex Voice Conversation (ChatGPT OAuth)
-     -> Codex Voice TTS (experimental subscription realtime)
+     -> Wyoming Piper TTS (local service on external host, es_MX-ald-medium)
   -> speaker
 
 ThirdReality: "Okay Computer"
@@ -47,11 +49,13 @@ not part of the component-only HACS ZIP.
 ## Status
 
 - Milestone 1: a standard Home Assistant pipeline using native Wyoming local
-  STT with Codex Voice Conversation and TTS entities.
+  STT and TTS around the Codex Voice Conversation entity. The recommended
+  Mexican Spanish voice is Piper `es_MX-ald-medium`.
 - New installations do not create the experimental Codex STT subentry by
   default. Existing subentries remain available for explicit diagnostics.
-- Milestone 1 TTS progressively delivers realtime speech frames instead of
-  waiting for the entire rendered response and remote cleanup.
+- The retained experimental Codex TTS entity progressively delivers realtime
+  speech frames instead of waiting for the entire rendered response and remote
+  cleanup, but it is not the recommended production TTS stage.
 - Newly created Conversation profiles default to low reasoning effort and App
   Server's configurable `priority` tier; upgraded profiles preserve standard
   usage until reconfigured, and `standard` remains available when lower
@@ -125,7 +129,25 @@ Assistant's **Wyoming Protocol** integration. See [reliable local
 speech-to-text](docs/local-stt.md) for the tested external service and systemd
 configuration.
 
-### 4. Install through HACS
+### 4. Add reliable local TTS
+
+Install the official Piper add-on (shown as an app in current Home Assistant
+UI) on Home Assistant OS, or run the pinned `wyoming-piper==2.3.1` service on a
+trusted external host. Add it through Home Assistant's native **Wyoming
+Protocol** integration and select
+`es_MX-ald-medium` for Mexican Spanish. The external service listens on
+`tcp://HOST:10200` after its bind address is configured. Its supplied installer
+pins and verifies that voice model, and the hardened service exposes the model
+directory read-only.
+
+On some virtualized x86-64 Home Assistant OS installations, the current
+official Piper add-on may require the guest CPU model to expose x86-64-v2
+instructions. This is specific to affected x86-64 virtualization setups, not a
+general Piper limitation. Expose an appropriate CPU model when practical, or
+use the supported external Wyoming service path. See [reliable local
+text-to-speech](docs/local-tts.md).
+
+### 5. Install through HACS
 
 Until the repository is accepted into HACS defaults:
 
@@ -136,21 +158,24 @@ Until the repository is accepted into HACS defaults:
 5. Enter the bridge URL, such as `http://192.0.2.10:8787`, and the separate
    bridge token.
 
-The config flow creates stable Conversation and TTS subentries. In an Assist
-pipeline select the Wyoming faster-whisper entity for STT, Codex Voice for
-Conversation, and Codex Voice for TTS.
+The config flow creates Conversation and subscription-backed TTS subentries.
+In the recommended Assist pipeline, select the Wyoming faster-whisper entity
+for STT, Codex Voice for Conversation, and the Wyoming Piper entity for TTS.
+The Codex TTS entity remains available for explicit experimental use and
+comparison.
 
-For Mexican Spanish, set the pipeline language and Conversation/TTS languages
-to `es-MX`, and select `es` for Wyoming faster-whisper STT. The bridge treats
-the pipeline locale as trusted response-language context. The component leaves
-Home Assistant's global interface language unchanged.
+For Mexican Spanish, set the pipeline and Conversation languages to `es-MX`,
+select `es` for Wyoming faster-whisper STT, set Piper TTS language to `es_MX`,
+and select voice `es_MX-ald-medium`. The bridge treats the pipeline locale as
+trusted response-language context. The component leaves Home Assistant's
+global interface language unchanged.
 
 For the lowest latency on ordinary device-control commands, enable **Prefer
 handling commands locally** on that pipeline. Home Assistant will handle
 matching built-in intents locally and retain Codex Voice as the fallback for
 open-ended conversation.
 
-### 5. Optional ThirdReality realtime mode
+### 6. Optional ThirdReality realtime mode
 
 Release assets include `thirdreality-realtime.zip` for the pinned Python-based
 ThirdReality v1.1.7 client. It contains the guarded `sitecustomize.py`, the
@@ -238,7 +263,7 @@ bridge advertises `local_flush: true` and `remote_cancel: false`; the next turn
 uses a new WebSocket, Codex thread, and realtime session. See the complete
 [v2 wire contract](protocol/realtime-wire-v2.md).
 
-The standard TTS entity uses the authenticated
+The retained experimental Codex TTS entity uses the authenticated
 `POST /v1/synthesize/stream` route. It sends an EOF-terminated PCM16 WAV stream
 through Home Assistant's TTS proxy as audio arrives; the finite
 `POST /v1/synthesize` route remains available for older clients and diagnostics.
@@ -267,13 +292,38 @@ service transcribed the same non-sensitive reference WAV three times in 0.775,
 roughly 19 seconds in an observed physical run and also intermittently missed
 clean input. These are small diagnostic samples, not latency guarantees.
 
+On that host, the repository smoke probe measured Piper
+`es_MX-ald-medium` to the first non-empty Wyoming PCM chunk. Across two service
+restarts, cold first PCM ranged from 0.714 to 0.956 seconds and complete
+synthesis from 0.824 to 1.072 seconds. Five warm requests reached first PCM in
+0.025, 0.024, 0.044, 0.028, and 0.035 seconds: a 0.028-second median and
+0.044-second maximum. Their median complete synthesis time was 0.116 seconds
+for 2.949 to 3.367 seconds of audio. Three controlled Codex TTS requests for
+the same text had a
+2.025-second median to first audio (1.671 to 2.898 seconds), about 72 times
+Piper's warm median at this provider boundary.
+
+A separate physical Home Assistant call changed the ThirdReality
+`media_player` state to playing at 0.018097 seconds and back to idle at
+3.564543 seconds, but actual audible onset was not instrumented. These small,
+host-side and state-boundary samples are not latency guarantees.
+
+A subsequent controlled self-acoustic Spanish canary traversed the physical
+speaker and microphone, wake detection, local STT, Codex Conversation, Piper,
+and response playback without errors. STT ended 6.590 seconds after pipeline
+start, Codex Conversation took 1.734 seconds, the satellite entered responding
+at 8.324 seconds, and it returned to idle at 13.919 seconds. The request was
+recognized with the intended words and the response was non-empty `es-MX`.
+These state boundaries still do not measure first audible sound.
+
 A later physical ThirdReality canary completed local recognition 0.497 seconds
 after VAD ended and reached its Conversation/TTS result 7.703 seconds after
 pipeline start, including capture. The answer played and the satellite returned
 to idle.
 
 Streaming Codex TTS exposed first PCM 4.222 seconds before the equivalent
-finite bridge response in one earlier probe.
+finite bridge response in one earlier probe. That historical comparison is
+between two Codex adapter modes, not between Codex and Piper.
 
 A controlled acoustic A/B on the same ThirdReality device had reduced the old
 adapter's STT completion from 9.519 to 6.138 seconds, but that tuning could not
@@ -285,8 +335,9 @@ component. Live v3 validation observed genuine assistant output before the
 user transcript completed, and the tagged Frameless Bidi client protocol has
 no supported response-cancel message. Both the component and bridge therefore
 disable ticket issuance; a handoff-shaped diagnostic request is validated but
-takes the isolated cold path. The production Assist path always cold-starts TTS
-in a fresh thread and session.
+takes the isolated cold path. When both experimental Codex speech entities are
+selected, TTS starts in a fresh thread and session. The recommended local Piper
+stage does not use this remote handoff mechanism.
 
 Always-on remote prewarming is not enabled: there is no provider hook before a
 wake word, an idle WebRTC peer still sends silent RTP, App Server does not
@@ -316,8 +367,8 @@ opt-in and must never print OAuth tokens or recorded audio.
 2. Remove Codex Voice from HACS and restart Home Assistant.
 3. Stop and disable the separately running bridge process if no other client
    uses it, then delete its dedicated bridge token.
-4. If it was installed only for this pipeline, remove the Wyoming integration
-   and stop its faster-whisper service separately.
+4. If they were installed only for this pipeline, remove the Wyoming
+   integrations and stop the faster-whisper and Piper services separately.
 5. If direct ThirdReality mode was installed, follow the device rollback
    contract, remove the route-scoped token from the bridge, and verify the
    approved TCP ADB port 5555 recovery path before and after the voice restart.
@@ -331,9 +382,11 @@ opt-in and must never print OAuth tokens or recorded audio.
   does not consume ChatGPT quota. ChatGPT subscription OAuth does not expose a
   supported standalone transcription endpoint. The retained Codex STT adapter
   can connect successfully without producing a transcript.
-- TTS is a bounded realtime-conversation compatibility session, not OpenAI's
-  separately billed `/v1/audio/*` endpoint. The live voice model may paraphrase
-  or expand text instead of reading it verbatim. Do not use this TTS entity for
+- Recommended Assist TTS is local Piper over Wyoming and does not use the
+  ChatGPT subscription speech lane. The retained Codex TTS entity is a bounded
+  realtime-conversation compatibility session, not OpenAI's separately billed
+  `/v1/audio/*` endpoint. Its live voice model may paraphrase or expand text
+  instead of reading it verbatim. Do not use that experimental entity for
   safety-critical or legally exact announcements.
 - The Codex subscription realtime surface is admitted one speech session at a
   time. Overlapping experimental Codex STT, TTS, or realtime requests fail

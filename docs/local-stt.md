@@ -5,7 +5,7 @@ Assist pipeline:
 
 ```text
 microphone -> Wyoming faster-whisper STT -> Codex Voice Conversation
-           -> Codex Voice TTS -> speaker
+           -> Wyoming Piper TTS -> speaker
 ```
 
 This is intentional. Codex App Server exposes ChatGPT OAuth realtime
@@ -24,7 +24,8 @@ Home Assistant.
 
 Install the official Whisper app, add the discovered **Wyoming Protocol**
 integration, and select its `stt.*` entity in the Assist pipeline. Keep the
-Codex Voice Conversation and TTS entities selected for the other two stages.
+Codex Voice Conversation entity selected, and use the Wyoming Piper entity for
+TTS. See [reliable local text-to-speech](local-tts.md).
 
 See the official [Wyoming integration
 documentation](https://www.home-assistant.io/integrations/wyoming).
@@ -106,7 +107,8 @@ Create or edit an Assist pipeline with:
 - Speech-to-text: the faster-whisper `stt.*` entity
 - Speech-to-text language: a base language code such as `en` or `es`
 - Conversation agent: the Codex Voice `conversation.*` entity
-- Text-to-speech: the Codex Voice `tts.*` entity
+- Text-to-speech: the Wyoming Piper `tts.*` entity
+- Mexican Spanish TTS voice: `es_MX-ald-medium`
 - Prefer handling commands locally: enabled
 
 The multilingual `base` model is the balanced default. `tiny` is faster but
@@ -128,8 +130,9 @@ explicit opt-in for non-sensitive test audio.
 
 Upgrades do not delete existing Codex Voice STT subentries. They remain
 available for explicit protocol diagnostics, but should not be selected in a
-production Assist pipeline. New Codex Voice installations create only the
-stable Conversation and TTS subentries by default.
+production Assist pipeline. New Codex Voice installations create the stable
+Conversation subentry and the retained experimental Codex TTS subentry by
+default.
 
 Changing the integration default does not rewrite stored Assist pipelines or
 stored subentry titles. After upgrading, edit every pipeline that referenced a
@@ -144,12 +147,13 @@ Before changing a physical satellite, verify all of these boundaries:
 2. Home Assistant reports `stt-start` followed promptly by `stt-end`.
 3. The transcript reaches the Codex Voice conversation entity and a local HA
    command can call an exposed tool.
-4. The Codex Voice TTS result plays on the satellite.
+4. The Wyoming Piper TTS result plays on the satellite.
 5. A failed local STT request returns an error without opening a Codex
    realtime session or silently switching providers.
 6. The service journal contains timing/readiness information but no recognized
    utterance text.
 
 Microphone audio for the STT stage stays between Home Assistant and the local
-Wyoming host. ChatGPT OAuth remains confined to the Codex Voice bridge for the
-Conversation and experimental realtime/TTS paths.
+Wyoming host. ChatGPT OAuth remains confined to the Codex Voice bridge for
+Conversation, direct realtime speech, and the optional experimental Codex TTS
+path. Recommended Piper synthesis remains local.

@@ -5,6 +5,48 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Add a hardened external Wyoming Piper user-service template pinned to
+  `wyoming-piper==2.3.1`, a bounded ONNX Runtime threading runner, a
+  privacy-safe synthesis smoke test, and deployment guidance for
+  `es_MX-ald-medium` on `tcp://HOST:10200`. Pin that voice to an immutable
+  upstream revision, verify its size and SHA-256 before atomic installation and
+  every service start, mount models read-only, and reject other voice downloads.
+
+### Changed
+
+- Make the recommended “Okay Nabu” production pipeline local Wyoming
+  faster-whisper STT, Codex Voice Conversation, and local Wyoming Piper TTS.
+  Keep Codex TTS as an explicit experimental compatibility entity and preserve
+  direct Codex realtime speech for “Okay Computer.”
+- Document the official Piper add-on (shown as an app in current Home Assistant
+  UI) as the simplest Home Assistant OS path and the external Wyoming service
+  as a supported fallback for affected
+  virtualized x86-64 guests that do not expose the x86-64-v2 instruction level.
+  This compatibility caveat is not generalized to other deployments or
+  architectures.
+
+- Record repository smoke-probe timings to Piper's first non-empty Wyoming PCM
+  chunk: across two restarts, cold first PCM from 0.714 to 0.956 seconds and
+  completion from 0.824 to 1.072 seconds; five warm requests with a
+  0.028-second median and 0.044-second maximum to first PCM; and 0.116-second
+  median complete synthesis. Three
+  controlled same-text Codex TTS requests had a 2.025-second median to first
+  audio (1.671 to 2.898 seconds), about 72 times Piper's warm median at the
+  provider boundary. A complete self-acoustic Spanish canary traversed the
+  physical ThirdReality speaker and microphone, wake detection, local STT,
+  Codex Conversation, Piper, and response playback without errors; the
+  satellite entered responding at 8.324 seconds and returned idle at 13.919
+  seconds from pipeline start. Actual audible onset was not instrumented.
+
+### Security
+
+- Keep Piper synthesis and model access local after Codex returns the
+  Conversation text, bind the external service to loopback by default, and
+  require operators to restrict the unauthenticated Wyoming port `10200` to
+  Home Assistant when enabling LAN access.
+
 ## [0.3.0] - 2026-08-09
 
 ### Added

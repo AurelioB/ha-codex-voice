@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "voice": "es_MX-ald-medium",
+  "revision": "0622afc867cf0388684853ecdf59a498b489949d",
+  "files": [
+    {
+      "filename": "es_MX-ald-medium.onnx",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/0622afc867cf0388684853ecdf59a498b489949d/es/es_MX/ald/medium/es_MX-ald-medium.onnx",
+      "size_bytes": 63201294,
+      "sha256": "019b3803293c93e34a206dd2e53a3889209a514e786fd7144f7b70196c579b63"
+    },
+    {
+      "filename": "es_MX-ald-medium.onnx.json",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/0622afc867cf0388684853ecdf59a498b489949d/es/es_MX/ald/medium/es_MX-ald-medium.onnx.json",
+      "size_bytes": 4878,
+      "sha256": "5a71498158e04afc8099bfd019c7e87c68eb9d042505a2b1a87e5c1ac2b1a61d"
+    }
+  ]
+}

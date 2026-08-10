@@ -7,18 +7,20 @@
 > failed for deterministic subscription-backed STT. Codex OAuth WebRTC can
 > accept a complete utterance without emitting an input transcript, and the
 > available alternate transcription transport requires a separately billed API
-> key. The production milestone now uses Home Assistant's native Wyoming
-> integration with local faster-whisper for STT. Codex Voice continues to own
-> ChatGPT OAuth Conversation and experimental TTS/realtime. The old Codex STT
-> entity is retained only as an explicit diagnostic compatibility adapter.
+> key. The recommended “Okay Nabu” pipeline now uses Home Assistant's native
+> Wyoming integration with local faster-whisper STT and local Piper TTS around
+> Codex Voice Conversation. “Okay Computer” retains direct Codex realtime
+> conversation and speech. The Codex STT and TTS entities remain explicit
+> experimental compatibility adapters rather than the production speech
+> boundaries.
 
 Build this as a hybrid Home Assistant custom integration plus a local companion add-on:
 
-- The custom integration exposes standard Home Assistant Conversation and TTS
-  entities plus an explicitly experimental Codex STT diagnostic entity.
+- The custom integration exposes a standard Home Assistant Conversation entity
+  plus explicit experimental Codex STT and TTS compatibility entities.
 - The production Assist pipeline selects a local Wyoming faster-whisper STT
-  entity, which Home Assistant composes independently with Codex Conversation
-  and TTS.
+  entity and a local Wyoming Piper TTS entity, which Home Assistant composes
+  independently around Codex Conversation.
 - The add-on runs a pinned `codex app-server` process, owns its JSON-RPC connection, and terminates the WebRTC media session used by subscription-backed voice.
 - Codex owns the ChatGPT browser/device-code OAuth flow, token persistence, and refresh.
 - All Codex model traffic goes through the ChatGPT-authenticated Codex process.
@@ -28,8 +30,9 @@ Build this as a hybrid Home Assistant custom integration plus a local companion 
 - There is no silent fallback to a separately billed Platform API key.
 
 This is technically viable as an **experimental local Codex client** for
-Conversation, TTS, and realtime work. ChatGPT sign-in for subscription access
-is an officially documented Codex authentication mode, and App Server exposes
+Conversation, diagnostic TTS, and realtime work. ChatGPT sign-in for
+subscription access is an officially documented Codex authentication mode, and
+App Server exposes
 managed browser and device-code login. The TTS/realtime compatibility layer
 relies on the experimental `thread/realtime/*` WebRTC surface, so the Codex
 version, generated protocol schema, and media behavior must be pinned and
@@ -44,16 +47,21 @@ Home Assistant already includes an OpenAI integration with Conversation, STT, an
 
 ```mermaid
 flowchart LR
+    N["ThirdReality<br/>Okay Nabu"]
     P["Home Assistant Assist pipeline"]
-    I["Custom integration<br/>Conversation · STT · TTS"]
+    S["Wyoming faster-whisper<br/>local STT"]
+    I["Codex Voice<br/>Conversation"]
+    Y["Wyoming Piper<br/>external-host local TTS · es_MX-ald-medium"]
+    D["ThirdReality<br/>Okay Computer"]
     B["Local subscription bridge add-on<br/>sessions · WebRTC · quotas · safety"]
     C["Pinned Codex App Server<br/>stdio JSON-RPC"]
     W["App-Server-created WebRTC call<br/>RTP audio · oai-events"]
     O["ChatGPT OAuth<br/>subscription entitlement"]
     T["HA exposed-entity tools"]
 
-    P <--> I
+    N --> P --> S --> I --> Y --> N
     I <-->|"authenticated local HTTP/WS"| B
+    D <-->|"direct realtime speech"| B
     B <-->|"JSON-RPC"| C
     B <-->|"SDP + media/data channels"| W
     C -->|"create/control call"| W
@@ -70,7 +78,8 @@ The add-on is the trust boundary. It must not mount the Home Assistant configura
 | Conversation agent | `ConversationEntity._async_handle_message(...)` with `ChatLog` | `thread/start`/`thread/resume`, `turn/start`, streamed agent messages; map selected HA LLM tools to App Server dynamic tools | Thread lifecycle is supported; dynamic tools are experimental |
 | Speech-to-text | Native Wyoming `SpeechToTextEntity` | Stream HA PCM to a persistent local faster-whisper service over Wyoming | Production path; finite local result, no ChatGPT/API quota |
 | Experimental Codex STT | `SpeechToTextEntity.async_process_audio_stream(...)` | Feed HA audio into the WebRTC microphone track and opportunistically harvest user transcript events | Diagnostics only; a completed media session may produce no transcript |
-| Text-to-speech | `TextToSpeechEntity.async_get_tts_audio(...)`, followed by streaming support | Send `thread/realtime/appendSpeech`, receive/decode the WebRTC remote audio track, and package it as a HA-supported format | Experimental compatibility adapter, not the public Speech API; exact-text behavior must be proven |
+| Text-to-speech | Native Wyoming `TextToSpeechEntity` | Send response text to persistent local Piper `es_MX-ald-medium` over Wyoming | Production path; finite local synthesis, no ChatGPT/API quota |
+| Experimental Codex TTS | `TextToSpeechEntity.async_get_tts_audio(...)`, with streaming support | Send text into a realtime conversation session, receive/decode the WebRTC remote audio track, and package it as a HA-supported format | Compatibility adapter, not the public Speech API; may paraphrase supplied text |
 | Authentication | Config flow backed by the add-on | `account/login/start` with `chatgptDeviceCode` or `chatgpt`; observe `account/login/completed` and `account/updated` | Managed ChatGPT auth is documented by App Server |
 | Quota diagnostics | Integration diagnostics/options UI | `account/rateLimits/read`, `account/rateLimits/updated`, and `account/usage/read` where available | Report only fields actually supplied by the active account |
 
@@ -102,7 +111,11 @@ Go/no-go criteria:
 - TTS speaks supplied text faithfully enough for announcements and Assist replies.
 - The protocol remains usable after a controlled App Server restart.
 
-If any of those fail, subscription-only STT/TTS is not shippable with the selected Codex version. The official API-key integration may be offered as an explicit alternative, but it must never activate automatically.
+If any of those fail, the corresponding subscription compatibility adapter is
+not shippable with the selected Codex version. Production Okay Nabu speech does
+not depend on that outcome: it uses local faster-whisper and Piper through
+Wyoming. The official API-key integration may be offered as an explicit
+alternative, but it must never activate automatically.
 
 ## Implementation phases
 
@@ -129,9 +142,10 @@ Use a unique domain such as `chatgpt_subscription_voice`; do not override Home A
 - Validate the local bridge and authenticated account during setup.
 - Provide redacted diagnostics with App Server version, protocol compatibility, auth mode, plan type, feature availability, and rate-limit fields.
 
-Exit gate: Codex Conversation/TTS and native Wyoming STT appear as selectable
-Assist pipeline components and reload cleanly without restarting HA. The
-experimental Codex STT entity must not be selected automatically.
+Exit gate: Codex Conversation and native Wyoming faster-whisper/Piper appear as
+selectable Assist pipeline components and reload cleanly without restarting
+HA. The experimental Codex STT and TTS entities must not be selected in the
+recommended pipeline.
 
 ### 3. Conversation agent and Home Assistant tools
 
@@ -164,20 +178,36 @@ Exit gate: repeated known WAVs and physical wake-word commands produce bounded
 local transcripts, and STT continues to work independently of Codex App Server
 restart or subscription speech availability.
 
-### 5. Text-to-speech entity
+### 5. Text-to-speech pipeline
 
-- Populate voice choices dynamically through `thread/realtime/listVoices` rather than hard-coding the list.
-- Implement one-shot `async_get_tts_audio` first by collecting decoded frames from the WebRTC remote media track, buffering bounded PCM, and returning a valid WAV payload.
-- Add `async_stream_tts_audio` once audio framing and player compatibility are proven.
-- Forward user-selected voice and style instructions only when supported by the pinned protocol.
-- Flush output promptly on cancellation and apply backpressure when a media player consumes audio slowly.
-- Disclose in documentation and setup that the voice is AI-generated.
+- Prefer the official Home Assistant Piper add-on (shown as an app in current
+  UI) where its runtime matches the host. On affected virtualized x86-64
+  deployments, verify that the guest CPU exposes the x86-64-v2 level required
+  by the current add-on; do not generalize that caveat to every architecture.
+- Provide a supported external service fallback pinned to
+  `wyoming-piper==2.3.1` on `tcp://HOST:10200` for environments where the add-on
+  cannot run. Register either path through Home Assistant's native Wyoming
+  integration.
+- Select `es_MX-ald-medium` for the Mexican Spanish production pipeline and
+  keep the model resident for warm synthesis. Pin its upstream revision and
+  verify its exact size and SHA-256 before atomic installation and every
+  service start; expose the model directory read-only and reject other voice
+  downloads.
+- Retain the Codex TTS entity for explicit diagnostics. Populate its voices
+  dynamically, bound PCM and cancellation, and disclose that its conversational
+  model can paraphrase rather than read supplied text exactly.
+- Never switch automatically from Piper to Codex TTS or a separately billed
+  API when local synthesis fails.
 
-Exit gate: `tts.speak` works on common HA media players and voice satellites, audio starts within the agreed latency target, and cancel/restart never leaves a stuck session.
+Exit gate: Piper `tts.speak` works on common Home Assistant media players and
+voice satellites, repeated warm requests meet the agreed provider-side target,
+and cancel/restart never leaves a stuck service. Record physical playback
+separately from Wyoming service timing.
 
 ### 6. Assist pipeline, reliability, and release
 
-- Test a complete `STT → conversation → TTS` pipeline and follow-up conversations.
+- Test a complete `faster-whisper STT → Codex Conversation → Piper TTS`
+  pipeline and follow-up conversations.
 - Preserve the distinction between staged Assist and true duplex voice: this component supplies the three standard providers but does not, by itself, add barge-in or simultaneous listen/speak.
 - Add authentication expiry, quota exhaustion, network loss, App Server upgrade, and HA restart tests.
 - Package the custom integration for HACS and the add-on as a separate Home Assistant add-on repository. Provide a standalone container for Home Assistant Container/Core installations that cannot install Supervisor add-ons.
@@ -224,6 +254,8 @@ tests/
   integration/
 docs/
   architecture.md
+  local-stt.md
+  local-tts.md
   security.md
   installation.md
   upgrading-codex.md
@@ -237,7 +269,11 @@ README.md
 - Protocol/media: pinned-schema validation, unknown notification handling, request timeout, child crash, incompatible version refusal, SDP/ICE failure, data-channel loss, RTP jitter, codec mismatch, resampling, and proof that subscription mode never selects the API-key-only raw WebSocket path.
 - Conversation: streaming, multi-turn resume, tool success/failure, exposed-entity filtering, iteration limit, cancellation, and quota exhaustion.
 - STT: all advertised metadata, multi-frame WebRTC input, empty transcript, tail flushing, unwanted-response muting, language handling, long input, cancellation, and concurrency rejection.
-- TTS: exact text, voice selection, remote-track decoding, valid WAV framing, incremental audio, slow consumer, cancellation, and media-player retrieval.
+- Production TTS: Piper voice selection, repeated cold/warm Wyoming requests,
+  valid audio, cancellation, service restart, and media-player retrieval.
+- Experimental Codex TTS: voice selection, remote-track decoding, valid WAV
+  framing, incremental audio, slow consumer, cancellation, and explicit
+  non-verbatim behavior disclosure.
 - Security: no credential in HA state/logs/diagnostics, no arbitrary RPC proxy, no host mounts, no unauthorised tool, and no API-key fallback.
 - End-to-end: Assist event order, one satellite pilot, HA/App Server restarts, and before/after subscription quota observations.
 
