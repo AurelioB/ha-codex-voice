@@ -24,9 +24,14 @@ from .api import (
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_BRIDGE_URL,
+    CONF_REALTIME_AUTHORITY,
+    CONF_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_LANGUAGE,
     MIN_HA_VERSION,
     PLATFORMS,
+    SUBENTRY_TYPE_CONVERSATION,
 )
+from .realtime_tools import async_start_realtime_tool_broker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,8 +50,9 @@ async def async_setup_entry(
             translation_placeholders={"minimum_version": MIN_HA_VERSION},
         )
 
+    session = async_get_clientsession(hass)
     client = BridgeClient(
-        async_get_clientsession(hass),
+        session,
         entry.data[CONF_BRIDGE_URL],
         entry.data[CONF_ACCESS_TOKEN],
     )
@@ -61,8 +67,36 @@ async def async_setup_entry(
         raise ConfigEntryError(str(err)) from err
 
     entry.runtime_data = client
+    async_start_realtime_tool_broker(hass, entry, session)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    return True
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant,
+    entry: CodexVoiceConfigEntry,
+) -> bool:
+    """Add opt-in realtime authority fields and Mexican Spanish language."""
+    if entry.version != 1:
+        return False
+    if entry.minor_version >= 2:
+        return True
+
+    conversations = [
+        subentry
+        for subentry in entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_TYPE_CONVERSATION
+    ]
+    for subentry in conversations:
+        data = dict(subentry.data)
+        # Existing installations were explicitly chat-only on the device path.
+        # Migration must not silently grant a new Home Assistant control surface.
+        data.setdefault(CONF_REALTIME_AUTHORITY, False)
+        data.setdefault(CONF_REALTIME_LANGUAGE, DEFAULT_REALTIME_LANGUAGE)
+        hass.config_entries.async_update_subentry(entry, subentry, data=data)
+
+    hass.config_entries.async_update_entry(entry, minor_version=2)
     return True
 
 

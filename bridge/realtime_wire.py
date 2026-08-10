@@ -36,6 +36,7 @@ DATA_CONTROL_EVENT_TYPES = frozenset(
         "input_audio_buffer.speech_stopped",
         "output_audio_buffer.started",
         "output_audio_buffer.stopped",
+        "response.cancelled",
         "response.created",
         "response.done",
         "session.started",
@@ -52,6 +53,8 @@ class RealtimeDataControl:
 
     event_type: str
     role: str | None
+    response_cancelled: bool = False
+    response_id: str | None = None
 
     def wire_value(self) -> dict[str, str]:
         return {"type": "control", "event_type": self.event_type}
@@ -124,6 +127,7 @@ class RealtimeWireProtocol:
                 "binary_pcm16": True,
                 "local_flush": True,
                 "remote_cancel": False,
+                "same_session_interrupt_ack": True,
             },
         }
 
@@ -146,7 +150,12 @@ def parse_data_control_event(value: str | bytes) -> RealtimeDataControl | None:
     if not isinstance(event_type, str) or event_type not in DATA_CONTROL_EVENT_TYPES:
         return None
     role = _event_role(decoded)
-    return RealtimeDataControl(event_type=event_type, role=role)
+    return RealtimeDataControl(
+        event_type=event_type,
+        role=role,
+        response_cancelled=_event_confirms_response_cancelled(decoded, event_type),
+        response_id=_event_response_id(decoded),
+    )
 
 
 def _required_integer(value: Mapping[str, Any], key: str) -> int:
@@ -167,6 +176,33 @@ def _event_role(value: Mapping[str, Any]) -> str | None:
             normalized = candidate.lower()
             if normalized in {"assistant", "input", "output", "user"}:
                 return normalized
+    return None
+
+
+def _event_confirms_response_cancelled(
+    value: Mapping[str, Any], event_type: str
+) -> bool:
+    """Recognize only provider events that explicitly confirm cancellation."""
+    if event_type == "response.cancelled":
+        return True
+    if event_type != "response.done":
+        return False
+    response = value.get("response")
+    status = response.get("status") if isinstance(response, Mapping) else None
+    if status is None:
+        status = value.get("status")
+    return isinstance(status, str) and status.lower() in {"cancelled", "canceled"}
+
+
+def _event_response_id(value: Mapping[str, Any]) -> str | None:
+    """Retain a response correlation id internally without exposing it."""
+    response = value.get("response")
+    if isinstance(response, Mapping) and isinstance(response.get("id"), str):
+        return response["id"] or None
+    for key in ("response_id", "responseId"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate:
+            return candidate
     return None
 
 

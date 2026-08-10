@@ -18,6 +18,8 @@ CONF_REASONING_EFFORT: Final = "reasoning_effort"
 CONF_SERVICE_TIER: Final = "service_tier"
 CONF_VOICE: Final = "voice"
 CONF_INSTRUCTIONS: Final = "instructions"
+CONF_REALTIME_AUTHORITY: Final = "realtime_authority"
+CONF_REALTIME_LANGUAGE: Final = "realtime_language"
 
 SUBENTRY_TYPE_CONVERSATION: Final = "conversation"
 SUBENTRY_TYPE_STT: Final = "stt"
@@ -33,6 +35,18 @@ DEFAULT_CONVERSATION_SERVICE_TIER: Final = "priority"
 LEGACY_CONVERSATION_SERVICE_TIER: Final = "standard"
 DEFAULT_VOICE: Final = "cove"
 DEFAULT_LLM_HASS_API: Final = ["assist"]
+DEFAULT_REALTIME_LANGUAGE: Final = "es-MX"
+
+REALTIME_TOOL_PROTOCOL_VERSION: Final = 1
+REALTIME_TOOL_PATH: Final = "/v1/home-assistant/tools"
+# Broker traffic is intentionally much smaller than normal conversation traffic.
+# These bounds also cap memory retained while a reconnecting registration is built.
+MAX_REALTIME_TOOL_MESSAGE_BYTES: Final = 256 * 1024
+MAX_REALTIME_TOOL_REGISTRATION_BYTES: Final = 256 * 1024
+MAX_REALTIME_TOOL_SCHEMA_BYTES: Final = 64 * 1024
+MAX_REALTIME_TOOL_RESULT_BYTES: Final = 64 * 1024
+MAX_REALTIME_TOOL_ARGUMENT_BYTES: Final = 64 * 1024
+MAX_REALTIME_TOOLS: Final = 128
 
 MIN_HA_VERSION: Final = "2026.8.0"
 REQUEST_TIMEOUT: Final = 120.0

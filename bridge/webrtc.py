@@ -37,18 +37,18 @@ except (
     ImportError
 ) as import_error:  # pragma: no cover - exercised in dependency-free installs.
     MediaStreamTrack = object  # type: ignore[assignment,misc]
-    RTCConfiguration = None  # type: ignore[assignment]
-    RTCPeerConnection = None  # type: ignore[assignment]
-    RTCSessionDescription = None  # type: ignore[assignment]
-    AudioFrame = None  # type: ignore[assignment]
-    AudioResampler = None  # type: ignore[assignment]
+    RTCConfiguration = None  # type: ignore[assignment,misc]
+    RTCPeerConnection = None  # type: ignore[assignment,misc]
+    RTCSessionDescription = None  # type: ignore[assignment,misc]
+    AudioFrame = None  # type: ignore[assignment,misc]
+    AudioResampler = None  # type: ignore[assignment,misc]
     MediaStreamError = Exception  # type: ignore[assignment,misc]
     _IMPORT_ERROR: ImportError | None = import_error
 else:
     _IMPORT_ERROR = None
 
 
-class PcmAudioTrack(MediaStreamTrack):  # type: ignore[misc,valid-type]
+class PcmAudioTrack(MediaStreamTrack):
     """A paced, queue-backed 24 kHz mono PCM16 WebRTC input track."""
 
     kind = "audio"
@@ -286,6 +286,23 @@ class WebRtcPeer:
         value = await self._recv_transport_queue(self.data_events, timeout)
         assert isinstance(value, (str, bytes))
         return value
+
+    def send_data_event(self, value: str | bytes) -> None:
+        """Send one bounded provider control over the negotiated data channel."""
+        if not isinstance(value, (str, bytes)):
+            raise ProtocolError("WebRTC data event must be text or bytes")
+        if self.closed:
+            raise ProtocolError("WebRTC data channel is closed")
+        if self._transport_error is not None:
+            raise self._transport_error
+        if getattr(self.data_channel, "readyState", None) != "open":
+            raise ProtocolError("WebRTC data channel is not open")
+        try:
+            self.data_channel.send(value)
+        except Exception as exc:
+            message = f"WebRTC data channel send failed: {exc}"
+            self._fail_transport(message)
+            raise ProtocolError(message) from exc
 
     async def close(self) -> None:
         if self.closed:

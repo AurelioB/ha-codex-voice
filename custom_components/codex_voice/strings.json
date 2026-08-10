@@ -50,6 +50,9 @@
       "abort": {
         "reconfigure_successful": "The conversation agent was updated."
       },
+      "error": {
+        "realtime_authority_already_configured": "Another conversation agent already provides realtime Home Assistant tools. Disable it there before enabling this agent."
+      },
       "step": {
         "init": {
           "title": "Conversation agent",
@@ -58,12 +61,16 @@
             "model": "Model",
             "name": "Name",
             "prompt": "Instructions",
+            "realtime_authority": "Provide Home Assistant tools to realtime voice",
+            "realtime_language": "Realtime voice language",
             "reasoning_effort": "Reasoning effort",
             "service_tier": "Service tier"
           },
           "data_description": {
             "llm_hass_api": "Select the Home Assistant LLM APIs whose exposed entities and tools this agent may use.",
             "prompt": "Instructions supplied before the conversation. Templates are supported.",
+            "realtime_authority": "Exactly one conversation agent may provide tools to realtime voice. Tool access is limited to the Home Assistant APIs selected above.",
+            "realtime_language": "Language and locale used for realtime tool context and responses.",
             "reasoning_effort": "Choose low, medium, high, xhigh, max, or ultra; higher effort can improve difficult reasoning at the cost of latency.",
             "service_tier": "Priority targets lower latency and increases subscription usage compared with standard."
           }

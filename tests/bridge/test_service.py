@@ -146,6 +146,7 @@ class FakePeer:
         self.fed = bytearray()
         self.audio: asyncio.Queue[bytes] = asyncio.Queue()
         self.data: asyncio.Queue[str | bytes] = asyncio.Queue()
+        self.sent_data_events: list[str | bytes] = []
         self.closed = False
         self.pending_input_discarded = False
         self.input_buffer_limit_milliseconds: int | None = None
@@ -218,6 +219,9 @@ class FakePeer:
         if timeout is None:
             return await self.data.get()
         return await asyncio.wait_for(self.data.get(), timeout)
+
+    def send_data_event(self, value: str | bytes) -> None:
+        self.sent_data_events.append(value)
 
     async def close(self) -> None:
         self.closed = True
@@ -1297,6 +1301,13 @@ async def test_realtime_device_token_is_route_scoped_and_v2_only(
         headers={"Authorization": "Bearer device-token"},
     )
     assert device_token_health.status == 401
+
+    with pytest.raises(WSServerHandshakeError) as tool_authority:
+        await client.ws_connect(
+            "/v1/home-assistant/tools",
+            headers={"Authorization": "Bearer device-token"},
+        )
+    assert tool_authority.value.status == 401
 
     legacy = await client.ws_connect(
         "/v1/realtime",
@@ -4730,6 +4741,7 @@ async def test_realtime_v2_negotiates_binary_pcm_and_stateful_resampling(
         "binary_pcm16": True,
         "local_flush": True,
         "remote_cancel": False,
+        "same_session_interrupt_ack": True,
     }
     assert (
         fake_rpc.peers[-1].input_buffer_limit_milliseconds
@@ -5117,7 +5129,9 @@ async def test_realtime_v2_drops_late_pcm_between_output_epochs(
     assert (await websocket.receive_json())["type"] == "started"
     peer = fake_rpc.peers[-1]
 
-    peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "private"}})
+    )
     assert (await websocket.receive_json(timeout=1))["event_type"] == "response.created"
     first = b"\x11\x01" * 480
     peer.audio.put_nowait(first)
@@ -5133,7 +5147,9 @@ async def test_realtime_v2_drops_late_pcm_between_output_epochs(
 
     peer.audio.put_nowait(stale)
     await asyncio.wait_for(stale_consumed.wait(), timeout=1)
-    peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "private"}})
+    )
     assert await websocket.receive_json(timeout=1) == {
         "type": "control",
         "event_type": "response.created",
@@ -5223,8 +5239,14 @@ async def test_realtime_v2_drops_content_bearing_rpc_events(
 
 @pytest.mark.asyncio
 async def test_realtime_interrupt_ends_session_without_claiming_remote_cancel(
-    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        bridge_service, "REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS", 0.01
+    )
     client = await aiohttp_client(bridge_app)
     websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
     await websocket.send_json(_realtime_v2_start())
@@ -5245,7 +5267,208 @@ async def test_realtime_interrupt_ends_session_without_claiming_remote_cancel(
 
     assert sum(method == "thread/realtime/stop" for method, _ in fake_rpc.calls) == 1
     assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+    assert fake_rpc.peers[-1].sent_data_events == ['{"type":"response.cancel"}']
     assert fake_rpc.peers[-1].closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_event",
+    [
+        {"type": "response.cancelled", "response": {"id": "private"}},
+        {
+            "type": "response.done",
+            "response": {"id": "private", "status": "cancelled"},
+        },
+    ],
+)
+async def test_realtime_interrupt_keeps_session_only_after_cancel_confirmation(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    cancel_event: dict[str, object],
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json(_realtime_v2_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "private"}})
+    )
+    assert (await websocket.receive_json(timeout=1))["event_type"] == "response.created"
+    peer.audio.put_nowait(b"\x11\x01" * 480)
+    assert (await websocket.receive_json(timeout=1))["event_type"] == (
+        "speaking.started"
+    )
+    assert (await websocket.receive(timeout=1)).type is WSMsgType.BINARY
+
+    await websocket.send_json({"type": "interrupt"})
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 1,
+    }
+    async with asyncio.timeout(1):
+        while not peer.sent_data_events:
+            await asyncio.sleep(0)
+    assert peer.sent_data_events == ['{"type":"response.cancel"}']
+    peer.data.put_nowait(json.dumps(cancel_event))
+
+    confirmed_messages = {
+        json.dumps(await websocket.receive_json(timeout=1), sort_keys=True),
+        json.dumps(await websocket.receive_json(timeout=1), sort_keys=True),
+    }
+    assert confirmed_messages == {
+        json.dumps(
+            {"type": "control", "event_type": cancel_event["type"]}, sort_keys=True
+        ),
+        json.dumps(
+            {
+                "type": "stopped",
+                "reason": "interrupt",
+                "fresh_session_required": False,
+                "remote_cancelled": True,
+            },
+            sort_keys=True,
+        ),
+    }
+    assert peer.closed is False
+    assert not any(method == "thread/delete" for method, _ in fake_rpc.calls)
+
+    await websocket.send_json({"type": "ping"})
+    assert await websocket.receive_json(timeout=1) == {"type": "pong"}
+    await websocket.send_json({"type": "stop"})
+    await websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_interrupt_rejects_stale_cancel_confirmation(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service, "REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS", 0.02
+    )
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json(_realtime_v2_start())
+    assert (await websocket.receive_json(timeout=1))["type"] == "started"
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "current-response"}})
+    )
+    assert (await websocket.receive_json(timeout=1))["event_type"] == (
+        "response.created"
+    )
+    await websocket.send_json({"type": "interrupt"})
+    async with asyncio.timeout(1):
+        while not peer.sent_data_events:
+            await asyncio.sleep(0)
+    peer.data.put_nowait(
+        json.dumps({"type": "response.cancelled", "response": {"id": "stale-response"}})
+    )
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "response.cancelled",
+    }
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "interrupt",
+        "fresh_session_required": True,
+        "remote_cancelled": False,
+    }
+    await websocket.receive(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_realtime_provider_speech_start_flushes_output_without_closing_session(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json(_realtime_v2_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "private"}})
+    )
+    assert (await websocket.receive_json(timeout=1))["event_type"] == "response.created"
+    peer.audio.put_nowait(b"\x11\x01" * 480)
+    assert (await websocket.receive_json(timeout=1))["event_type"] == (
+        "speaking.started"
+    )
+    assert (await websocket.receive(timeout=1)).type is WSMsgType.BINARY
+
+    peer.data.put_nowait(json.dumps({"type": "input_audio_buffer.speech_started"}))
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "input_audio_buffer.speech_started",
+    }
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 1,
+    }
+
+    peer.audio.put_nowait(b"\x22\x02" * 480)
+    peer.data.put_nowait(
+        json.dumps({"type": "response.cancelled", "response": {"id": "private"}})
+    )
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "response.cancelled",
+    }
+    assert peer.sent_data_events == []
+    await websocket.send_json({"type": "ping"})
+    assert await websocket.receive_json(timeout=1) == {"type": "pong"}
+    assert peer.closed is False
+
+    await websocket.send_json({"type": "stop"})
+    await websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_completed_response_does_not_confirm_remote_cancel(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service, "REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS", 0.02
+    )
+    client = await aiohttp_client(bridge_app)
+    websocket = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await websocket.send_json(_realtime_v2_start())
+    assert (await websocket.receive_json())["type"] == "started"
+    peer = fake_rpc.peers[-1]
+
+    await websocket.send_json({"type": "interrupt"})
+    async with asyncio.timeout(1):
+        while not peer.sent_data_events:
+            await asyncio.sleep(0)
+    peer.data.put_nowait(
+        json.dumps({"type": "response.done", "response": {"status": "completed"}})
+    )
+
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "response.done",
+    }
+    assert await websocket.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "interrupt",
+        "fresh_session_required": True,
+        "remote_cancelled": False,
+    }
+    await websocket.receive(timeout=1)
 
 
 @pytest.mark.asyncio
@@ -5333,10 +5556,357 @@ async def test_realtime_v2_never_forwards_provider_tool_calls(
         }
     )
 
-    assert await websocket.receive_json(timeout=1) == {
-        "type": "error",
-        "error": "protocol_version 2 does not expose provider tool calls",
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    assert fake_rpc.responses == [
+        (
+            "provider-tool-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": '{"error":"home_assistant_tool_unavailable"}',
+                    }
+                ],
+                "success": False,
+            },
+        )
+    ]
+    with pytest.raises(asyncio.TimeoutError):
+        await websocket.receive_json(timeout=0.02)
+    await websocket.send_json({"type": "ping"})
+    assert await websocket.receive_json(timeout=1) == {"type": "pong"}
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_executes_only_captured_home_assistant_tools(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
+    await authority.send_json(
+        {
+            "type": "register",
+            "protocol_version": 1,
+            "authority_id": "conversation-profile",
+            "language": "es-MX",
+            "instructions": "Controla solo las entidades expuestas.",
+            "tools": [
+                {
+                    "name": "HassTurnOn",
+                    "description": "Enciende una entidad expuesta",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                }
+            ],
+        }
+    )
+    registered = await authority.receive_json(timeout=1)
+    assert registered["type"] == "registered"
+
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start())
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert thread_start["dynamicTools"] == [
+        {
+            "type": "function",
+            "name": "HassTurnOn",
+            "description": "Enciende una entidad expuesta",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
+    ]
+    assert "Language: es-MX" in thread_start["baseInstructions"]
+    assert "Controla solo las entidades expuestas." in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-tool-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "provider-call-1",
+                "tool": "HassTurnOn",
+                "arguments": {"name": "Cocina"},
+            },
+        }
+    )
+    tool_call = await authority.receive_json(timeout=1)
+    assert tool_call["type"] == "tool_call"
+    assert tool_call["generation"] == registered["generation"]
+    assert tool_call["name"] == "HassTurnOn"
+    assert tool_call["arguments"] == {"name": "Cocina"}
+    await authority.send_json(
+        {
+            "type": "tool_result",
+            "generation": registered["generation"],
+            "call_id": tool_call["call_id"],
+            "success": True,
+            "result": {"speech": "Encendí la cocina"},
+        }
+    )
+
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    assert fake_rpc.responses[-1] == (
+        "provider-tool-1",
+        {
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": '{"speech":"Encend\\u00ed la cocina"}',
+                }
+            ],
+            "success": True,
+        },
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await device.receive_json(timeout=0.02)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_home_assistant_tool_does_not_block_provider_close(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
+    await authority.send_json(
+        {
+            "type": "register",
+            "protocol_version": 1,
+            "authority_id": "conversation-profile",
+            "language": "es-MX",
+            "instructions": "Controla solo las entidades expuestas.",
+            "tools": [
+                {
+                    "name": "HassTurnOn",
+                    "description": "Enciende una entidad expuesta",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+    )
+    registered = await authority.receive_json(timeout=1)
+    assert registered["type"] == "registered"
+
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start())
+    started = await device.receive_json(timeout=1)
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-tool-pending",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "provider-call-pending",
+                "tool": "HassTurnOn",
+                "arguments": {"name": "Cocina"},
+            },
+        }
+    )
+    tool_call = await authority.receive_json(timeout=1)
+    assert tool_call["type"] == "tool_call"
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/closed",
+            "params": {"threadId": started["thread_id"], "reason": "completed"},
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "remote_closed",
     }
+    await device.receive(timeout=1)
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    assert fake_rpc.responses[-1] == (
+        "provider-tool-pending",
+        {
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": '{"error":"home_assistant_tool_outcome_unknown"}',
+                }
+            ],
+            "success": False,
+        },
+    )
+
+    # A side effect may have completed after the realtime socket closed. The
+    # retired correlation consumes its one late result without reconnecting or
+    # retrying the authority generation.
+    await authority.send_json(
+        {
+            "type": "tool_result",
+            "generation": registered["generation"],
+            "call_id": tool_call["call_id"],
+            "success": True,
+            "result": {"speech": "late"},
+        }
+    )
+    await authority.send_json({"type": "ping"})
+    assert await authority.receive_json(timeout=1) == {"type": "pong"}
+    await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_home_assistant_tools_deduplicate_provider_call_ids(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
+    await authority.send_json(
+        {
+            "type": "register",
+            "protocol_version": 1,
+            "authority_id": "conversation-profile",
+            "language": "es-MX",
+            "instructions": "Controla solo las entidades expuestas.",
+            "tools": [
+                {
+                    "name": "HassTurnOn",
+                    "description": "Enciende una entidad expuesta",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+    )
+    registered = await authority.receive_json(timeout=1)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start())
+    started = await device.receive_json(timeout=1)
+    original = {
+        "id": "provider-tool-original",
+        "method": "item/tool/call",
+        "params": {
+            "threadId": started["thread_id"],
+            "callId": "semantic-call",
+            "tool": "HassTurnOn",
+            "arguments": {"name": "Cocina"},
+        },
+    }
+    await fake_rpc.broadcast(original)
+    await fake_rpc.broadcast(original)
+    tool_call = await authority.receive_json(timeout=1)
+    with pytest.raises(asyncio.TimeoutError):
+        await authority.receive_json(timeout=0.02)
+    await authority.send_json(
+        {
+            "type": "tool_result",
+            "generation": registered["generation"],
+            "call_id": tool_call["call_id"],
+            "success": True,
+            "result": {"speech": "done"},
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    assert [item[0] for item in fake_rpc.responses] == ["provider-tool-original"]
+
+    duplicate_semantic_call = dict(original)
+    duplicate_semantic_call["id"] = "provider-tool-duplicate"
+    await fake_rpc.broadcast(duplicate_semantic_call)
+    async with asyncio.timeout(1):
+        while len(fake_rpc.responses) < 2:
+            await asyncio.sleep(0)
+    assert fake_rpc.responses[-1] == (
+        "provider-tool-duplicate",
+        {
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": '{"error":"duplicate_home_assistant_tool_call"}',
+                }
+            ],
+            "success": False,
+        },
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await authority.receive_json(timeout=0.02)
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_home_assistant_tool_burst_is_bounded(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
+    await authority.send_json(
+        {
+            "type": "register",
+            "protocol_version": 1,
+            "authority_id": "conversation-profile",
+            "language": "es-MX",
+            "instructions": "Controla solo las entidades expuestas.",
+            "tools": [
+                {
+                    "name": "HassTurnOn",
+                    "description": "Enciende una entidad expuesta",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+    )
+    assert (await authority.receive_json(timeout=1))["type"] == "registered"
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start())
+    started = await device.receive_json(timeout=1)
+
+    for index in range(bridge_service.REALTIME_MAX_PENDING_TOOL_CALLS + 1):
+        await fake_rpc.broadcast(
+            {
+                "id": f"provider-burst-{index}",
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": started["thread_id"],
+                    "callId": f"semantic-burst-{index}",
+                    "tool": "HassTurnOn",
+                    "arguments": {"name": f"Entity {index}"},
+                },
+            }
+        )
+
+    delivered = [
+        await authority.receive_json(timeout=1)
+        for _ in range(bridge_service.REALTIME_MAX_PENDING_TOOL_CALLS)
+    ]
+    assert all(item["type"] == "tool_call" for item in delivered)
+    with pytest.raises(asyncio.TimeoutError):
+        await authority.receive_json(timeout=0.02)
+    async with asyncio.timeout(1):
+        while not fake_rpc.responses:
+            await asyncio.sleep(0)
+    assert fake_rpc.responses == [
+        (
+            f"provider-burst-{bridge_service.REALTIME_MAX_PENDING_TOOL_CALLS}",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": '{"error":"too_many_home_assistant_tool_calls"}',
+                    }
+                ],
+                "success": False,
+            },
+        )
+    ]
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await authority.close()
 
 
 @pytest.mark.asyncio

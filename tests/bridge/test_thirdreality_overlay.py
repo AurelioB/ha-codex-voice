@@ -311,6 +311,7 @@ def _fake_realtime_support(
             self.started = 0
             self.stopped = 0
             self.interrupted = 0
+            self.interrupt_preserve_session: list[bool] = []
             self.audio: list[bytes] = []
             sessions.append(self)
 
@@ -326,8 +327,9 @@ def _fake_realtime_support(
         def stop(self) -> None:
             self.stopped += 1
 
-        def interrupt(self) -> None:
+        def interrupt(self, *, preserve_session: bool = True) -> None:
             self.interrupted += 1
+            self.interrupt_preserve_session.append(preserve_session)
 
         def submit_audio(self, value: bytes) -> object:
             if len(value) % 2:
@@ -426,6 +428,7 @@ def test_normal_wake_preempts_realtime_then_starts_official_assist(
     _wake(instance, "okay nabu")
 
     assert session.interrupted == 1
+    assert session.interrupt_preserve_session == [False]
     assert getattr(instance, "_codex_realtime_owner", None) is None
     assert instance.requests == ["okay nabu"]
     assert instance.events == ["duck", "unduck", "request", "duck"]

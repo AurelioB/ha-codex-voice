@@ -18,10 +18,13 @@ from custom_components.codex_voice.api import BridgeAuthenticationError
 from custom_components.codex_voice.const import (
     CONF_ACCESS_TOKEN,
     CONF_BRIDGE_URL,
+    CONF_REALTIME_AUTHORITY,
+    CONF_REALTIME_LANGUAGE,
     CONF_REASONING_EFFORT,
     CONF_SERVICE_TIER,
     DEFAULT_CONVERSATION_REASONING_EFFORT,
     DEFAULT_CONVERSATION_SERVICE_TIER,
+    DEFAULT_REALTIME_LANGUAGE,
     DOMAIN,
 )
 
@@ -80,6 +83,83 @@ async def test_user_flow_creates_stable_provider_subentries(
     assert result["subentries"][0]["data"][CONF_SERVICE_TIER] == (
         DEFAULT_CONVERSATION_SERVICE_TIER
     )
+    assert result["subentries"][0]["data"][CONF_REALTIME_AUTHORITY] is False
+    assert (
+        result["subentries"][0]["data"][CONF_REALTIME_LANGUAGE]
+        == DEFAULT_REALTIME_LANGUAGE
+    )
+
+
+async def test_added_conversation_defaults_to_non_authoritative_mexican_spanish(
+    hass: HomeAssistant,
+) -> None:
+    """Additional agents never silently take over realtime Home Assistant tools."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_BRIDGE_URL: "http://bridge.local:8787",
+            CONF_ACCESS_TOKEN: "bridge-token",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "conversation"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    suggestions = {
+        marker.schema: marker.description.get("suggested_value")
+        for marker in result["data_schema"].schema
+        if isinstance(marker.description, dict)
+    }
+    assert suggestions[CONF_REALTIME_AUTHORITY] is False
+    assert suggestions[CONF_REALTIME_LANGUAGE] == "es-MX"
+
+
+async def test_second_realtime_authority_is_rejected(
+    hass: HomeAssistant,
+) -> None:
+    """The subentry flow prevents an ambiguous second authority."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_BRIDGE_URL: "http://bridge.local:8787",
+            CONF_ACCESS_TOKEN: "bridge-token",
+        },
+        subentries_data=[
+            {
+                "data": {
+                    CONF_REALTIME_AUTHORITY: True,
+                    CONF_REALTIME_LANGUAGE: "es-MX",
+                },
+                "subentry_type": "conversation",
+                "title": "Authority",
+                "unique_id": None,
+            }
+        ],
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "conversation"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Second conversation",
+            "model": "gpt-test",
+            CONF_REASONING_EFFORT: "low",
+            CONF_SERVICE_TIER: "standard",
+            CONF_REALTIME_AUTHORITY: True,
+            CONF_REALTIME_LANGUAGE: "es-MX",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "realtime_authority_already_configured"}
+    assert len(entry.subentries) == 1
 
 
 async def test_experimental_stt_subentry_remains_manually_available(

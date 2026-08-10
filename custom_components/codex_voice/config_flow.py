@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -42,6 +43,8 @@ from .const import (
     CONF_BRIDGE_URL,
     CONF_INSTRUCTIONS,
     CONF_MODEL,
+    CONF_REALTIME_AUTHORITY,
+    CONF_REALTIME_LANGUAGE,
     CONF_REASONING_EFFORT,
     CONF_SERVICE_TIER,
     CONF_VOICE,
@@ -51,6 +54,7 @@ from .const import (
     DEFAULT_CONVERSATION_REASONING_EFFORT,
     DEFAULT_CONVERSATION_SERVICE_TIER,
     DEFAULT_LLM_HASS_API,
+    DEFAULT_REALTIME_LANGUAGE,
     DEFAULT_STT_NAME,
     DEFAULT_TTS_NAME,
     DEFAULT_VOICE,
@@ -59,6 +63,7 @@ from .const import (
     SUBENTRY_TYPE_CONVERSATION,
     SUBENTRY_TYPE_STT,
     SUBENTRY_TYPE_TTS,
+    SUPPORTED_LANGUAGES,
     SUPPORTED_REASONING_EFFORTS,
     SUPPORTED_SERVICE_TIERS,
     SUPPORTED_VOICES,
@@ -98,6 +103,11 @@ def _default_subentries() -> list[ConfigSubentryData]:
                 CONF_SERVICE_TIER: DEFAULT_CONVERSATION_SERVICE_TIER,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
+                # Realtime control is a distinct, privileged execution path.
+                # Keep it disabled until the user explicitly enables one
+                # Conversation subentry in its options flow.
+                CONF_REALTIME_AUTHORITY: False,
+                CONF_REALTIME_LANGUAGE: DEFAULT_REALTIME_LANGUAGE,
             },
         },
         {
@@ -137,7 +147,7 @@ class CodexVoiceConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Codex Voice config flow."""
 
     VERSION = 1
-    MINOR_VERSION = 1
+    MINOR_VERSION = 2
 
     @override
     async def async_step_user(
@@ -326,21 +336,43 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
         user_input: dict[str, Any] | None = None,
     ) -> SubentryFlowResult:
         """Configure the selected profile type."""
+        errors: dict[str, str] = {}
         if user_input is not None:
             submitted = dict(user_input)
-            if self._is_new:
+            if (
+                self._subentry_type == SUBENTRY_TYPE_CONVERSATION
+                and submitted.get(CONF_REALTIME_AUTHORITY) is True
+                and self._another_realtime_authority_exists()
+            ):
+                errors["base"] = "realtime_authority_already_configured"
+                self._values = submitted
+            elif self._is_new:
                 title = submitted.pop(CONF_NAME)
                 return self.async_create_entry(title=title, data=submitted)
-            return self.async_update_and_abort(
-                self._get_entry(),
-                self._get_reconfigure_subentry(),
-                data=submitted,
-            )
+            else:
+                return self.async_update_and_abort(
+                    self._get_entry(),
+                    self._get_reconfigure_subentry(),
+                    data=submitted,
+                )
 
         schema = self._schema_for_type()
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(schema, self._values),
+            errors=errors,
+        )
+
+    def _another_realtime_authority_exists(self) -> bool:
+        """Return whether another Conversation profile owns realtime tools."""
+        current_id = (
+            None if self._is_new else self._get_reconfigure_subentry().subentry_id
+        )
+        return any(
+            subentry.subentry_type == SUBENTRY_TYPE_CONVERSATION
+            and subentry.subentry_id != current_id
+            and subentry.data.get(CONF_REALTIME_AUTHORITY) is True
+            for subentry in self._get_entry().subentries.values()
         )
 
     def _schema_for_type(self) -> vol.Schema:
@@ -366,6 +398,10 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
                     vol.Optional(CONF_PROMPT): TemplateSelector(),
                     vol.Optional(CONF_LLM_HASS_API): SelectSelector(
                         SelectSelectorConfig(options=hass_apis, multiple=True)
+                    ),
+                    vol.Required(CONF_REALTIME_AUTHORITY): BooleanSelector(),
+                    vol.Required(CONF_REALTIME_LANGUAGE): SelectSelector(
+                        SelectSelectorConfig(options=list(SUPPORTED_LANGUAGES))
                     ),
                 }
             )
@@ -396,6 +432,8 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
                 CONF_SERVICE_TIER: DEFAULT_CONVERSATION_SERVICE_TIER,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
+                CONF_REALTIME_AUTHORITY: False,
+                CONF_REALTIME_LANGUAGE: DEFAULT_REALTIME_LANGUAGE,
             }
         if self._subentry_type == SUBENTRY_TYPE_STT:
             return {CONF_NAME: DEFAULT_STT_NAME}

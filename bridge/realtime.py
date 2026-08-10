@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import deque
 from collections.abc import Mapping
@@ -39,6 +40,8 @@ class PeerLike(Protocol):
     async def recv_audio(self, timeout: float | None = None) -> bytes: ...
 
     async def recv_data_event(self, timeout: float | None = None) -> str | bytes: ...
+
+    def send_data_event(self, value: str | bytes) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -237,6 +240,14 @@ class RealtimeSession:
 
     async def recv_data_event(self, timeout: float | None = None) -> str | bytes:
         return await self.peer.recv_data_event(timeout)
+
+    def request_response_cancel(self) -> None:
+        """Request provider response cancellation without claiming it succeeded."""
+        if not self._started:
+            raise ProtocolError("realtime session has not started")
+        self.peer.send_data_event(
+            json.dumps({"type": "response.cancel"}, separators=(",", ":"))
+        )
 
     def discard_pending_input(self) -> None:
         """Drop finite STT PCM that has not yet left the paced input track."""

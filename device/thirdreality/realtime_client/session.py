@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import select
+import shlex
 import struct
 import subprocess
 import threading
@@ -25,6 +27,13 @@ _LOGGER = logging.getLogger("linux_voice_assistant.realtime")
 _INPUT_BYTES_PER_SECOND = 16_000 * 2
 _INPUT_ACTIVITY_SIGNAL_PEAK = 256
 _MAX_INPUT_CATCH_UP_RATE = 2.0
+_PACTL_ARGV = ("/usr/bin/pactl",)
+_PULSE_ECHO_CANCEL_MODULE = "module-echo-cancel"
+_PULSE_SOURCE_MASTER = "alsa_input.hw_0_2"
+_PULSE_SINK_MASTER = "alsa_output.hw_0_1"
+_PULSE_NATIVE_DRIVER = "protocol-native.c"
+_PULSE_VOLUME_RAW = re.compile(r"([0-9]+)\s*/\s*[0-9]+%\s*/")
+_PULSE_VOLUME_NORM = 65_536
 _PAPLAY_ARGV = (
     "/usr/bin/paplay",
     "--raw",
@@ -45,6 +54,7 @@ _CONTROL_EVENTS = frozenset(
         "output_audio_buffer.started",
         "output_audio_buffer.stopped",
         "response.created",
+        "response.cancelled",
         "response.done",
         "session.started",
         "session.updated",
@@ -145,10 +155,18 @@ class _PcmPlayer:
         self,
         maximum_bytes: int,
         *,
+        sink: str | None = None,
+        volume_percent: int | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     ) -> None:
         self._maximum_bytes = maximum_bytes
         self._popen = popen
+        self._sink = sink
+        self._volume = (
+            None
+            if volume_percent is None
+            else _PULSE_VOLUME_NORM * volume_percent // 100
+        )
         self._process: subprocess.Popen[bytes] | None = None
         self._stdin: Any = None
         self._pending = bytearray()
@@ -158,8 +176,13 @@ class _PcmPlayer:
     def begin(self, epoch: int) -> None:
         self.abort()
         try:
+            argv = list(_PAPLAY_ARGV)
+            if self._sink is not None:
+                argv.append(f"--device={self._sink}")
+            if self._volume is not None:
+                argv.append(f"--volume={self._volume}")
             process = self._popen(
-                list(_PAPLAY_ARGV),
+                argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -278,6 +301,151 @@ def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=_PLAYER_REAP_SECONDS)
 
 
+def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
+    """Fail closed unless the configured echo-cancel endpoints are active.
+
+    The voice process starts PulseAudio with module loading disabled, so this
+    check deliberately observes startup state instead of trying to mutate it.
+    It also runs before the bridge socket is opened: full-duplex audio is never
+    submitted when the capture or playback route could bypass AEC.
+    """
+    if not config.full_duplex:
+        return
+    source = config.pulse_aec_source
+    sink = config.pulse_aec_sink
+    if source is None or sink is None:
+        raise WebSocketError("PulseAudio echo cancellation is not configured")
+
+    timeout = config.io_timeout_seconds
+    default_source = _pactl_output(("get-default-source",), timeout=timeout).strip()
+    default_sink = _pactl_output(("get-default-sink",), timeout=timeout).strip()
+    if default_source != source or default_sink != sink:
+        raise WebSocketError("PulseAudio echo cancellation is not active")
+
+    modules = _pactl_output(("list", "short", "modules"), timeout=timeout)
+    if not _has_expected_aec_module(modules, source=source, sink=sink):
+        raise WebSocketError("PulseAudio echo cancellation is not active")
+
+    sources = _pactl_output(("list", "short", "sources"), timeout=timeout)
+    source_index = _pulse_object_index(sources, source)
+    source_outputs = _pactl_output(
+        ("--format=json", "list", "source-outputs"), timeout=timeout
+    )
+    if source_index is None or not _process_capture_uses_source(
+        source_outputs, source_index=source_index, process_id=os.getpid()
+    ):
+        raise WebSocketError("PulseAudio echo cancellation is not active")
+
+    _verify_aec_sink_volume(config)
+
+
+def _verify_aec_sink_volume(config: RealtimeConfig) -> None:
+    """Fail closed if the selected AEC sink is above the canary ceiling."""
+    sink = config.pulse_aec_sink
+    if sink is None:
+        raise WebSocketError("PulseAudio echo cancellation is not configured")
+    sink_volume = _pactl_output(
+        ("get-sink-volume", sink), timeout=config.io_timeout_seconds
+    )
+    if not _sink_volume_within_ceiling(
+        sink_volume, ceiling=config.aec_test_volume_percent
+    ):
+        raise WebSocketError("PulseAudio echo cancellation is not active")
+
+
+def _has_expected_aec_module(modules: str, *, source: str, sink: str) -> bool:
+    expected_arguments = {
+        f"source_master={_PULSE_SOURCE_MASTER}",
+        f"sink_master={_PULSE_SINK_MASTER}",
+        f"source_name={source}",
+        f"sink_name={sink}",
+        "aec_method=webrtc",
+        "use_master_format=1",
+    }
+    for line in modules.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) != 3 or fields[1] != _PULSE_ECHO_CANCEL_MODULE:
+            continue
+        try:
+            arguments = set(shlex.split(fields[2], comments=False, posix=True))
+        except ValueError:
+            return False
+        if expected_arguments.issubset(arguments):
+            return True
+    return False
+
+
+def _pulse_object_index(objects: str, name: str) -> str | None:
+    matches = []
+    for line in objects.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == name and fields[0].isdigit():
+            matches.append(fields[0])
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _process_capture_uses_source(
+    source_outputs: str, *, source_index: str, process_id: int
+) -> bool:
+    try:
+        decoded = json.loads(source_outputs)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(decoded, list):
+        return False
+    expected_source = int(source_index)
+    process_outputs = []
+    for candidate in decoded:
+        if not isinstance(candidate, dict):
+            return False
+        properties = candidate.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        if properties.get("application.process.id") == str(process_id):
+            process_outputs.append(candidate)
+    return bool(process_outputs) and all(
+        candidate.get("driver") == _PULSE_NATIVE_DRIVER
+        and candidate.get("source") == expected_source
+        and candidate.get("corked") is False
+        for candidate in process_outputs
+    )
+
+
+def _sink_volume_within_ceiling(value: str, *, ceiling: int) -> bool:
+    channels = [int(match) for match in _PULSE_VOLUME_RAW.findall(value)]
+    raw_ceiling = _PULSE_VOLUME_NORM * ceiling // 100
+    return bool(channels) and all(channel <= raw_ceiling for channel in channels)
+
+
+def _pactl_output(arguments: tuple[str, ...], *, timeout: float) -> str:
+    """Run one fixed-binary, bounded, content-free PulseAudio probe."""
+    try:
+        result = subprocess.run(
+            [*_PACTL_ARGV, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            close_fds=True,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WebSocketError(
+            "PulseAudio echo cancellation could not be verified"
+        ) from exc
+    if result.returncode != 0:
+        raise WebSocketError("PulseAudio echo cancellation could not be verified")
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WebSocketError(
+            "PulseAudio echo cancellation could not be verified"
+        ) from exc
+
+
 _SESSIONS: weakref.WeakSet[RealtimeSession] = weakref.WeakSet()
 _SESSIONS_LOCK = threading.Lock()
 
@@ -294,12 +462,21 @@ class RealtimeSession:
             WebSocketConnection.connect
         ),
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        aec_verifier: Callable[[RealtimeConfig], None] | None = None,
+        volume_guard: Callable[[RealtimeConfig], None] | None = None,
     ) -> None:
         """Create an unstarted, single-use session."""
         self._config = config
         self._clock = clock
         self._connection_factory = connection_factory
         self._popen = popen
+        self._aec_verifier = aec_verifier or _verify_pulseaudio_aec
+        # Tests and downstream embedders that supply a complete AEC verifier
+        # retain a hermetic guard by default. Production uses the cheaper sink
+        # check for every new response after the complete startup preflight.
+        self._volume_guard = volume_guard or (
+            aec_verifier if aec_verifier is not None else _verify_aec_sink_volume
+        )
         self._audio = _BoundedAudioQueue(config.input_queue_bytes)
         self._state = SessionState.NEW
         self._state_lock = threading.Lock()
@@ -308,7 +485,9 @@ class RealtimeSession:
         self._wake_network = threading.Event()
         self._stop_requested = threading.Event()
         self._interrupt_requested = threading.Event()
+        self._interrupt_preserve_session = True
         self._output_active = threading.Event()
+        self._suppressed_output_epoch: int | None = None
         self._thread: threading.Thread | None = None
         self._ever_ready = False
 
@@ -368,10 +547,10 @@ class RealtimeSession:
             return SubmitResult.INVALID
         if len(value) > self._config.max_message_bytes:
             return SubmitResult.INVALID
-        # The released v1.1.7 device path has no verified acoustic echo
-        # cancellation. Config loading rejects full_duplex=true, and this
-        # unconditional gate keeps direct construction fail-closed too.
-        if self._output_active.is_set():
+        # Half-duplex remains the default. Full-duplex construction requires
+        # explicit AEC routing, and _run verifies that live PulseAudio topology
+        # before opening the bridge socket.
+        if self._output_active.is_set() and not self._config.full_duplex:
             return SubmitResult.GATED
         if self.state not in {SessionState.CONNECTING, SessionState.READY}:
             return SubmitResult.CLOSED
@@ -381,13 +560,26 @@ class RealtimeSession:
         self._wake_network.set()
         return SubmitResult.ACCEPTED
 
-    def interrupt(self) -> None:
-        """Flush local ownership and request a fresh-session bridge interrupt."""
+    def interrupt(self, *, preserve_session: bool = True) -> None:
+        """Flush local output and request bounded provider interruption.
+
+        A session is resumed only after the bridge explicitly confirms remote
+        cancellation. Device teardown callers pass ``preserve_session=False``
+        so a successful provider cancel cannot outlive the vendor owner.
+        """
         if self._terminal.is_set():
             return
         self._output_active.clear()
-        self._interrupt_requested.set()
-        self._set_stopping()
+        with self._state_lock:
+            if self._interrupt_requested.is_set():
+                self._interrupt_preserve_session = (
+                    self._interrupt_preserve_session and preserve_session
+                )
+            else:
+                self._interrupt_preserve_session = preserve_session
+            self._interrupt_requested.set()
+            if self._state in {SessionState.CONNECTING, SessionState.READY}:
+                self._state = SessionState.STOPPING
         self._wake_network.set()
 
     def stop(self) -> None:
@@ -411,12 +603,23 @@ class RealtimeSession:
             if self._state in {SessionState.CONNECTING, SessionState.READY}:
                 self._state = SessionState.STOPPING
 
-    def _run(self) -> None:
+    def _run(self) -> None:  # noqa: C901 - one bounded protocol state machine
         connection: WebSocketConnection | None = None
-        player = _PcmPlayer(self._config.output_queue_bytes, popen=self._popen)
+        player = _PcmPlayer(
+            self._config.output_queue_bytes,
+            sink=(self._config.pulse_aec_sink if self._config.full_duplex else None),
+            volume_percent=(
+                self._config.aec_test_volume_percent
+                if self._config.full_duplex
+                else None
+            ),
+            popen=self._popen,
+        )
         failed = False
         try:
             started_at = self._clock()
+            if self._config.full_duplex:
+                self._aec_verifier(self._config)
             connection = self._connection_factory(
                 url=self._config.url,
                 connect_address=self._config.connect_address,
@@ -464,6 +667,8 @@ class RealtimeSession:
                     player.abort()
                     self._audio.clear()
                     self._output_active.clear()
+                    if output_epoch is not None:
+                        self._suppressed_output_epoch = output_epoch
                     output_epoch = None
                     if not interrupt_sent:
                         connection.send_json({"type": "interrupt"})
@@ -547,6 +752,20 @@ class RealtimeSession:
                     return
                 if interrupt_sent and action == "interrupted":
                     return
+                if interrupt_sent and action == "interrupt_resumed":
+                    with self._state_lock:
+                        preserve_session = self._interrupt_preserve_session
+                        if preserve_session:
+                            self._interrupt_requested.clear()
+                            if self._state is SessionState.STOPPING:
+                                self._state = SessionState.READY
+                    if not preserve_session:
+                        connection.send_json({"type": "stop"})
+                        return
+                    interrupt_sent = False
+                    interrupt_deadline = None
+                    self._suppressed_output_epoch = None
+                    last_semantic_activity = self._clock()
         except (OSError, TimeoutError, ValueError, WebSocketError):
             failed = not (
                 self._stop_requested.is_set() or self._interrupt_requested.is_set()
@@ -600,7 +819,7 @@ class RealtimeSession:
             _validate_started(value)
             return
 
-    def _handle_message(
+    def _handle_message(  # noqa: C901 - one bounded protocol decoder
         self,
         message: Message,
         player: _PcmPlayer,
@@ -610,6 +829,8 @@ class RealtimeSession:
     ) -> tuple[str | None, int | None, int, bool]:
         if message.kind == "binary":
             if output_epoch is None:
+                if self._suppressed_output_epoch is not None:
+                    return None, None, last_output_epoch, False
                 raise WebSocketError("binary output arrived outside a speaking epoch")
             assert isinstance(message.data, bytes)
             player.enqueue(message.data)
@@ -630,12 +851,20 @@ class RealtimeSession:
                     raise WebSocketError(
                         "overlapping speaking epochs are not supported"
                     )
+                # A new monotonic epoch is an unambiguous boundary after any
+                # locally suppressed response tail.
+                self._suppressed_output_epoch = None
+                if self._config.full_duplex:
+                    self._volume_guard(self._config)
                 player.begin(epoch)
                 self._output_active.set()
                 return None, epoch, epoch, True
             if event_type == "speaking.stopped":
                 epoch = _output_epoch(value)
                 if output_epoch is None:
+                    if self._suppressed_output_epoch == epoch:
+                        self._suppressed_output_epoch = None
+                        return None, None, last_output_epoch, True
                     if epoch <= last_output_epoch:
                         return None, None, last_output_epoch, False
                     raise WebSocketError("future speaking stop has no active epoch")
@@ -645,6 +874,16 @@ class RealtimeSession:
                     raise WebSocketError("speaking stop does not match active epoch")
                 player.finish(epoch)
                 return None, None, last_output_epoch, True
+            if event_type == "input_audio_buffer.speech_started":
+                if self._config.full_duplex and (
+                    output_epoch is not None or player.active
+                ):
+                    player.abort()
+                    self._output_active.clear()
+                    suppressed_epoch = output_epoch or last_output_epoch
+                    if suppressed_epoch > 0:
+                        self._suppressed_output_epoch = suppressed_epoch
+                    return None, None, last_output_epoch, True
             return None, output_epoch, last_output_epoch, True
         if message_type == "pong":
             return None, output_epoch, last_output_epoch, False
@@ -653,14 +892,15 @@ class RealtimeSession:
             self._output_active.clear()
             reason = value.get("reason")
             if reason == "interrupt":
-                if (
-                    value.get("fresh_session_required") is not True
-                    or value.get("remote_cancelled") is not False
-                ):
-                    raise WebSocketError(
-                        "bridge returned incompatible interrupt semantics"
-                    )
-                return "interrupted", None, last_output_epoch, True
+                fresh_session_required = value.get("fresh_session_required")
+                remote_cancelled = value.get("remote_cancelled")
+                if fresh_session_required is True and remote_cancelled is False:
+                    self._suppressed_output_epoch = None
+                    return "interrupted", None, last_output_epoch, True
+                if fresh_session_required is False and remote_cancelled is True:
+                    self._suppressed_output_epoch = None
+                    return "interrupt_resumed", None, last_output_epoch, True
+                raise WebSocketError("bridge returned incompatible interrupt semantics")
             return "stop", None, last_output_epoch, True
         if message_type == "error":
             raise WebSocketError("bridge reported a realtime session error")
@@ -731,6 +971,8 @@ def _validate_started(value: dict[str, Any]) -> None:
         raise WebSocketError("bridge does not support local flush")
     if capabilities.get("remote_cancel") is not False:
         raise WebSocketError("bridge returned incompatible cancel semantics")
+    if capabilities.get("same_session_interrupt_ack") is not True:
+        raise WebSocketError("bridge omitted same-session interrupt acknowledgement")
 
 
 def _output_epoch(value: dict[str, Any]) -> int:

@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from bridge import realtime as realtime_module
-from bridge.errors import AppServerExited
+from bridge.errors import AppServerExited, ProtocolError
 from bridge.realtime import RealtimeSession
 
 
@@ -66,6 +66,7 @@ class FakePeer:
         self.answer: str | None = None
         self.connected = False
         self.closed = False
+        self.sent_data_events: list[str | bytes] = []
 
     async def create_offer(self) -> str:
         return "v=0\r\noffer\r\n"
@@ -90,6 +91,9 @@ class FakePeer:
     async def recv_data_event(self, timeout: float | None = None) -> str | bytes:
         del timeout
         raise AssertionError("not used")
+
+    def send_data_event(self, value: str | bytes) -> None:
+        self.sent_data_events.append(value)
 
     async def close(self) -> None:
         self.closed = True
@@ -275,6 +279,23 @@ async def test_start_accepts_sdp_before_started_notification() -> None:
     await session.stop()
     assert peer.closed is True
     assert rpc.subscription.closed is True
+
+
+def test_response_cancel_uses_provider_data_channel() -> None:
+    peer = FakePeer()
+    session = RealtimeSession(SdpFirstRpc(), "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    session.request_response_cancel()
+
+    assert peer.sent_data_events == ['{"type":"response.cancel"}']
+
+
+def test_response_cancel_requires_a_started_session() -> None:
+    session = RealtimeSession(SdpFirstRpc(), "thread-1", peer=FakePeer(), timeout=1)
+
+    with pytest.raises(ProtocolError, match="realtime session has not started"):
+        session.request_response_cancel()
 
 
 @pytest.mark.asyncio
