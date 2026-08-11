@@ -135,9 +135,13 @@ sides of a narrow bridge API.
   directories and mode-0644 files remain readable but not writable, while the
   mode-0600 device configuration and staging archive are unreadable to the
   child. This is privilege separation, not a general filesystem, syscall, or
-  network sandbox. Exact vendor bytecode guards fail closed before patching.
-  Its JSON configuration must be a root-owned, non-symlink regular file with
-  mode 0600; source directories/files must not be writable by group or other.
+  network sandbox. Exact vendor guards are staged: the wake/LED group is
+  validated before the latency patch, and the broader audio/configuration/
+  constructor/microphone-loop group is validated before direct ownership and
+  detector ordering. A second-stage mismatch disables direct mode while
+  retaining only the separately guarded normal Assist path. Its JSON
+  configuration must be a root-owned, non-symlink regular file with mode 0600;
+  source directories/files must not be writable by group or other.
 - V3 `device_webrtc` requires full duplex and fails closed without a reviewed static
   PulseAudio `module-echo-cancel` block using the exact configured allowlisted
   AEC engine, exact raw masters and default AEC routes, and the current voice
@@ -299,6 +303,10 @@ Realtime event-shape tracing records only deduplicated source/event types,
 allowlisted item types, and coarse role/target labels. It omits transcript text,
 agent deltas, prompts, tool names, arguments, results, raw provider payloads,
 SDP, audio, and provider identifiers.
+
+The ThirdReality overlay emits one device-syslog wake selection using only
+fixed detector-class and reason enums. It never includes the spoken phrase,
+detector ID, confidence, audio, configuration, or credential data.
 
 Upstream `wyoming-faster-whisper` 3.5.0 logs recognized text at INFO. The
 supplied systemd unit deliberately starts it through the privacy runner, which

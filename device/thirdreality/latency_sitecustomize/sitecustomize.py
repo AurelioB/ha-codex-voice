@@ -9,8 +9,10 @@ import importlib
 import logging
 import marshal
 import subprocess
+import syslog
 import threading
 from collections import deque
+from contextlib import suppress
 from typing import Any
 
 from aioesphomeapi.api_pb2 import VoiceAssistantRequest
@@ -40,9 +42,21 @@ _EXPECTED_BASE_HANDLE_AUDIO_OPCODES = (
 _EXPECTED_BASE_STOP_OPCODES = (
     "b249e6254095ee6c19fa26795eeb424b762972adf52ba931b2a04ae3985c80ea"
 )
+_EXPECTED_BASE_HANDLE_MESSAGE = (
+    "d930b8d7852ac6567b219119b3ac29599df0f87f39f6ad92beb9cd27cb678724"
+)
+_EXPECTED_TR_INIT = "9120bc4f5b727f360bdd632bd0fef25747a299ad64aabc5ec0bd57ac299eb24b"
+_EXPECTED_BASE_INIT = "1c8edd949cc12268f15e2ead3af5d9c8125b9c22a9c74f5e7dc5a6695a3eff25"
+_EXPECTED_MAIN_MODULE_FILE = (
+    "38fe14a2068eaa0bbd4af989ddc1a8581d193edcd98f1fe9a837300bec48648d"
+)
+_MAX_VENDOR_MODULE_BYTES = 4 * 1024 * 1024
 
+_VENDOR_BASE_INIT = VoiceSatelliteProtocol.__init__
 _VENDOR_BASE_HANDLE_AUDIO = VoiceSatelliteProtocol.handle_audio
 _VENDOR_BASE_STOP = VoiceSatelliteProtocol.stop
+_VENDOR_BASE_HANDLE_MESSAGE = VoiceSatelliteProtocol.handle_message
+_VENDOR_TR_INIT = thirdreality_satellite.TRSatelliteProtocol.__init__
 _REALTIME_SUPPORT: Any = None
 _REALTIME_CONFIG: Any = None
 _REALTIME_PATCH_ACTIVE = False
@@ -77,6 +91,25 @@ def _code_hash(function: Any) -> str:
 def _opcode_hash(function: Any) -> str:
     """Return the exact installed opcode-stream hash for a narrow patch."""
     return hashlib.sha256(function.__code__.co_code).hexdigest()
+
+
+def _module_file_hash(module_name: str) -> str | None:
+    """Hash one bounded installed module file without importing its code."""
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, AttributeError, ValueError):
+        return None
+    origin = getattr(spec, "origin", None)
+    if not isinstance(origin, str) or not origin.startswith("/"):
+        return None
+    try:
+        with open(origin, "rb") as handle:  # noqa: PTH123 - guarded vendor path
+            content = handle.read(_MAX_VENDOR_MODULE_BYTES + 1)
+    except OSError:
+        return None
+    if len(content) > _MAX_VENDOR_MODULE_BYTES:
+        return None
+    return hashlib.sha256(content).hexdigest()
 
 
 class _RealtimeOwner:
@@ -143,19 +176,91 @@ def _load_realtime_config() -> None:
     _REALTIME_CONFIG = config
 
 
-def _is_realtime_wake(wake_word: Any) -> bool:
+def _classify_wake(wake_word: Any) -> tuple[bool, str]:
     if (
         not _REALTIME_PATCH_ACTIVE
         or _REALTIME_CONFIG is None
         or _REALTIME_SUPPORT is None
     ):
-        return False
+        return False, "realtime_unavailable"
     phrase = getattr(wake_word, "wake_word", "")
     if not isinstance(phrase, str):
-        return False
-    return (
-        _REALTIME_SUPPORT.normalize_wake_phrase(phrase) == _REALTIME_CONFIG.wake_phrase
-    )
+        return False, "invalid_phrase"
+    if _REALTIME_SUPPORT.normalize_wake_phrase(phrase) == _REALTIME_CONFIG.wake_phrase:
+        return True, "configured_phrase"
+    return False, "normal_phrase"
+
+
+def _is_realtime_wake(wake_word: Any) -> bool:
+    return _classify_wake(wake_word)[0]
+
+
+def _log_wake_selection(detector: str, selection: str) -> None:
+    """Emit one fixed-vocabulary detector event to the device system log."""
+    if detector not in {"realtime", "assist"}:
+        return
+    if selection not in {
+        "configured_phrase",
+        "invalid_phrase",
+        "normal_phrase",
+        "realtime_unavailable",
+    }:
+        return
+    with suppress(Exception):  # diagnostics cannot affect wake routing
+        syslog.syslog(
+            syslog.LOG_INFO,
+            f"codex-voice wake_detector={detector} selection={selection}",
+        )
+
+
+def _tune_realtime_wake(wake_word: Any) -> None:
+    """Apply an optional validated cutoff to only the configured detector."""
+    cutoff = getattr(_REALTIME_CONFIG, "wake_probability_cutoff", None)
+    if cutoff is None:
+        return
+    observed = getattr(wake_word, "probability_cutoff", None)
+    if isinstance(observed, bool) or not isinstance(observed, (int, float)):
+        return
+    with suppress(Exception):  # keep the vendor detector unchanged
+        wake_word.probability_cutoff = cutoff
+
+
+class _RealtimeFirstWakeWords(dict[Any, Any]):
+    """Keep vendor mapping semantics but expose direct detectors first."""
+
+    def values(self) -> tuple[Any, ...]:
+        observed = tuple(dict.values(self))
+        realtime: list[Any] = []
+        normal: list[Any] = []
+        for wake_word in observed:
+            if _is_realtime_wake(wake_word):
+                _tune_realtime_wake(wake_word)
+                realtime.append(wake_word)
+            else:
+                normal.append(wake_word)
+        return (*realtime, *normal)
+
+
+def _install_realtime_wake_order(state: Any) -> None:
+    """Replace one existing vendor mapping without mutating it in place."""
+    wake_words = getattr(state, "wake_words", None)
+    if isinstance(wake_words, dict) and not isinstance(
+        wake_words, _RealtimeFirstWakeWords
+    ):
+        state.wake_words = _RealtimeFirstWakeWords(wake_words)
+
+
+def _fast_thirdreality_init(instance: Any, state: Any = None) -> None:
+    """Install deterministic wake arbitration before publishing the protocol."""
+    if state is None:
+        # Compatibility for constructor shims that manufacture their own state.
+        # The guarded appliance constructor always supplies state and therefore
+        # takes the pre-publication branch below.
+        _VENDOR_TR_INIT(instance)
+        _install_realtime_wake_order(instance.state)
+        return
+    _install_realtime_wake_order(state)
+    _VENDOR_TR_INIT(instance, state)
 
 
 def _uses_device_webrtc() -> bool:
@@ -760,9 +865,13 @@ def _fast_wakeup(instance: Any, wake_word: Any) -> None:
 
 def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
     """Apply the fast wake path directly to the pinned device subclass."""
+    realtime_wake, selection = _classify_wake(wake_word)
+    _log_wake_selection(
+        "realtime" if realtime_wake else "assist",
+        selection,
+    )
     with _realtime_state_lock(instance):
         preroll_audio = _take_realtime_preroll(instance)
-        realtime_wake = _is_realtime_wake(wake_word)
         if not realtime_wake:
             _preempt_realtime_for_normal_wake(instance)
         previous_active = instance._pipeline_active  # noqa: SLF001
@@ -925,15 +1034,26 @@ if _observed_hashes == _expected_hashes:
         _observed_realtime_hashes = (
             _opcode_hash(_VENDOR_BASE_HANDLE_AUDIO),
             _opcode_hash(_VENDOR_BASE_STOP),
+            _code_hash(_VENDOR_BASE_HANDLE_MESSAGE),
+            _code_hash(_VENDOR_TR_INIT),
+            _code_hash(_VENDOR_BASE_INIT),
+            _module_file_hash("linux_voice_assistant.__main__"),
         )
         _expected_realtime_hashes = (
             _EXPECTED_BASE_HANDLE_AUDIO_OPCODES,
             _EXPECTED_BASE_STOP_OPCODES,
+            _EXPECTED_BASE_HANDLE_MESSAGE,
+            _EXPECTED_TR_INIT,
+            _EXPECTED_BASE_INIT,
+            _EXPECTED_MAIN_MODULE_FILE,
         )
         if _observed_realtime_hashes == _expected_realtime_hashes:
             _REALTIME_PATCH_ACTIVE = True
             VoiceSatelliteProtocol.handle_audio = _realtime_handle_audio
             VoiceSatelliteProtocol.stop = _realtime_stop
+            thirdreality_satellite.TRSatelliteProtocol.__init__ = (
+                _fast_thirdreality_init
+            )
             atexit.register(_REALTIME_SUPPORT.shutdown_all_sessions)
             if _uses_device_webrtc() and not _REALTIME_SUPPORT.prewarm_device_webrtc():
                 _LOGGER.warning("ThirdReality direct WebRTC prewarm is unavailable")

@@ -53,6 +53,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert isinstance(config, RealtimeConfig)
     assert config.connect_address == "192.0.2.10"
     assert config.wake_phrase == "okay computer"
+    assert config.wake_probability_cutoff is None
     assert config.voice is None
     assert config.prompt is None
     assert config.full_duplex is False
@@ -89,6 +90,7 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
             "voice": "Cove",
             "prompt": private_prompt,
             "max_message_bytes": 2_048,
+            "wake_probability_cutoff": 0.85,
         },
     )
 
@@ -97,6 +99,7 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert config is not None
     assert config.voice == "cove"
     assert config.prompt == private_prompt
+    assert config.wake_probability_cutoff == 0.85
     assert private_prompt not in repr(config)
 
 
@@ -313,6 +316,44 @@ def test_direct_config_rejects_volume_above_sixty_percent(tmp_path: Path) -> Non
         replace(config, playback_volume_percent=61)
 
 
+def test_direct_config_rejects_invalid_wake_probability_cutoff(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+
+    with pytest.raises(ConfigError, match=r"wake_probability_cutoff.*0.5 through 0.99"):
+        replace(config, wake_probability_cutoff=True)
+
+
+def test_wake_probability_cutoff_preserves_existing_positional_arguments() -> None:
+    config = RealtimeConfig(
+        "ws://192.0.2.10:8787/v1/realtime",
+        "192.0.2.10",
+        "token",
+        "okay computer",
+        1.0,
+        2.0,
+        1.0,
+        10.0,
+        30.0,
+        5.0,
+        2.0,
+        64 * 1024,
+        64 * 1024,
+        48 * 1024,
+        64 * 1024,
+        False,
+        BRIDGE_PCM_TRANSPORT,
+        "cove",
+    )
+
+    assert config.voice == "cove"
+    assert config.wake_probability_cutoff is None
+
+
 def test_full_duplex_defaults_to_existing_webrtc_aec_contract(tmp_path: Path) -> None:
     path = tmp_path / "realtime.json"
     _write_config(
@@ -366,6 +407,9 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"prompt": "line\nbreak"}, "control characters"),
         ({"prompt": "x" * 1_025}, "up to 1024"),
         ({"wake_phrase": "okay nabu"}, "distinct"),
+        ({"wake_probability_cutoff": True}, "must be a number"),
+        ({"wake_probability_cutoff": 0.49}, "outside its supported range"),
+        ({"wake_probability_cutoff": 1.0}, "outside its supported range"),
         ({"connect_address": "bridge.local"}, "numeric IP"),
         ({"max_message_bytes": 2_047}, "outside its supported range"),
         ({"max_message_bytes": 65_535}, "PCM16 aligned"),

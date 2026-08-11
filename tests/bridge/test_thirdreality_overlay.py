@@ -20,13 +20,29 @@ _BASE_HANDLE_AUDIO_HASH = (
     "ecc9e6112426a14c798736e18244af1cea526ec072882e4d95c622106a06a41d"
 )
 _BASE_STOP_HASH = "b249e6254095ee6c19fa26795eeb424b762972adf52ba931b2a04ae3985c80ea"
+_BASE_HANDLE_MESSAGE_HASH = (
+    "d930b8d7852ac6567b219119b3ac29599df0f87f39f6ad92beb9cd27cb678724"
+)
+_TR_INIT_HASH = "9120bc4f5b727f360bdd632bd0fef25747a299ad64aabc5ec0bd57ac299eb24b"
+_BASE_INIT_HASH = "1c8edd949cc12268f15e2ead3af5d9c8125b9c22a9c74f5e7dc5a6695a3eff25"
+_MAIN_MODULE_FILE_HASH = (
+    "38fe14a2068eaa0bbd4af989ddc1a8581d193edcd98f1fe9a837300bec48648d"
+)
 _KNOWN_HASHES = (
     _BASE_WAKEUP_HASH,
     _BASE_FINISH_HASH,
     _TR_WAKEUP_HASH,
     _TR_LED_FIRE_HASH,
 )
-_REALTIME_HASHES = (*_KNOWN_HASHES, _BASE_HANDLE_AUDIO_HASH, _BASE_STOP_HASH)
+_REALTIME_HASHES = (
+    *_KNOWN_HASHES,
+    _BASE_HANDLE_AUDIO_HASH,
+    _BASE_STOP_HASH,
+    _BASE_HANDLE_MESSAGE_HASH,
+    _TR_INIT_HASH,
+    _BASE_INIT_HASH,
+    _MAIN_MODULE_FILE_HASH,
+)
 _OVERLAY_PATH = (
     Path(__file__).resolve().parents[2]
     / "device"
@@ -69,7 +85,19 @@ class _FakeProtocol:
             muted=False,
             tts_player=_FakePlayer(self.events),
             wakeup_sound=object(),
-            active_wake_words={"okay_nabu"},
+            active_wake_words={"okay_nabu", "okay_computer"},
+            wake_words={
+                "okay_nabu": SimpleNamespace(
+                    id="okay_nabu",
+                    wake_word="Okay Nabu",
+                    probability_cutoff=0.85,
+                ),
+                "okay_computer": SimpleNamespace(
+                    id="okay_computer",
+                    wake_word="Okay Computer",
+                    probability_cutoff=0.97,
+                ),
+            },
             stop_word=SimpleNamespace(id="stop"),
         )
         self._timer_finished = False
@@ -135,6 +163,10 @@ class _FakeProtocol:
             return
         self.send_messages([_FakeAudio(data=audio_chunk)])
 
+    def handle_message(self, _message: Any) -> Any:
+        if False:
+            yield None
+
     def stop(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
@@ -166,14 +198,20 @@ _VENDOR_BASE_WAKEUP = _FakeProtocol.wakeup
 _VENDOR_BASE_FINISH = _FakeProtocol._on_wakeup_sound_finished
 _VENDOR_BASE_HANDLE_AUDIO = _FakeProtocol.handle_audio
 _VENDOR_BASE_STOP = _FakeProtocol.stop
+_VENDOR_BASE_HANDLE_MESSAGE = _FakeProtocol.handle_message
 _VENDOR_TR_WAKEUP = _FakeTRProtocol.wakeup
+_VENDOR_TR_INIT = _FakeTRProtocol.__init__
 
 
 @pytest.fixture
 def load_overlay(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> Any:
     loaded_modules: list[ModuleType] = []
+    vendor_main = tmp_path / "linux_voice_assistant_main.pyc"
+    vendor_main.write_bytes(b"pinned vendor main")
+    real_find_spec = importlib.util.find_spec
 
     def load(
         hashes: tuple[str, ...] = _KNOWN_HASHES,
@@ -183,7 +221,9 @@ def load_overlay(
         _FakeProtocol._on_wakeup_sound_finished = _VENDOR_BASE_FINISH
         _FakeProtocol.handle_audio = _VENDOR_BASE_HANDLE_AUDIO
         _FakeProtocol.stop = _VENDOR_BASE_STOP
+        _FakeProtocol.handle_message = _VENDOR_BASE_HANDLE_MESSAGE
         _FakeTRProtocol.wakeup = _VENDOR_TR_WAKEUP
+        _FakeTRProtocol.__init__ = _VENDOR_TR_INIT
 
         aioesphomeapi = ModuleType("aioesphomeapi")
         aioesphomeapi.__path__ = []  # type: ignore[attr-defined]
@@ -224,6 +264,13 @@ def load_overlay(
         else:
             monkeypatch.setitem(sys.modules, "realtime_client", realtime_support)
 
+        def fake_find_spec(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "linux_voice_assistant.__main__":
+                return SimpleNamespace(origin=str(vendor_main))
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
         values = iter(hashes)
 
         def fake_sha256(_value: bytes) -> Any:
@@ -248,6 +295,7 @@ def load_overlay(
                 stderr=b"",
             ),
         )
+        monkeypatch.setattr(module.syslog, "syslog", lambda *_args: None)
         return _FakeTRProtocol, module, tr_satellite
 
     yield load
@@ -258,7 +306,9 @@ def load_overlay(
     _FakeProtocol._on_wakeup_sound_finished = _VENDOR_BASE_FINISH
     _FakeProtocol.handle_audio = _VENDOR_BASE_HANDLE_AUDIO
     _FakeProtocol.stop = _VENDOR_BASE_STOP
+    _FakeProtocol.handle_message = _VENDOR_BASE_HANDLE_MESSAGE
     _FakeTRProtocol.wakeup = _VENDOR_TR_WAKEUP
+    _FakeTRProtocol.__init__ = _VENDOR_TR_INIT
 
 
 def _wake(instance: _FakeProtocol, phrase: str = "okay nabu") -> None:
@@ -282,6 +332,7 @@ def _fake_realtime_support(
     submit_release: threading.Event | None = None,
     media_transport: str = "bridge_pcm",
     prewarm_result: bool = True,
+    wake_probability_cutoff: float | None = 0.85,
 ) -> ModuleType:
     support = ModuleType("realtime_client")
     config = SimpleNamespace(
@@ -289,6 +340,7 @@ def _fake_realtime_support(
         fallback_buffer_bytes=fallback_buffer_bytes,
         input_queue_bytes=input_queue_bytes,
         media_transport=media_transport,
+        wake_probability_cutoff=wake_probability_cutoff,
     )
     sessions: list[Any] = []
 
@@ -374,6 +426,164 @@ def test_direct_webrtc_prewarms_only_after_guarded_overlay_activation(
 
     assert module._REALTIME_PATCH_ACTIVE
     assert support.prewarm_calls == [None]  # type: ignore[attr-defined]
+
+
+def test_realtime_init_prioritizes_and_tunes_only_configured_detector(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(wake_probability_cutoff=0.85)
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+
+    instance = protocol()
+    wake_words = instance.state.wake_words
+    wake_words["okay_nabu"].probability_cutoff = 0.91
+
+    assert isinstance(wake_words, module._RealtimeFirstWakeWords)
+    assert list(wake_words) == ["okay_nabu", "okay_computer"]
+    assert [wake_word.id for wake_word in wake_words.values()] == [
+        "okay_computer",
+        "okay_nabu",
+    ]
+    assert wake_words["okay_computer"].probability_cutoff == 0.85
+    assert wake_words["okay_nabu"].probability_cutoff == 0.91
+
+    wake_words["hey_jarvis"] = SimpleNamespace(
+        id="hey_jarvis",
+        wake_word="Hey Jarvis",
+        probability_cutoff=0.90,
+    )
+    module._install_realtime_wake_order(instance.state)
+
+    assert instance.state.wake_words is wake_words
+    assert [wake_word.id for wake_word in wake_words.values()] == [
+        "okay_computer",
+        "okay_nabu",
+        "hey_jarvis",
+    ]
+
+
+def test_realtime_init_installs_order_before_vendor_publication_and_late_add(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support(wake_probability_cutoff=None)
+    _protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    nabu = SimpleNamespace(
+        id="okay_nabu",
+        wake_word="Okay Nabu",
+        probability_cutoff=0.85,
+    )
+    computer = SimpleNamespace(
+        id="okay_computer",
+        wake_word="Okay Computer",
+        probability_cutoff=0.97,
+    )
+    state = SimpleNamespace(wake_words={"okay_nabu": nabu})
+    observed: list[bool] = []
+
+    def vendor_init(_instance: Any, received_state: Any) -> None:
+        observed.append(
+            isinstance(received_state.wake_words, module._RealtimeFirstWakeWords)
+        )
+
+    monkeypatch.setattr(module, "_VENDOR_TR_INIT", vendor_init)
+    module._fast_thirdreality_init(SimpleNamespace(), state)
+    state.wake_words["okay_computer"] = computer
+
+    assert observed == [True]
+    assert [wake_word.id for wake_word in state.wake_words.values()] == [
+        "okay_computer",
+        "okay_nabu",
+    ]
+    assert computer.probability_cutoff == 0.97
+
+    detector_without_cutoff = SimpleNamespace(
+        id="okay_computer",
+        wake_word="Okay Computer",
+    )
+    unsupported = module._RealtimeFirstWakeWords(
+        {"okay_computer": detector_without_cutoff}
+    )
+
+    assert tuple(unsupported.values()) == (detector_without_cutoff,)
+    assert not hasattr(detector_without_cutoff, "probability_cutoff")
+
+
+def test_realtime_order_only_prioritizes_same_block_collision(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    ordered = tuple(protocol().state.wake_words.values())
+
+    def first_activation(blocks: list[set[str]]) -> str | None:
+        for ready_ids in blocks:
+            for wake_word in ordered:
+                if wake_word.id in ready_ids:
+                    return wake_word.id
+        return None
+
+    assert first_activation([{"okay_nabu", "okay_computer"}]) == "okay_computer"
+    assert first_activation([{"okay_nabu"}, {"okay_computer"}]) == "okay_nabu"
+
+
+def test_wake_detector_syslog_uses_only_fixed_vocabulary(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    messages: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        module.syslog,
+        "syslog",
+        lambda priority, message: messages.append((priority, message)),
+    )
+
+    direct = protocol()
+    normal = protocol()
+    _wake(direct, "Okay Computer")
+    _wake(normal, "Okay Nabu")
+
+    assert messages == [
+        (
+            module.syslog.LOG_INFO,
+            "codex-voice wake_detector=realtime selection=configured_phrase",
+        ),
+        (
+            module.syslog.LOG_INFO,
+            "codex-voice wake_detector=assist selection=normal_phrase",
+        ),
+    ]
+
+
+def test_wake_detector_syslog_failure_and_invalid_values_are_non_disruptive(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    messages: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        module.syslog,
+        "syslog",
+        lambda priority, message: messages.append((priority, message)),
+    )
+
+    module._log_wake_selection("unknown", "configured_phrase")
+    module._log_wake_selection("realtime", "unknown")
+
+    assert messages == []
+
+    def fail_syslog(_priority: int, _message: str) -> None:
+        raise OSError("syslog unavailable")
+
+    monkeypatch.setattr(module.syslog, "syslog", fail_syslog)
+    instance = protocol()
+    _wake(instance, "Okay Computer")
+
+    assert len(support.sessions) == 1  # type: ignore[attr-defined]
+    assert instance._codex_realtime_owner is not None
 
 
 def test_direct_webrtc_constructor_failure_does_not_start_ha_fallback(
@@ -952,6 +1162,8 @@ def test_realtime_opcode_mismatch_keeps_latency_patch_and_normal_audio_path(
     assert module._REALTIME_PATCH_ACTIVE is False
     assert _FakeProtocol.handle_audio is _VENDOR_BASE_HANDLE_AUDIO
     assert _FakeProtocol.stop is _VENDOR_BASE_STOP
+    assert _FakeProtocol.handle_message is _VENDOR_BASE_HANDLE_MESSAGE
+    assert _FakeTRProtocol.__init__ is _VENDOR_TR_INIT
     assert _FakeTRProtocol.wakeup is module._fast_thirdreality_wakeup
     assert tr_satellite._led_fire is module._nonblocking_led_fire  # type: ignore[attr-defined]
     assert (
@@ -965,6 +1177,21 @@ def test_realtime_opcode_mismatch_keeps_latency_patch_and_normal_audio_path(
     assert instance.requests == ["okay computer"]
     assert instance.audio == [b"normal"]
     assert not support.sessions  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("guard_index", [6, 7, 8, 9])
+def test_wake_arbitration_guard_mismatch_skips_constructor_patch(
+    load_overlay: Any,
+    guard_index: int,
+) -> None:
+    support = _fake_realtime_support()
+    hashes = list(_REALTIME_HASHES)
+    hashes[guard_index] = "unknown"
+
+    _protocol, module, _tr_satellite = load_overlay(tuple(hashes), support)
+
+    assert module._REALTIME_PATCH_ACTIVE is False
+    assert _FakeTRProtocol.__init__ is _VENDOR_TR_INIT
 
 
 def test_wake_fast_path_streams_immediately_without_cue_or_watchdog(

@@ -42,6 +42,10 @@ and releases use semantic versioning.
 
 ### Changed
 
+- Prioritize the configured ThirdReality realtime detector for same-block
+  shared-prefix collisions without changing stored model order, add an
+  optional bounded detector cutoff for accented speech, and record only
+  fixed-vocabulary detector selections in the device system log.
 - Raise the ThirdReality realtime session defaults from 45 to 120 seconds of
   semantic idle time and from 300 to 900 seconds of total lifetime. The idle
   limit remains activity-based; the hard limit still covers local preflight,

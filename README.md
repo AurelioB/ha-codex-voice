@@ -308,6 +308,15 @@ and stores only the route-scoped realtime bearer—not the Home Assistant token
 or the Codex OAuth credential. Deployment and rollback must preserve and verify
 TCP ADB port 5555 on devices where it is the approved recovery path.
 
+On the pinned firmware, active wake models share an insertion-ordered detector
+loop even though Home Assistant persists their active IDs through a set. The
+guarded overlay therefore presents the configured realtime detector first for
+same-block collisions and can apply a bounded `wake_probability_cutoff` only to
+that exact phrase. The reference Okay Computer installation uses 0.85 for more
+reliable accented English while leaving Okay Nabu at its vendor threshold and
+on official Assist. Earlier-block Nabu activation still wins, so physical
+acceptance verifies the fixed detector marker for both spoken phrases.
+
 The reference client hardcodes `conversation_mode: "native"` in every v3 or
 rollback-v2 start and requires the bridge to echo it in `started`. It is
 deliberately not a device setting: Okay Computer cannot silently become a

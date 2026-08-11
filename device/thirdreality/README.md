@@ -464,6 +464,7 @@ replace the documentation address and placeholder token, then explicitly set
   "connect_address": "192.0.2.10",
   "token": "REPLACE_WITH_DISTINCT_REALTIME_DEVICE_TOKEN",
   "wake_phrase": "okay computer",
+  "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
   "media_transport": "device_webrtc",
@@ -513,6 +514,17 @@ playback, or lifecycle activity—not pings or sub-audible decode residue. The
 hard clock starts before local AEC/player preflight and covers all startup,
 runtime, and rollover work. Deployments may lower the values within their
 enforced 5–120-second and 15–900-second ranges, respectively.
+
+`wake_probability_cutoff` is optional and accepts 0.5–0.99. The pinned Okay
+Computer model ships at 0.97; the reference speaker uses 0.85 so accented
+English reaches the dedicated detector reliably. When several active models
+become ready in the same recorder block and share “Okay,” the guarded overlay
+presents the configured realtime detector first while preserving the relative
+order of every other model. It cannot override a Nabu activation from an
+earlier block; physical acceptance must verify that spoken Okay Computer does
+not produce an Assist detector marker. The cutoff override applies only to the
+exact normalized `wake_phrase`; Okay Nabu keeps its vendor threshold and
+continues to select Home Assistant Assist.
 
 Before physical input qualification, install the guarded early microphone-gain
 hook described in [`deploy/README.md`](deploy/README.md). The pinned firmware
@@ -644,10 +656,14 @@ ADB connection. A physical wake must also show no
 `wake_word_triggered_old.wav` playback. Merely importing `sitecustomize` in a
 separate probe process is not acceptance.
 
-Python imports `sitecustomize` during process startup. The script validates all
-compatibility guards before mutating the vendor class. An import failure or
-unknown bytecode is non-destructive: Python reports the error or warning and
-the original wake implementation remains installed.
+Python imports `sitecustomize` during process startup. The script first
+validates the wake/LED compatibility group atomically before installing the
+latency wrapper. When direct configuration is present, a second guard covers
+the audio/stop handlers, configuration mutation, both constructors, and the
+separately executed microphone-loop bytecode before enabling direct ownership
+and detector ordering. An initial-group mismatch leaves vendor wake behavior
+untouched; a direct-group mismatch retains only the separately guarded latency
+path and normal Home Assistant routing. Both cases emit a content-free warning.
 
 ## Acceptance and rollback
 
@@ -686,6 +702,12 @@ event types, signal-bearing playback aggregates, capture-age bounds, duration,
 and terminal outcome. A failure warning contains only the phase and exception
 class. Neither record includes PCM, transcripts, provider payloads, item or
 turn identifiers, SDP, prompts, URLs, or credentials.
+
+Every physical wake also emits one fixed-vocabulary syslog selection such as
+`wake_detector=realtime selection=configured_phrase` or
+`wake_detector=assist selection=normal_phrase`. This records classifier intent,
+not transport startup success. It contains no phrase text, detector ID,
+confidence, audio, prompt, endpoint, or credential.
 
 The 2026-08-11 reference-device root-fix canary used the production v3 session,
 AEC source, sidecar, Opus/RTP path, provider VAD, and `paplay` at the qualified

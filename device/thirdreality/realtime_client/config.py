@@ -45,6 +45,7 @@ _ALLOWED_KEYS = frozenset(
         "connect_address",
         "token",
         "wake_phrase",
+        "wake_probability_cutoff",
         "voice",
         "prompt",
         "connect_timeout_seconds",
@@ -95,6 +96,7 @@ class RealtimeConfig:
     max_message_bytes: int
     full_duplex: bool
     media_transport: str = BRIDGE_PCM_TRANSPORT
+    wake_probability_cutoff: float | None = field(default=None, kw_only=True)
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
     pulse_aec_source: str | None = None
@@ -118,6 +120,17 @@ class RealtimeConfig:
             raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
         if self.media_transport == DEVICE_WEBRTC_TRANSPORT and not self.full_duplex:
             raise ConfigError("device_webrtc media transport requires full_duplex")
+        if self.wake_probability_cutoff is not None:
+            cutoff = self.wake_probability_cutoff
+            if (
+                isinstance(cutoff, bool)
+                or not isinstance(cutoff, (int, float))
+                or not 0.5 <= float(cutoff) <= 0.99
+            ):
+                raise ConfigError(
+                    "wake_probability_cutoff must be a number from 0.5 through 0.99"
+                )
+            object.__setattr__(self, "wake_probability_cutoff", float(cutoff))
 
         legacy_volume_percent = self.aec_test_volume_percent
         if (
@@ -293,6 +306,12 @@ def load_config(
         raise ConfigError("wake_phrase must be distinct from the normal wake phrase")
     if any(not character.isprintable() for character in wake_phrase):
         raise ConfigError("wake_phrase must contain only printable characters")
+    wake_probability_cutoff = _optional_bounded_float(
+        decoded,
+        "wake_probability_cutoff",
+        minimum=0.5,
+        maximum=0.99,
+    )
 
     input_queue_bytes = _bounded_int(
         decoded,
@@ -460,6 +479,7 @@ def load_config(
         max_message_bytes=max_message_bytes,
         full_duplex=full_duplex,
         media_transport=media_transport,
+        wake_probability_cutoff=wake_probability_cutoff,
         voice=voice,
         prompt=prompt,
         pulse_aec_source=pulse_aec_source,
@@ -615,6 +635,24 @@ def _bounded_float(
     maximum: float,
 ) -> float:
     candidate = value.get(key, default)
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise ConfigError(f"{key} must be a number")
+    result = float(candidate)
+    if not minimum <= result <= maximum:
+        raise ConfigError(f"{key} is outside its supported range")
+    return result
+
+
+def _optional_bounded_float(
+    value: dict[str, Any],
+    key: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float | None:
+    if key not in value:
+        return None
+    candidate = value.get(key)
     if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
         raise ConfigError(f"{key} must be a number")
     result = float(candidate)
