@@ -782,7 +782,7 @@ def test_realtime_wake_claims_mic_without_starting_home_assistant(
     assert not instance.requests
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" in instance.state.active_wake_words
+    assert "stop" not in instance.state.active_wake_words
 
     instance.handle_audio(b"\x01\x00" * 8)
     assert session.audio == [b"\x01\x00" * 8]
@@ -848,7 +848,7 @@ def test_wake_detector_false_positive_cannot_preempt_realtime_session(
     assert instance.events == ["duck"]
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" in instance.state.active_wake_words
+    assert "stop" not in instance.state.active_wake_words
 
     instance.handle_audio(b"\x01\x00" * 8)
     assert session.audio == [b"\x01\x00" * 8]
@@ -889,7 +889,7 @@ def test_terminal_owner_is_reaped_before_starting_next_realtime_wake(
     ]
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" in instance.state.active_wake_words
+    assert "stop" not in instance.state.active_wake_words
 
 
 def test_terminal_owner_cleanup_on_next_wake_is_idempotently_idle(
@@ -1297,6 +1297,7 @@ def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
     _wake(instance, "okay computer")
     owner = instance._codex_realtime_owner
     session = support.sessions[0]  # type: ignore[attr-defined]
+    assert "stop" not in instance.state.active_wake_words
 
     instance.stop()
     module._detach_realtime_owner(instance, owner, unduck=True)
@@ -1307,6 +1308,36 @@ def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
     assert not instance._is_streaming_audio
     assert instance.events.count("unduck") == 1
     assert ("stop" in instance.state.active_wake_words) is stop_word_preexisting
+
+
+def test_direct_owner_suspends_legacy_stop_detector_until_terminal_cleanup(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    instance.state.active_wake_words.add("stop")
+
+    _wake(instance, "okay computer")
+    owner = instance._codex_realtime_owner
+    session = support.sessions[0]  # type: ignore[attr-defined]
+
+    # This is the exact membership gate used by the pinned microphone loop
+    # after its legacy stop model fires. Provider playback echo must not be
+    # allowed to turn that detection into a terminal local stop.
+    if "stop" in instance.state.active_wake_words:
+        instance.stop()
+
+    assert session.interrupted == 0
+    assert instance._codex_realtime_owner is owner
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+
+    session.terminal = True
+    instance.handle_audio(_pcm_frame(1))
+
+    assert instance._codex_realtime_owner is None
+    assert "stop" in instance.state.active_wake_words
 
 
 def test_realtime_opcode_mismatch_keeps_latency_patch_and_normal_audio_path(

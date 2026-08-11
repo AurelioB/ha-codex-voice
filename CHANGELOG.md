@@ -110,6 +110,11 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Suspend the ThirdReality vendor's legacy terminal stop-word detector while a
+  direct full-duplex owner is live. Provider playback echo and ordinary reply
+  tails can no longer end an otherwise healthy realtime conversation; spoken
+  interruptions remain on the realtime barge-in path, and teardown restores
+  the detector's exact prior membership.
 - Answer Codex App Server's client-owned `currentTime/read` callback with whole
   Unix seconds, so realtime voice can complete clock questions instead of
   stopping after its acknowledgement. Unexpected runtime tool requests now

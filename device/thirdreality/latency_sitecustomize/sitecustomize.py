@@ -285,15 +285,19 @@ def _assist_fallback_allowed() -> bool:
     return not _uses_device_webrtc() and not _realtime_only_mode()
 
 
-def _stop_word_membership(instance: Any) -> tuple[Any, bool]:
+def _suspend_stop_word_membership(instance: Any) -> tuple[Any, bool]:
+    """Disable the vendor's terminal stop detector for one direct session."""
     stop_word = getattr(instance.state, "stop_word", None)
     stop_word_id = getattr(stop_word, "id", None)
     active = getattr(instance.state, "active_wake_words", None)
     if stop_word_id is None or active is None:
         return None, False
     was_active = stop_word_id in active
-    if not was_active:
-        active.add(stop_word_id)
+    # Direct full-duplex speech already owns interruption. Leaving the legacy
+    # terminal stop-word detector armed lets playback echo or ordinary reply
+    # tails tear down the entire conversation instead of producing a realtime
+    # barge-in. Restore the exact prior membership when the owner is released.
+    active.discard(stop_word_id)
     return stop_word_id, was_active
 
 
@@ -445,7 +449,7 @@ def _start_realtime_wakeup(
                 stop_word_id=None,
                 stop_word_was_active=False,
             )
-            stop_word_id, stop_word_was_active = _stop_word_membership(instance)
+            stop_word_id, stop_word_was_active = _suspend_stop_word_membership(instance)
             owner.stop_word_id = stop_word_id
             owner.stop_word_was_active = stop_word_was_active
         except Exception:  # noqa: BLE001 - preserve the normal wake path

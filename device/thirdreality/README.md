@@ -18,10 +18,14 @@ The two wake phrases deliberately have different authority:
 | Okay Computer | Explicit native [realtime wire v3](../../protocol/realtime-wire-v3.md) signaling to the Codex Voice bridge | Tool-free direct device WebRTC media/data channel; fresh-peer barge-in when the AEC safety contract is enabled |
 
 Okay Nabu can preempt an active direct session and immediately reclaim the
-microphone for the normal Home Assistant path. Saying the configured stop word,
-starting the normal Home Assistant path, mute/disconnect, or otherwise releasing
-the vendor owner flushes local playback and tears down the remote session. A
-later wake after teardown creates a fresh WebSocket, peer, and realtime thread.
+microphone for the normal Home Assistant path. While a direct full-duplex
+session owns the microphone, the legacy terminal stop-word detector is
+suspended: spoken interruptions belong to realtime barge-in, and playback echo
+must not tear down the conversation. Its exact prior membership is restored on
+release. Starting the normal Home Assistant path, mute/disconnect, idle expiry,
+or otherwise releasing the vendor owner flushes local playback and tears down
+the remote session. A later wake after teardown creates a fresh WebSocket,
+peer, and realtime thread.
 In v3, bounded local AEC-filtered speech detection clears queued playback and
 immediately SIGKILLs the active `paplay` child in the parent, retires the old
 PeerConnection epoch, and sends no later capture to that peer. The outer vendor owner,
@@ -760,7 +764,8 @@ On the physical device, verify these independently:
 1. Okay Nabu still completes Home Assistant commands, timers, announcements,
    reconnects, and repeated wakes.
 2. Okay Computer starts direct voice, speaks a response, returns to listening,
-   and responds to the stop word without replaying its own output.
+   accepts a spoken interruption and a follow-up without another wake, and does
+   not let its own output activate the legacy terminal stop-word detector.
 3. Okay Computer cannot control Home Assistant even when a compatibility
    realtime authority is registered. Its start and `started` frames both carry
    `conversation_mode: "native"`. Okay Nabu can invoke only the reviewed
