@@ -102,6 +102,11 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Restore and verify the configured direct-playback sink volume before the
+  complete AEC topology preflight. Home Assistant TTS could leave the shared
+  dedicated AEC sink at 70%, causing every later 60%-ceiling Okay Computer
+  session to fail closed before WebRTC negotiation even though direct playback
+  would otherwise have reset it to 60% immediately afterward.
 - Prevent a normal-wake detector false positive on the first post-wake command
   from preempting a newly started Okay Computer session and silently routing
   the utterance through single-turn Assist instead. All later wake detections

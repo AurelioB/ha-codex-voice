@@ -1472,7 +1472,6 @@ class RealtimeSession:
         capture_ages_ms: deque[float] = deque(maxlen=256)
         try:
             started_at = self._clock()
-            self._aec_verifier(self._config)
             sink = self._config.pulse_aec_sink
             if sink is None:
                 raise WebSocketError(  # noqa: TRY301
@@ -1486,6 +1485,11 @@ class RealtimeSession:
             # media loop must never block on pactl while it owns VAD, interrupt,
             # IPC draining, and immediate paplay termination.
             player.prepare()
+            # Assist/TTS playback may leave the shared dedicated AEC sink above
+            # the direct-session ceiling. Restore and verify the configured
+            # exact volume first, then prove the complete echo-cancel topology
+            # and live capture route before opening any network connection.
+            self._aec_verifier(self._config)
             state = _DirectPlaybackState()
             diagnostics.phase = "sidecar_offer"
             sidecar = self._sidecar_factory()

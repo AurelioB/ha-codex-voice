@@ -100,9 +100,9 @@ not part of the component-only HACS ZIP.
   default remains turn-taking until the installation passes the reviewed
   static PulseAudio `module-echo-cancel` requirements with one explicit,
   allowlisted AEC engine, exact capture/playback routing, an explicit startup
-  sink value aligned with the vendor media-player preference, a startup safety
-  preflight, and one exact sink set/verify sequence before direct-session SDP
-  negotiation. Those local AEC and player-preparation steps do not consume the
+  sink value aligned with the vendor media-player preference, one exact sink
+  set/verify sequence followed by a complete startup safety preflight before
+  direct-session SDP negotiation. Those local AEC and player-preparation steps do not consume the
   signaling handshake deadline; that deadline starts only after both finish,
   while the outer maximum-session bound still spans the complete startup. The
   v3 response and interruption loops perform no blocking `pactl` work. V3 then
@@ -721,9 +721,9 @@ opt-in and must never print OAuth tokens or recorded audio.
   full duplex plus a deterministic aarch64/Python 3.11 sidecar runtime. It also
   requires a repository-reviewed PulseAudio AEC fragment, an exact configured
   engine match, exact process routing, and a fixed-argv `paplay` route to that
-  sink. Once before each direct session negotiates SDP, the client performs the
-  sink-ceiling preflight and sets/verifies the dedicated sink at the exact
-  configured raw playback value; the live response/interruption loop does not
+  sink. Before each direct session negotiates SDP, the client sets/verifies the
+  dedicated sink at the exact configured raw playback value and then performs
+  the complete topology, capture-route, and sink-ceiling preflight; the live response/interruption loop does not
   invoke `pactl`. `paplay` is forced to raw 65536 (100% relative) without
   sink-input manipulation. The sink has a 25% default and 60% hard maximum; v2
   retains its configured stream-volume behavior. WebRTC is the

@@ -619,6 +619,25 @@ def test_direct_handshake_budget_starts_after_local_aec_preparation(
     assert session.join(1.0)
 
 
+def test_direct_player_restores_sink_volume_before_complete_aec_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    player = _DirectRecordingPlayer()
+
+    def verify_after_volume_restore(_config: RealtimeConfig) -> None:
+        assert player.events == [("prepare", None)]
+
+    session, _connection, _sidecar, _player, _sidecars = _start_direct_session(
+        monkeypatch,
+        direct_player=player,
+        aec_verifier=verify_after_volume_restore,
+    )
+
+    assert session.ready
+    session.stop()
+    assert session.join(1.0)
+
+
 def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

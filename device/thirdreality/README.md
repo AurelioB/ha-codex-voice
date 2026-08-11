@@ -675,7 +675,7 @@ startup,
 retained v2 pre-ready fallback/replay, strict v2 and v3 framing, device-owned
 SDP negotiation, absence of bridge PCM in v3, bounded sidecar IPC and media
 queues, receiver-owned `media.started`/`media.quiet` boundaries,
-PulseAudio AEC preflight and once-per-session pre-negotiation sink preparation,
+pre-preflight sink restoration plus complete PulseAudio AEC verification,
 continuous full-duplex capture, RTP-before-start and stopped-before-tail
 ordering, trusted-AEC-only fresh-peer rollover, immediate retirement of the old
 sidecar, consecutive epoch validation, bounded pre-roll/live capture replay in

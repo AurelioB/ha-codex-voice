@@ -110,7 +110,7 @@ The shipped bounds are intentionally small and fail closed:
 | V3 decoded-receiver quiet boundary | About 120 ms without PCM meeting both peak 64 and RMS 8 | Splits only normal media generations; exact silence and sub-audible Opus residue are not played or semantic, while every decoded RTP frame still participates in the independent interruption fence |
 | V3 first-playback AEC settle | One 512 ms window per fresh peer/new `paplay` onset | Sends timestamp-preserving capture silence and ignores local barge-in evidence while the physical AEC converges; a normal quiet boundary that reuses the player does not restart it |
 | V3 fresh-peer rollover | 4 KiB / 128 ms recent AEC pre-roll; eight detector-quiet 64 ms frames (512 ms) to rearm after a committed interruption; 2.25 s maximum capture age rechecked at RTP consumption; configured handshake deadline | Stops local output immediately; one uninterrupted local speech segment retires only one peer; exactly two reusable sidecar slots alternate fresh PeerConnections; an absent/invalid standby terminates the outer session without a cold launch; pre-ack output is inaudible within `output_queue_bytes`; negotiation remains measurable |
-| Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked once at direct-session preflight | Keeps boot-time writers aligned; exact set/verify runs once before negotiation, with no live-loop volume monitor |
+| Full-duplex AEC sink ceiling | Configured guard, 1–60% (25% default), restored exactly and then checked once at direct-session preflight | Recovers safely when Assist/TTS changes the shared sink; exact set/verify runs once before the complete topology check and negotiation, with no live-loop volume monitor |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
 | Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
 | Legacy managed: App Server tool fallback | 45 s | Remains responsible until the result write completes |
@@ -293,7 +293,8 @@ pre-ready behavior, stop-word latency, first-audio latency, queue failures, repe
 turns, memory stability, player cleanup, and recovery after bridge and Wi-Fi
 loss. Full-duplex acceptance must additionally cover early/middle/late
 double-talk at the configured sink/playback values, self-echo rejection, exact
-once-per-session pre-negotiation raw sink-volume preparation, absence of live
+once-per-session pre-preflight raw sink-volume restoration and verification,
+absence of live
 response/interruption `pactl` work, playback sink pinning, fixed `paplay`
 arguments and immediate abort, RTP-before-start and stopped-before-tail
 preservation, absence of public Realtime cancel/clear controls, trusted-AEC-only
