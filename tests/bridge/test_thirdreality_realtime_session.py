@@ -43,6 +43,11 @@ from device.thirdreality.realtime_client.websocket import Message, WebSocketErro
 from device.thirdreality.webrtc_sidecar.protocol import ControlMessage, PlaybackAudio
 
 
+@pytest.fixture(autouse=True)
+def _silence_device_syslog(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session_module.syslog, "syslog", lambda *_args: None)
+
+
 def _config(**overrides: object) -> RealtimeConfig:
     values: dict[str, Any] = {
         "url": "ws://192.0.2.10:8787/v1/realtime",
@@ -827,6 +832,219 @@ def test_direct_summary_sanitizes_lifecycle_types_and_never_logs_content(
     assert "lifecycle_events=other:1,session.updated:1" in summaries[0]
     assert sensitive not in caplog.text
     assert "secret-token" not in caplog.text
+
+
+def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    records: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        session_module.syslog,
+        "syslog",
+        lambda priority, message: records.append((priority, message)),
+    )
+    session, _connection, sidecar, player, _sidecars = _start_direct_session(
+        monkeypatch,
+        clock=lambda: now[0],
+        idle_timeout_seconds=120.0,
+        max_session_seconds=900.0,
+        ping_interval_seconds=60.0,
+    )
+
+    assert len(records) == 1
+    priority, ready = records[0]
+    assert priority == session_module.syslog.LOG_INFO
+    assert ready.startswith("codex-voice direct_webrtc_status=ready ")
+    assert "phase=runtime handshake_ready=yes" in ready
+    assert "peer_answer_applied=yes" in ready
+    assert "peer_connected=yes" in ready
+    assert "peer_data_ready=yes" in ready
+    assert "outcome=live" in ready
+
+    sensitive = "TOP-SECRET-TRANSCRIPT-AND-IDENTIFIER"
+    capture = (500).to_bytes(2, "little", signed=True) * 4
+    assert session.submit_audio(capture) is SubmitResult.ACCEPTED
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "capture.rtp_started", "generation": 0},
+        )
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "playback.rtp_started", "generation": 0},
+        )
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {
+                "event_type": f"session.{sensitive}",
+                "generation": 0,
+                "transcript": sensitive,
+                "token": sensitive,
+                "sdp": sensitive,
+            },
+        )
+    )
+    assert _wait_for(lambda: len(sidecar.audio) == 1 and not sidecar._incoming)
+
+    now[0] += session_module._DIRECT_SYSLOG_INTERVAL_SECONDS
+    session._wake_network.set()
+    assert _wait_for(
+        lambda: any(
+            "direct_webrtc_status=waiting_output" in item[1] for item in records
+        )
+    )
+    heartbeat = next(
+        item[1] for item in records if "direct_webrtc_status=waiting_output" in item[1]
+    )
+    assert "capture_sent_packets=1" in heartbeat
+    assert "capture_sent_bytes=8" in heartbeat
+    assert "capture_signal_frames=1" in heartbeat
+    assert (
+        "lifecycle_events=capture.rtp_started:1,other:1,playback.rtp_started:1"
+    ) in heartbeat
+    assert "playback_signal_packets=0" in heartbeat
+
+    playback = (300).to_bytes(2, "little", signed=True) * 4
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    sidecar.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=playback,
+        )
+    )
+    assert _wait_for(lambda: ("audio", playback) in player.events)
+    heartbeat_count = sum(
+        "direct_webrtc_status=waiting_output" in item[1] for item in records
+    )
+
+    now[0] += session_module._DIRECT_SYSLOG_INTERVAL_SECONDS * 3
+    session._wake_network.set()
+    time.sleep(0.05)
+    assert (
+        sum("direct_webrtc_status=waiting_output" in item[1] for item in records)
+        == heartbeat_count
+    )
+
+    session.stop()
+    assert session.join(1.0)
+    terminals = [
+        message
+        for _priority, message in records
+        if "direct_webrtc_status=terminal" in message
+    ]
+    assert len(terminals) == 1
+    terminal = terminals[0]
+    assert "capture.rtp_started:1" in terminal
+    assert "playback.rtp_started:1" in terminal
+    assert "playback_signal_packets=1" in terminal
+    assert "playback_signal_bytes=8" in terminal
+    assert "outcome=stopped" in terminal
+    emitted = "\n".join(message for _priority, message in records)
+    assert sensitive not in emitted
+    assert "secret-token" not in emitted
+    assert "v=0" not in emitted
+    assert all(
+        len(message) <= session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES
+        for _priority, message in records
+    )
+
+
+def test_direct_syslog_failure_does_not_change_media_session_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_statuses: list[str] = []
+
+    def fail_syslog(_priority: int, message: str) -> None:
+        attempted_statuses.append(message.split()[1])
+        raise OSError("syslog unavailable")
+
+    monkeypatch.setattr(session_module.syslog, "syslog", fail_syslog)
+    session, _connection, _sidecar, _player, _sidecars = _start_direct_session(
+        monkeypatch
+    )
+
+    assert session.ready
+    session.stop()
+    assert session.join(1.0)
+    assert session.state is SessionState.STOPPED
+    assert attempted_statuses == [
+        "direct_webrtc_status=ready",
+        "direct_webrtc_status=terminal",
+    ]
+
+
+def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[str] = []
+    monkeypatch.setattr(
+        session_module.syslog,
+        "syslog",
+        lambda _priority, message: records.append(message),
+    )
+    diagnostics = session_module._DirectSessionDiagnostics(started_at=0.0)
+    diagnostics.phase = "peer_handshake"
+    diagnostics.handshake_ready = True
+    diagnostics.peer_answer_applied = True
+    diagnostics.peer_connected = True
+    diagnostics.peer_data_ready = True
+    for event_type in session_module._DIRECT_DIAGNOSTIC_LIFECYCLE_EVENTS:
+        diagnostics.lifecycle_events[event_type] = (
+            session_module._DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX
+        )
+    diagnostics.lifecycle_events["other"] = (
+        session_module._DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX
+    )
+    for field_name in (
+        "capture_packets",
+        "capture_bytes",
+        "capture_max_peak",
+        "capture_max_rms",
+        "capture_signal_frames",
+        "playback_signal_packets",
+        "playback_signal_bytes",
+        "playback_max_peak",
+        "playback_max_rms",
+    ):
+        setattr(diagnostics, field_name, 10**20)
+
+    session_module._emit_direct_syslog_status(
+        diagnostics,
+        status="secret-status",
+        duration_ms=10**20,
+        outcome="live",
+    )
+    session_module._emit_direct_syslog_status(
+        diagnostics,
+        status="waiting_output",
+        duration_ms=10**20,
+        outcome="secret-outcome",
+    )
+    session_module._emit_direct_syslog_status(
+        diagnostics,
+        status="waiting_output",
+        duration_ms=10**20,
+        outcome="remote_stopped",
+    )
+
+    assert len(records) == 1
+    assert len(records[0]) <= session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES
+    assert "capture_sent_packets=99999999" in records[0]
+    assert "capture_max_peak=32768" in records[0]
+    assert "outcome=remote_stopped" in records[0]
+    assert "secret" not in records[0]
 
 
 @pytest.mark.parametrize("boundary_name", ["stop", "interrupt"])

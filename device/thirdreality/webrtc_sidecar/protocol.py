@@ -24,8 +24,12 @@ _SAFE_ROLE = frozenset({"assistant", "developer", "system", "tool", "user"})
 _SAFE_RESPONSE_STATUS = frozenset(
     {"in_progress", "completed", "cancelled", "failed", "incomplete"}
 )
-_INTERNAL_LIFECYCLE_TYPES = frozenset(
-    {"media.started", "media.quiet", "interrupt.fenced"}
+_RTP_STARTED_LIFECYCLE_TYPES = frozenset(
+    {"capture.rtp_started", "playback.rtp_started"}
+)
+_INTERNAL_LIFECYCLE_TYPES = (
+    frozenset({"media.started", "media.quiet", "interrupt.fenced"})
+    | _RTP_STARTED_LIFECYCLE_TYPES
 )
 _PARENT_CONTROL_TYPES = frozenset(
     {
@@ -323,8 +327,14 @@ def _validate_control(
     if message_type == "error" and _safe_token(values.get("code")) is None:
         raise ProtocolError("sidecar error code is invalid")
     if message_type == "lifecycle":
-        if _safe_token(values.get("event_type")) is None:
+        event_type = _safe_token(values.get("event_type"))
+        if event_type is None:
             raise ProtocolError("sidecar lifecycle event type is invalid")
+        if event_type in _RTP_STARTED_LIFECYCLE_TYPES and set(values) != {
+            "event_type",
+            "generation",
+        }:
+            raise ProtocolError("sidecar RTP lifecycle has invalid fields")
         if "role" in values and values["role"] not in _SAFE_ROLE:
             raise ProtocolError("sidecar lifecycle role is invalid")
         for key in ("item_id", "response_id", "turn_id"):

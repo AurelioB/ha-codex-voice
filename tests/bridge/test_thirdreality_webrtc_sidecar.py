@@ -161,7 +161,13 @@ def test_provider_lifecycle_sanitizer_rejects_content_disguised_as_identifier() 
 
 @pytest.mark.parametrize(
     "event_type",
-    ["media.started", "media.quiet", "interrupt.fenced"],
+    [
+        "capture.rtp_started",
+        "playback.rtp_started",
+        "media.started",
+        "media.quiet",
+        "interrupt.fenced",
+    ],
 )
 def test_provider_lifecycle_sanitizer_rejects_internal_namespace_spoofing(
     event_type: str,
@@ -170,6 +176,31 @@ def test_provider_lifecycle_sanitizer_rejects_internal_namespace_spoofing(
         sanitize_provider_lifecycle(json.dumps({"type": event_type, "generation": 4}))
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ["capture.rtp_started", "playback.rtp_started"],
+)
+def test_rtp_started_lifecycle_has_one_content_free_protocol_shape(
+    event_type: str,
+) -> None:
+    assert decode_packet(
+        encode_control("lifecycle", event_type=event_type, generation=0)
+    ) == ControlMessage(
+        type="lifecycle",
+        values={"event_type": event_type, "generation": 0},
+    )
+
+    with pytest.raises(ProtocolError, match="RTP lifecycle"):
+        encode_control("lifecycle", event_type=event_type)
+    with pytest.raises(ProtocolError, match="RTP lifecycle"):
+        encode_control(
+            "lifecycle",
+            event_type=event_type,
+            generation=0,
+            response_id="resp_1",
+        )
 
 
 def test_launcher_uses_isolated_interpreter_and_explicit_runtime_path(
@@ -954,6 +985,35 @@ def _fake_device_peer(
 
 
 @pytest.mark.asyncio
+async def test_peer_reports_first_capture_rtp_consumption_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer, emitted = _fake_device_peer(monkeypatch)
+    captured_at = time.monotonic_ns()
+    try:
+        peer.feed_capture(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=captured_at,
+                pcm=b"\x01\x00" * 640,
+            )
+        )
+
+        assert emitted == []
+        await peer.input_track.recv()
+        await peer.input_track.recv()
+
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 0},
+            )
+        ]
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.asyncio
 async def test_runtime_reports_delayed_capture_consumption_as_terminal_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1195,6 +1255,31 @@ def test_peer_sanitizes_fixed_response_status_and_causal_error_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_peer_reports_first_received_playback_rtp_once_before_signal_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        track.frames.put_nowait(_remote_frame(0, pts=0))
+        track.frames.put_nowait(_remote_frame(0, pts=480))
+        await _wait_for(lambda: track.received == 2)
+
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "playback.rtp_started", "generation": 0},
+            )
+        ]
+        assert peer._generation == 0
+        assert not peer._media_generation_open
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
 async def test_peer_preserves_rtp_before_any_provider_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1206,7 +1291,11 @@ async def test_peer_preserves_rtp_before_any_provider_start(
         pcm = b"\x03\x00" * 480
         track.frames.put_nowait(_remote_frame(3, pts=960))
         await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
-        assert emitted[:2] == [
+        assert emitted[:3] == [
+            (
+                "lifecycle",
+                {"event_type": "playback.rtp_started", "generation": 0},
+            ),
             ("lifecycle", {"event_type": "media.started", "generation": 1}),
             (
                 "playback",
@@ -1242,7 +1331,12 @@ async def test_peer_exact_zero_pcm_waits_for_first_signal(
             track.frames.put_nowait(_remote_frame(0, pts=pts))
         await _wait_for(lambda: track.received == 4)
 
-        assert emitted == []
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "playback.rtp_started", "generation": 0},
+            )
+        ]
         assert peer._generation == 0
         assert not peer._media_generation_open
 
@@ -1250,6 +1344,10 @@ async def test_peer_exact_zero_pcm_waits_for_first_signal(
         await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
 
         assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "playback.rtp_started", "generation": 0},
+            ),
             ("lifecycle", {"event_type": "media.started", "generation": 1}),
             (
                 "playback",
@@ -1305,7 +1403,11 @@ async def test_peer_subaudible_pcm_waits_for_first_audible_signal(
             track.frames.put_nowait(_remote_frame(4, pts=pts))
         await _wait_for(lambda: track.received == 4)
 
-        assert emitted == []
+        rtp_started = (
+            "lifecycle",
+            {"event_type": "playback.rtp_started", "generation": 0},
+        )
+        assert emitted == [rtp_started]
         assert settle_observations == []
         assert peer._generation == 0
         assert not peer._media_generation_open
@@ -1314,6 +1416,7 @@ async def test_peer_subaudible_pcm_waits_for_first_audible_signal(
         await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
 
         assert emitted == [
+            rtp_started,
             ("lifecycle", {"event_type": "media.started", "generation": 1}),
             (
                 "playback",
@@ -1325,7 +1428,7 @@ async def test_peer_subaudible_pcm_waits_for_first_audible_signal(
                 ),
             ),
         ]
-        assert settle_observations == [[]]
+        assert settle_observations == [[rtp_started]]
     finally:
         await _close_audio_peer(peer, task)
 
@@ -1478,7 +1581,11 @@ async def test_peer_exact_zero_pcm_does_not_extend_open_media_generation(
             (value["event_type"], value["generation"])
             for kind, value in emitted
             if kind == "lifecycle"
-        ] == [("media.started", 1), ("media.quiet", 1)]
+        ] == [
+            ("playback.rtp_started", 0),
+            ("media.started", 1),
+            ("media.quiet", 1),
+        ]
         assert [value for kind, value in emitted if kind == "playback"] == [
             PlaybackAudio(
                 generation=1,
@@ -1530,7 +1637,11 @@ async def test_peer_continuous_subaudible_pcm_does_not_extend_media(
             (value["event_type"], value["generation"])
             for kind, value in emitted
             if kind == "lifecycle"
-        ] == [("media.started", 1), ("media.quiet", 1)]
+        ] == [
+            ("playback.rtp_started", 0),
+            ("media.started", 1),
+            ("media.quiet", 1),
+        ]
         assert [value for kind, value in emitted if kind == "playback"] == [
             PlaybackAudio(
                 generation=1,
@@ -1592,7 +1703,13 @@ def test_peer_drops_provider_spoofs_of_internal_lifecycle_events(
 ) -> None:
     peer, emitted = _fake_device_peer(monkeypatch)
     try:
-        for event_type in ("media.started", "media.quiet", "interrupt.fenced"):
+        for event_type in (
+            "capture.rtp_started",
+            "playback.rtp_started",
+            "media.started",
+            "media.quiet",
+            "interrupt.fenced",
+        ):
             _provider_event(peer, type=event_type, generation=0xFFFFFFFF)
         assert emitted == []
     finally:
@@ -1690,7 +1807,13 @@ async def test_peer_overdue_deadline_wins_after_event_loop_stall(
         time.sleep(0.06)  # noqa: ASYNC251 - deliberately stall the event loop.
         peer._maybe_complete_fence()
 
-        assert emitted == [("fatal", "media_fence_timeout")]
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 0},
+            ),
+            ("fatal", "media_fence_timeout"),
+        ]
         assert fence.timed_out
         assert peer._muted
         assert not _has_fenced(emitted)
@@ -1830,7 +1953,13 @@ async def test_peer_latched_fatal_wins_over_already_awakened_fence(
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-        assert emitted == [("fatal", "connection_failed")]
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 0},
+            ),
+            ("fatal", "connection_failed"),
+        ]
         assert peer._failed
         assert peer._muted
         assert not _has_fenced(emitted)
@@ -2300,7 +2429,11 @@ async def test_peer_local_interrupt_requires_guard_quiet_and_capture_progress(
         await _wait_for(lambda: _has_fenced(emitted))
         assert [
             value["event_type"] for kind, value in emitted if kind == "lifecycle"
-        ] == ["input_audio_buffer.speech_started", "interrupt.fenced"]
+        ] == [
+            "capture.rtp_started",
+            "input_audio_buffer.speech_started",
+            "interrupt.fenced",
+        ]
         assert not any(kind == "fatal" for kind, _ in emitted)
     finally:
         await _close_audio_peer(peer, task)
@@ -2344,8 +2477,12 @@ async def test_peer_interrupt_requires_fresh_guard_after_preexisting_rtp_quiet(
         assert emitted == [
             (
                 "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 1},
+            ),
+            (
+                "lifecycle",
                 {"event_type": "interrupt.fenced", "generation": 1},
-            )
+            ),
         ]
     finally:
         await _close_audio_peer(peer, task)
@@ -2389,7 +2526,13 @@ async def test_peer_late_rtp_resets_fence_quiet_and_preserves_media_sequence(
         assert [
             value["event_type"] if kind == "lifecycle" else "playback"
             for kind, value in emitted
-        ] == ["media.quiet", "interrupt.fenced", "media.started", "playback"]
+        ] == [
+            "capture.rtp_started",
+            "media.quiet",
+            "interrupt.fenced",
+            "media.started",
+            "playback",
+        ]
         assert [value for kind, value in emitted if kind == "playback"] == [
             PlaybackAudio(
                 generation=2,
@@ -2464,7 +2607,13 @@ async def test_peer_duplicate_interrupt_does_not_restart_fence_or_deadline(
         assert peer.data_channel.sent == []
 
         await _wait_for(lambda: ("fatal", "media_fence_capture_timeout") in emitted)
-        assert emitted == [("fatal", "media_fence_capture_timeout")]
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 0},
+            ),
+            ("fatal", "media_fence_capture_timeout"),
+        ]
     finally:
         await peer.stop()
 
@@ -2488,7 +2637,12 @@ async def test_peer_provider_speech_started_is_informational_only(
         assert [
             value["event_type"] if kind == "lifecycle" else "playback"
             for kind, value in emitted
-        ] == ["input_audio_buffer.speech_started", "media.started", "playback"]
+        ] == [
+            "input_audio_buffer.speech_started",
+            "playback.rtp_started",
+            "media.started",
+            "playback",
+        ]
         assert not _has_fenced(emitted)
     finally:
         await _close_audio_peer(peer, task)

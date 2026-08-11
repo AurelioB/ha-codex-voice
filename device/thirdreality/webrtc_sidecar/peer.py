@@ -638,6 +638,8 @@ class DeviceWebRtcPeer:
         self._decoder_queue: _TrackedDecoderQueue | None = None
         self._audio_receiver: Any | None = None
         self._remote_audio_track_seen = False
+        self._capture_rtp_started_emitted = False
+        self._playback_rtp_started_emitted = False
         self._capture_echo_settle_started = False
         self._playback_sample_index = 0
         self._consumer_tasks: set[asyncio.Task[None]] = set()
@@ -1084,7 +1086,27 @@ class DeviceWebRtcPeer:
 
     def _note_capture_consumed(self, _consumed_samples: int) -> None:
         """Re-evaluate a fence when actual WebRTC capture progress advances."""
+        if not self._capture_rtp_started_emitted:
+            self._capture_rtp_started_emitted = True
+            self._safe_lifecycle(
+                {
+                    "event_type": "capture.rtp_started",
+                    "generation": self._generation,
+                }
+            )
         self._maybe_complete_fence()
+
+    def _note_playback_rtp_received(self) -> None:
+        """Report the first frame returned by this peer's RTP receiver."""
+        if self._playback_rtp_started_emitted:
+            return
+        self._playback_rtp_started_emitted = True
+        self._safe_lifecycle(
+            {
+                "event_type": "playback.rtp_started",
+                "generation": self._generation,
+            }
+        )
 
     def _arm_fence_quiet_timer(self) -> None:
         """Check after the overlapping guard and decoded-RTP quiet windows."""
@@ -1239,7 +1261,9 @@ class DeviceWebRtcPeer:
                         name="codex-device-webrtc-receiver-barrier",
                     )
                 if receive_task in done:
-                    self._consume_remote_frame(receive_task.result(), resampler)
+                    frame = receive_task.result()
+                    self._note_playback_rtp_received()
+                    self._consume_remote_frame(frame, resampler)
                     receiver_queue = self._receiver_queue
                     if receiver_queue is None:
                         raise PeerError("remote audio queue tracker disappeared")

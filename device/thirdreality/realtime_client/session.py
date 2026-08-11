@@ -10,6 +10,7 @@ import select
 import shlex
 import struct
 import subprocess
+import syslog
 import threading
 import time
 import weakref
@@ -97,12 +98,34 @@ _CONTROL_EVENTS = frozenset(
 )
 _DIRECT_DIAGNOSTIC_LIFECYCLE_EVENTS = _CONTROL_EVENTS | frozenset(
     {
+        "capture.rtp_started",
         "error",
         "interrupt.fenced",
         "invalid_request_error",
+        "playback.rtp_started",
     }
 )
 _DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX = 999_999
+_DIRECT_DIAGNOSTIC_PHASES = frozenset(
+    {
+        "preflight",
+        "sidecar_offer",
+        "bridge_connect",
+        "bridge_answer",
+        "peer_handshake",
+        "bridge_ready",
+        "runtime",
+        "rollover",
+        "remote_stop",
+    }
+)
+_DIRECT_SYSLOG_STATUSES = frozenset({"ready", "waiting_output", "terminal"})
+_DIRECT_SYSLOG_OUTCOMES = frozenset(
+    {"live", "failed", "interrupted", "stopped", "remote_stopped"}
+)
+_DIRECT_SYSLOG_INTERVAL_SECONDS = 5.0
+_DIRECT_SYSLOG_COUNTER_MAX = 99_999_999
+_DIRECT_SYSLOG_RECORD_MAX_BYTES = 1_024
 
 
 class SessionState(Enum):
@@ -224,6 +247,52 @@ class _DirectSessionDiagnostics:
             f"{event_type}:{self.lifecycle_events[event_type]}"
             for event_type in sorted(self.lifecycle_events)
         )
+
+
+def _emit_direct_syslog_status(
+    diagnostics: _DirectSessionDiagnostics,
+    *,
+    status: str,
+    duration_ms: int,
+    outcome: str,
+) -> None:
+    """Emit one bounded fixed-vocabulary direct-media status record."""
+    if status not in _DIRECT_SYSLOG_STATUSES or outcome not in _DIRECT_SYSLOG_OUTCOMES:
+        return
+    phase = (
+        diagnostics.phase
+        if diagnostics.phase in _DIRECT_DIAGNOSTIC_PHASES
+        else "unknown"
+    )
+
+    def bounded(value: int) -> int:
+        return min(max(0, value), _DIRECT_SYSLOG_COUNTER_MAX)
+
+    with suppress(Exception):  # diagnostics must never affect live media
+        message = (
+            "codex-voice "
+            f"direct_webrtc_status={status} phase={phase} "
+            f"handshake_ready={'yes' if diagnostics.handshake_ready else 'no'} "
+            "peer_answer_applied="
+            f"{'yes' if diagnostics.peer_answer_applied else 'no'} "
+            f"peer_connected={'yes' if diagnostics.peer_connected else 'no'} "
+            f"peer_data_ready={'yes' if diagnostics.peer_data_ready else 'no'} "
+            f"capture_sent_packets={bounded(diagnostics.capture_packets)} "
+            f"capture_sent_bytes={bounded(diagnostics.capture_bytes)} "
+            f"capture_max_peak={min(32_768, bounded(diagnostics.capture_max_peak))} "
+            f"capture_max_rms={min(32_768, bounded(diagnostics.capture_max_rms))} "
+            f"capture_signal_frames={bounded(diagnostics.capture_signal_frames)} "
+            f"lifecycle_events={diagnostics.lifecycle_summary()} "
+            "playback_signal_packets="
+            f"{bounded(diagnostics.playback_signal_packets)} "
+            f"playback_signal_bytes={bounded(diagnostics.playback_signal_bytes)} "
+            f"playback_max_peak={min(32_768, bounded(diagnostics.playback_max_peak))} "
+            f"playback_max_rms={min(32_768, bounded(diagnostics.playback_max_rms))} "
+            f"duration_ms={bounded(duration_ms)} outcome={outcome}"
+        )
+        if len(message) > _DIRECT_SYSLOG_RECORD_MAX_BYTES:
+            return
+        syslog.syslog(syslog.LOG_INFO, message)
 
 
 class _DirectPendingOutput:
@@ -1595,11 +1664,18 @@ class RealtimeSession:
             with self._state_lock:
                 if self._state is SessionState.CONNECTING:
                     self._state = SessionState.READY
+            _emit_direct_syslog_status(
+                diagnostics,
+                status="ready",
+                duration_ms=int((time.monotonic() - diagnostics.started_at) * 1_000),
+                outcome="live",
+            )
 
             standby = self._start_direct_standby(sidecar)
             peer_epoch = 1
 
             last_semantic_activity = self._clock()
+            next_syslog_at = last_semantic_activity + _DIRECT_SYSLOG_INTERVAL_SECONDS
             next_ping_at = last_semantic_activity + self._config.ping_interval_seconds
             pending_ping: bytes | None = None
             pong_deadline: float | None = None
@@ -1710,6 +1786,18 @@ class RealtimeSession:
                     )
                 if input_semantic or output_semantic:
                     last_semantic_activity = self._clock()
+
+                if now >= next_syslog_at:
+                    if diagnostics.playback_signal_packets == 0:
+                        _emit_direct_syslog_status(
+                            diagnostics,
+                            status="waiting_output",
+                            duration_ms=int(
+                                (time.monotonic() - diagnostics.started_at) * 1_000
+                            ),
+                            outcome="live",
+                        )
+                    next_syslog_at = now + _DIRECT_SYSLOG_INTERVAL_SECONDS
 
                 if standby is not None:
                     standby = self._poll_direct_standby(standby)
@@ -1836,6 +1924,12 @@ class RealtimeSession:
                 duration_ms = max(
                     0,
                     int((time.monotonic() - diagnostics.started_at) * 1_000),
+                )
+                _emit_direct_syslog_status(
+                    diagnostics,
+                    status="terminal",
+                    duration_ms=duration_ms,
+                    outcome=outcome,
                 )
                 _LOGGER.info(
                     "ThirdReality direct WebRTC session summary: "
