@@ -42,6 +42,10 @@ and releases use semantic versioning.
 
 ### Changed
 
+- Raise the ThirdReality realtime session defaults from 45 to 120 seconds of
+  semantic idle time and from 300 to 900 seconds of total lifetime. The idle
+  limit remains activity-based; the hard limit still covers local preflight,
+  negotiation, runtime, and rollover.
 - Configure the disabled ThirdReality example for `device_webrtc`, the
   separately qualified Adrian AEC topology, 25% sink/playback ceilings, and a
   Mexican Spanish prompt. Protocol v2 remains selectable explicitly with
@@ -92,6 +96,36 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Protect the first audible playback of each fresh device peer from its
+  physical AEC convergence transient. For one 512 ms onset window, capture
+  frames are replaced with timestamp-preserving silence while the parent also
+  ignores local barge-in evidence; a normal quiet media boundary that reuses
+  the same `paplay` child does not restart the guard. Before the fix, the
+  physical canary stopped after 22 playback packets (about 0.44 seconds) with
+  the response unfinished. After it, 626 packets (about 12.52 seconds) played,
+  both turns completed, `session.started=1`, and no rollover occurred.
+- Reframe ThirdReality's 1,024-sample / 64 ms microphone callbacks into exact
+  320-sample source frames, expanded to one 960-sample / 48 kHz Opus frame per
+  `MediaStreamTrack.recv()`. Pinned aiortc otherwise encoded each callback as
+  three or four RTP payloads with one shared timestamp, and a deterministic
+  receiver reconstruction discarded about 69% of the command. The regression
+  now exercises the real Opus encoder and requires one payload with 960-sample
+  timestamp steps across callback boundaries.
+- Reject sub-audible decoded RTP residue as playback media, so Opus silence
+  cannot keep `paplay`, semantic activity, or the listening LED alive for the
+  full idle timeout; all decoded RTP still counts toward the independent
+  interruption fence.
+- Emit one bounded, content-free device-WebRTC summary per session, including
+  handshake phase, sent-capture peak/RMS and counts, allowlisted provider
+  lifecycle counts, signal-bearing playback metrics, duration, and outcome.
+  Failure warnings expose only the phase and exception class—never PCM,
+  transcripts, identifiers, credentials, or provider payloads.
+- Add a guarded `S49codex-mic-gain` init hook for pinned ThirdReality v1.1.7
+  devices so the validated `sound.json` microphone gain is written before
+  `S50pulseaudio` opens PDM capture. The stock late write changed the displayed
+  control but did not affect samples until ALSA capture reopened. Installation
+  is exact-file, dry-run-first, firmware-guarded, and symmetrically removable;
+  invalid gain data uses the vendor's 30% fail-safe.
 - Prevent direct ThirdReality WebRTC startup from retaining a redundant Home
   Assistant fallback copy of pre-ready microphone audio. With the default
   64 KiB fallback bound and 12 KiB pre-roll, that unused copy previously filled

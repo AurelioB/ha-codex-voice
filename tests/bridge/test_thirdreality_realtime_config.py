@@ -11,6 +11,8 @@ from device.thirdreality.realtime_client.config import (
     BRIDGE_PCM_TRANSPORT,
     DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_MAX_SESSION_SECONDS,
     DEFAULT_PLAYBACK_VOLUME_PERCENT,
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
@@ -67,6 +69,8 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.input_queue_bytes == 64 * 1024
     assert config.fallback_buffer_bytes == 64 * 1024
     assert config.io_timeout_seconds == 1.0
+    assert config.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_SECONDS
+    assert config.max_session_seconds == DEFAULT_MAX_SESSION_SECONDS
     assert config.output_queue_bytes == 48 * 1024
     assert "0123456789abcdef" not in repr(config)
 

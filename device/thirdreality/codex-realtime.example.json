@@ -6,6 +6,8 @@
   "wake_phrase": "okay computer",
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
+  "idle_timeout_seconds": 120,
+  "max_session_seconds": 900,
   "max_message_bytes": 65536,
   "media_transport": "device_webrtc",
   "full_duplex": true,

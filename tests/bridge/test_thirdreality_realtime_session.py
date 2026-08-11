@@ -515,6 +515,13 @@ def _start_direct_session(
     _DirectRecordingPlayer,
     list[_FakeSidecar],
 ]:
+    # Rollover tests exercise post-settle barge-in. The dedicated convergence
+    # test below owns the non-zero physical playback guard boundary.
+    monkeypatch.setattr(
+        session_module,
+        "_LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS",
+        0.0,
+    )
     connection = _FakeRealtimeConnection()
     sidecars: list[_FakeSidecar] = []
     factory_calls = 0
@@ -633,6 +640,174 @@ def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     assert connection.json_sent.count({"type": "stop"}) == 1
     assert sidecar.stop_count >= 1
     assert connection.closed
+
+
+def test_direct_session_logs_content_free_capture_and_playback_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO", logger="linux_voice_assistant.realtime"):
+        session, _connection, sidecar, player, _sidecars = _start_direct_session(
+            monkeypatch
+        )
+        quiet_capture = (100).to_bytes(2, "little", signed=True) * 4
+        signal_capture = (500).to_bytes(2, "little", signed=True) * 4
+
+        assert session.submit_audio(quiet_capture) is SubmitResult.ACCEPTED
+        assert _wait_for(lambda: len(sidecar.audio) == 1)
+        assert session.submit_audio(signal_capture) is SubmitResult.ACCEPTED
+        assert _wait_for(lambda: len(sidecar.audio) == 2)
+
+        quiet_playback = (100).to_bytes(2, "little", signed=True) * 4
+        signal_playback = (300).to_bytes(2, "little", signed=True) * 4
+        peaked_playback = (1000).to_bytes(2, "little", signed=True) + b"\x00\x00" * 3
+        sidecar.feed(
+            ControlMessage(
+                "lifecycle",
+                {"event_type": "media.started", "generation": 1},
+            )
+        )
+        for sample_index, pcm in enumerate(
+            (quiet_playback, signal_playback, peaked_playback)
+        ):
+            sidecar.feed(
+                PlaybackAudio(
+                    generation=1,
+                    sample_index=sample_index * 4,
+                    media_timestamp=sample_index * 4,
+                    pcm=pcm,
+                )
+            )
+        sidecar.feed(
+            ControlMessage(
+                "lifecycle",
+                {"event_type": "media.quiet", "generation": 1},
+            )
+        )
+        assert _wait_for(
+            lambda: sum(event[0] == "audio" for event in player.events) == 3
+        )
+
+        session.stop()
+        assert session.join(1.0)
+
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "INFO"
+        and record.getMessage().startswith(
+            "ThirdReality direct WebRTC session summary:"
+        )
+    ]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    for expected in (
+        "handshake_ready=yes",
+        "peer_answer_applied=yes",
+        "peer_connected=yes",
+        "peer_data_ready=yes",
+        "capture_sent_packets=2",
+        "capture_sent_bytes=16",
+        "capture_max_peak=500",
+        "capture_max_rms=500",
+        "capture_signal_frames=1",
+        "lifecycle_events=media.quiet:1,media.started:1",
+        "playback_signal_packets=2",
+        "playback_signal_bytes=16",
+        "playback_max_peak=1000",
+        "playback_max_rms=500",
+        "outcome=stopped",
+    ):
+        assert expected in summary
+
+
+def test_direct_startup_failure_logs_only_phase_and_exception_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive = "secret-token transcript v=0 private-session-id"
+
+    def fail_preflight(_config: RealtimeConfig) -> None:
+        raise WebSocketError(sensitive)
+
+    def unexpected_sidecar() -> _FakeSidecar:
+        raise AssertionError("preflight failure must not launch a sidecar")
+
+    session = RealtimeSession(
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        aec_verifier=fail_preflight,
+        sidecar_factory=unexpected_sidecar,  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level("INFO", logger="linux_voice_assistant.realtime"):
+        session.start()
+        assert session.join(1.0)
+
+    assert session.state is SessionState.FAILED
+    assert session.failed_before_ready
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    expected_warning = (
+        "ThirdReality direct WebRTC session failed: phase=preflight "
+        "error=WebSocketError"
+    )
+    assert warnings == [expected_warning]
+    summaries = [
+        record.getMessage() for record in caplog.records if record.levelname == "INFO"
+    ]
+    assert len(summaries) == 1
+    assert "handshake_ready=no phase=preflight" in summaries[0]
+    assert "peer_answer_applied=no" in summaries[0]
+    assert "peer_connected=no" in summaries[0]
+    assert "peer_data_ready=no" in summaries[0]
+    assert "outcome=failed" in summaries[0]
+    assert sensitive not in caplog.text
+
+
+def test_direct_summary_sanitizes_lifecycle_types_and_never_logs_content(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive = "TOP-SECRET-TRANSCRIPT-AND-IDENTIFIER"
+    with caplog.at_level("INFO", logger="linux_voice_assistant.realtime"):
+        session, _connection, sidecar, _player, _sidecars = _start_direct_session(
+            monkeypatch
+        )
+        sidecar.feed(
+            ControlMessage(
+                "lifecycle",
+                {
+                    "event_type": "session.updated",
+                    "generation": 0,
+                    "transcript": sensitive,
+                    "response_id": sensitive,
+                    "token": sensitive,
+                },
+            )
+        )
+        sidecar.feed(
+            ControlMessage(
+                "lifecycle",
+                {
+                    "event_type": f"session.{sensitive}",
+                    "generation": 0,
+                },
+            )
+        )
+        assert _wait_for(lambda: not sidecar._incoming)
+
+        session.stop()
+        assert session.join(1.0)
+
+    summaries = [
+        record.getMessage() for record in caplog.records if record.levelname == "INFO"
+    ]
+    assert len(summaries) == 1
+    assert "lifecycle_events=other:1,session.updated:1" in summaries[0]
+    assert sensitive not in caplog.text
+    assert "secret-token" not in caplog.text
 
 
 @pytest.mark.parametrize("boundary_name", ["stop", "interrupt"])
@@ -1931,6 +2106,77 @@ def test_local_barge_in_signal_requires_peak_and_sustained_energy() -> None:
     assert _pcm_has_local_barge_in_signal(
         (1_024).to_bytes(2, "little", signed=True) * 1_024
     )
+
+
+def test_direct_first_playback_settle_rejects_echo_before_arming_barge_in() -> None:
+    now = [50.0]
+    session = RealtimeSession(
+        _duplex_config(
+            media_transport=DEVICE_WEBRTC_TRANSPORT,
+            input_queue_bytes=16_384,
+        ),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    session._set_local_output_epoch(1, settle_barge_in=True)
+    speech_like_echo = (2_000).to_bytes(2, "little", signed=True) * 1_024
+
+    assert session.submit_audio(speech_like_echo) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech_like_echo) is SubmitResult.ACCEPTED
+    assert session._local_barge_in_requested_epoch is None
+
+    # A short receiver-quiet boundary must not restart or prematurely clear the
+    # physical player's one-time AEC convergence window.
+    session._set_local_output_epoch(None)
+    now[0] += 0.2
+    session._set_local_output_epoch(2)
+    assert session.submit_audio(speech_like_echo) is SubmitResult.ACCEPTED
+    assert session._local_barge_in_requested_epoch is None
+
+    now[0] += 0.313
+    assert session.submit_audio(speech_like_echo) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech_like_echo) is SubmitResult.ACCEPTED
+    assert session._local_barge_in_requested_epoch == 2
+    assert session._local_barge_in_requested_watermark == 5
+
+
+def test_device_webrtc_capture_queues_and_detects_original_pcm_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at = 123.5
+    session = RealtimeSession(
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        clock=lambda: captured_at,
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    detector_values: list[bytes] = []
+
+    def record_detector(value: bytes) -> bool:
+        detector_values.append(value)
+        return False
+
+    monkeypatch.setattr(
+        session_module,
+        "_pcm_has_local_barge_in_signal",
+        record_detector,
+    )
+    # This frame would have been amplified by the removed amplitude-only
+    # normalizer, despite measured self-echo being stronger than ambient input.
+    frame = (100).to_bytes(2, "little", signed=True) * 1_024
+
+    assert session.submit_audio(frame) is SubmitResult.ACCEPTED
+    packet, remaining = session._audio.pop()
+
+    assert packet is not None
+    assert remaining == 0
+    assert packet.data is frame
+    assert detector_values == [frame]
+    assert packet.captured_at == captured_at
+    assert packet.capture_watermark == 1
 
 
 def test_input_queue_is_nonblocking_bounded_and_pcm_aligned() -> None:

@@ -747,6 +747,14 @@ opt-in and must never print OAuth tokens or recorded audio.
   microphone gain are
   device-side changes with explicit accuracy, compatibility, and clipping
   acceptance checks.
+- That firmware also applies stored PDM microphone gain after PulseAudio has
+  already opened capture. The guarded `S49codex-mic-gain` deployment hook
+  latches the validated 0–100 preference before `S50pulseaudio`, without
+  replacing a vendor script or touching ADB. Invalid values use the vendor's
+  30% fail-safe. Each change requires an ALSA capture reopen and real capture
+  canary rather than trusting the mixer display alone; the hook guarantees the
+  ordering on reboot, while a separately controlled PulseAudio reopen can also
+  latch it.
 - The official ThirdReality v1.2 firmware is a substantial Python-to-C++
   rewrite, but the target has one boot/system/recovery set rather than A/B
   slots. Do not flash the sole production speaker. Test only on a spare after

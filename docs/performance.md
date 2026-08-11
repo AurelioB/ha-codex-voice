@@ -100,12 +100,15 @@ The shipped bounds are intentionally small and fail closed:
 |---|---:|---|
 | Direct-wake idle pre-roll | 12 KiB / 384 ms | Retains the newest six 64 ms recorder frames in RAM for Okay Computer only |
 | Device microphone queue | 64 KiB / 2.048 s | Holds PCM while the network thread connects and while paced transfer catches up |
+| Device Opus/RTP input frame | 320 source samples / 20 ms, expanded to 960 samples at 48 kHz | Produces exactly one pinned-aiortc Opus payload and one 960-sample RTP timestamp per track read, continuously across 64 ms recorder callback boundaries |
+| Device realtime lifetime | 120 s semantic idle / 900 s hard maximum | Idle begins after readiness and is refreshed by semantic microphone, playback, or lifecycle activity; the hard clock begins before local preflight and covers startup, runtime, and rollover. Configurable ranges remain 5–120 s and 15–900 s |
 | V2 retained pre-ready Assist copy | 64 KiB / 2.048 s | `bridge_pcm` rollback only; v3 neither allocates this compatibility copy nor replays into Assist |
 | Reserved live startup headroom | 32 KiB / 1.024 s | Trims or omits pre-roll before it can consume this post-wake allowance |
 | Bridge v2 WebRTC input track | 2,250 ms | V2 rollback only; v3 media bypasses the bridge |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | V1/v2/adapters only; v3 provider audio stays on the device peer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds v2 child input and the v3 direct player's configured buffer allowance |
-| V3 decoded-receiver quiet boundary | About 120 ms without an audio frame | Splits only normal media generations; it is not an interruption acknowledgement |
+| V3 decoded-receiver quiet boundary | About 120 ms without PCM meeting both peak 64 and RMS 8 | Splits only normal media generations; exact silence and sub-audible Opus residue are not played or semantic, while every decoded RTP frame still participates in the independent interruption fence |
+| V3 first-playback AEC settle | One 512 ms window per fresh peer/new `paplay` onset | Sends timestamp-preserving capture silence and ignores local barge-in evidence while the physical AEC converges; a normal quiet boundary that reuses the player does not restart it |
 | V3 fresh-peer rollover | 4 KiB / 128 ms recent AEC pre-roll; eight detector-quiet 64 ms frames (512 ms) to rearm after a committed interruption; 2.25 s maximum capture age rechecked at RTP consumption; configured handshake deadline | Stops local output immediately; one uninterrupted local speech segment retires only one peer; exactly two reusable sidecar slots alternate fresh PeerConnections; an absent/invalid standby terminates the outer session without a cold launch; pre-ack output is inaudible within `output_queue_bytes`; negotiation remains measurable |
 | Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked once at direct-session preflight | Keeps boot-time writers aligned; exact set/verify runs once before negotiation, with no live-loop volume monitor |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
@@ -162,10 +165,38 @@ on `response.created`, playback begin/resume, or interruption. V2 instead
 derives its `paplay` stream volume from the configured percentage.
 
 Provider response/output lifecycle never labels or gates the normal RTP lane.
-The decoded receiver opens a local media epoch on first audio and closes it
-only after an actual roughly 120 ms quiet gap, preserving RTP-before-start
-prefixes and stopped-before-tail audio. This normal-generation boundary is
-not an interruption acknowledgement and does not authorize peer reuse.
+The decoded receiver opens a local media epoch on the first frame meeting both
+the fixed peak-64 and RMS-8 PCM bounds and closes it after roughly 120 ms
+without another qualifying frame. Exact silence and sub-audible Opus decode
+residue are not played and do not extend semantic activity; every decoded RTP
+frame still participates in the separate interruption fence. This preserves
+audible RTP-before-start prefixes and stopped-before-tail audio without letting
+keepalive residue hold `paplay` open. The normal-generation boundary is not an
+interruption acknowledgement and does not authorize peer reuse.
+
+The device writes one aggregate summary when a v3 session ends. Use its
+handshake phase, sent-capture packet/byte/peak/RMS/signal counts, allowlisted
+lifecycle counts, signal-bearing playback metrics, capture-age bounds,
+duration, and outcome to distinguish a microphone/VAD stall from an output
+stall. This diagnostic is deliberately content-free: failure records include
+only phase and exception class, and neither record contains PCM, transcripts,
+provider payloads, identifiers, SDP, prompts, URLs, or credentials.
+
+At the first audible frame on each fresh peer, the sidecar applies one 512 ms
+AEC-settle window keyed to the original capture timestamps. It still consumes
+and emits every exact 20 ms frame, but zero-fills those inside the window so
+PTS/RTP progression, sender cadence, freshness checks, and consumption
+watermarks remain continuous. The parent simultaneously ignores local
+two-frame barge-in evidence until the matching deadline. Receiver quiet followed
+by another media generation on the still-active `paplay` child does not restart
+the window; after it expires, full-duplex capture is unchanged. This onset guard
+is independent of the eight-quiet-callback rearm required after a committed
+interruption.
+
+In the physical before/after canary, the unguarded response stopped unfinished
+after 22 playback packets, about 0.44 seconds. The guarded run delivered 626
+packets, about 12.52 seconds, completed both turns, recorded
+`session.started=1`, and performed no rollover.
 
 With those checks active, capture continues during playback. Two consecutive
 qualifying AEC-filtered 64 ms frames immediately kill `paplay` and drop queued
@@ -184,6 +215,14 @@ triggers from the same uninterrupted local speech segment across the replacement
 boundary. Eight consecutive detector-quiet callbacks (512 ms) rearm it for a
 new speech edge; qualifying signal before the eighth resets the quiet count,
 and a stale output-epoch request does not arm the gate.
+
+The 20 ms capture reframer is a transport correctness boundary, not a cosmetic
+latency tweak. With the old 1,024-sample / 64 ms track reads, pinned aiortc
+returned three or four Opus payloads from one encoder call and stamped that
+whole group with one RTP timestamp. An offline pass through the pinned jitter
+buffer and decoder recovered only 80 × 20 ms from the 5.184-second reference
+input. With exact 960-sample / 48 kHz track frames, every encoder call returns
+one payload and timestamps advance by 960.
 
 The age check runs again when the RTP sender actually consumes a packet, so a
 frame cannot become stale while waiting behind negotiation. Replacement
@@ -743,13 +782,28 @@ transcript is not a performance improvement.
 
 ### Microphone gain
 
-On the measured device, a stored ThirdReality microphone-gain setting of 50 was
-observed at ALSA PDM 24/48 in an earlier snapshot and 34/48 in the current
-v1.1.7 runtime; the factory 30% setting had mapped to 14/48. Treat the stored
-percentage as a device preference, not a stable linear ALSA mapping, and verify
-the effective runtime control after each firmware or service change. The higher
-setting is an acceptance candidate, not a universal recommendation. Room
-acoustics and individual hardware vary.
+The pinned v1.1.7 firmware starts PulseAudio at `S50`, opening PDM capture
+before `S99ha-speaker` reads `/data/conf/sound.json` and writes `mic_gain`.
+Controlled testing confirmed that this is a latch boundary, not just a stale
+display: changing PDM Gain from 34/48 to 48/48 while PulseAudio held capture
+open did not materially change recorded samples. Reopening capture at gain 0
+dropped the same speaker-prompt peak from about 274 to 15; reopening it at gain
+48 raised the peak to about 325 per channel.
+
+The guarded deployment hook applies the configured percentage at `S49`, before
+PulseAudio opens `hw:0,2`. On the measured ALSA control, standard percentage
+mapping gives 30% = 14/48, 70% = 34/48, and 100% = 48/48. The earlier claim
+that a stored value of 50 produced 34/48 was a stale-snapshot attribution;
+34/48 corresponds to 70%. Treat the stored percentage as a device preference
+and verify both the control and actual captured audio after each firmware or
+boot change. Invalid or out-of-range settings are not clamped; the early hook
+uses the vendor's 30% fail-safe.
+
+The maximum setting is an acceptance candidate, not a universal
+recommendation. Room acoustics and individual hardware vary. Changing the
+stored preference requires ALSA capture to reopen. The early hook makes that
+deterministic on the next controlled reboot; a separately managed PulseAudio
+stop/start can latch it sooner. Restarting only the voice process cannot.
 
 Test near, typical, and far speech plus a loud voice. Accept the higher gain
 only when recognition improves without clipped peaks, elevated background

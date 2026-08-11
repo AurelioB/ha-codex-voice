@@ -64,8 +64,11 @@ executor thread, or `thread/realtime/appendSpeech` render. Okay Nabu remains a
 separate vendor/Home Assistant path rather than an error fallback for v3.
 
 The v3 child accepts timestamped 16 kHz mono PCM16 from the vendor capture
-callback, sends it as WebRTC audio, and decodes provider audio to 24 kHz mono
-PCM16. On the media/data path it passes only bounded playback packets and
+callback. It continuously reframes those variable callback boundaries into
+exact 20 ms / 320-sample source frames, repeats each sample into one 960-sample
+48 kHz frame, and therefore gives pinned aiortc exactly one Opus payload and
+one advancing RTP timestamp per `recv()`. It decodes provider audio to 24 kHz
+mono PCM16. On the media/data path it passes only bounded playback packets and
 sanitized lifecycle metadata back over a Unix `SOCK_SEQPACKET` socket; the
 signaling path also carries offer/answer SDP. No long-lived application credential—the
 Home Assistant token, route-scoped device bearer, or Codex OAuth credential—nor
@@ -84,6 +87,13 @@ provider-generation latency. V3 retains no Home Assistant compatibility copy:
 startup or capacity failure clears its direct queue and returns idle without
 replaying a captured prefix. The retained v2 `bridge_pcm` route alone keeps a
 separate default 64 KiB pre-ready buffer for historical bounded Assist replay.
+
+Do not hand a complete 64 ms recorder callback directly to aiortc's Opus
+encoder. In pinned aiortc 1.15 that callback produces three or four payloads,
+but `RTCRtpSender` assigns every payload from one `recv()` the same timestamp.
+An exact-WAV regression reconstructed only 1.6 seconds from 5.184 seconds of
+input before the 20 ms reframer was added. The production regression requires
+one payload per frame and consecutive 960-sample RTP timestamps.
 
 Wake activation occurs after the pinned recorder callback has already handled
 the triggering frame. While the satellite is idle, connected, and unmuted, the
@@ -140,14 +150,35 @@ receiver-quiescence media boundary can reuse that child so RTP tail is not
 discarded. Interruption clears pending PCM, closes stdin, and issues immediate
 SIGKILL without blocking the realtime loop; reap remains separately bounded.
 
+The first audible playback on each fresh sidecar peer starts one 512 ms
+physical-AEC convergence guard. The sidecar continues consuming and emitting
+exact 20 ms capture frames, but zero-fills frames whose original capture
+timestamps fall inside that window. Their PTS/RTP timeline, cadence, freshness
+checks, and consumption accounting are preserved. At the same new `paplay`
+onset, the parent ignores local two-frame barge-in evidence until the matching
+deadline. A later `media.started` after receiver quiet that resumes the same
+active child does not restart or extend either guard. This is onset-only
+protection: normal full-duplex capture and local barge-in resume after 512 ms,
+and the separate post-interruption rearm rule below is unchanged.
+
+The physical before/after canary exposed the startup echo directly. Without
+the guard, playback stopped after 22 20 ms packets (about 0.44 seconds) and the
+response remained unfinished. With the guard, it delivered 626 packets (about
+12.52 seconds), completed both turns, reported `session.started=1`, and did not
+roll over.
+
 Provider response/output lifecycle does not label, gate, or retire the normal
-RTP lane. The decoded receiver is one continuous media lane: its first frame
-emits transcript-free `media.started`, every frame resets the quiet timer, and
-only about 120 ms of actual receiver silence emits `media.quiet`. A later frame
-opens a new local media generation. This preserves prefixes received before
-provider output-start and tails received after provider stopped events. This
-normal-generation quiet boundary is not an interruption acknowledgement and
-does not authorize peer reuse.
+RTP lane. The decoded receiver is one continuous media lane: its first
+audible-scale PCM frame emits transcript-free `media.started`, and only another
+audible-scale frame resets the quiet timer. Exact digital silence and decoded
+Opus residue below both the 64-sample peak and 8-sample RMS bounds are neither
+played nor semantic; about 120 ms without qualifying PCM emits `media.quiet`.
+A later qualifying frame opens a new local media generation. This preserves
+audible prefixes received before provider output-start and tails received after
+provider stopped events without letting sub-audible keepalives hold `paplay` or
+the LED open. Every decoded RTP frame still advances the independent receiver
+fence, so this normal-generation boundary is not an interruption
+acknowledgement and does not authorize peer reuse.
 
 While verified full duplex is active, capture remains continuous during
 playback. Two consecutive 64 ms AEC-filtered microphone frames that meet the
@@ -312,7 +343,10 @@ webrtc_sidecar/
   runtime.py
 deploy/
   README.md
+  prepare_mic_gain_boot.py
   prepare_pulseaudio_aec.py
+  init/
+    S49codex-mic-gain
   pulse/
     codex-echo-cancel.pa
     codex-echo-cancel-speex.pa
@@ -472,7 +506,28 @@ fixed 2,048-byte recorder frame. An absent or explicitly disabled config
 leaves the direct client inactive while retaining the guarded wake-latency
 patch.
 
-To qualify full duplex, first follow [`deploy/README.md`](deploy/README.md).
+When omitted, `idle_timeout_seconds` defaults to 120 seconds and
+`max_session_seconds` defaults to 900 seconds. The direct-session idle clock
+starts after the transport is ready and is refreshed by semantic microphone,
+playback, or lifecycle activity—not pings or sub-audible decode residue. The
+hard clock starts before local AEC/player preflight and covers all startup,
+runtime, and rollover work. Deployments may lower the values within their
+enforced 5–120-second and 15–900-second ranges, respectively.
+
+Before physical input qualification, install the guarded early microphone-gain
+hook described in [`deploy/README.md`](deploy/README.md). The pinned firmware
+otherwise writes the configured PDM gain only after PulseAudio has opened
+capture, so `amixer` can report the requested value while the live samples
+still use the boot default. The hook is a separate `S49` init file; it does not
+modify vendor boot scripts, restart a service, or touch ADB. Its 0–100 integer
+preference validation falls back to the vendor's 30% default rather than
+clamping malformed data. Reopen ALSA capture—normally with a controlled reboot
+that exercises the persistent boot ordering—and run an acoustic capture
+canary. A separately controlled PulseAudio reopen can also latch the value; a
+voice-only restart and `amixer cget` are not proof that the codec did so.
+
+To qualify full duplex, also follow the static AEC procedure in that deployment
+guide.
 The pinned PulseAudio server starts with `--disallow-module-loading`, and its
 `default.pa.d` include occurs before the raw hardware masters; dynamic module
 loading or a naive drop-in cannot establish the required startup order. The
@@ -622,6 +677,22 @@ build/install/rollback validation, guarded static-AEC installation and
 rollback, interrupt cleanup, timer interruption, serialized non-blocking LED
 execution, newest-state overload coalescing, DBus timeout/nonzero handling,
 explicit worker shutdown, and the atomic unknown-bytecode fail-closed path.
+
+Each direct session now emits one INFO-level, content-free summary that makes a
+stalled LED diagnosable without recording speech. It reports whether the
+handshake became ready, the current phase, aggregate peak/RMS and counts for
+PCM actually sent to the sidecar, bounded counts for allowlisted lifecycle
+event types, signal-bearing playback aggregates, capture-age bounds, duration,
+and terminal outcome. A failure warning contains only the phase and exception
+class. Neither record includes PCM, transcripts, provider payloads, item or
+turn identifiers, SDP, prompts, URLs, or credentials.
+
+The 2026-08-11 reference-device root-fix canary used the production v3 session,
+AEC source, sidecar, Opus/RTP path, provider VAD, and `paplay` at the qualified
+60% setting. It reached full peer readiness in 6.749 seconds, observed first
+output at 12.046 seconds, and received 536 signal-bearing playback packets with
+no captured audio or transcript persisted. Before 20 ms reframing, the same
+input reached `session.started` but produced no speech lifecycle or playback.
 
 Automated checks are not physical v3 acceptance. At that installation's
 qualified 60% setting, the reference-device hardware double-interruption canary

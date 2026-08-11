@@ -16,8 +16,9 @@ import weakref
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from math import isqrt
 from typing import Any, Protocol
 
 from .config import (
@@ -47,6 +48,7 @@ _LOCAL_BARGE_IN_SIGNAL_PEAK = 1_024
 _LOCAL_BARGE_IN_SIGNAL_RMS = 384
 _LOCAL_BARGE_IN_FRAMES = 2
 _LOCAL_BARGE_IN_REARM_QUIET_FRAMES = 8
+_LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS = 0.512
 _MAX_INPUT_CATCH_UP_RATE = 2.0
 _PACTL_ARGV = ("/usr/bin/pactl",)
 _PULSE_ECHO_CANCEL_MODULE = "module-echo-cancel"
@@ -93,6 +95,14 @@ _CONTROL_EVENTS = frozenset(
         "media.started",
     }
 )
+_DIRECT_DIAGNOSTIC_LIFECYCLE_EVENTS = _CONTROL_EVENTS | frozenset(
+    {
+        "error",
+        "interrupt.fenced",
+        "invalid_request_error",
+    }
+)
+_DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX = 999_999
 
 
 class SessionState(Enum):
@@ -140,6 +150,80 @@ class _DirectPlaybackState:
     newest_generation: int = 0
     retired_generation: int = 0
     expected_sample_index: int | None = None
+
+
+@dataclass(slots=True)
+class _DirectSessionDiagnostics:
+    """Content-free aggregate diagnostics for one direct-media session."""
+
+    started_at: float
+    phase: str = "preflight"
+    handshake_ready: bool = False
+    peer_answer_applied: bool = False
+    peer_connected: bool = False
+    peer_data_ready: bool = False
+    capture_packets: int = 0
+    capture_bytes: int = 0
+    capture_max_peak: int = 0
+    capture_max_rms: int = 0
+    capture_signal_frames: int = 0
+    playback_signal_packets: int = 0
+    playback_signal_bytes: int = 0
+    playback_max_peak: int = 0
+    playback_max_rms: int = 0
+    lifecycle_events: dict[str, int] = field(default_factory=dict)
+
+    def observe_peer_state(self, value: str) -> None:
+        """Retain only the three fixed initial peer-readiness milestones."""
+        if value == "answer.applied":
+            self.peer_answer_applied = True
+        elif value == "connected":
+            self.peer_connected = True
+        elif value == "data.ready":
+            self.peer_data_ready = True
+
+    def observe_capture(self, value: bytes, *, has_signal: bool) -> None:
+        """Account for original microphone PCM after its IPC send succeeds."""
+        peak, rms = _pcm_peak_and_rms(value)
+        self.capture_packets += 1
+        self.capture_bytes += len(value)
+        self.capture_max_peak = max(self.capture_max_peak, peak)
+        self.capture_max_rms = max(self.capture_max_rms, rms)
+        if has_signal:
+            self.capture_signal_frames += 1
+
+    def observe_playback(self, value: bytes) -> None:
+        """Account only for speech-scale playback received from the child."""
+        if not _pcm_has_signal(value):
+            return
+        peak, rms = _pcm_peak_and_rms(value)
+        self.playback_signal_packets += 1
+        self.playback_signal_bytes += len(value)
+        self.playback_max_peak = max(self.playback_max_peak, peak)
+        self.playback_max_rms = max(self.playback_max_rms, rms)
+
+    def observe_lifecycle(self, event_type: object) -> None:
+        """Count only fixed safe event names, collapsing everything else."""
+        key = (
+            event_type
+            if isinstance(event_type, str)
+            and event_type in _DIRECT_DIAGNOSTIC_LIFECYCLE_EVENTS
+            else "other"
+        )
+        count = self.lifecycle_events.get(key, 0)
+        self.lifecycle_events[key] = min(
+            count + 1,
+            _DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX,
+        )
+
+    def lifecycle_summary(self) -> str:
+        """Return one bounded, deterministically ordered safe count string."""
+        if not self.lifecycle_events:
+            return "none"
+        return ",".join(
+            f"{event_type}:{self.lifecycle_events[event_type]}"
+            for event_type in sorted(self.lifecycle_events)
+        )
 
 
 class _DirectPendingOutput:
@@ -762,6 +846,7 @@ class RealtimeSession:
         self._local_barge_in_frames = 0
         self._local_barge_in_rearm_required = False
         self._local_barge_in_quiet_frames = 0
+        self._local_barge_in_settle_until = 0.0
         self._local_barge_in_lock = threading.Lock()
         self._suppressed_output_epoch: int | None = None
         self._direct_preroll: deque[_AudioPacket] = deque()
@@ -770,6 +855,7 @@ class RealtimeSession:
         self._context_loss_rollovers = 0
         self._thread: threading.Thread | None = None
         self._ever_ready = False
+        self._direct_diagnostics: _DirectSessionDiagnostics | None = None
 
     @property
     def state(self) -> SessionState:
@@ -900,6 +986,11 @@ class RealtimeSession:
         if not self._config.full_duplex:
             return False
         with self._local_barge_in_lock:
+            if self._clock() < self._local_barge_in_settle_until:
+                self._local_barge_in_requested_epoch = None
+                self._local_barge_in_requested_watermark = None
+                self._local_barge_in_frames = 0
+                return False
             has_signal = _pcm_has_local_barge_in_signal(value)
             if self._local_barge_in_rearm_required:
                 if has_signal:
@@ -936,9 +1027,19 @@ class RealtimeSession:
             self._local_barge_in_requested_watermark = capture_watermark
             return False
 
-    def _set_local_output_epoch(self, output_epoch: int | None) -> None:
+    def _set_local_output_epoch(
+        self,
+        output_epoch: int | None,
+        *,
+        settle_barge_in: bool = False,
+    ) -> None:
         """Publish one network-thread-owned playback generation to capture."""
         with self._local_barge_in_lock:
+            if settle_barge_in:
+                self._local_barge_in_settle_until = max(
+                    self._local_barge_in_settle_until,
+                    self._clock() + _LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS,
+                )
             self._local_output_epoch = output_epoch
             self._local_barge_in_requested_epoch = None
             self._local_barge_in_requested_watermark = None
@@ -956,6 +1057,7 @@ class RealtimeSession:
             self._local_barge_in_frames = 0
             self._local_barge_in_rearm_required = False
             self._local_barge_in_quiet_frames = 0
+            self._local_barge_in_settle_until = 0.0
 
     def _remember_direct_preroll(self, packet: _AudioPacket) -> None:
         """Retain recent capture already sent during the active response.
@@ -1360,6 +1462,8 @@ class RealtimeSession:
         self,
     ) -> None:
         """Terminate WebRTC on the device and keep the bridge signaling-only."""
+        diagnostics = _DirectSessionDiagnostics(started_at=time.monotonic())
+        self._direct_diagnostics = diagnostics
         connection: WebSocketConnection | None = None
         sidecar: WebRtcSidecarClient | None = None
         standby: _DirectStandby | None = None
@@ -1383,6 +1487,7 @@ class RealtimeSession:
             # IPC draining, and immediate paplay termination.
             player.prepare()
             state = _DirectPlaybackState()
+            diagnostics.phase = "sidecar_offer"
             sidecar = self._sidecar_factory()
             negotiation_started_at = self._clock()
             handshake_deadline = min(
@@ -1392,6 +1497,7 @@ class RealtimeSession:
 
             sidecar.request_offer()
             offer_sdp = self._wait_for_direct_offer(sidecar, handshake_deadline)
+            diagnostics.phase = "bridge_connect"
             connection = self._connection_factory(
                 url=self._config.url,
                 connect_address=self._config.connect_address,
@@ -1403,12 +1509,14 @@ class RealtimeSession:
             connection.send_json(
                 realtime_start_message(self._config, webrtc_sdp=offer_sdp)
             )
+            diagnostics.phase = "bridge_answer"
             answer_sdp = self._wait_for_direct_answer(
                 connection,
                 sidecar,
                 handshake_deadline,
             )
             sidecar.set_answer(answer_sdp)
+            diagnostics.phase = "peer_handshake"
 
             pacer = _AudioPacer()
             sample_index = 0
@@ -1431,6 +1539,7 @@ class RealtimeSession:
                 )
                 for control in controls:
                     if control.type in required_states:
+                        diagnostics.observe_peer_state(control.type)
                         ready_states.add(control.type)
                     else:
                         raise SidecarError(  # noqa: TRY301
@@ -1440,6 +1549,7 @@ class RealtimeSession:
                 self._wait_direct_tick(pacer, now, handshake_deadline)
 
             connection.send_json({"type": "transport_ready", "protocol_version": 3})
+            diagnostics.phase = "bridge_ready"
             while True:
                 self._raise_if_direct_startup_cancelled(handshake_deadline)
                 now = self._clock()
@@ -1475,6 +1585,8 @@ class RealtimeSession:
                 self._wait_direct_tick(pacer, now, handshake_deadline)
 
             self._ever_ready = True
+            diagnostics.handshake_ready = True
+            diagnostics.phase = "runtime"
             self._ready.set()
             with self._state_lock:
                 if self._state is SessionState.CONNECTING:
@@ -1539,6 +1651,7 @@ class RealtimeSession:
                     peer_epoch += 1
                     replacement = standby
                     standby = None
+                    diagnostics.phase = "rollover"
                     (
                         sidecar,
                         state,
@@ -1557,6 +1670,7 @@ class RealtimeSession:
                         ),
                         capture_ages_ms=capture_ages_ms,
                     )
+                    diagnostics.phase = "runtime"
                     if not context_retained:
                         with self._state_lock:
                             self._context_loss_rollovers += 1
@@ -1620,6 +1734,7 @@ class RealtimeSession:
                     if message_type == "pong":
                         continue
                     if message_type == "stopped":
+                        diagnostics.phase = "remote_stop"
                         return
                     if message_type == "error":
                         raise WebSocketError(  # noqa: TRY301
@@ -1655,16 +1770,23 @@ class RealtimeSession:
             TimeoutError,
             ValueError,
             WebSocketError,
-        ):
+        ) as exc:
             failed = not (
                 self._stop_requested.is_set() or self._interrupt_requested.is_set()
             )
             if failed:
-                _LOGGER.warning("ThirdReality direct WebRTC session failed")
-        except Exception:  # noqa: BLE001 - never escape the vendor daemon thread
+                _LOGGER.warning(
+                    "ThirdReality direct WebRTC session failed: phase=%s error=%s",
+                    diagnostics.phase,
+                    type(exc).__name__,
+                    exc_info=False,
+                )
+        except Exception as exc:  # noqa: BLE001 - never escape vendor daemon thread
             failed = True
             _LOGGER.warning(
-                "ThirdReality direct WebRTC session failed",
+                "ThirdReality direct WebRTC session failed: phase=%s error=%s",
+                diagnostics.phase,
+                type(exc).__name__,
                 exc_info=False,
             )
         finally:
@@ -1692,14 +1814,56 @@ class RealtimeSession:
                     with suppress(Exception):
                         connection.close()
             finally:
+                capture_age_p95_ms = 0.0
+                capture_age_max_ms = 0.0
                 if capture_ages_ms:
                     ordered_ages = sorted(capture_ages_ms)
                     p95_index = max(0, int(len(ordered_ages) * 0.95) - 1)
-                    _LOGGER.info(
-                        "ThirdReality direct capture age: p95_ms=%.1f max_ms=%.1f",
-                        ordered_ages[p95_index],
-                        ordered_ages[-1],
-                    )
+                    capture_age_p95_ms = ordered_ages[p95_index]
+                    capture_age_max_ms = ordered_ages[-1]
+                if failed:
+                    outcome = "failed"
+                elif self._interrupt_requested.is_set():
+                    outcome = "interrupted"
+                elif self._stop_requested.is_set():
+                    outcome = "stopped"
+                else:
+                    outcome = "remote_stopped"
+                duration_ms = max(
+                    0,
+                    int((time.monotonic() - diagnostics.started_at) * 1_000),
+                )
+                _LOGGER.info(
+                    "ThirdReality direct WebRTC session summary: "
+                    "handshake_ready=%s phase=%s peer_answer_applied=%s "
+                    "peer_connected=%s peer_data_ready=%s "
+                    "capture_sent_packets=%d capture_sent_bytes=%d "
+                    "capture_max_peak=%d capture_max_rms=%d "
+                    "capture_signal_frames=%d lifecycle_events=%s "
+                    "playback_signal_packets=%d playback_signal_bytes=%d "
+                    "playback_max_peak=%d playback_max_rms=%d "
+                    "capture_age_p95_ms=%.1f capture_age_max_ms=%.1f "
+                    "duration_ms=%d outcome=%s",
+                    "yes" if diagnostics.handshake_ready else "no",
+                    diagnostics.phase,
+                    "yes" if diagnostics.peer_answer_applied else "no",
+                    "yes" if diagnostics.peer_connected else "no",
+                    "yes" if diagnostics.peer_data_ready else "no",
+                    diagnostics.capture_packets,
+                    diagnostics.capture_bytes,
+                    diagnostics.capture_max_peak,
+                    diagnostics.capture_max_rms,
+                    diagnostics.capture_signal_frames,
+                    diagnostics.lifecycle_summary(),
+                    diagnostics.playback_signal_packets,
+                    diagnostics.playback_signal_bytes,
+                    diagnostics.playback_max_peak,
+                    diagnostics.playback_max_rms,
+                    capture_age_p95_ms,
+                    capture_age_max_ms,
+                    duration_ms,
+                    outcome,
+                )
                 with self._state_lock:
                     self._state = (
                         SessionState.FAILED if failed else SessionState.STOPPED
@@ -1800,6 +1964,7 @@ class RealtimeSession:
                 "retired sidecar returned an invalid stop acknowledgement"
             )
         for message in messages[:-1]:
+            self._observe_direct_sidecar_message(message)
             if isinstance(message, PlaybackAudio):
                 continue
             if message.type != "lifecycle":
@@ -2209,6 +2374,10 @@ class RealtimeSession:
                 packet.capture_watermark,
             )
             self._remember_direct_preroll(packet)
+        has_signal = _pcm_has_signal(packet.data)
+        diagnostics = self._direct_diagnostics
+        if diagnostics is not None:
+            diagnostics.observe_capture(packet.data, has_signal=has_signal)
         capture_ages_ms.append(age_seconds * 1_000)
         sample_index += len(packet.data) // 2
         pacer.sent(
@@ -2216,7 +2385,21 @@ class RealtimeSession:
             len(packet.data),
             catching_up=remaining_packets > 0,
         )
-        return sample_index, _pcm_has_signal(packet.data)
+        return sample_index, has_signal
+
+    def _observe_direct_sidecar_message(
+        self,
+        message: ControlMessage | PlaybackAudio,
+    ) -> None:
+        """Update direct diagnostics without retaining any media or metadata."""
+        diagnostics = self._direct_diagnostics
+        if diagnostics is None:
+            return
+        if isinstance(message, PlaybackAudio):
+            diagnostics.observe_playback(message.pcm)
+            return
+        if message.type == "lifecycle":
+            diagnostics.observe_lifecycle(message.values.get("event_type"))
 
     def _direct_output_allowed(self) -> bool:
         """Return whether direct media may cross the explicit output boundary."""
@@ -2254,6 +2437,7 @@ class RealtimeSession:
             controls: list[ControlMessage] = []
             semantic = False
             for message in sidecar.drain_messages(maximum=8):
+                self._observe_direct_sidecar_message(message)
                 if isinstance(message, PlaybackAudio):
                     self._handle_direct_playback(message, player, state)
                     semantic = True
@@ -2280,6 +2464,7 @@ class RealtimeSession:
                 return []
             controls: list[ControlMessage] = []
             for message in sidecar.drain_messages(maximum=8):
+                self._observe_direct_sidecar_message(message)
                 if isinstance(message, PlaybackAudio):
                     pending_output.append(message)
                     continue
@@ -2378,7 +2563,8 @@ class RealtimeSession:
                 raise SidecarError("media generation did not advance")
             if state.active_generation is not None:
                 raise SidecarError("media generation overlapped its predecessor")
-            if player.active:
+            player_was_active = player.active
+            if player_was_active:
                 resume = getattr(player, "resume", None)
                 if not callable(resume):
                     raise SidecarError("playback cannot resume a media epoch")
@@ -2386,7 +2572,10 @@ class RealtimeSession:
             else:
                 player.begin(generation)
             self._clear_direct_preroll()
-            self._set_local_output_epoch(generation)
+            self._set_local_output_epoch(
+                generation,
+                settle_barge_in=not player_was_active,
+            )
             state.newest_generation = generation
             state.active_generation = generation
             self._suppressed_output_epoch = None
@@ -2582,6 +2771,20 @@ def _pcm_has_signal(value: bytes) -> bool:
         abs(sample) >= _INPUT_ACTIVITY_SIGNAL_PEAK
         for (sample,) in struct.iter_unpack("<h", value)
     )
+
+
+def _pcm_peak_and_rms(value: bytes) -> tuple[int, int]:
+    """Return content-free integer peak and RMS for one aligned PCM16 frame."""
+    sample_count = len(value) // 2
+    if sample_count == 0:
+        return 0, 0
+    peak = 0
+    energy = 0
+    for (sample,) in struct.iter_unpack("<h", value):
+        magnitude = abs(sample)
+        peak = max(peak, magnitude)
+        energy += sample * sample
+    return peak, isqrt(energy // sample_count)
 
 
 def _pcm_has_local_barge_in_signal(value: bytes) -> bool:

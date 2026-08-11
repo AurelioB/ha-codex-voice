@@ -1,15 +1,79 @@
-# ThirdReality full-duplex AEC deployment assets
+# ThirdReality microphone and full-duplex AEC deployment assets
 
 These assets are an opt-in preparation step for the pinned ThirdReality
 `1.01.07`/upstream `v1.1.7` image. They do not deploy themselves. The helper
-never restarts PulseAudio or the voice service, never changes the running
-speaker volume, and never changes or disables TCP ADB on port 5555. It does
-write the explicitly selected AEC sink volume into the managed PulseAudio
-startup block so the reviewed value is applied when the AEC sink is created.
-On the stock device, the vendor voice process later reapplies the separate
-media-player preference from `/data/conf/sound.json`; that authoritative
-preference must be set to the same value through Home Assistant and verified
-after every restart or reboot.
+scripts never restart PulseAudio or the voice service, never change the running
+speaker volume, and never change or disable TCP ADB on port 5555.
+
+## Latch configured microphone gain before capture opens
+
+The pinned firmware has a boot-order defect. `S50pulseaudio` opens the PDM
+capture device at `hw:0,2`; only later does `S99ha-speaker` run
+`setup_env.sh`, which reads `mic_gain` from `/data/conf/sound.json` and calls
+`amixer`. Changing that mixer control while capture is open updates the value
+reported by `amixer`, but does not update the samples from this codec. The new
+gain takes effect only after ALSA capture is reopened. This can make a correctly
+configured microphone appear almost silent after every reboot.
+
+[`prepare_mic_gain_boot.py`](prepare_mic_gain_boot.py) installs exactly one
+root-owned mode-0755 init script, `/etc/init.d/S49codex-mic-gain`. It reads the
+same preference and applies ALSA card 0 control `numid=7` before
+`S50pulseaudio`. It does not edit or replace either vendor script. Installation
+fails closed unless the init names, sibling ordering, pinned `rcS`, and pinned
+`S50pulseaudio` match the reviewed firmware. It also refuses to overwrite any
+pre-existing or modified hook.
+
+The preference must be a JSON number that is an integer from 0 through 100.
+The hook does not silently clamp an invalid value upward or downward. An
+absent, malformed, non-integer, or out-of-range value uses the vendor's safe
+30% default and writes a warning to the boot log. On the observed control,
+ALSA's standard percentage mapping gives 30% = 14/48, 70% = 34/48, and 100% =
+48/48.
+
+After copying the reviewed helper from a pinned release, install it with the
+dry-run/apply/check sequence:
+
+```sh
+python3 prepare_mic_gain_boot.py check
+python3 prepare_mic_gain_boot.py install
+python3 prepare_mic_gain_boot.py install --apply
+python3 prepare_mic_gain_boot.py check
+```
+
+The command intentionally does not touch the live mixer. Review the installed
+file, root ownership, mode 0755, `sound.json`, and TCP ADB reachability before
+a controlled reboot. The hook's purpose is deterministic ordering on every
+boot; a separately controlled PulseAudio stop/start can also latch a new mixer
+value by reopening ALSA capture. A voice-only restart cannot. After reboot,
+confirm the early-hook log precedes PulseAudio startup, verify
+`amixer -c 0 cget numid=7`, then perform a raw microphone peak/RMS recording
+and human near-/normal-/far-field canary. The reported mixer value alone does
+not prove that capture latched it.
+
+Changing `mic_gain` later updates the stored preference but does not affect
+captured samples until ALSA capture reopens. The installed hook guarantees the
+new value is applied on the next controlled reboot; an explicitly managed
+PulseAudio capture reopen can apply it sooner. Rollback is symmetric:
+
+```sh
+python3 prepare_mic_gain_boot.py remove
+python3 prepare_mic_gain_boot.py remove --apply
+```
+
+Removal is available even if the pinned vendor boot files later drift, but it
+deletes only the byte-exact installer-owned hook. No backup restoration is
+needed because installation never overwrites an existing file. Removal does
+not restart services; the original late vendor behavior returns on the next
+boot. Verify TCP ADB port 5555 before and after that reboot.
+
+## Static PulseAudio echo cancellation
+
+The AEC helper writes the explicitly selected AEC sink volume into the managed
+PulseAudio startup block so the reviewed value is applied when the AEC sink is
+created. On the stock device, the vendor voice process later reapplies the
+separate media-player preference from `/data/conf/sound.json`; that
+authoritative preference must be set to the same value through Home Assistant
+and verified after every restart or reboot.
 
 The device starts PulseAudio with `--disallow-module-loading`. Its
 `/etc/pulse/default.pa` includes `default.pa.d` **before** the two raw ALSA

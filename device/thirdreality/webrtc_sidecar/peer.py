@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import queue as thread_queue
+import struct
 import threading
 import time
 from collections.abc import Callable, Coroutine, Iterator
@@ -15,6 +16,16 @@ from typing import Any
 from .protocol import CaptureAudio, PlaybackAudio, sanitize_provider_lifecycle
 
 CAPTURE_SAMPLE_RATE = 16_000
+CAPTURE_RTP_SAMPLE_RATE = 48_000
+CAPTURE_FRAME_MILLISECONDS = 20
+CAPTURE_FRAME_SAMPLES = CAPTURE_SAMPLE_RATE * CAPTURE_FRAME_MILLISECONDS // 1_000
+CAPTURE_RTP_FRAME_SAMPLES = (
+    CAPTURE_RTP_SAMPLE_RATE * CAPTURE_FRAME_MILLISECONDS // 1_000
+)
+CAPTURE_ECHO_SETTLE_MILLISECONDS = 512
+_CAPTURE_RTP_RATE_MULTIPLIER = CAPTURE_RTP_SAMPLE_RATE // CAPTURE_SAMPLE_RATE
+_CAPTURE_FRAME_BYTES = CAPTURE_FRAME_SAMPLES * 2
+_CAPTURE_ECHO_SETTLE_NANOSECONDS = CAPTURE_ECHO_SETTLE_MILLISECONDS * 1_000_000
 PLAYBACK_SAMPLE_RATE = 24_000
 PCM_SAMPLE_WIDTH = 2
 MAX_CAPTURE_QUEUE_FRAMES = 32
@@ -36,6 +47,11 @@ MEDIA_FENCE_MINIMUM_CAPTURE_SAMPLES = CAPTURE_SAMPLE_RATE * 250 // 1_000
 MEDIA_FENCE_TIMEOUT_SECONDS = 5.0
 MEDIA_FENCE_RECEIVER_HEARTBEAT_SECONDS = 0.020
 MEDIA_FENCE_RECEIVER_MAX_TICK_SLIP_SECONDS = 0.010
+# Opus decode can turn provider RTP silence into sub-audible non-zero PCM.
+# Treat only sustained samples above roughly -54 dBFS as local playback media;
+# decoded RTP still advances the independent interruption fence below.
+PLAYBACK_SIGNAL_PEAK = 64
+PLAYBACK_SIGNAL_RMS = 8
 
 try:
     import aiortc
@@ -64,6 +80,22 @@ else:
     _IMPORT_ERROR = None
 
 
+def _pcm_has_playback_signal(value: bytes) -> bool:
+    """Reject decoded keepalive residue without trimming audible response PCM."""
+    sample_count = len(value) // PCM_SAMPLE_WIDTH
+    if sample_count == 0 or len(value) % PCM_SAMPLE_WIDTH:
+        return False
+    peak = 0
+    energy = 0
+    for (sample,) in struct.iter_unpack("<h", value):
+        magnitude = abs(sample)
+        peak = max(peak, magnitude)
+        energy += sample * sample
+    return peak >= PLAYBACK_SIGNAL_PEAK and energy >= (
+        PLAYBACK_SIGNAL_RMS**2 * sample_count
+    )
+
+
 class PeerError(RuntimeError):
     """Raised for one content-independent WebRTC peer failure."""
 
@@ -90,7 +122,15 @@ class CaptureAudioTrack(MediaStreamTrack):
         self._queue: asyncio.Queue[CaptureAudio | None] = asyncio.Queue(
             maxsize=MAX_CAPTURE_QUEUE_FRAMES
         )
+        self._recv_lock = asyncio.Lock()
         self._stopped = False
+        self._capture_packet: CaptureAudio | None = None
+        self._capture_packet_sample_offset = 0
+        self._source_frame_pcm = bytearray()
+        self._source_frame_sample_index: int | None = None
+        self._source_frame_capture_monotonic_ns: int | None = None
+        self._suppress_capture_from_ns = 0
+        self._suppress_capture_before_ns = 0
         self._first_sample_index: int | None = None
         self._last_sample_end: int | None = None
         self._last_capture_monotonic_ns: int | None = None
@@ -155,37 +195,130 @@ class CaptureAudioTrack(MediaStreamTrack):
         self._last_capture_monotonic_ns = value.capture_monotonic_ns
 
     async def recv(self) -> Any:
-        """Return the next timestamped frame without imposing a second 1x clock."""
-        value = await self._queue.get()
-        if value is None:
-            raise MediaStreamError
-        samples = len(value.pcm) // PCM_SAMPLE_WIDTH
-        self._queued_samples -= samples
-        if time.monotonic_ns() - value.capture_monotonic_ns > (
-            _MAX_CAPTURE_AGE_NANOSECONDS
-        ):
-            # Offer-created peers can accumulate capture before the remote SDP
-            # activates RTP. Admission freshness is therefore insufficient:
-            # prove freshness again at the sender's actual consumption point.
-            if self._on_fatal is not None:
-                self._on_fatal("capture_audio_stale")
-            self.stop()
-            raise PeerBackpressure(
-                "capture packet exceeded its age bound before RTP consumption"
+        """Return one encoder-sized frame without imposing a second 1x clock."""
+        async with self._recv_lock:
+            if self._stopped:
+                raise MediaStreamError
+            await self._fill_source_frame()
+
+            capture_monotonic_ns = self._source_frame_capture_monotonic_ns
+            source_sample_index = self._source_frame_sample_index
+            assert capture_monotonic_ns is not None
+            assert source_sample_index is not None
+            self._raise_if_capture_stale(capture_monotonic_ns)
+
+            # aiortc 1.15's Opus encoder emits one 20 ms payload for one exact
+            # 960-sample / 48 kHz input frame. Larger inputs produce several
+            # payloads which RTCRtpSender incorrectly stamps with one shared
+            # RTP timestamp. Repeat each 16 kHz PCM16 sample three times so the
+            # source timeline remains exact while every recv maps to one RTP
+            # timestamp and one Opus payload. Deliberately do not add a pacer:
+            # capture arrival is already live-clocked and immediate draining
+            # minimizes microphone latency.
+            output_pcm = bytearray(CAPTURE_RTP_FRAME_SAMPLES * PCM_SAMPLE_WIDTH)
+            if not (
+                self._suppress_capture_from_ns
+                <= capture_monotonic_ns
+                < self._suppress_capture_before_ns
+            ):
+                for source_offset in range(0, _CAPTURE_FRAME_BYTES, PCM_SAMPLE_WIDTH):
+                    output_offset = source_offset * _CAPTURE_RTP_RATE_MULTIPLIER
+                    sample = self._source_frame_pcm[
+                        source_offset : source_offset + PCM_SAMPLE_WIDTH
+                    ]
+                    output_pcm[
+                        output_offset : output_offset
+                        + PCM_SAMPLE_WIDTH * _CAPTURE_RTP_RATE_MULTIPLIER
+                    ] = sample * _CAPTURE_RTP_RATE_MULTIPLIER
+
+            assert AudioFrame is not None
+            frame = AudioFrame(
+                format="s16",
+                layout="mono",
+                samples=CAPTURE_RTP_FRAME_SAMPLES,
             )
-        assert AudioFrame is not None
-        frame = AudioFrame(format="s16", layout="mono", samples=samples)
-        frame.planes[0].update(value.pcm)
-        frame.sample_rate = CAPTURE_SAMPLE_RATE
-        first_sample_index = self._first_sample_index
-        assert first_sample_index is not None
-        frame.pts = value.sample_index - first_sample_index
-        frame.time_base = Fraction(1, CAPTURE_SAMPLE_RATE)
-        self._consumed_samples += samples
-        self._consumed_sample_end = value.sample_index + samples
-        if self._on_consumed is not None:
-            self._on_consumed(self._consumed_samples)
-        return frame
+            frame.planes[0].update(output_pcm)
+            frame.sample_rate = CAPTURE_RTP_SAMPLE_RATE
+            first_sample_index = self._first_sample_index
+            assert first_sample_index is not None
+            frame.pts = (
+                source_sample_index - first_sample_index
+            ) * _CAPTURE_RTP_RATE_MULTIPLIER
+            frame.time_base = Fraction(1, CAPTURE_RTP_SAMPLE_RATE)
+
+            self._source_frame_pcm.clear()
+            self._source_frame_sample_index = None
+            self._source_frame_capture_monotonic_ns = None
+            self._queued_samples -= CAPTURE_FRAME_SAMPLES
+            self._consumed_samples += CAPTURE_FRAME_SAMPLES
+            self._consumed_sample_end = source_sample_index + CAPTURE_FRAME_SAMPLES
+            if self._on_consumed is not None:
+                self._on_consumed(self._consumed_samples)
+            return frame
+
+    def suppress_capture_for_playback_settle(self) -> None:
+        """Send silence for capture recorded during first-playback AEC settling."""
+        started_at = time.monotonic_ns()
+        self._suppress_capture_from_ns = started_at
+        self._suppress_capture_before_ns = started_at + _CAPTURE_ECHO_SETTLE_NANOSECONDS
+
+    async def _fill_source_frame(self) -> None:
+        """Assemble one contiguous 20 ms source frame across IPC packets."""
+        while len(self._source_frame_pcm) < _CAPTURE_FRAME_BYTES:
+            if self._capture_packet is None:
+                value = await self._queue.get()
+                if value is None:
+                    raise MediaStreamError
+                self._capture_packet = value
+                self._capture_packet_sample_offset = 0
+
+            value = self._capture_packet
+            assert value is not None
+            self._raise_if_capture_stale(value.capture_monotonic_ns)
+            source_samples = len(self._source_frame_pcm) // PCM_SAMPLE_WIDTH
+            packet_samples = len(value.pcm) // PCM_SAMPLE_WIDTH
+            take_samples = min(
+                CAPTURE_FRAME_SAMPLES - source_samples,
+                packet_samples - self._capture_packet_sample_offset,
+            )
+            chunk_sample_index = value.sample_index + self._capture_packet_sample_offset
+            if self._source_frame_sample_index is None:
+                self._source_frame_sample_index = chunk_sample_index
+                self._source_frame_capture_monotonic_ns = value.capture_monotonic_ns
+            else:
+                assert chunk_sample_index == (
+                    self._source_frame_sample_index + source_samples
+                )
+                capture_monotonic_ns = self._source_frame_capture_monotonic_ns
+                assert capture_monotonic_ns is not None
+                self._source_frame_capture_monotonic_ns = min(
+                    capture_monotonic_ns,
+                    value.capture_monotonic_ns,
+                )
+
+            byte_offset = self._capture_packet_sample_offset * PCM_SAMPLE_WIDTH
+            byte_count = take_samples * PCM_SAMPLE_WIDTH
+            self._source_frame_pcm.extend(
+                value.pcm[byte_offset : byte_offset + byte_count]
+            )
+            self._capture_packet_sample_offset += take_samples
+            if self._capture_packet_sample_offset == packet_samples:
+                self._capture_packet = None
+                self._capture_packet_sample_offset = 0
+
+    def _raise_if_capture_stale(self, capture_monotonic_ns: int) -> None:
+        """Fail closed when source PCM is stale at actual sender consumption."""
+        if time.monotonic_ns() - capture_monotonic_ns <= (_MAX_CAPTURE_AGE_NANOSECONDS):
+            return
+        # Offer-created peers can accumulate capture before the remote SDP
+        # activates RTP. Admission freshness is therefore insufficient:
+        # prove freshness again at the sender's actual consumption point.
+        if self._on_fatal is not None:
+            self._on_fatal("capture_audio_stale")
+        self.stop()
+        raise PeerBackpressure(
+            "capture packet exceeded its age bound before RTP consumption"
+        )
 
     def stop(self) -> None:
         """Wake a blocked sender and reject any later capture packet."""
@@ -195,6 +328,11 @@ class CaptureAudioTrack(MediaStreamTrack):
         super().stop()
         while not self._queue.empty():
             self._queue.get_nowait()
+        self._capture_packet = None
+        self._capture_packet_sample_offset = 0
+        self._source_frame_pcm.clear()
+        self._source_frame_sample_index = None
+        self._source_frame_capture_monotonic_ns = None
         self._queued_samples = 0
         self._queue.put_nowait(None)
 
@@ -500,6 +638,7 @@ class DeviceWebRtcPeer:
         self._decoder_queue: _TrackedDecoderQueue | None = None
         self._audio_receiver: Any | None = None
         self._remote_audio_track_seen = False
+        self._capture_echo_settle_started = False
         self._playback_sample_index = 0
         self._consumer_tasks: set[asyncio.Task[None]] = set()
         self._ice_gathering_complete = asyncio.Event()
@@ -1199,12 +1338,21 @@ class DeviceWebRtcPeer:
                 continue
             size = output.samples * PCM_SAMPLE_WIDTH
             pcm = bytes(output.planes[0])[:size]
-            if not pcm or self._muted or not any(pcm):
+            if not pcm or self._muted or not _pcm_has_playback_signal(pcm):
                 continue
-            # The provider keeps its remote RTP track alive with exact digital
-            # silence between responses. Only signal-bearing PCM represents
-            # audible media: silent keepalive frames must not open a generation,
-            # feed playback, arm local barge-in, or extend semantic activity.
+            # The provider keeps its remote RTP track alive between responses.
+            # Only audible-scale PCM represents media: exact silence and Opus
+            # decode residue must not open a generation, feed playback, arm
+            # local barge-in, or extend semantic activity.
+            if not self._capture_echo_settle_started:
+                # The physical AEC has a short convergence transient when its
+                # reference stream first becomes audible. Never send that
+                # speaker-only onset to provider VAD: it otherwise interrupts
+                # the response that caused it. Timestamps and sender cadence
+                # continue with silence, and later full-duplex capture remains
+                # unchanged.
+                self._capture_echo_settle_started = True
+                self.input_track.suppress_capture_for_playback_settle()
             self._start_receiver_quiet_window()
             if not self._media_generation_open:
                 self._generation += 1

@@ -27,6 +27,8 @@ NATIVE_CONVERSATION_MODE = "native"
 BRIDGE_PCM_TRANSPORT = "bridge_pcm"
 DEVICE_WEBRTC_TRANSPORT = "device_webrtc"
 SUPPORTED_MEDIA_TRANSPORTS = frozenset({BRIDGE_PCM_TRANSPORT, DEVICE_WEBRTC_TRANSPORT})
+DEFAULT_IDLE_TIMEOUT_SECONDS = 120.0
+DEFAULT_MAX_SESSION_SECONDS = 900.0
 DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
 MAX_REALTIME_VOLUME_PERCENT = 60
@@ -420,14 +422,14 @@ def load_config(
         idle_timeout_seconds=_bounded_float(
             decoded,
             "idle_timeout_seconds",
-            default=45.0,
+            default=DEFAULT_IDLE_TIMEOUT_SECONDS,
             minimum=5.0,
             maximum=120.0,
         ),
         max_session_seconds=_bounded_float(
             decoded,
             "max_session_seconds",
-            default=300.0,
+            default=DEFAULT_MAX_SESSION_SECONDS,
             minimum=15.0,
             maximum=900.0,
         ),

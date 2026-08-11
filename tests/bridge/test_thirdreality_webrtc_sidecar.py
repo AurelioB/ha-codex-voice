@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiortc.codecs.opus import OpusEncoder
 
 from device.thirdreality.realtime_client.sidecar import (
     SidecarBackpressure,
@@ -570,15 +571,127 @@ async def test_capture_track_preserves_sample_clock_without_second_realtime_pace
         )
         assert track.sender_sample_cursor == 1_000
         first, second = await asyncio.gather(track.recv(), track.recv())
-        assert first.sample_rate == 16_000
-        assert first.samples == 320
+        assert first.sample_rate == 48_000
+        assert first.samples == 960
         assert first.pts == 0
-        assert second.pts == 320
-        assert first.time_base == second.time_base == Fraction(1, 16_000)
+        assert second.pts == 960
+        assert first.time_base == second.time_base == Fraction(1, 48_000)
         assert track.consumed_samples == 640
         assert track.latest_sample_end == 1_640
         assert track.consumed_sample_end == 1_640
         assert track.sender_sample_cursor == 1_640
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_capture_track_reframes_packets_into_single_payload_opus_frames() -> None:
+    consumed: list[int] = []
+    track = CaptureAudioTrack(on_consumed=consumed.append)
+    captured_at = time.monotonic_ns()
+    first_pcm = b"\x01\x00" * 1_024
+    second_pcm = b"\x02\x00" * 1_024
+    try:
+        track.feed(
+            CaptureAudio(
+                sample_index=1_000,
+                capture_monotonic_ns=captured_at,
+                pcm=first_pcm,
+            )
+        )
+        track.feed(
+            CaptureAudio(
+                sample_index=2_024,
+                capture_monotonic_ns=captured_at + 64_000_000,
+                pcm=second_pcm,
+            )
+        )
+
+        frames = [await track.recv() for _ in range(6)]
+
+        assert [frame.samples for frame in frames] == [960] * 6
+        assert [frame.sample_rate for frame in frames] == [48_000] * 6
+        assert [frame.pts for frame in frames] == list(range(0, 5_760, 960))
+        assert [frame.time_base for frame in frames] == [Fraction(1, 48_000)] * 6
+
+        source_pcm = first_pcm + second_pcm
+        for index, frame in enumerate(frames):
+            source_frame = source_pcm[index * 640 : (index + 1) * 640]
+            expected_pcm = b"".join(
+                source_frame[offset : offset + 2] * 3
+                for offset in range(0, len(source_frame), 2)
+            )
+            assert bytes(frame.planes[0])[:1_920] == expected_pcm
+
+        assert consumed == [320, 640, 960, 1_280, 1_600, 1_920]
+        assert track.consumed_samples == 1_920
+        assert track.latest_sample_end == 3_048
+        assert track.consumed_sample_end == 2_920
+        assert track.sender_sample_cursor == 2_920
+        assert track._queued_samples == 128
+
+        assert peer_module.aiortc is not None
+        assert peer_module.aiortc.__version__ == "1.15.0"
+        encoder = OpusEncoder()
+        encoded = [encoder.encode(frame) for frame in frames]
+        assert [len(payloads) for payloads, _timestamp in encoded] == [1] * 6
+        assert [timestamp for _payloads, timestamp in encoded] == list(
+            range(0, 5_760, 960)
+        )
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_capture_track_sends_silence_during_first_playback_aec_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [40_000_000_000]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    track = CaptureAudioTrack()
+    try:
+        track.feed(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=now[0] - 20_000_000,
+                pcm=b"\x04\x00" * 320,
+            )
+        )
+        track.suppress_capture_for_playback_settle()
+
+        pre_playback = await track.recv()
+
+        assert bytes(pre_playback.planes[0])[:1_920] == b"\x04\x00" * 960
+        assert pre_playback.pts == 0
+
+        now[0] += 1_000_000
+        track.feed(
+            CaptureAudio(
+                sample_index=320,
+                capture_monotonic_ns=now[0],
+                pcm=b"\x05\x00" * 320,
+            )
+        )
+        suppressed = await track.recv()
+
+        assert bytes(suppressed.planes[0])[:1_920] == bytes(1_920)
+        assert suppressed.pts == 960
+        assert track.consumed_samples == 640
+
+        now[0] += (peer_module.CAPTURE_ECHO_SETTLE_MILLISECONDS + 1) * 1_000_000
+        track.feed(
+            CaptureAudio(
+                sample_index=640,
+                capture_monotonic_ns=now[0],
+                pcm=b"\x06\x00" * 320,
+            )
+        )
+
+        audible = await track.recv()
+
+        assert bytes(audible.planes[0])[:1_920] == b"\x06\x00" * 960
+        assert audible.pts == 1_920
+        assert track.consumed_samples == 960
     finally:
         track.stop()
 
@@ -705,7 +818,8 @@ async def test_capture_track_accepts_exact_age_bound_at_rtp_consumption(
 
         frame = await track.recv()
 
-        assert frame.samples == 320
+        assert frame.samples == 960
+        assert frame.sample_rate == 48_000
         assert track.consumed_samples == 320
     finally:
         track.stop()
@@ -810,6 +924,10 @@ def _fake_device_peer(
 
     monkeypatch.setattr(peer_module, "RTCConfiguration", Configuration)
     monkeypatch.setattr(peer_module, "RTCPeerConnection", FakePeerConnection)
+    # Most protocol tests use tiny integers as readable stand-ins for audible
+    # PCM. Dedicated signal-gate regressions below restore production bounds.
+    monkeypatch.setattr(peer_module, "PLAYBACK_SIGNAL_PEAK", 1)
+    monkeypatch.setattr(peer_module, "PLAYBACK_SIGNAL_RMS", 1)
     if emit_lifecycle is None:
 
         def lifecycle_emitter(value: dict[str, str | int]) -> None:
@@ -1147,6 +1265,71 @@ async def test_peer_exact_zero_pcm_waits_for_first_signal(
         await _close_audio_peer(peer, task)
 
 
+@pytest.mark.parametrize(
+    ("pcm", "expected"),
+    [
+        (b"", False),
+        (b"\x00\x00" * 480, False),
+        (b"\x01\x00" * 480, False),
+        (b"\x3f\x00" * 480, False),
+        (b"\x40\x00" + b"\x00\x00" * 63, True),
+        (b"\x40\x00" * 480, True),
+        (b"\x40", False),
+    ],
+)
+def test_playback_signal_gate_rejects_subaudible_decode_residue(
+    pcm: bytes,
+    expected: bool,
+) -> None:
+    assert peer_module._pcm_has_playback_signal(pcm) is expected
+
+
+@pytest.mark.asyncio
+async def test_peer_subaudible_pcm_waits_for_first_audible_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    settle_observations: list[list[tuple[str, Any]]] = []
+    monkeypatch.setattr(
+        peer.input_track,
+        "suppress_capture_for_playback_settle",
+        lambda: settle_observations.append(list(emitted)),
+    )
+    monkeypatch.setattr(peer_module, "PLAYBACK_SIGNAL_PEAK", 64)
+    monkeypatch.setattr(peer_module, "PLAYBACK_SIGNAL_RMS", 8)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        for pts in range(0, 1_920, 480):
+            track.frames.put_nowait(_remote_frame(4, pts=pts))
+        await _wait_for(lambda: track.received == 4)
+
+        assert emitted == []
+        assert settle_observations == []
+        assert peer._generation == 0
+        assert not peer._media_generation_open
+
+        track.frames.put_nowait(_remote_frame(128, pts=1_920))
+        await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
+
+        assert emitted == [
+            ("lifecycle", {"event_type": "media.started", "generation": 1}),
+            (
+                "playback",
+                PlaybackAudio(
+                    generation=1,
+                    sample_index=0,
+                    media_timestamp=1_920,
+                    pcm=b"\x80\x00" * 480,
+                ),
+            ),
+        ]
+        assert settle_observations == [[]]
+    finally:
+        await _close_audio_peer(peer, task)
+
+
 @pytest.mark.asyncio
 async def test_peer_retains_rtp_tail_after_provider_output_stopped(
     monkeypatch: pytest.MonkeyPatch,
@@ -1215,6 +1398,12 @@ async def test_peer_receiver_quiet_gap_starts_next_media_generation(
     monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
     monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
     peer, emitted = _fake_device_peer(monkeypatch)
+    settle_calls: list[None] = []
+    monkeypatch.setattr(
+        peer.input_track,
+        "suppress_capture_for_playback_settle",
+        lambda: settle_calls.append(None),
+    )
     track = QueuedRemoteTrack()
     task = asyncio.create_task(peer._consume_remote_audio(track))
     try:
@@ -1250,6 +1439,7 @@ async def test_peer_receiver_quiet_gap_starts_next_media_generation(
             (1, 0),
             (2, 480),
         ]
+        assert settle_calls == [None]
     finally:
         await _close_audio_peer(peer, task)
 
@@ -1301,6 +1491,58 @@ async def test_peer_exact_zero_pcm_does_not_extend_open_media_generation(
         if zero_feeder is not None:
             zero_feeder.cancel()
             await asyncio.gather(zero_feeder, return_exceptions=True)
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_continuous_subaudible_pcm_does_not_extend_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.05)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    monkeypatch.setattr(peer_module, "PLAYBACK_SIGNAL_PEAK", 64)
+    monkeypatch.setattr(peer_module, "PLAYBACK_SIGNAL_RMS", 8)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    residue_feeder: asyncio.Task[None] | None = None
+    try:
+        track.frames.put_nowait(_remote_frame(128, pts=0))
+        await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
+
+        async def feed_continuous_residue() -> None:
+            for pts in range(480, 96_480, 480):
+                track.frames.put_nowait(_remote_frame(4, pts=pts))
+                await asyncio.sleep(0.005)
+
+        residue_feeder = asyncio.create_task(feed_continuous_residue())
+        await _wait_for(lambda: track.received >= 2)
+        await _wait_for(
+            lambda: any(
+                kind == "lifecycle" and value["event_type"] == "media.quiet"
+                for kind, value in emitted
+            )
+        )
+
+        assert not residue_feeder.done()
+        assert not peer._media_generation_open
+        assert [
+            (value["event_type"], value["generation"])
+            for kind, value in emitted
+            if kind == "lifecycle"
+        ] == [("media.started", 1), ("media.quiet", 1)]
+        assert [value for kind, value in emitted if kind == "playback"] == [
+            PlaybackAudio(
+                generation=1,
+                sample_index=0,
+                media_timestamp=0,
+                pcm=b"\x80\x00" * 480,
+            )
+        ]
+    finally:
+        if residue_feeder is not None:
+            residue_feeder.cancel()
+            await asyncio.gather(residue_feeder, return_exceptions=True)
         await _close_audio_peer(peer, task)
 
 
@@ -1387,8 +1629,11 @@ async def _consume_queued_capture(
     *,
     samples: int,
 ) -> None:
-    frame = await peer.input_track.recv()
-    assert frame.samples == samples
+    assert samples % peer_module.CAPTURE_FRAME_SAMPLES == 0
+    for _ in range(samples // peer_module.CAPTURE_FRAME_SAMPLES):
+        frame = await peer.input_track.recv()
+        assert frame.samples == peer_module.CAPTURE_RTP_FRAME_SAMPLES
+        assert frame.sample_rate == peer_module.CAPTURE_RTP_SAMPLE_RATE
 
 
 async def _prime_capture_sender(
@@ -1438,7 +1683,7 @@ async def test_peer_overdue_deadline_wins_after_event_loop_stall(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         assert fence.capture_complete
 
@@ -1487,7 +1732,7 @@ async def test_peer_lifecycle_emission_failure_seals_fence_until_timeout(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
 
         await _wait_for(lambda: ("fatal", "lifecycle_output_failed") in emitted)
@@ -1536,7 +1781,7 @@ async def test_peer_successful_fenced_write_commits_before_deadline_overrun(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
 
         await _wait_for(lambda: _has_fenced(emitted))
@@ -1574,7 +1819,7 @@ async def test_peer_latched_fatal_wins_over_already_awakened_fence(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await _wait_for(barrier_entered.is_set)
 
@@ -1642,7 +1887,7 @@ async def test_peer_counts_receiver_activity_before_buffering_resampler_output(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
 
         await asyncio.sleep(0.03)
@@ -1678,7 +1923,7 @@ async def test_peer_fence_discards_pre_fence_resampler_tail(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await _wait_for(lambda: _has_fenced(emitted))
 
@@ -1716,7 +1961,7 @@ async def test_peer_fence_replaces_retained_pinned_jitter_buffer(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await _wait_for(lambda: _has_fenced(emitted))
 
@@ -1764,10 +2009,10 @@ async def test_peer_receiver_drain_barrier_processes_queued_ready_rtp_while_mute
         _feed_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
 
-        await _consume_queued_capture(peer, samples=3_680)
+        await _consume_queued_capture(peer, samples=3_840)
         assert peer._muted
         assert not _has_fenced(emitted)
 
@@ -1811,7 +2056,7 @@ async def test_peer_decoder_thread_production_during_loop_stall_resets_fence(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await _wait_for(barrier_requested.is_set)
 
@@ -1874,7 +2119,7 @@ async def test_peer_decoder_thread_terminal_during_loop_stall_never_fences(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await _wait_for(barrier_requested.is_set)
 
@@ -1919,7 +2164,7 @@ async def test_peer_terminal_decoder_queue_blocks_fence_until_timeout(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
 
         await _wait_for(lambda: ("fatal", "media_fence_timeout") in emitted)
@@ -1972,7 +2217,7 @@ async def test_peer_inflight_decoder_work_must_finish_before_fence(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
 
         await asyncio.sleep(0.04)
@@ -2002,15 +2247,15 @@ async def test_peer_capture_timeout_when_progress_stops_before_token_watermark(
         # The first queued sample is then the sender cursor, not an unavailable
         # proof, while the full pre-token queue remains the watermark.
         next_sample_index = 8_000
-        _feed_capture(peer, sample_index=next_sample_index, samples=4_000)
-        _feed_capture(peer, sample_index=next_sample_index + 4_000, samples=2_000)
+        _feed_capture(peer, sample_index=next_sample_index, samples=3_840)
+        _feed_capture(peer, sample_index=next_sample_index + 3_840, samples=1_920)
         peer.interrupt_response()
         fence = peer._fence
         assert fence is not None
-        assert fence.required_consumed_end == next_sample_index + 6_000
+        assert fence.required_consumed_end == next_sample_index + 5_760
 
-        await _consume_queued_capture(peer, samples=4_000)
-        assert peer.input_track.consumed_sample_end == next_sample_index + 4_000
+        await _consume_queued_capture(peer, samples=3_840)
+        assert peer.input_track.consumed_sample_end == next_sample_index + 3_840
         assert not fence.capture_complete
         await _wait_for(lambda: ("fatal", "media_fence_capture_timeout") in emitted)
 
@@ -2031,7 +2276,7 @@ async def test_peer_local_interrupt_requires_guard_quiet_and_capture_progress(
     task = asyncio.create_task(peer._consume_remote_audio(track))
     try:
         next_sample_index = await _prime_capture_sender(peer)
-        _feed_capture(peer, sample_index=next_sample_index, samples=2_000)
+        _feed_capture(peer, sample_index=next_sample_index, samples=2_240)
         peer.data_channel.readyState = "closed"
         peer.interrupt_response()
         assert peer.data_channel.sent == []
@@ -2042,16 +2287,16 @@ async def test_peer_local_interrupt_requires_guard_quiet_and_capture_progress(
         # Provider lifecycle is observational only on the live Frameless
         # surface and cannot replace actual outbound microphone progress.
         _provider_event(peer, type="input_audio_buffer.speech_started")
-        await _consume_queued_capture(peer, samples=2_000)
-        assert peer.input_track.consumed_samples == 2_320
+        await _consume_queued_capture(peer, samples=2_240)
+        assert peer.input_track.consumed_samples == 2_560
         assert not _has_fenced(emitted)
 
         await _consume_capture(
             peer,
-            sample_index=next_sample_index + 2_000,
-            samples=2_000,
+            sample_index=next_sample_index + 2_240,
+            samples=2_240,
         )
-        assert peer.input_track.consumed_samples == 4_320
+        assert peer.input_track.consumed_samples == 4_800
         await _wait_for(lambda: _has_fenced(emitted))
         assert [
             value["event_type"] for kind, value in emitted if kind == "lifecycle"
@@ -2089,7 +2334,7 @@ async def test_peer_interrupt_requires_fresh_guard_after_preexisting_rtp_quiet(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await asyncio.sleep(0.025)
         assert not _has_fenced(emitted)
@@ -2128,7 +2373,7 @@ async def test_peer_late_rtp_resets_fence_quiet_and_preserves_media_sequence(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         await asyncio.sleep(0.015)
         track.frames.put_nowait(_remote_frame(11, pts=480))
@@ -2178,7 +2423,7 @@ async def test_peer_continuous_rtp_hits_fixed_timeout_and_stays_muted(
         await _consume_capture(
             peer,
             sample_index=next_sample_index + 320,
-            samples=3_680,
+            samples=3_840,
         )
         deadline = asyncio.get_running_loop().time() + 0.07
         pts = 0
