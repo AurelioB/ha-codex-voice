@@ -32,6 +32,8 @@ DEFAULT_MAX_SESSION_SECONDS = 900.0
 DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
 MAX_REALTIME_VOLUME_PERCENT = 60
+DEFAULT_DIRECT_CAPTURE_GAIN_DB = 0.0
+MAX_DIRECT_CAPTURE_GAIN_DB = 12.0
 # Retained for source compatibility. JSON configurations may also keep using
 # ``aec_test_volume_percent`` as an unambiguous legacy alias for both new
 # settings.
@@ -68,6 +70,7 @@ _ALLOWED_KEYS = frozenset(
         "aec_test_volume_percent",
         "aec_sink_volume_ceiling_percent",
         "playback_volume_percent",
+        "direct_capture_gain_db",
     }
 )
 
@@ -110,6 +113,10 @@ class RealtimeConfig:
     aec_test_volume_percent: int = DEFAULT_AEC_TEST_VOLUME_PERCENT
     aec_sink_volume_ceiling_percent: int = field(default=cast(int, _VOLUME_UNSET))
     playback_volume_percent: int = field(default=cast(int, _VOLUME_UNSET))
+    direct_capture_gain_db: float = field(
+        default=DEFAULT_DIRECT_CAPTURE_GAIN_DB,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         """Keep direct construction as strict as the root-only JSON loader."""
@@ -133,6 +140,29 @@ class RealtimeConfig:
             raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
         if self.media_transport == DEVICE_WEBRTC_TRANSPORT and not self.full_duplex:
             raise ConfigError("device_webrtc media transport requires full_duplex")
+        capture_gain = self.direct_capture_gain_db
+        if (
+            isinstance(capture_gain, bool)
+            or not isinstance(capture_gain, (int, float))
+            or not 0.0 <= float(capture_gain) <= MAX_DIRECT_CAPTURE_GAIN_DB
+        ):
+            raise ConfigError(
+                "direct_capture_gain_db must be a number from 0 through "
+                f"{MAX_DIRECT_CAPTURE_GAIN_DB:g}"
+            )
+        normalized_capture_gain = float(capture_gain)
+        if (
+            self.media_transport != DEVICE_WEBRTC_TRANSPORT
+            and normalized_capture_gain != DEFAULT_DIRECT_CAPTURE_GAIN_DB
+        ):
+            raise ConfigError(
+                "direct_capture_gain_db requires device_webrtc media transport"
+            )
+        object.__setattr__(
+            self,
+            "direct_capture_gain_db",
+            normalized_capture_gain,
+        )
         if self.wake_probability_cutoff is not None:
             cutoff = self.wake_probability_cutoff
             if (
@@ -378,6 +408,20 @@ def load_config(
         raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
     if media_transport == DEVICE_WEBRTC_TRANSPORT and not full_duplex:
         raise ConfigError("device_webrtc media transport requires full_duplex")
+    direct_capture_gain_db = _bounded_float(
+        decoded,
+        "direct_capture_gain_db",
+        default=DEFAULT_DIRECT_CAPTURE_GAIN_DB,
+        minimum=0.0,
+        maximum=MAX_DIRECT_CAPTURE_GAIN_DB,
+    )
+    if (
+        media_transport != DEVICE_WEBRTC_TRANSPORT
+        and direct_capture_gain_db != DEFAULT_DIRECT_CAPTURE_GAIN_DB
+    ):
+        raise ConfigError(
+            "direct_capture_gain_db requires device_webrtc media transport"
+        )
     pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
     pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
     pulse_aec_method = _optional_pulse_aec_method(decoded)
@@ -499,6 +543,7 @@ def load_config(
         max_message_bytes=max_message_bytes,
         full_duplex=full_duplex,
         media_transport=media_transport,
+        direct_capture_gain_db=direct_capture_gain_db,
         realtime_only=realtime_only,
         wake_probability_cutoff=wake_probability_cutoff,
         voice=voice,

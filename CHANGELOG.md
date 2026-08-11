@@ -7,6 +7,10 @@ and releases use semantic versioning.
 
 ### Added
 
+- Add explicit `direct_capture_gain_db` tuning for device-WebRTC microphone
+  RTP, defaulting to 0 dB and bounded to 0–12 dB. Gain uses saturating PCM16,
+  leaves wake/Assist/local-barge audio unchanged, and reports only bounded
+  post-gain peak/RMS and clipping counts for acoustic qualification.
 - Add a reversible ThirdReality `realtime_only` wake policy. It permits Okay
   Nabu to replace the normal Assist wake, ignores every non-matching detector,
   disables buffered v2 Assist fallback, and fails closed if guarded realtime
@@ -106,6 +110,15 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Answer Codex App Server's client-owned `currentTime/read` callback with whole
+  Unix seconds, so realtime voice can complete clock questions instead of
+  stopping after its acknowledgement. Unexpected runtime tool requests now
+  end a tool-free direct session after their fail-closed response rather than
+  leaving its device owner live indefinitely.
+- Release terminal ThirdReality realtime owners before routing the next wake,
+  and stop ambient capture or signal-free decoded RTP from renewing semantic
+  idle time. Live owners remain protected from duplicate wake detections while
+  stalled sessions can return the microphone and LED to idle.
 - Restore and verify the configured direct-playback sink volume before the
   complete AEC topology preflight. Home Assistant TTS could leave the shared
   dedicated AEC sink at 70%, causing every later 60%-ceiling Okay Computer

@@ -299,6 +299,12 @@ expected 16 kHz mono endpoints is only a topology canary. A prior v2
 bridge-PCM deployment passed a bounded 25% echo-residual and staged double-talk
 canary. V3 now has the reference-device double-interruption result summarized
 above, but has not completed every item in the documented physical acceptance matrix.
+Direct v3 also supports an explicit `direct_capture_gain_db` value from 0
+through 12 dB, defaulting to 0. It applies saturating fixed gain only to
+outbound WebRTC microphone PCM and is rejected on the bridge-PCM route. Use it
+only after level telemetry and a physical canary establish that provider VAD is
+missing low-level speech; begin at 6 dB and requalify echo rejection and
+barge-in rather than enabling automatic gain control.
 The v3 sink ceiling and playback setting default to 25% and permit an explicit
 maximum of 60%, with playback rejected above the ceiling. Physical echo and
 early/middle/late double-talk tests must pass at the configured operational

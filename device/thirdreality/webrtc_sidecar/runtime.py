@@ -27,6 +27,10 @@ class PeerLike(Protocol):
         """Return one gathered device SDP offer."""
         ...
 
+    def set_capture_gain_db(self, value: float) -> None:
+        """Configure outbound microphone gain before offer creation."""
+        ...
+
     async def set_answer(self, sdp: str) -> None:
         """Apply one remote SDP answer."""
         ...
@@ -86,6 +90,7 @@ class SidecarRuntime:
         return self._peer_factory(
             emit_lifecycle=self._emit_lifecycle,
             emit_playback=self._emit_playback,
+            emit_capture_metrics=self._emit_capture_metrics,
             emit_state=self._emit_state,
             emit_fatal=self._fail,
         )
@@ -170,7 +175,10 @@ class SidecarRuntime:
                 self._stopped = False
             if self._offer_created:
                 raise RuntimeErrorCode("offer_state_invalid")
+            gain_db = message.values.get("direct_capture_gain_db", 0.0)
+            assert isinstance(gain_db, (int, float)) and not isinstance(gain_db, bool)
             try:
+                self._peer.set_capture_gain_db(float(gain_db))
                 sdp = await self._peer.create_offer()
             except Exception as exc:
                 raise RuntimeErrorCode("offer_failed") from exc
@@ -223,6 +231,15 @@ class SidecarRuntime:
 
     def _emit_playback(self, value: PlaybackAudio) -> None:
         self._send(encode_playback_audio(value))
+
+    def _emit_capture_metrics(self, values: dict[str, int]) -> None:
+        # Optional diagnostics are deliberately lossy. A full parent socket
+        # must not turn clipping telemetry into a fatal media-path failure.
+        packet = encode_control("capture.metrics", **values)
+        try:
+            self._transport.send(packet)
+        except (BlockingIOError, OSError):
+            return
 
     def _emit_state(self, state: str) -> None:
         if state not in {"connected", "data.ready"}:

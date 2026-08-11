@@ -6,6 +6,7 @@ import json
 import re
 import struct
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 WIRE_VERSION = 1
@@ -28,7 +29,7 @@ _RTP_STARTED_LIFECYCLE_TYPES = frozenset(
     {"capture.rtp_started", "playback.rtp_started"}
 )
 _INTERNAL_LIFECYCLE_TYPES = (
-    frozenset({"media.started", "media.quiet", "interrupt.fenced"})
+    frozenset({"media.started", "media.quiet", "interrupt.fenced", "capture.metrics"})
     | _RTP_STARTED_LIFECYCLE_TYPES
 )
 _PARENT_CONTROL_TYPES = frozenset(
@@ -47,6 +48,7 @@ _CHILD_CONTROL_TYPES = frozenset(
         "connected",
         "data.ready",
         "lifecycle",
+        "capture.metrics",
         "stopped",
         "shutdown.complete",
         "error",
@@ -64,7 +66,7 @@ class ControlMessage:
     """One validated JSON control packet."""
 
     type: str
-    values: dict[str, str | int | bool]
+    values: dict[str, str | int | bool | float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +91,10 @@ class PlaybackAudio:
 Packet = ControlMessage | CaptureAudio | PlaybackAudio
 
 
-def encode_control(message_type: str, **values: str | int | bool) -> bytes:
+def encode_control(
+    message_type: str,
+    **values: str | int | bool | float,
+) -> bytes:
     """Encode one allowlisted, bounded control message."""
     _validate_control(message_type, values)
     body = json.dumps(
@@ -242,9 +247,12 @@ def _decode_control(packet: bytes) -> ControlMessage:
     message_type = decoded.pop("type", None)
     if not isinstance(message_type, str):
         raise ProtocolError("sidecar control packet has no valid type")
-    values: dict[str, str | int | bool] = {}
+    values: dict[str, str | int | bool | float] = {}
     for key, value in decoded.items():
-        if not isinstance(key, str) or not isinstance(value, (str, int, bool)):
+        if not isinstance(key, str) or not isinstance(
+            value,
+            (str, int, bool, float),
+        ):
             raise ProtocolError("sidecar control packet has an invalid field")
         values[key] = value
     _validate_control(message_type, values)
@@ -282,12 +290,12 @@ def _decode_audio(packet: bytes) -> CaptureAudio | PlaybackAudio:
 
 def _validate_control(
     message_type: str,
-    values: dict[str, str | int | bool],
+    values: dict[str, str | int | bool | float],
 ) -> None:
     if message_type not in _CONTROL_TYPES:
         raise ProtocolError("sidecar control type is not allowed")
     allowed: dict[str, frozenset[str]] = {
-        "create_offer": frozenset(),
+        "create_offer": frozenset({"direct_capture_gain_db"}),
         "set_answer": frozenset({"sdp"}),
         "response.interrupt": frozenset(),
         "stop": frozenset(),
@@ -312,12 +320,22 @@ def _validate_control(
                 "error_param",
             }
         ),
+        "capture.metrics": frozenset(
+            {
+                "post_gain_max_peak",
+                "post_gain_max_rms",
+                "clipped_samples",
+                "clipped_frames",
+            }
+        ),
         "stopped": frozenset(),
         "shutdown.complete": frozenset(),
         "error": frozenset({"code"}),
     }
     if set(values) - allowed[message_type]:
         raise ProtocolError("sidecar control packet contains an unexpected field")
+    if "direct_capture_gain_db" in values:
+        _validate_capture_gain(values["direct_capture_gain_db"])
     if message_type in {"set_answer", "offer"}:
         sdp = values.get("sdp")
         if not isinstance(sdp, str) or not sdp or len(sdp) > MAX_SDP_CHARACTERS:
@@ -326,6 +344,8 @@ def _validate_control(
         raise ProtocolError("sidecar response identifier is invalid")
     if message_type == "error" and _safe_token(values.get("code")) is None:
         raise ProtocolError("sidecar error code is invalid")
+    if message_type == "capture.metrics":
+        _validate_capture_metrics(values, allowed[message_type])
     if message_type == "lifecycle":
         event_type = _safe_token(values.get("event_type"))
         if event_type is None:
@@ -359,6 +379,40 @@ def _validate_control(
                     or not 0 <= value <= 0xFFFFFFFF
                 ):
                     raise ProtocolError("sidecar lifecycle generation is invalid")
+
+
+def _validate_capture_gain(value: str | int | bool | float) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(float(value))
+        or not 0.0 <= float(value) <= 12.0
+    ):
+        raise ProtocolError("sidecar capture gain is invalid")
+
+
+def _validate_capture_metrics(
+    values: dict[str, str | int | bool | float],
+    required: frozenset[str],
+) -> None:
+    if set(values) != required:
+        raise ProtocolError("sidecar capture metrics have invalid fields")
+    for key in ("post_gain_max_peak", "post_gain_max_rms"):
+        value = values[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 32_768
+        ):
+            raise ProtocolError("sidecar capture level is invalid")
+    for key in ("clipped_samples", "clipped_frames"):
+        value = values[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 0xFFFFFFFF
+        ):
+            raise ProtocolError("sidecar capture clipping count is invalid")
 
 
 def _validate_pcm(pcm: bytes, *, maximum: int, name: str) -> None:

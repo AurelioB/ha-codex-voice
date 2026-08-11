@@ -228,6 +228,7 @@ class _FakeSidecar:
         self.ipc_sent: list[tuple[str, bytes | None]] = []
         self.interruptions = 0
         self.offer_requests = 0
+        self.offer_capture_gains: list[float] = []
         self.stop_count = 0
         self.fail_stop = False
         self.close_timeouts: list[float] = []
@@ -246,8 +247,9 @@ class _FakeSidecar:
             self._incoming.append(message)
             self._condition.notify_all()
 
-    def request_offer(self) -> None:
+    def request_offer(self, *, direct_capture_gain_db: float = 0.0) -> None:
         self.offer_requests += 1
+        self.offer_capture_gains.append(direct_capture_gain_db)
         self.feed(
             ControlMessage(
                 "offer",
@@ -646,8 +648,9 @@ def test_direct_player_restores_sink_volume_before_complete_aec_preflight(
 def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, connection, sidecar, _player, _sidecars = _start_direct_session(
-        monkeypatch
+    session, connection, sidecar, _player, sidecars = _start_direct_session(
+        monkeypatch,
+        direct_capture_gain_db=6.0,
     )
     frame = b"\x01\x00" * 1_024
 
@@ -658,6 +661,7 @@ def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     assert sample_index == 0
     assert captured_ns > 0
     assert not connection.binary_sent
+    assert all(item.offer_capture_gains == [6.0] for item in sidecars)
 
     session.stop()
     assert session.join(1.0)
@@ -729,6 +733,55 @@ def test_direct_capture_signal_does_not_extend_idle_timeout_but_lifecycle_does(
     assert session.join(1.0)
     assert session.state is SessionState.FAILED
     assert diagnostics.capture_signal_frames == 8
+
+
+def test_direct_silent_playback_and_noop_session_events_do_not_extend_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    session, _connection, sidecar, player, _sidecars = _start_direct_session(
+        monkeypatch,
+        clock=lambda: now[0],
+        idle_timeout_seconds=5.0,
+        max_session_seconds=100.0,
+        ping_interval_seconds=60.0,
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: ("begin", 1) in player.events)
+
+    for index, timestamp in enumerate(range(11, 15)):
+        now[0] = float(timestamp)
+        sidecar.feed(
+            PlaybackAudio(
+                generation=1,
+                sample_index=index * 4,
+                media_timestamp=index * 4,
+                pcm=bytes(8),
+            )
+        )
+        sidecar.feed(
+            ControlMessage(
+                "lifecycle",
+                {"event_type": "session.updated", "generation": 1},
+            )
+        )
+        assert _wait_for(
+            lambda expected=index + 1: (
+                sum(event[0] == "audio" for event in player.events) == expected
+            )
+        )
+
+    # Media start at t=10 is semantic. Neither decoded RTP silence nor the
+    # recurring session bookkeeping events may move its t=15 idle deadline.
+    now[0] = 15.0
+    session._wake_network.set()
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
 
 
 def test_direct_session_logs_content_free_capture_and_playback_metrics(
@@ -923,7 +976,7 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
                 "direct_webrtc_status=ready" in message
                 for _priority, message in records
             )
-            == 5
+            == 6
         )
     )
     ready_records = [
@@ -932,7 +985,7 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
         if priority == session_module.syslog.LOG_INFO
         and "direct_webrtc_status=ready" in message
     ]
-    assert len(ready_records) == 5
+    assert len(ready_records) == 6
     assert {
         next(field for field in message.split() if field.startswith("record="))
         for message in ready_records
@@ -940,6 +993,7 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
         "record=state",
         "record=media",
         "record=levels",
+        "record=gain",
         "record=events_1",
         "record=events_2",
     }
@@ -986,6 +1040,17 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
             },
         )
     )
+    sidecar.feed(
+        ControlMessage(
+            "capture.metrics",
+            {
+                "post_gain_max_peak": 997,
+                "post_gain_max_rms": 500,
+                "clipped_samples": 3,
+                "clipped_frames": 1,
+            },
+        )
+    )
     assert _wait_for(lambda: len(sidecar.audio) == 1 and not sidecar._incoming)
 
     now[0] += session_module._DIRECT_SYSLOG_INTERVAL_SECONDS
@@ -1000,12 +1065,15 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
         for _priority, message in records
         if "direct_webrtc_status=waiting_output" in message
     ]
-    assert len(heartbeat_records) == 5
+    assert len(heartbeat_records) == 6
     heartbeat_media = next(
         message for message in heartbeat_records if "record=media" in message
     )
     heartbeat_levels = next(
         message for message in heartbeat_records if "record=levels" in message
+    )
+    heartbeat_gain = next(
+        message for message in heartbeat_records if "record=gain" in message
     )
     assert "capture_sent_packets=1" in heartbeat_media
     assert "capture_signal_frames=1" in heartbeat_media
@@ -1014,6 +1082,10 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
     assert "capture_max_rms=500" in heartbeat_levels
     assert "playback_max_peak=0" in heartbeat_levels
     assert "playback_max_rms=0" in heartbeat_levels
+    assert "post_gain_max_peak=997" in heartbeat_gain
+    assert "post_gain_max_rms=500" in heartbeat_gain
+    assert "clipped_samples=3" in heartbeat_gain
+    assert "clipped_frames=1" in heartbeat_gain
     heartbeat_events = "\n".join(
         message for message in heartbeat_records if "record=events_" in message
     )
@@ -1055,7 +1127,7 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
         for _priority, message in records
         if "direct_webrtc_status=terminal" in message
     ]
-    assert len(terminals) == 5
+    assert len(terminals) == 6
     terminal_state = next(message for message in terminals if "record=state" in message)
     terminal_media = next(message for message in terminals if "record=media" in message)
     terminal_levels = next(
@@ -1106,11 +1178,13 @@ def test_direct_syslog_failure_does_not_change_media_session_outcome(
         ("direct_webrtc_status=ready", "record=state"),
         ("direct_webrtc_status=ready", "record=media"),
         ("direct_webrtc_status=ready", "record=levels"),
+        ("direct_webrtc_status=ready", "record=gain"),
         ("direct_webrtc_status=ready", "record=events_1"),
         ("direct_webrtc_status=ready", "record=events_2"),
         ("direct_webrtc_status=terminal", "record=state"),
         ("direct_webrtc_status=terminal", "record=media"),
         ("direct_webrtc_status=terminal", "record=levels"),
+        ("direct_webrtc_status=terminal", "record=gain"),
         ("direct_webrtc_status=terminal", "record=events_1"),
         ("direct_webrtc_status=terminal", "record=events_2"),
     ]
@@ -1146,6 +1220,10 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
         "capture_max_peak",
         "capture_max_rms",
         "capture_signal_frames",
+        "post_gain_max_peak",
+        "post_gain_max_rms",
+        "clipped_samples",
+        "clipped_frames",
         "playback_signal_packets",
         "playback_signal_bytes",
         "playback_max_peak",
@@ -1172,7 +1250,7 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
         outcome="remote_stopped",
     )
 
-    assert len(records) == 5
+    assert len(records) == 6
     assert session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES == 220
     assert all(
         record.isascii()
@@ -1187,12 +1265,14 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
         "record=state",
         "record=media",
         "record=levels",
+        "record=gain",
         "record=events_1",
         "record=events_2",
     }
     state = next(record for record in records if "record=state" in record)
     media = next(record for record in records if "record=media" in record)
     levels = next(record for record in records if "record=levels" in record)
+    gain = next(record for record in records if "record=gain" in record)
     events = "\n".join(record for record in records if "record=events_" in record)
     assert "phase=unknown" in state
     assert "duration_ms=99999999" in state
@@ -1204,6 +1284,10 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
     assert "capture_max_rms=32768" in levels
     assert "playback_max_peak=32768" in levels
     assert "playback_max_rms=32768" in levels
+    assert "post_gain_max_peak=32768" in gain
+    assert "post_gain_max_rms=32768" in gain
+    assert "clipped_samples=99999999" in gain
+    assert "clipped_frames=99999999" in gain
     for event_type in (
         "capture.rtp_started",
         "playback.rtp_started",
@@ -1218,6 +1302,81 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
     ):
         assert f"{event_type}=999999" in events
     assert sensitive not in "\n".join(records)
+
+
+def test_direct_failure_record_allowlists_child_code_and_hides_unknown_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[str] = []
+    monkeypatch.setattr(
+        session_module.syslog,
+        "syslog",
+        lambda _priority, message: records.append(message),
+    )
+    session = RealtimeSession(_duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT))
+
+    known = session_module._DirectSessionDiagnostics(started_at=0.0)
+    session._direct_diagnostics = known
+    session._observe_direct_sidecar_message(
+        ControlMessage("error", {"code": "capture_rejected"})
+    )
+    session_module._emit_direct_syslog_status(
+        known,
+        status="terminal",
+        duration_ms=10,
+        outcome="failed",
+    )
+
+    sensitive = "private-transcript-shaped-error"
+    unknown = session_module._DirectSessionDiagnostics(started_at=0.0)
+    session._direct_diagnostics = unknown
+    session._observe_direct_sidecar_message(
+        ControlMessage("error", {"code": sensitive})
+    )
+    session_module._emit_direct_syslog_status(
+        unknown,
+        status="terminal",
+        duration_ms=10,
+        outcome="failed",
+    )
+
+    failures = [record for record in records if "record=failure" in record]
+    assert failures == [
+        (
+            "codex-voice direct_webrtc_status=terminal "
+            "record=failure code=capture_rejected"
+        ),
+        "codex-voice direct_webrtc_status=terminal record=failure code=unknown",
+    ]
+    assert sensitive not in "\n".join(records)
+
+
+def test_direct_provider_error_lifecycle_sets_failure_code_without_followup_batch() -> (
+    None
+):
+    session = RealtimeSession(_duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT))
+    diagnostics = session_module._DirectSessionDiagnostics(started_at=0.0)
+    session._direct_diagnostics = diagnostics
+    for _ in range(7):
+        session._observe_direct_sidecar_message(
+            ControlMessage(
+                "capture.metrics",
+                {
+                    "post_gain_max_peak": 0,
+                    "post_gain_max_rms": 0,
+                    "clipped_samples": 0,
+                    "clipped_frames": 0,
+                },
+            )
+        )
+    session._observe_direct_sidecar_message(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "error", "generation": 0},
+        )
+    )
+
+    assert diagnostics.failure_code == "provider_error"
 
 
 @pytest.mark.parametrize("boundary_name", ["stop", "interrupt"])

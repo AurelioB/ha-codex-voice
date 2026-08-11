@@ -11,6 +11,7 @@ from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from fractions import Fraction
+from math import isfinite, isqrt, pow
 from typing import Any
 
 from .protocol import CaptureAudio, PlaybackAudio, sanitize_provider_lifecycle
@@ -23,6 +24,8 @@ CAPTURE_RTP_FRAME_SAMPLES = (
     CAPTURE_RTP_SAMPLE_RATE * CAPTURE_FRAME_MILLISECONDS // 1_000
 )
 CAPTURE_ECHO_SETTLE_MILLISECONDS = 512
+MAX_CAPTURE_GAIN_DB = 12.0
+CAPTURE_METRICS_INTERVAL_FRAMES = 50
 _CAPTURE_RTP_RATE_MULTIPLIER = CAPTURE_RTP_SAMPLE_RATE // CAPTURE_SAMPLE_RATE
 _CAPTURE_FRAME_BYTES = CAPTURE_FRAME_SAMPLES * 2
 _CAPTURE_ECHO_SETTLE_NANOSECONDS = CAPTURE_ECHO_SETTLE_MILLISECONDS * 1_000_000
@@ -52,6 +55,69 @@ MEDIA_FENCE_RECEIVER_MAX_TICK_SLIP_SECONDS = 0.010
 # decoded RTP still advances the independent interruption fence below.
 PLAYBACK_SIGNAL_PEAK = 64
 PLAYBACK_SIGNAL_RMS = 8
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureFrameMetrics:
+    """Privacy-safe post-gain levels and saturation counts for one PCM frame."""
+
+    max_peak: int
+    rms: int
+    clipped_samples: int
+    clipped: bool
+
+
+def _apply_capture_gain_pcm16(
+    value: bytes | bytearray,
+    gain_db: float,
+) -> tuple[bytes, CaptureFrameMetrics]:
+    """Apply bounded PCM16 gain with symmetric truncation and saturation."""
+    if (
+        isinstance(gain_db, bool)
+        or not isinstance(gain_db, (int, float))
+        or not isfinite(float(gain_db))
+        or not 0.0 <= float(gain_db) <= MAX_CAPTURE_GAIN_DB
+    ):
+        raise ValueError("capture gain is outside its supported range")
+    if not value or len(value) % PCM_SAMPLE_WIDTH:
+        raise ValueError("capture gain requires non-empty aligned PCM16")
+
+    normalized_gain = float(gain_db)
+    gain = 1.0 if normalized_gain == 0.0 else pow(10.0, normalized_gain / 20.0)
+    output: bytes | bytearray
+    if normalized_gain == 0.0:
+        # Preserve the exact PCM bytes at unity gain; the scan below is only
+        # for content-free levels and never rewrites a sample.
+        output = bytes(value)
+    else:
+        output = bytearray(len(value))
+
+    peak = 0
+    energy = 0
+    clipped_samples = 0
+    for index, (sample,) in enumerate(struct.iter_unpack("<h", value)):
+        scaled = sample if normalized_gain == 0.0 else int(sample * gain)
+        if scaled > 32_767:
+            scaled = 32_767
+            clipped_samples += 1
+        elif scaled < -32_768:
+            scaled = -32_768
+            clipped_samples += 1
+        if isinstance(output, bytearray):
+            struct.pack_into("<h", output, index * PCM_SAMPLE_WIDTH, scaled)
+        magnitude = abs(scaled)
+        peak = max(peak, magnitude)
+        energy += scaled * scaled
+
+    sample_count = len(value) // PCM_SAMPLE_WIDTH
+    metrics = CaptureFrameMetrics(
+        max_peak=peak,
+        rms=isqrt(energy // sample_count),
+        clipped_samples=clipped_samples,
+        clipped=clipped_samples > 0,
+    )
+    return bytes(output), metrics
+
 
 try:
     import aiortc
@@ -112,6 +178,8 @@ class CaptureAudioTrack(MediaStreamTrack):
     def __init__(
         self,
         *,
+        capture_gain_db: float = 0.0,
+        on_metrics: Callable[[dict[str, int]], None] | None = None,
         on_consumed: Callable[[int], None] | None = None,
         on_fatal: Callable[[str], None] | None = None,
     ) -> None:
@@ -137,8 +205,17 @@ class CaptureAudioTrack(MediaStreamTrack):
         self._queued_samples = 0
         self._consumed_samples = 0
         self._consumed_sample_end: int | None = None
+        self._capture_gain_db = 0.0
+        self._metrics_frames = 0
+        self._metrics_max_peak = 0
+        self._metrics_max_rms = 0
+        self._metrics_clipped_samples = 0
+        self._metrics_clipped_frames = 0
+        self._total_metrics_frames = 0
+        self._on_metrics = on_metrics
         self._on_consumed = on_consumed
         self._on_fatal = on_fatal
+        self.set_capture_gain_db(capture_gain_db)
 
     @property
     def consumed_samples(self) -> int:
@@ -161,6 +238,19 @@ class CaptureAudioTrack(MediaStreamTrack):
         if self._consumed_sample_end is not None:
             return self._consumed_sample_end
         return self._first_sample_index
+
+    def set_capture_gain_db(self, value: float) -> None:
+        """Set bounded gain before capture is admitted to this fresh track."""
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(float(value))
+            or not 0.0 <= float(value) <= MAX_CAPTURE_GAIN_DB
+        ):
+            raise PeerError("capture gain is outside its supported range")
+        if self._first_sample_index is not None or self._source_frame_pcm:
+            raise PeerError("capture gain cannot change after capture starts")
+        self._capture_gain_db = float(value)
 
     def feed(self, value: CaptureAudio) -> None:
         """Queue one validated capture packet without blocking."""
@@ -215,21 +305,34 @@ class CaptureAudioTrack(MediaStreamTrack):
             # timestamp and one Opus payload. Deliberately do not add a pacer:
             # capture arrival is already live-clocked and immediate draining
             # minimizes microphone latency.
-            output_pcm = bytearray(CAPTURE_RTP_FRAME_SAMPLES * PCM_SAMPLE_WIDTH)
-            if not (
+            suppressed = (
                 self._suppress_capture_from_ns
                 <= capture_monotonic_ns
                 < self._suppress_capture_before_ns
-            ):
-                for source_offset in range(0, _CAPTURE_FRAME_BYTES, PCM_SAMPLE_WIDTH):
-                    output_offset = source_offset * _CAPTURE_RTP_RATE_MULTIPLIER
-                    sample = self._source_frame_pcm[
-                        source_offset : source_offset + PCM_SAMPLE_WIDTH
-                    ]
-                    output_pcm[
-                        output_offset : output_offset
-                        + PCM_SAMPLE_WIDTH * _CAPTURE_RTP_RATE_MULTIPLIER
-                    ] = sample * _CAPTURE_RTP_RATE_MULTIPLIER
+            )
+            if suppressed:
+                source_pcm = bytes(_CAPTURE_FRAME_BYTES)
+                source_metrics = CaptureFrameMetrics(
+                    max_peak=0,
+                    rms=0,
+                    clipped_samples=0,
+                    clipped=False,
+                )
+            else:
+                source_pcm, source_metrics = _apply_capture_gain_pcm16(
+                    self._source_frame_pcm,
+                    self._capture_gain_db,
+                )
+            self._observe_metrics(source_metrics)
+
+            output_pcm = bytearray(CAPTURE_RTP_FRAME_SAMPLES * PCM_SAMPLE_WIDTH)
+            for source_offset in range(0, _CAPTURE_FRAME_BYTES, PCM_SAMPLE_WIDTH):
+                output_offset = source_offset * _CAPTURE_RTP_RATE_MULTIPLIER
+                sample = source_pcm[source_offset : source_offset + PCM_SAMPLE_WIDTH]
+                output_pcm[
+                    output_offset : output_offset
+                    + PCM_SAMPLE_WIDTH * _CAPTURE_RTP_RATE_MULTIPLIER
+                ] = sample * _CAPTURE_RTP_RATE_MULTIPLIER
 
             assert AudioFrame is not None
             frame = AudioFrame(
@@ -255,6 +358,36 @@ class CaptureAudioTrack(MediaStreamTrack):
             if self._on_consumed is not None:
                 self._on_consumed(self._consumed_samples)
             return frame
+
+    def _observe_metrics(self, value: CaptureFrameMetrics) -> None:
+        """Emit bounded interval aggregates without copying or retaining PCM."""
+        self._metrics_frames += 1
+        self._total_metrics_frames += 1
+        self._metrics_max_peak = max(self._metrics_max_peak, value.max_peak)
+        self._metrics_max_rms = max(self._metrics_max_rms, value.rms)
+        self._metrics_clipped_samples += value.clipped_samples
+        if value.clipped:
+            self._metrics_clipped_frames += 1
+        if self._on_metrics is None:
+            return
+        if not (
+            self._total_metrics_frames == 1
+            or self._metrics_frames >= CAPTURE_METRICS_INTERVAL_FRAMES
+        ):
+            return
+        self._on_metrics(
+            {
+                "post_gain_max_peak": self._metrics_max_peak,
+                "post_gain_max_rms": self._metrics_max_rms,
+                "clipped_samples": self._metrics_clipped_samples,
+                "clipped_frames": self._metrics_clipped_frames,
+            }
+        )
+        self._metrics_frames = 0
+        self._metrics_max_peak = 0
+        self._metrics_max_rms = 0
+        self._metrics_clipped_samples = 0
+        self._metrics_clipped_frames = 0
 
     def suppress_capture_for_playback_settle(self) -> None:
         """Send silence for capture recorded during first-playback AEC settling."""
@@ -339,6 +472,7 @@ class CaptureAudioTrack(MediaStreamTrack):
 
 LifecycleEmitter = Callable[[dict[str, str | int]], None]
 PlaybackEmitter = Callable[[PlaybackAudio], None]
+CaptureMetricsEmitter = Callable[[dict[str, int]], None]
 StateEmitter = Callable[[str], None]
 FatalEmitter = Callable[[str], None]
 
@@ -605,6 +739,7 @@ class DeviceWebRtcPeer:
         *,
         emit_lifecycle: LifecycleEmitter,
         emit_playback: PlaybackEmitter,
+        emit_capture_metrics: CaptureMetricsEmitter,
         emit_state: StateEmitter,
         emit_fatal: FatalEmitter,
     ) -> None:
@@ -619,6 +754,7 @@ class DeviceWebRtcPeer:
             raise PeerError("WebRTC dependencies are unavailable") from _IMPORT_ERROR
         self._emit_lifecycle = emit_lifecycle
         self._emit_playback = emit_playback
+        self._emit_capture_metrics = emit_capture_metrics
         self._emit_state = emit_state
         self._emit_fatal = emit_fatal
         self._closed = False
@@ -645,6 +781,7 @@ class DeviceWebRtcPeer:
         self._consumer_tasks: set[asyncio.Task[None]] = set()
         self._ice_gathering_complete = asyncio.Event()
         self.input_track = CaptureAudioTrack(
+            on_metrics=self._safe_capture_metrics,
             on_consumed=self._note_capture_consumed,
             on_fatal=self._safe_fatal,
         )
@@ -719,6 +856,12 @@ class DeviceWebRtcPeer:
         if not isinstance(sdp, str) or not sdp:
             raise PeerError("WebRTC did not create an SDP offer")
         return sdp
+
+    def set_capture_gain_db(self, value: float) -> None:
+        """Configure gain while this peer is still a capture-free standby."""
+        if self._closed:
+            raise PeerError("WebRTC peer is closed")
+        self.input_track.set_capture_gain_db(value)
 
     async def set_answer(self, sdp: str) -> None:
         """Apply exactly one App Server SDP answer."""
@@ -1425,6 +1568,14 @@ class DeviceWebRtcPeer:
             self._safe_fatal("lifecycle_output_failed")
             return False
         return True
+
+    def _safe_capture_metrics(self, values: dict[str, int]) -> None:
+        if self._failed:
+            return
+        try:
+            self._emit_capture_metrics(values)
+        except Exception:  # noqa: BLE001 - diagnostics never own live media.
+            return
 
     def _safe_state(self, state: str) -> None:
         if self._failed:

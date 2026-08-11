@@ -6,6 +6,7 @@ import asyncio
 import json
 import queue as thread_queue
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -31,6 +32,7 @@ from device.thirdreality.webrtc_sidecar.peer import (
     DeviceWebRtcPeer,
     PeerBackpressure,
     PeerError,
+    _apply_capture_gain_pcm16,
 )
 from device.thirdreality.webrtc_sidecar.protocol import (
     CaptureAudio,
@@ -121,6 +123,40 @@ def test_ipc_exposes_interrupt_but_not_unsupported_provider_cancel() -> None:
         encode_control("response.cancel", response_id="resp_1")
 
 
+@pytest.mark.parametrize("gain_db", [0.0, 6.25, 12.0])
+def test_ipc_round_trips_strict_capture_gain(gain_db: float) -> None:
+    assert decode_packet(
+        encode_control("create_offer", direct_capture_gain_db=gain_db)
+    ) == ControlMessage(
+        type="create_offer",
+        values={"direct_capture_gain_db": gain_db},
+    )
+
+
+@pytest.mark.parametrize(
+    "gain_db",
+    [True, float("nan"), float("inf"), -0.01, 12.01],
+)
+def test_ipc_rejects_invalid_capture_gain(gain_db: object) -> None:
+    with pytest.raises(ProtocolError, match="capture gain"):
+        encode_control("create_offer", direct_capture_gain_db=gain_db)  # type: ignore[arg-type]
+
+
+def test_ipc_capture_metrics_have_one_bounded_content_free_shape() -> None:
+    values = {
+        "post_gain_max_peak": 32_768,
+        "post_gain_max_rms": 12_345,
+        "clipped_samples": 7,
+        "clipped_frames": 2,
+    }
+    assert decode_packet(encode_control("capture.metrics", **values)) == ControlMessage(
+        type="capture.metrics",
+        values=values,
+    )
+    with pytest.raises(ProtocolError, match="invalid fields"):
+        encode_control("capture.metrics", post_gain_max_peak=1)
+
+
 def test_provider_lifecycle_sanitizer_never_forwards_transcripts_or_arguments() -> None:
     lifecycle = sanitize_provider_lifecycle(
         json.dumps(
@@ -167,6 +203,7 @@ def test_provider_lifecycle_sanitizer_rejects_content_disguised_as_identifier() 
         "media.started",
         "media.quiet",
         "interrupt.fenced",
+        "capture.metrics",
     ],
 )
 def test_provider_lifecycle_sanitizer_rejects_internal_namespace_spoofing(
@@ -259,7 +296,7 @@ def test_launcher_uses_isolated_interpreter_and_explicit_runtime_path(
         client.request_offer()
         assert decode_packet(probe.recv(4096)) == ControlMessage(
             type="create_offer",
-            values={},
+            values={"direct_capture_gain_db": 0.0},
         )
         probe.send(encode_control("offer", sdp="v=0\r\n"))
         assert client.drain_messages() == [
@@ -354,17 +391,23 @@ class FakePeer:
         *,
         emit_lifecycle: Any,
         emit_playback: Any,
+        emit_capture_metrics: Any,
         emit_state: Any,
         emit_fatal: Any,
     ) -> None:
         self.emit_lifecycle = emit_lifecycle
         self.emit_playback = emit_playback
+        self.emit_capture_metrics = emit_capture_metrics
         self.emit_state = emit_state
         self.emit_fatal = emit_fatal
         self.captures: list[CaptureAudio] = []
         self.answers: list[str] = []
         self.interruptions = 0
         self.stop_count = 0
+        self.capture_gains: list[float] = []
+
+    def set_capture_gain_db(self, value: float) -> None:
+        self.capture_gains.append(value)
 
     async def create_offer(self) -> str:
         return "v=0\r\na=fake-offer\r\n"
@@ -405,12 +448,13 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
     try:
         await asyncio.get_running_loop().sock_sendall(
             parent,
-            encode_control("create_offer"),
+            encode_control("create_offer", direct_capture_gain_db=6.25),
         )
         assert await _recv_packet(parent) == ControlMessage(
             type="offer",
             values={"sdp": "v=0\r\na=fake-offer\r\n"},
         )
+        assert peers[0].capture_gains == [6.25]
 
         await asyncio.get_running_loop().sock_sendall(
             parent,
@@ -482,6 +526,7 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
         )
         assert len(peers) == 2
         assert peers[0].stop_count == 1
+        assert peers[1].capture_gains == [0.0]
         await asyncio.get_running_loop().sock_sendall(
             parent,
             encode_control("shutdown"),
@@ -615,6 +660,112 @@ async def test_capture_track_preserves_sample_clock_without_second_realtime_pace
         track.stop()
 
 
+def test_capture_gain_scales_signed_pcm_saturates_and_preserves_unity() -> None:
+    source = struct.pack("<hhhhh", 1_000, -1_000, 20_000, -20_000, 0)
+
+    unity, unity_metrics = _apply_capture_gain_pcm16(source, 0.0)
+    amplified, metrics = _apply_capture_gain_pcm16(source, 6.0)
+
+    assert unity == source
+    assert unity_metrics.clipped_samples == 0
+    assert struct.unpack("<hhhhh", amplified) == (
+        1_995,
+        -1_995,
+        32_767,
+        -32_768,
+        0,
+    )
+    assert metrics.max_peak == 32_768
+    assert metrics.clipped_samples == 2
+    assert metrics.clipped is True
+
+
+def test_capture_gain_preserves_exact_silence() -> None:
+    amplified, metrics = _apply_capture_gain_pcm16(bytes(640), 12.0)
+
+    assert amplified == bytes(640)
+    assert metrics.max_peak == 0
+    assert metrics.rms == 0
+    assert metrics.clipped_samples == 0
+    assert metrics.clipped is False
+
+
+def test_capture_metrics_are_rate_bounded_and_callback_failure_is_nonfatal() -> None:
+    emitted: list[dict[str, int]] = []
+    track = CaptureAudioTrack(on_metrics=emitted.append)
+    clipped = peer_module.CaptureFrameMetrics(
+        max_peak=32_768,
+        rms=20_000,
+        clipped_samples=10,
+        clipped=True,
+    )
+
+    for _ in range(10):
+        track._observe_metrics(clipped)
+
+    assert emitted == [
+        {
+            "post_gain_max_peak": 32_768,
+            "post_gain_max_rms": 20_000,
+            "clipped_samples": 10,
+            "clipped_frames": 1,
+        }
+    ]
+
+    fatal: list[str] = []
+    peer = object.__new__(DeviceWebRtcPeer)
+    peer._failed = False
+    peer._emit_capture_metrics = lambda _values: (_ for _ in ()).throw(BlockingIOError)
+    peer._emit_fatal = fatal.append
+    peer._safe_capture_metrics(emitted[0])
+
+    assert fatal == []
+    assert peer._failed is False
+
+
+@pytest.mark.asyncio
+async def test_capture_gain_applies_after_mixed_packet_frame_assembly() -> None:
+    metrics: list[dict[str, int]] = []
+    track = CaptureAudioTrack(capture_gain_db=6.0, on_metrics=metrics.append)
+    captured_at = time.monotonic_ns()
+    try:
+        # The first half models retained rollover preroll and the second half
+        # live capture. One sidecar frame assembly applies the same gain to both.
+        track.feed(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=captured_at,
+                pcm=(1_000).to_bytes(2, "little", signed=True) * 160,
+            )
+        )
+        track.feed(
+            CaptureAudio(
+                sample_index=160,
+                capture_monotonic_ns=captured_at + 10_000_000,
+                pcm=(-1_000).to_bytes(2, "little", signed=True) * 160,
+            )
+        )
+
+        frame = await track.recv()
+
+        assert bytes(frame.planes[0])[:960] == (
+            (1_995).to_bytes(2, "little", signed=True) * 480
+        )
+        assert bytes(frame.planes[0])[960:1_920] == (
+            (-1_995).to_bytes(2, "little", signed=True) * 480
+        )
+        assert metrics == [
+            {
+                "post_gain_max_peak": 1_995,
+                "post_gain_max_rms": 1_995,
+                "clipped_samples": 0,
+                "clipped_frames": 0,
+            }
+        ]
+    finally:
+        track.stop()
+
+
 @pytest.mark.asyncio
 async def test_capture_track_reframes_packets_into_single_payload_opus_frames() -> None:
     consumed: list[int] = []
@@ -679,7 +830,7 @@ async def test_capture_track_sends_silence_during_first_playback_aec_settle(
 ) -> None:
     now = [40_000_000_000]
     monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
-    track = CaptureAudioTrack()
+    track = CaptureAudioTrack(capture_gain_db=12.0)
     try:
         track.feed(
             CaptureAudio(
@@ -692,7 +843,7 @@ async def test_capture_track_sends_silence_during_first_playback_aec_settle(
 
         pre_playback = await track.recv()
 
-        assert bytes(pre_playback.planes[0])[:1_920] == b"\x04\x00" * 960
+        assert bytes(pre_playback.planes[0])[:1_920] == b"\x0f\x00" * 960
         assert pre_playback.pts == 0
 
         now[0] += 1_000_000
@@ -720,7 +871,7 @@ async def test_capture_track_sends_silence_during_first_playback_aec_settle(
 
         audible = await track.recv()
 
-        assert bytes(audible.planes[0])[:1_920] == b"\x06\x00" * 960
+        assert bytes(audible.planes[0])[:1_920] == b"\x17\x00" * 960
         assert audible.pts == 1_920
         assert track.consumed_samples == 960
     finally:
@@ -969,6 +1120,7 @@ def _fake_device_peer(
     peer = DeviceWebRtcPeer(
         emit_lifecycle=lifecycle_emitter,
         emit_playback=lambda value: emitted.append(("playback", value)),
+        emit_capture_metrics=lambda _value: None,
         emit_state=lambda value: emitted.append(("state", value)),
         emit_fatal=lambda value: emitted.append(("fatal", value)),
     )

@@ -96,6 +96,22 @@ _CONTROL_EVENTS = frozenset(
         "media.started",
     }
 )
+_DIRECT_SEMANTIC_LIFECYCLE_EVENTS = frozenset(
+    {
+        "input_audio_buffer.committed",
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "output_audio_buffer.started",
+        "output_audio_buffer.stopped",
+        "response.created",
+        "response.cancelled",
+        "response.done",
+        "speaking.started",
+        "speaking.stopped",
+        "turn.created",
+        "turn.done",
+    }
+)
 _DIRECT_DIAGNOSTIC_LIFECYCLE_EVENTS = _CONTROL_EVENTS | frozenset(
     {
         "capture.rtp_started",
@@ -122,6 +138,41 @@ _DIRECT_DIAGNOSTIC_PHASES = frozenset(
 _DIRECT_SYSLOG_STATUSES = frozenset({"ready", "waiting_output", "terminal"})
 _DIRECT_SYSLOG_OUTCOMES = frozenset(
     {"live", "failed", "interrupted", "stopped", "remote_stopped"}
+)
+_DIRECT_SIDECAR_FAILURE_CODES = frozenset(
+    {
+        "answer_failed",
+        "answer_state_invalid",
+        "capture_audio_stale",
+        "capture_metrics_output_failed",
+        "capture_outside_session",
+        "capture_rejected",
+        "connection_failed",
+        "control_direction_invalid",
+        "data_channel_closed",
+        "interrupt_failed",
+        "interrupt_state_invalid",
+        "ipc_send_failed",
+        "lifecycle_output_failed",
+        "media_fence_capture_timeout",
+        "media_fence_timeout",
+        "offer_failed",
+        "offer_state_invalid",
+        "output_backpressure",
+        "packet_direction_invalid",
+        "packet_too_large",
+        "partial_packet",
+        "peer_initialization_failed",
+        "protocol_error",
+        "provider_error",
+        "receiver_boundary_reset_failed",
+        "remote_audio_failed",
+        "state_invalid",
+        "state_output_failed",
+        "stop_failed",
+        "unexpected_media_track",
+        "unsupported_receiver_boundary",
+    }
 )
 _DIRECT_SYSLOG_INTERVAL_SECONDS = 5.0
 _DIRECT_SYSLOG_COUNTER_MAX = 99_999_999
@@ -190,11 +241,16 @@ class _DirectSessionDiagnostics:
     capture_max_peak: int = 0
     capture_max_rms: int = 0
     capture_signal_frames: int = 0
+    post_gain_max_peak: int = 0
+    post_gain_max_rms: int = 0
+    clipped_samples: int = 0
+    clipped_frames: int = 0
     playback_signal_packets: int = 0
     playback_signal_bytes: int = 0
     playback_max_peak: int = 0
     playback_max_rms: int = 0
     lifecycle_events: dict[str, int] = field(default_factory=dict)
+    failure_code: str | None = None
 
     def observe_peer_state(self, value: str) -> None:
         """Retain only the three fixed initial peer-readiness milestones."""
@@ -225,6 +281,34 @@ class _DirectSessionDiagnostics:
         self.playback_max_peak = max(self.playback_max_peak, peak)
         self.playback_max_rms = max(self.playback_max_rms, rms)
 
+    def observe_capture_metrics(
+        self,
+        values: dict[str, str | int | bool | float],
+    ) -> None:
+        """Merge one strict sidecar interval without retaining microphone PCM."""
+        peak = values.get("post_gain_max_peak")
+        rms = values.get("post_gain_max_rms")
+        clipped_samples = values.get("clipped_samples")
+        clipped_frames = values.get("clipped_frames")
+        if not all(
+            type(value) is int for value in (peak, rms, clipped_samples, clipped_frames)
+        ):
+            return
+        assert isinstance(peak, int)
+        assert isinstance(rms, int)
+        assert isinstance(clipped_samples, int)
+        assert isinstance(clipped_frames, int)
+        self.post_gain_max_peak = max(self.post_gain_max_peak, peak)
+        self.post_gain_max_rms = max(self.post_gain_max_rms, rms)
+        self.clipped_samples = min(
+            _DIRECT_SYSLOG_COUNTER_MAX,
+            self.clipped_samples + clipped_samples,
+        )
+        self.clipped_frames = min(
+            _DIRECT_SYSLOG_COUNTER_MAX,
+            self.clipped_frames + clipped_frames,
+        )
+
     def observe_lifecycle(self, event_type: object) -> None:
         """Count only fixed safe event names, collapsing everything else."""
         key = (
@@ -237,6 +321,16 @@ class _DirectSessionDiagnostics:
         self.lifecycle_events[key] = min(
             count + 1,
             _DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX,
+        )
+
+    def observe_failure_code(self, value: object) -> None:
+        """Preserve only one fixed child error classification."""
+        if self.failure_code is not None:
+            return
+        self.failure_code = (
+            value
+            if isinstance(value, str) and value in _DIRECT_SIDECAR_FAILURE_CODES
+            else "unknown"
         )
 
     def lifecycle_summary(self) -> str:
@@ -281,7 +375,7 @@ def _emit_direct_syslog_status(
     # repeat the bounded status on every continuation. All labels and string
     # values come from fixed vocabularies; only non-negative counters vary.
     prefix = f"codex-voice direct_webrtc_status={status}"
-    records = (
+    records = [
         (
             f"{prefix} record=state phase={phase} outcome={outcome} "
             f"duration_ms={bounded(duration_ms)} "
@@ -306,6 +400,13 @@ def _emit_direct_syslog_status(
             f"playback_max_rms={pcm_level(diagnostics.playback_max_rms)}"
         ),
         (
+            f"{prefix} record=gain "
+            f"post_gain_max_peak={pcm_level(diagnostics.post_gain_max_peak)} "
+            f"post_gain_max_rms={pcm_level(diagnostics.post_gain_max_rms)} "
+            f"clipped_samples={bounded(diagnostics.clipped_samples)} "
+            f"clipped_frames={bounded(diagnostics.clipped_frames)}"
+        ),
+        (
             f"{prefix} record=events_1 "
             f"capture.rtp_started={lifecycle_count('capture.rtp_started')} "
             f"playback.rtp_started={lifecycle_count('playback.rtp_started')} "
@@ -325,7 +426,10 @@ def _emit_direct_syslog_status(
             "output_audio_buffer.stopped="
             f"{lifecycle_count('output_audio_buffer.stopped')}"
         ),
-    )
+    ]
+    if status == "terminal" and outcome == "failed":
+        failure_code = diagnostics.failure_code or "unknown"
+        records.append(f"{prefix} record=failure code={failure_code}")
     for message in records:
         with suppress(Exception):  # diagnostics must never affect live media
             encoded = message.encode("ascii")
@@ -1606,7 +1710,9 @@ class RealtimeSession:
                 negotiation_started_at + self._config.handshake_timeout_seconds,
             )
 
-            sidecar.request_offer()
+            sidecar.request_offer(
+                direct_capture_gain_db=self._config.direct_capture_gain_db,
+            )
             offer_sdp = self._wait_for_direct_offer(sidecar, handshake_deadline)
             diagnostics.phase = "bridge_connect"
             connection = self._connection_factory(
@@ -1977,7 +2083,10 @@ class RealtimeSession:
                     "peer_connected=%s peer_data_ready=%s "
                     "capture_sent_packets=%d capture_sent_bytes=%d "
                     "capture_max_peak=%d capture_max_rms=%d "
-                    "capture_signal_frames=%d lifecycle_events=%s "
+                    "capture_signal_frames=%d "
+                    "post_gain_max_peak=%d post_gain_max_rms=%d "
+                    "clipped_samples=%d clipped_frames=%d "
+                    "lifecycle_events=%s "
                     "playback_signal_packets=%d playback_signal_bytes=%d "
                     "playback_max_peak=%d playback_max_rms=%d "
                     "capture_age_p95_ms=%.1f capture_age_max_ms=%.1f "
@@ -1992,6 +2101,10 @@ class RealtimeSession:
                     diagnostics.capture_max_peak,
                     diagnostics.capture_max_rms,
                     diagnostics.capture_signal_frames,
+                    diagnostics.post_gain_max_peak,
+                    diagnostics.post_gain_max_rms,
+                    diagnostics.clipped_samples,
+                    diagnostics.clipped_frames,
                     diagnostics.lifecycle_summary(),
                     diagnostics.playback_signal_packets,
                     diagnostics.playback_signal_bytes,
@@ -2022,6 +2135,7 @@ class RealtimeSession:
             self._raise_if_direct_startup_cancelled(deadline)
             if _socket_readable(sidecar, 0):
                 for message in sidecar.drain_messages():
+                    self._observe_direct_sidecar_message(message)
                     if (
                         isinstance(message, ControlMessage)
                         and message.type == "offer"
@@ -2046,6 +2160,8 @@ class RealtimeSession:
             if _socket_readable(sidecar, 0):
                 messages = sidecar.drain_messages()
                 if messages:
+                    for message in messages:
+                        self._observe_direct_sidecar_message(message)
                     raise SidecarError("sidecar failed while awaiting SDP answer")
             if _socket_readable(connection, 0):
                 message = connection.receive_message()
@@ -2079,7 +2195,9 @@ class RealtimeSession:
                 return None
             if recycled is not None:
                 self._consume_direct_stopped(candidate)
-            candidate.request_offer()
+            candidate.request_offer(
+                direct_capture_gain_db=self._config.direct_capture_gain_db,
+            )
             return _DirectStandby(candidate)
         except Exception:  # noqa: BLE001 - active conversation remains usable
             if candidate is not None and candidate is not active:
@@ -2104,6 +2222,8 @@ class RealtimeSession:
         for message in messages[:-1]:
             self._observe_direct_sidecar_message(message)
             if isinstance(message, PlaybackAudio):
+                continue
+            if message.type == "capture.metrics":
                 continue
             if message.type != "lifecycle":
                 raise SidecarError(
@@ -2536,8 +2656,24 @@ class RealtimeSession:
         if isinstance(message, PlaybackAudio):
             diagnostics.observe_playback(message.pcm)
             return
+        if message.type == "capture.metrics":
+            diagnostics.observe_capture_metrics(message.values)
+            return
+        if message.type == "error":
+            diagnostics.observe_failure_code(message.values.get("code"))
+            return
         if message.type == "lifecycle":
-            diagnostics.observe_lifecycle(message.values.get("event_type"))
+            event_type = message.values.get("event_type")
+            diagnostics.observe_lifecycle(event_type)
+            if isinstance(event_type, str) and (
+                event_type in {"error", "invalid_request_error"}
+                or event_type.endswith("_error")
+            ):
+                # The strict peer maps every sanitized provider error to this
+                # fixed child classification. Record it immediately rather
+                # than relying on the following error control fitting in the
+                # same bounded drain batch.
+                diagnostics.observe_failure_code("provider_error")
 
     def _direct_output_allowed(self) -> bool:
         """Return whether direct media may cross the explicit output boundary."""
@@ -2574,11 +2710,20 @@ class RealtimeSession:
                 return [], False
             controls: list[ControlMessage] = []
             semantic = False
-            for message in sidecar.drain_messages(maximum=8):
+            messages = sidecar.drain_messages(maximum=8)
+            # Observe the complete ordered batch first. Provider failures emit
+            # a sanitized lifecycle error followed by a fixed child error
+            # code; the lifecycle handler raises, so observing lazily would
+            # lose the decisive second classification.
+            for message in messages:
                 self._observe_direct_sidecar_message(message)
+            for message in messages:
                 if isinstance(message, PlaybackAudio):
-                    self._handle_direct_playback(message, player, state)
-                    semantic = True
+                    admitted = self._handle_direct_playback(message, player, state)
+                    if admitted and _pcm_has_signal(message.pcm):
+                        semantic = True
+                    continue
+                if message.type == "capture.metrics":
                     continue
                 if message.type == "error":
                     raise SidecarError("device WebRTC sidecar reported an error")
@@ -2601,10 +2746,14 @@ class RealtimeSession:
             if not _socket_readable(sidecar, 0):
                 return []
             controls: list[ControlMessage] = []
-            for message in sidecar.drain_messages(maximum=8):
+            messages = sidecar.drain_messages(maximum=8)
+            for message in messages:
                 self._observe_direct_sidecar_message(message)
+            for message in messages:
                 if isinstance(message, PlaybackAudio):
                     pending_output.append(message)
+                    continue
+                if message.type == "capture.metrics":
                     continue
                 if message.type == "error":
                     raise SidecarError("device WebRTC sidecar reported an error")
@@ -2657,7 +2806,7 @@ class RealtimeSession:
         message: PlaybackAudio,
         player: _PlayerLike,
         state: _DirectPlaybackState,
-    ) -> None:
+    ) -> bool:
         """Render contiguous PCM only inside a sidecar-proven media epoch."""
         samples = len(message.pcm) // 2
         if message.generation < 1:
@@ -2669,14 +2818,15 @@ class RealtimeSession:
             raise SidecarError("playback sample sequence is not contiguous")
         state.expected_sample_index = message.sample_index + samples
         if message.generation <= state.retired_generation:
-            return
+            return False
         if message.generation < state.newest_generation:
-            return
+            return False
         if message.generation > state.newest_generation:
             raise SidecarError("playback arrived before its media boundary")
         if state.active_generation != message.generation:
             raise SidecarError("playback arrived outside its active media epoch")
         player.enqueue(message.pcm)
+        return True
 
     def _handle_direct_lifecycle(
         self,
@@ -2724,14 +2874,15 @@ class RealtimeSession:
                 self._set_local_output_epoch(None)
                 state.retired_generation = max(state.retired_generation, generation)
                 state.active_generation = None
-            return True
+                return True
+            return False
 
         if event_type == "interrupt.fenced":
             raise SidecarError("unsolicited same-peer interrupt fence")
 
         if event_type == "error":
             raise SidecarError("realtime provider reported an error")
-        return event_type in _CONTROL_EVENTS or event_type.startswith("session.")
+        return event_type in _DIRECT_SEMANTIC_LIFECYCLE_EVENTS
 
     def _wait_for_started(
         self, connection: WebSocketConnection, deadline: float

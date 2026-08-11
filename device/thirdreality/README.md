@@ -143,6 +143,19 @@ operator must not mutate the qualified sink while the direct session is live.
 The preflight and exact preparation compare raw PulseAudio units rather than
 trusting rounded displayed percentages.
 
+`direct_capture_gain_db` is an explicit, direct-WebRTC-only outbound microphone
+gain from 0 through 12 dB. It defaults to 0 dB and is rejected when nonzero on
+the bridge-PCM transport. Gain is applied after the 16 kHz AEC capture frame is
+assembled and before WebRTC resampling, using saturating PCM16 arithmetic; it
+does not change the wake detector, Home Assistant Assist audio, or the local
+barge-in detector. Keep it at 0 unless privacy-safe peak/RMS telemetry and a
+physical speech canary demonstrate that provider VAD is missing low-level
+speech. Start such a canary at 6 dB, test close/normal/far and loud speech plus
+playback echo and interruption, and increase no further than the 12 dB hard
+limit only when the 6 dB evidence still requires it. This is fixed gain, not
+automatic gain control, so it cannot pump ambient noise or AEC residual between
+utterances.
+
 V3 owns at most one fixed-argv `paplay` child at a time. It accepts raw 24 kHz
 mono signed-16-bit PCM, requests 60 ms latency and 20 ms process time, and uses
 non-blocking stdin writes of at most 20 ms per network-loop service pass. A
@@ -474,7 +487,8 @@ replace the documentation address and placeholder token, then explicitly set
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 25,
-  "playback_volume_percent": 25
+  "playback_volume_percent": 25,
+  "direct_capture_gain_db": 0
 }
 ```
 
@@ -574,7 +588,8 @@ settings together:
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 25,
-  "playback_volume_percent": 25
+  "playback_volume_percent": 25,
+  "direct_capture_gain_db": 0
 }
 ```
 

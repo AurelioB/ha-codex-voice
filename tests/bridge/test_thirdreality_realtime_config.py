@@ -11,6 +11,7 @@ from device.thirdreality.realtime_client.config import (
     BRIDGE_PCM_TRANSPORT,
     DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_DIRECT_CAPTURE_GAIN_DB,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_MAX_SESSION_SECONDS,
     DEFAULT_PLAYBACK_VOLUME_PERCENT,
@@ -18,6 +19,7 @@ from device.thirdreality.realtime_client.config import (
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
     DEVICE_WEBRTC_TRANSPORT,
+    MAX_DIRECT_CAPTURE_GAIN_DB,
     MAX_REALTIME_VOLUME_PERCENT,
     NATIVE_CONVERSATION_MODE,
     ConfigError,
@@ -59,6 +61,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.prompt is None
     assert config.full_duplex is False
     assert config.media_transport == BRIDGE_PCM_TRANSPORT
+    assert config.direct_capture_gain_db == DEFAULT_DIRECT_CAPTURE_GAIN_DB
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
     assert config.pulse_aec_method is None
@@ -189,6 +192,96 @@ def test_device_webrtc_requires_full_duplex_and_an_offer(tmp_path: Path) -> None
     assert config is not None
     with pytest.raises(ConfigError, match="requires an SDP offer"):
         realtime_start_message(config)
+
+
+def test_config_loads_normalized_device_webrtc_capture_gain(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": 6,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.direct_capture_gain_db == 6.0
+    assert isinstance(config.direct_capture_gain_db, float)
+
+
+@pytest.mark.parametrize(
+    "gain_db",
+    [DEFAULT_DIRECT_CAPTURE_GAIN_DB, MAX_DIRECT_CAPTURE_GAIN_DB],
+)
+def test_config_accepts_device_webrtc_capture_gain_boundaries(
+    tmp_path: Path,
+    gain_db: float,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": gain_db,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.direct_capture_gain_db == gain_db
+
+
+@pytest.mark.parametrize(
+    ("gain_db", "message"),
+    [
+        (True, "must be a number"),
+        ("6", "must be a number"),
+        (float("nan"), "outside its supported range"),
+        (float("inf"), "outside its supported range"),
+        (float("-inf"), "outside its supported range"),
+        (-0.01, "outside its supported range"),
+        (12.01, "outside its supported range"),
+    ],
+)
+def test_config_rejects_invalid_device_webrtc_capture_gain(
+    tmp_path: Path,
+    gain_db: object,
+    message: str,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": gain_db,
+        },
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(path, expected_uid=os.getuid())
+
+
+def test_config_rejects_nonzero_capture_gain_for_bridge_pcm(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, {**_valid_config(), "direct_capture_gain_db": 6})
+
+    with pytest.raises(ConfigError, match="requires device_webrtc"):
+        load_config(path, expected_uid=os.getuid())
 
 
 def test_conversation_mode_is_not_a_user_configurable_setting(tmp_path: Path) -> None:

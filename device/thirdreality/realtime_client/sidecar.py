@@ -206,9 +206,14 @@ class WebRtcSidecarClient:
             return -1
         return self._transport.fileno()
 
-    def request_offer(self) -> None:
-        """Ask the prewarmed child to create one device-owned SDP offer."""
-        self._send(encode_control("create_offer"))
+    def request_offer(self, *, direct_capture_gain_db: float = 0.0) -> None:
+        """Ask the prewarmed child for an offer with one bounded capture gain."""
+        self._send(
+            encode_control(
+                "create_offer",
+                direct_capture_gain_db=direct_capture_gain_db,
+            )
+        )
 
     def set_answer(self, sdp: str) -> None:
         """Apply the App Server SDP answer in the device peer."""
