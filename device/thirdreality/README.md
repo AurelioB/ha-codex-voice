@@ -75,30 +75,30 @@ DTLS negotiation material.
 The parent uses a bounded direct player pinned to the configured AEC
 sink; media never traverses the bridge WebSocket.
 
-The default input and pre-ready fallback buffers are each 64 KiB: 2.048 seconds
-at 16 kHz mono PCM16. Once a cold handshake completes, queued input is sent at
-no more than 2× capture rate while more than one captured frame remains, then
-returns to realtime pacing. This bounded catch-up preserves accepted audio and
-removes a permanent startup offset; it does **not** remove the cold
-App Server/WebRTC handshake or provider-generation latency. In v3, startup or
-capacity failure clears both copies and returns idle; no captured prefix is
-replayed to Home Assistant. The retained v2 `bridge_pcm` route alone keeps its
-historical bounded pre-ready Assist replay behavior.
+The default input queue is 64 KiB: 2.048 seconds at 16 kHz mono PCM16. Once a
+cold handshake completes, queued input is sent at no more than 2× capture rate
+while more than one captured frame remains, then returns to realtime pacing.
+This bounded catch-up preserves accepted audio and removes a permanent startup
+offset; it does **not** remove the cold App Server/WebRTC handshake or
+provider-generation latency. V3 retains no Home Assistant compatibility copy:
+startup or capacity failure clears its direct queue and returns idle without
+replaying a captured prefix. The retained v2 `bridge_pcm` route alone keeps a
+separate default 64 KiB pre-ready buffer for historical bounded Assist replay.
 
 Wake activation occurs after the pinned recorder callback has already handled
 the triggering frame. While the satellite is idle, connected, and unmuted, the
 overlay therefore retains only the newest six 2,048-byte recorder frames in
 RAM: 384 ms, or 12 KiB. An Okay Computer wake atomically takes that direct-only
-pre-roll and seeds the bounded direct queues. An Okay Nabu wake discards it, so
-the official Assist path still receives only post-wake audio. Stop, mute,
-disconnect, teardown, and every v3 failure clear the buffer without forwarding,
-persisting, or logging it.
+pre-roll and seeds the selected transport's bounded input. An Okay Nabu wake
+discards it, so the official Assist path still receives only post-wake audio.
+Stop, mute, disconnect, teardown, and every v3 failure clear the buffer without
+forwarding, persisting, or logging it.
 
 Pre-roll never consumes the client's reserved 32 KiB (1.024 s) of live
 post-wake capacity. It is trimmed from the oldest samples or omitted when a
-smaller legal input or fallback queue needs that headroom; the default 64 KiB
-queues retain all 12 KiB. This allowance is part of the existing queue bounds,
-not additional unbounded storage.
+smaller legal input queue needs that headroom; v2 also applies the same rule to
+its fallback buffer. The default 64 KiB bounds retain all 12 KiB. This allowance
+is part of the existing queue bounds, not additional unbounded storage.
 
 The default device output queue is 48 KiB, about 1.024 seconds at 24 kHz mono
 PCM16. V3 also bounds every child IPC packet and fails rather than dropping a

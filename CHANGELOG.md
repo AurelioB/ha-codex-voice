@@ -90,6 +90,16 @@ and releases use semantic versioning.
   eight do; its cuts were 209/211 ms and rollovers 1,432/1,276 ms, with the
   same two PIDs reused and context retained twice.
 
+### Fixed
+
+- Prevent direct ThirdReality WebRTC startup from retaining a redundant Home
+  Assistant fallback copy of pre-ready microphone audio. With the default
+  64 KiB fallback bound and 12 KiB pre-roll, that unused copy previously filled
+  after 1.664 seconds and could fail closed before a roughly two-second cold
+  handshake completed. V3 remains bounded by its real 64 KiB input queue and
+  never replays into Assist; the `bridge_pcm` rollback keeps its existing
+  bounded fallback/replay behavior.
+
 ## [0.6.0] - 2026-08-10
 
 ### Added

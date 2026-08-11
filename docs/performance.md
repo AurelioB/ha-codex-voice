@@ -100,7 +100,7 @@ The shipped bounds are intentionally small and fail closed:
 |---|---:|---|
 | Direct-wake idle pre-roll | 12 KiB / 384 ms | Retains the newest six 64 ms recorder frames in RAM for Okay Computer only |
 | Device microphone queue | 64 KiB / 2.048 s | Holds PCM while the network thread connects and while paced transfer catches up |
-| Device retained pre-ready copy | 64 KiB / 2.048 s | V3 clears it on failure; only the v2 rollback may replay it into official Assist |
+| V2 retained pre-ready Assist copy | 64 KiB / 2.048 s | `bridge_pcm` rollback only; v3 neither allocates this compatibility copy nor replays into Assist |
 | Reserved live startup headroom | 32 KiB / 1.024 s | Trims or omits pre-roll before it can consume this post-wake allowance |
 | Bridge v2 WebRTC input track | 2,250 ms | V2 rollback only; v3 media bypasses the bridge |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | V1/v2/adapters only; v3 provider audio stays on the device peer |
@@ -115,17 +115,17 @@ The shipped bounds are intentionally small and fail closed:
 | V3 direct `paplay` | Dedicated AEC sink set/verified to exact raw `playback_volume_percent`; stream forced to raw 65536; 60 ms latency, 20 ms process time and writes | One fixed-argv child, non-blocking stdin, immediate SIGKILL on abort, no sink-input manipulation |
 | V2 full-duplex `paplay` stream | Configured 1–60% (25% default), never above the sink ceiling | Retained rollback-only fixed linear playback setting |
 
-The pre-roll is included inside the microphone and fallback bounds; it is not
-additional queue capacity. It is transferred only for Okay Computer. Okay Nabu
-discards it before official Assist starts, and lifecycle teardown clears it.
-The microphone and fallback rows describe two ownership copies of the same
-pre-ready audio, not a 4.096-second serial buffer. If the handshake becomes
-ready within the bound, the client transfers queued frames at no more than 2×
-capture cadence while more than one frame remains. It then sends at normal
-cadence. This shrinks startup lag without a burst and without dropping accepted
-audio. If a v3 pre-ready or post-ready bound is exhausted, the direct owner
-clears both copies and returns idle without invoking Assist. Only the v2
-rollback preserves the official Assist fallback.
+The pre-roll is included inside the microphone bound; v2 also includes it in
+its fallback bound. It is not additional queue capacity and is transferred only
+for Okay Computer. Okay Nabu discards it before official Assist starts, and
+lifecycle teardown clears it. Only v2 owns two copies of the same pre-ready
+audio; they are not a 4.096-second serial buffer. V3 owns only the real input
+queue. If the handshake becomes ready within the bound, the client transfers
+queued frames at no more than 2× capture cadence while more than one frame
+remains, then sends at normal cadence. This shrinks startup lag without a burst
+and without dropping accepted audio. If a v3 pre-ready or post-ready bound is
+exhausted, the direct owner clears its queue and returns idle without invoking
+Assist. Only the v2 rollback preserves the official Assist fallback.
 
 The 2× catch-up does not shorten the cold handshake or provider response time.
 For initial v3 startup, the signaling handshake deadline begins only after local

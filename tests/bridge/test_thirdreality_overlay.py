@@ -415,6 +415,60 @@ def test_direct_webrtc_pre_ready_failure_releases_mic_without_ha_replay(
     assert not instance._is_streaming_audio
 
 
+def test_direct_webrtc_does_not_duplicate_pre_ready_audio_into_ha_fallback(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        media_transport="device_webrtc",
+        fallback_buffer_bytes=4,
+        input_queue_bytes=64 * 1024,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    preroll = [_pcm_frame(1, samples=1_024), _pcm_frame(2, samples=1_024)]
+    for frame in preroll:
+        instance.handle_audio(frame)
+
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    first_live = _pcm_frame(3)
+    second_live = _pcm_frame(4)
+    instance.handle_audio(first_live)
+    instance.handle_audio(second_live)
+
+    assert session.audio == [*preroll, first_live, second_live]
+    owner = instance._codex_realtime_owner
+    assert owner is not None
+    assert not owner.ready_seen
+    assert list(owner.fallback_audio) == []
+    assert owner.fallback_bytes == 0
+    assert not instance.requests
+    assert not instance.audio
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+
+
+def test_direct_webrtc_real_input_queue_full_fails_closed(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(media_transport="device_webrtc")
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    session.submit_result = support.SubmitResult.FULL  # type: ignore[attr-defined]
+
+    instance.handle_audio(_pcm_frame(1))
+
+    assert session.stopped == 1
+    assert session.interrupted == 0
+    assert instance._codex_realtime_owner is None
+    assert not instance.requests
+    assert not instance.audio
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+
+
 def test_realtime_wake_claims_mic_without_starting_home_assistant(
     load_overlay: Any,
 ) -> None:

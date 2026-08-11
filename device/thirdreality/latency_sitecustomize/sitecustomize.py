@@ -244,11 +244,20 @@ def _preroll_with_startup_headroom(preroll_audio: list[bytes]) -> list[bytes]:
         "input_queue_bytes",
         fallback_capacity,
     )
+    # Device-owned WebRTC can never replay capture into Home Assistant, so its
+    # compatibility fallback deque is intentionally empty. Do not let that
+    # unused bound suppress valid direct pre-roll; only the real input queue
+    # and its reserved live headroom constrain direct startup.
+    startup_capacity = (
+        input_capacity
+        if _uses_device_webrtc()
+        else min(fallback_capacity, input_capacity)
+    )
     budget = min(
         _REALTIME_PREROLL_MAX_BYTES,
         max(
             0,
-            min(fallback_capacity, input_capacity) - _REALTIME_STARTUP_HEADROOM_BYTES,
+            startup_capacity - _REALTIME_STARTUP_HEADROOM_BYTES,
         ),
     )
     if budget == 0:
@@ -341,8 +350,9 @@ def _start_realtime_wakeup(
                 _LOGGER.warning("ThirdReality direct WebRTC startup failed closed")
                 _nonblocking_led_fire("idle", to_idle=True)
             return
-        owner.fallback_audio.extend(preroll_audio)
-        owner.fallback_bytes = sum(len(chunk) for chunk in preroll_audio)
+        if not _uses_device_webrtc():
+            owner.fallback_audio.extend(preroll_audio)
+            owner.fallback_bytes = sum(len(chunk) for chunk in preroll_audio)
         setattr(instance, _REALTIME_OWNER_ATTRIBUTE, owner)
         # The pinned capture loop already uses these flags to decide whether to
         # call handle_audio and suppress duplicate wakes. The guarded wrapper
@@ -573,12 +583,13 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             return
 
         if not owner.session.ready:
-            maximum = _REALTIME_CONFIG.fallback_buffer_bytes
-            if owner.fallback_bytes + len(audio_chunk) > maximum:
-                _fallback_realtime_to_ha(instance, owner, audio_chunk)
-                return
-            owner.fallback_audio.append(audio_chunk)
-            owner.fallback_bytes += len(audio_chunk)
+            if not _uses_device_webrtc():
+                maximum = _REALTIME_CONFIG.fallback_buffer_bytes
+                if owner.fallback_bytes + len(audio_chunk) > maximum:
+                    _fallback_realtime_to_ha(instance, owner, audio_chunk)
+                    return
+                owner.fallback_audio.append(audio_chunk)
+                owner.fallback_bytes += len(audio_chunk)
         elif not owner.ready_seen:
             owner.ready_seen = True
             owner.fallback_audio.clear()
@@ -602,8 +613,8 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
         }:
             return
         if not owner.ready_seen:
-            # The current frame is already in the fallback deque when capacity
-            # in the session queue, rather than fallback storage, was exhausted.
+            # bridge_pcm already retained this frame for HA replay. Direct
+            # WebRTC intentionally retains no compatibility copy and closes.
             _fallback_realtime_to_ha(instance, owner)
             return
         _interrupt_realtime_owner(instance, owner)
