@@ -188,6 +188,8 @@ def _classify_wake(wake_word: Any) -> tuple[bool, str]:
         return False, "invalid_phrase"
     if _REALTIME_SUPPORT.normalize_wake_phrase(phrase) == _REALTIME_CONFIG.wake_phrase:
         return True, "configured_phrase"
+    if _realtime_only_mode():
+        return False, "realtime_only"
     return False, "normal_phrase"
 
 
@@ -197,12 +199,13 @@ def _is_realtime_wake(wake_word: Any) -> bool:
 
 def _log_wake_selection(detector: str, selection: str) -> None:
     """Emit one fixed-vocabulary detector event to the device system log."""
-    if detector not in {"realtime", "assist"}:
+    if detector not in {"realtime", "assist", "disabled"}:
         return
     if selection not in {
         "configured_phrase",
         "invalid_phrase",
         "normal_phrase",
+        "realtime_only",
         "realtime_unavailable",
     }:
         return
@@ -270,6 +273,16 @@ def _uses_device_webrtc() -> bool:
     return getattr(_REALTIME_CONFIG, "media_transport", None) == getattr(
         _REALTIME_SUPPORT, "DEVICE_WEBRTC_TRANSPORT", "device_webrtc"
     )
+
+
+def _realtime_only_mode() -> bool:
+    """Return whether this appliance must never enter the Assist wake path."""
+    return bool(getattr(_REALTIME_CONFIG, "realtime_only", False))
+
+
+def _assist_fallback_allowed() -> bool:
+    """Return whether buffered direct audio may fall back to Home Assistant."""
+    return not _uses_device_webrtc() and not _realtime_only_mode()
 
 
 def _stop_word_membership(instance: Any) -> tuple[Any, bool]:
@@ -354,9 +367,9 @@ def _preroll_with_startup_headroom(preroll_audio: list[bytes]) -> list[bytes]:
     # unused bound suppress valid direct pre-roll; only the real input queue
     # and its reserved live headroom constrain direct startup.
     startup_capacity = (
-        input_capacity
-        if _uses_device_webrtc()
-        else min(fallback_capacity, input_capacity)
+        min(fallback_capacity, input_capacity)
+        if _assist_fallback_allowed()
+        else input_capacity
     )
     budget = min(
         _REALTIME_PREROLL_MAX_BYTES,
@@ -406,10 +419,7 @@ def _start_realtime_wakeup(
         except Exception:  # noqa: BLE001 - optional client must fail closed
             if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
                 return
-            if _uses_device_webrtc():
-                _LOGGER.warning("ThirdReality direct WebRTC startup failed closed")
-                _nonblocking_led_fire("idle", to_idle=True)
-            else:
+            if _assist_fallback_allowed():
                 _LOGGER.warning(
                     "ThirdReality realtime startup fell back to Home Assistant"
                 )
@@ -417,6 +427,9 @@ def _start_realtime_wakeup(
                 if _wake_is_armed(instance):
                     for chunk in preroll_audio:
                         _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
+            else:
+                _LOGGER.warning("ThirdReality realtime startup failed closed")
+                _nonblocking_led_fire("idle", to_idle=True)
             return
 
         if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
@@ -442,7 +455,7 @@ def _start_realtime_wakeup(
                 _LOGGER.warning("Failed to stop unowned ThirdReality session")
             if (
                 not getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False)
-                and not _uses_device_webrtc()
+                and _assist_fallback_allowed()
             ):
                 _LOGGER.warning(
                     "ThirdReality realtime startup fell back to Home Assistant"
@@ -452,10 +465,10 @@ def _start_realtime_wakeup(
                     for chunk in preroll_audio:
                         _VENDOR_BASE_HANDLE_AUDIO(instance, chunk)
             elif not getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
-                _LOGGER.warning("ThirdReality direct WebRTC startup failed closed")
+                _LOGGER.warning("ThirdReality realtime startup failed closed")
                 _nonblocking_led_fire("idle", to_idle=True)
             return
-        if not _uses_device_webrtc():
+        if _assist_fallback_allowed():
             owner.fallback_audio.extend(preroll_audio)
             owner.fallback_bytes = sum(len(chunk) for chunk in preroll_audio)
         setattr(instance, _REALTIME_OWNER_ATTRIBUTE, owner)
@@ -599,8 +612,8 @@ def _fallback_realtime_to_ha(
             owner.session.stop()
         except Exception:  # noqa: BLE001 - HA fallback must survive cleanup errors
             _LOGGER.warning("Failed to stop ThirdReality realtime session")
-        if _uses_device_webrtc():
-            _LOGGER.warning("ThirdReality direct WebRTC session failed closed")
+        if not _assist_fallback_allowed():
+            _LOGGER.warning("ThirdReality realtime session failed closed")
             _detach_realtime_owner(instance, owner, unduck=owner.ducked)
             return
         if owner.stop_requested or getattr(
@@ -688,7 +701,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             return
 
         if not owner.session.ready:
-            if not _uses_device_webrtc():
+            if _assist_fallback_allowed():
                 maximum = _REALTIME_CONFIG.fallback_buffer_bytes
                 if owner.fallback_bytes + len(audio_chunk) > maximum:
                     _fallback_realtime_to_ha(instance, owner, audio_chunk)
@@ -863,11 +876,21 @@ def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
             return
 
         realtime_wake, selection = _classify_wake(wake_word)
+        realtime_only_blocked = _realtime_only_mode() and not realtime_wake
         _log_wake_selection(
-            "realtime" if realtime_wake else "assist",
+            (
+                "realtime"
+                if realtime_wake
+                else "disabled"
+                if realtime_only_blocked
+                else "assist"
+            ),
             selection,
         )
         preroll_audio = _take_realtime_preroll(instance)
+        if realtime_only_blocked:
+            _LOGGER.debug("Ignoring non-realtime wake word in realtime-only mode")
+            return
         previous_active = instance._pipeline_active  # noqa: SLF001
         if realtime_wake:
             _start_realtime_wakeup(instance, wake_word, preroll_audio)

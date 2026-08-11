@@ -45,6 +45,7 @@ _ALLOWED_KEYS = frozenset(
         "connect_address",
         "token",
         "wake_phrase",
+        "realtime_only",
         "wake_probability_cutoff",
         "voice",
         "prompt",
@@ -96,6 +97,7 @@ class RealtimeConfig:
     max_message_bytes: int
     full_duplex: bool
     media_transport: str = BRIDGE_PCM_TRANSPORT
+    realtime_only: bool = field(default=False, kw_only=True)
     wake_probability_cutoff: float | None = field(default=None, kw_only=True)
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
@@ -113,6 +115,17 @@ class RealtimeConfig:
         """Keep direct construction as strict as the root-only JSON loader."""
         if not isinstance(self.full_duplex, bool):
             raise ConfigError("full_duplex must be a boolean")
+        if not isinstance(self.realtime_only, bool):
+            raise ConfigError("realtime_only must be a boolean")
+        if (
+            not self.realtime_only
+            and isinstance(self.wake_phrase, str)
+            and normalize_wake_phrase(self.wake_phrase) == _NORMAL_WAKE_PHRASE
+        ):
+            raise ConfigError(
+                "wake_phrase must be distinct from the normal wake phrase unless "
+                "realtime_only is true"
+            )
         if (
             not isinstance(self.media_transport, str)
             or self.media_transport not in SUPPORTED_MEDIA_TRANSPORTS
@@ -282,6 +295,10 @@ def load_config(
     if not enabled:
         return None
 
+    realtime_only = decoded.get("realtime_only", False)
+    if not isinstance(realtime_only, bool):
+        raise ConfigError("realtime_only must be a boolean")
+
     parsed = _validated_url(_required_text(decoded, "url", maximum=2_048))
     connect_address = decoded.get("connect_address", parsed.hostname)
     if not isinstance(connect_address, str) or not connect_address:
@@ -302,8 +319,11 @@ def load_config(
     wake_phrase = normalize_wake_phrase(
         _required_text(decoded, "wake_phrase", maximum=64)
     )
-    if not wake_phrase or wake_phrase == _NORMAL_WAKE_PHRASE:
-        raise ConfigError("wake_phrase must be distinct from the normal wake phrase")
+    if not wake_phrase or (wake_phrase == _NORMAL_WAKE_PHRASE and not realtime_only):
+        raise ConfigError(
+            "wake_phrase must be distinct from the normal wake phrase unless "
+            "realtime_only is true"
+        )
     if any(not character.isprintable() for character in wake_phrase):
         raise ConfigError("wake_phrase must contain only printable characters")
     wake_probability_cutoff = _optional_bounded_float(
@@ -479,6 +499,7 @@ def load_config(
         max_message_bytes=max_message_bytes,
         full_duplex=full_duplex,
         media_transport=media_transport,
+        realtime_only=realtime_only,
         wake_probability_cutoff=wake_probability_cutoff,
         voice=voice,
         prompt=prompt,

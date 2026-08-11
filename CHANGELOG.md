@@ -7,6 +7,10 @@ and releases use semantic versioning.
 
 ### Added
 
+- Add a reversible ThirdReality `realtime_only` wake policy. It permits Okay
+  Nabu to replace the normal Assist wake, ignores every non-matching detector,
+  disables buffered v2 Assist fallback, and fails closed if guarded realtime
+  support is unavailable while preserving the turn-based implementation.
 - Add strict ThirdReality wire protocol v3: the device supplies an SDP offer,
   confirms ICE/DTLS/SCTP and `oai-events` readiness, and keeps RTP audio plus
   provider data directly on its own WebRTC peer. The bridge now owns only the

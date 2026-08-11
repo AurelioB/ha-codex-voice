@@ -464,6 +464,7 @@ replace the documentation address and placeholder token, then explicitly set
   "connect_address": "192.0.2.10",
   "token": "REPLACE_WITH_DISTINCT_REALTIME_DEVICE_TOKEN",
   "wake_phrase": "okay computer",
+  "realtime_only": false,
   "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
@@ -525,6 +526,15 @@ earlier block; physical acceptance must verify that spoken Okay Computer does
 not produce an Assist detector marker. The cutoff override applies only to the
 exact normalized `wake_phrase`; Okay Nabu keeps its vendor threshold and
 continues to select Home Assistant Assist.
+
+For a reversible realtime-only trial, set `wake_phrase` to `okay nabu`, set
+`realtime_only` to `true`, and leave only `okay_nabu` active in
+`/data/conf/sound.json`. This intentionally replaces the normal Assist wake
+route without removing any Assist code. A matching Okay Nabu detection starts
+the direct session; every other detector is ignored, a realtime guard mismatch
+fails closed, and the v2 buffered Assist fallback is disabled. Restore split
+mode by setting `realtime_only` to `false`, returning `wake_phrase` to a
+distinct phrase such as `okay computer`, and re-enabling both detector IDs.
 
 Before physical input qualification, install the guarded early microphone-gain
 hook described in [`deploy/README.md`](deploy/README.md). The pinned firmware
@@ -633,11 +643,11 @@ Home Assistant path, while v3 always clears captured direct audio and returns
 idle. Complete removal of the overlay is documented in
 [Acceptance and rollback](#acceptance-and-rollback).
 
-Enable both installed detector identifiers—`okay_nabu` and
-`okay_computer`—in the device's existing sound configuration without replacing
-its other settings. Keep Okay Nabu as the normal Home Assistant wake phrase and
-make `wake_phrase` match Okay Computer. Do not assign the same phrase to both
-paths.
+In the default split mode, enable both installed detector
+identifiers—`okay_nabu` and `okay_computer`—in the device's existing sound
+configuration without replacing its other settings. Keep Okay Nabu as the
+normal Home Assistant wake phrase and make `wake_phrase` match Okay Computer.
+Do not assign the same phrase to both paths unless `realtime_only` is true.
 
 The v1.1.7 unified init script keeps its supervision functions in a long-lived
 shell. Editing the script does not update the function already held by that

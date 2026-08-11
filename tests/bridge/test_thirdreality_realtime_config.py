@@ -53,6 +53,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert isinstance(config, RealtimeConfig)
     assert config.connect_address == "192.0.2.10"
     assert config.wake_phrase == "okay computer"
+    assert config.realtime_only is False
     assert config.wake_probability_cutoff is None
     assert config.voice is None
     assert config.prompt is None
@@ -101,6 +102,26 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert config.prompt == private_prompt
     assert config.wake_probability_cutoff == 0.85
     assert private_prompt not in repr(config)
+
+
+def test_config_allows_normal_wake_phrase_only_for_realtime_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "wake_phrase": " Okay   Nabu ",
+            "realtime_only": True,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.wake_phrase == "okay nabu"
+    assert config.realtime_only is True
 
 
 def test_realtime_start_message_hardcodes_native_conversation_mode(
@@ -328,6 +349,27 @@ def test_direct_config_rejects_invalid_wake_probability_cutoff(
         replace(config, wake_probability_cutoff=True)
 
 
+def test_direct_config_validates_realtime_only_and_normal_phrase(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+
+    with pytest.raises(ConfigError, match=r"realtime_only.*boolean"):
+        replace(config, realtime_only=1)
+    with pytest.raises(ConfigError, match=r"wake_phrase.*normal wake phrase"):
+        replace(config, wake_phrase="Okay Nabu")
+
+    realtime_only = replace(
+        config,
+        wake_phrase=" Okay   Nabu ",
+        realtime_only=True,
+    )
+    assert realtime_only.realtime_only is True
+
+
 def test_wake_probability_cutoff_preserves_existing_positional_arguments() -> None:
     config = RealtimeConfig(
         "ws://192.0.2.10:8787/v1/realtime",
@@ -351,6 +393,7 @@ def test_wake_probability_cutoff_preserves_existing_positional_arguments() -> No
     )
 
     assert config.voice == "cove"
+    assert config.realtime_only is False
     assert config.wake_probability_cutoff is None
 
 
@@ -407,6 +450,7 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"prompt": "line\nbreak"}, "control characters"),
         ({"prompt": "x" * 1_025}, "up to 1024"),
         ({"wake_phrase": "okay nabu"}, "distinct"),
+        ({"realtime_only": 1}, "must be a boolean"),
         ({"wake_probability_cutoff": True}, "must be a number"),
         ({"wake_probability_cutoff": 0.49}, "outside its supported range"),
         ({"wake_probability_cutoff": 1.0}, "outside its supported range"),

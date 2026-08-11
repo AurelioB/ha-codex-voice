@@ -333,14 +333,17 @@ def _fake_realtime_support(
     media_transport: str = "bridge_pcm",
     prewarm_result: bool = True,
     wake_probability_cutoff: float | None = 0.85,
+    wake_phrase: str = "okay computer",
+    realtime_only: bool = False,
 ) -> ModuleType:
     support = ModuleType("realtime_client")
     config = SimpleNamespace(
-        wake_phrase="okay computer",
+        wake_phrase=wake_phrase,
         fallback_buffer_bytes=fallback_buffer_bytes,
         input_queue_bytes=input_queue_bytes,
         media_transport=media_transport,
         wake_probability_cutoff=wake_probability_cutoff,
+        realtime_only=realtime_only,
     )
     sessions: list[Any] = []
 
@@ -584,6 +587,89 @@ def test_wake_detector_syslog_failure_and_invalid_values_are_non_disruptive(
 
     assert len(support.sessions) == 1  # type: ignore[attr-defined]
     assert instance._codex_realtime_owner is not None
+
+
+def test_realtime_only_routes_nabu_directly_and_blocks_assist_wakes(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support(
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    messages: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        module.syslog,
+        "syslog",
+        lambda priority, message: messages.append((priority, message)),
+    )
+
+    direct = protocol()
+    blocked = protocol()
+    _wake(direct, "Okay Nabu")
+    _wake(blocked, "Okay Computer")
+
+    assert len(support.sessions) == 1  # type: ignore[attr-defined]
+    assert direct._codex_realtime_owner is not None
+    assert direct.requests == []
+    assert blocked.requests == []
+    assert not blocked._pipeline_active
+    assert not blocked._is_streaming_audio
+    assert messages == [
+        (
+            module.syslog.LOG_INFO,
+            "codex-voice wake_detector=realtime selection=configured_phrase",
+        ),
+        (
+            module.syslog.LOG_INFO,
+            "codex-voice wake_detector=disabled selection=realtime_only",
+        ),
+    ]
+
+
+def test_realtime_only_bridge_failure_does_not_fall_back_to_assist(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        start_error=OSError("bridge unavailable"),
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "okay nabu")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    assert session.started == 1
+    assert session.stopped == 1
+    assert instance.requests == []
+    assert instance.audio == []
+    assert instance._codex_realtime_owner is None
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+
+
+def test_realtime_only_guard_mismatch_fails_closed_instead_of_using_assist(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    hashes = list(_REALTIME_HASHES)
+    hashes[4] = "unknown"
+    protocol, module, _tr_satellite = load_overlay(tuple(hashes), support)
+    instance = protocol()
+
+    _wake(instance, "okay nabu")
+
+    assert module._REALTIME_PATCH_ACTIVE is False
+    assert support.sessions == []  # type: ignore[attr-defined]
+    assert instance.requests == []
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
 
 
 def test_direct_webrtc_constructor_failure_does_not_start_ha_fallback(

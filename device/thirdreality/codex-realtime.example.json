@@ -4,6 +4,7 @@
   "connect_address": "192.0.2.10",
   "token": "REPLACE_WITH_DISTINCT_REALTIME_DEVICE_TOKEN",
   "wake_phrase": "okay computer",
+  "realtime_only": false,
   "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
