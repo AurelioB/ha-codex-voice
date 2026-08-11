@@ -288,8 +288,8 @@ frames (maximum peak 2 and integer RMS 0), and staged double-talk flushed
 playback in 141 ms versus 2.650 seconds when waiting for the provider-only
 boundary. The same v2 socket continued and produced the next response. These
 measurements do not validate v3. Physical acceptance for each v3 installation
-must cover both wake routes, normal-wake preemption, fail-closed pre-ready
-behavior, stop-word latency, first-audio latency, queue failures, repeated
+must cover both idle wake routes, active-session wake suppression, fail-closed
+pre-ready behavior, stop-word latency, first-audio latency, queue failures, repeated
 turns, memory stability, player cleanup, and recovery after bridge and Wi-Fi
 loss. Full-duplex acceptance must additionally cover early/middle/late
 double-talk at the configured sink/playback values, self-echo rejection, exact

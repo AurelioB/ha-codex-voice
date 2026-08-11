@@ -753,19 +753,6 @@ def _realtime_stop(instance: Any) -> None:
         setattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False)
 
 
-def _preempt_realtime_for_normal_wake(instance: Any) -> None:
-    """Let a normal wake atomically reclaim the mic on its vendor thread."""
-    observed_owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
-    if observed_owner is not None:
-        observed_owner.stop_requested = True
-    with _realtime_state_lock(instance):
-        owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
-        if owner is None:
-            return
-        owner.stop_requested = True
-        _interrupt_realtime_owner(instance, owner)
-
-
 def _rollback_wakeup(
     instance: Any,
     phrase: str,
@@ -865,15 +852,22 @@ def _fast_wakeup(instance: Any, wake_word: Any) -> None:
 
 def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
     """Apply the fast wake path directly to the pinned device subclass."""
-    realtime_wake, selection = _classify_wake(wake_word)
-    _log_wake_selection(
-        "realtime" if realtime_wake else "assist",
-        selection,
-    )
     with _realtime_state_lock(instance):
+        # Once direct mode owns the microphone, every later utterance belongs
+        # to that conversation. Keeping the normal wake detector armed is a
+        # vendor implementation detail: treating one of its false positives as
+        # an intentional route switch would tear down realtime before VAD can
+        # provide barge-in or a follow-up turn.
+        if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not None:
+            _LOGGER.debug("Ignoring wake word - realtime session active")
+            return
+
+        realtime_wake, selection = _classify_wake(wake_word)
+        _log_wake_selection(
+            "realtime" if realtime_wake else "assist",
+            selection,
+        )
         preroll_audio = _take_realtime_preroll(instance)
-        if not realtime_wake:
-            _preempt_realtime_for_normal_wake(instance)
         previous_active = instance._pipeline_active  # noqa: SLF001
         if realtime_wake:
             _start_realtime_wakeup(instance, wake_word, preroll_audio)

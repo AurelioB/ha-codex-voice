@@ -77,8 +77,10 @@ and releases use semantic versioning.
   path. Fresh-peer rollover is a subscription-backed approximation, not exact
   ChatGPT same-session semantics, and adds a measurable negotiation handoff.
 - Require rollover queue/age/timeout and epoch validation to fail the outer
-  session closed. Stop, mute, disconnect, and normal-wake preemption still end
-  it; no failure falls back to Home Assistant or writes audio to logs.
+  session closed. Stop, mute, and disconnect still end it. Once realtime owns
+  the microphone, later detector hits are ignored so a false normal-wake match
+  cannot destroy barge-in or follow-up; no failure falls back to Home Assistant
+  or writes audio to logs.
 - Recheck capture freshness at actual RTP consumption, re-poll standby health
   before use, and hold replacement lifecycle/PCM inaudibly in the configured
   `output_queue_bytes` bound until exact `rollover_started`, then replay it in
@@ -100,6 +102,11 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Prevent a normal-wake detector false positive on the first post-wake command
+  from preempting a newly started Okay Computer session and silently routing
+  the utterance through single-turn Assist instead. All later wake detections
+  are suppressed while realtime owns the microphone; live VAD remains the
+  interruption and follow-up mechanism.
 - Protect the first audible playback of each fresh device peer from its
   physical AEC convergence transient. For one 512 ms onset window, capture
   frames are replaced with timestamp-preserving silence while the parent also

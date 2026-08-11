@@ -670,7 +670,8 @@ path and normal Home Assistant routing. Both cases emit a content-free warning.
 The repository tests cover immediate request/duck/stream ordering, the first
 post-wake microphone frame, VAD/run-end/disconnect/mute flag races during setup,
 startup guards and exceptions, bounded direct-only pre-roll, normal-wake
-discard, 32 KiB live headroom, normal-wake preemption, v3 fail-closed startup,
+discard, 32 KiB live headroom, active-session wake suppression, v3 fail-closed
+startup,
 retained v2 pre-ready fallback/replay, strict v2 and v3 framing, device-owned
 SDP negotiation, absence of bridge PCM in v3, bounded sidecar IPC and media
 queues, receiver-owned `media.started`/`media.quiet` boundaries,
@@ -786,8 +787,9 @@ On the physical device, verify these independently:
    be treated as proof that interrupted unheard assistant audio is absent from
    context. Exercise queue,
    age, deadline, sidecar, and invalid-epoch failures: all must close the outer
-   session without Assist fallback or audio logging. Verify stop, mute,
-   disconnect, and normal-wake preemption still end it. Measure local playback
+   session without Assist fallback or audio logging. Verify stop, mute, and
+   disconnect still end it, while later detector hits cannot preempt an active
+   realtime owner. Measure local playback
    stop and fresh-peer response separately because negotiation adds handoff
    latency. Repeat two successive interruptions under adverse timing. The
    reference-device double-interruption canary now passes, but every deployment

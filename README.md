@@ -132,8 +132,10 @@ not part of the component-only HACS ZIP.
   recycled as the next standby. Exactly those two prewarmed process slots are
   used: if the standby is absent or invalid, the outer session terminates
   instead of cold-launching a replacement or allocating a third process.
-  Manual stop, mute, disconnect, and normal-wake preemption still end the outer
-  session. The bridge gives the old realtime session 100 ms to confirm close.
+  Manual stop, mute, and disconnect still end the outer session. Later wake
+  detections are suppressed while realtime owns the microphone, preventing a
+  false normal-wake match from replacing live VAD with single-turn Assist. The
+  bridge gives the old realtime session 100 ms to confirm close.
   Once an interruption commits, one uninterrupted local speech segment may
   retire only that peer epoch. Eight consecutive detector-quiet 64 ms capture
   frames (512 ms) rearm barge-in for a genuinely new speech edge; qualifying
@@ -538,9 +540,10 @@ pre-roll may overlap samples already seen by the retired provider peer.
 Fresh-peer rollover is a safe subscription-backed approximation, not exact
 ChatGPT same-session interruption. It adds a measurable WebRTC/provider
 negotiation handoff. Queue/age/timeout, sidecar, and epoch errors fail the outer
-session closed; manual stop, mute, disconnect, and normal-wake preemption still
-end it. A reference-device hardware double-interruption canary cut playback in
-in 208–211 ms and completed rollovers in 1.29–1.57 s across two consecutive
+session closed; manual stop, mute, and disconnect still end it. Later detector
+hits are ignored until realtime releases the microphone. A reference-device
+hardware double-interruption canary cut playback in
+208–211 ms and completed rollovers in 1.29–1.57 s across two consecutive
 exact-artifact runs at that installation's qualified 60% setting. Each run
 recycled the same two worker PIDs with no cold replacement and retained context
 on both rollovers. This passes the reference double-interruption rollover

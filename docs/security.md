@@ -111,8 +111,9 @@ sides of a narrow bridge API.
   consumer closes, and provider/thread cleanup remains tracked and shielded
   from request-handler cancellation.
 - “Okay Computer” selects explicit native v3 and gains no Home Assistant
-  authority. “Okay Nabu” selects the official Assist path;
-  a normal wake can preempt a direct session and reclaim the microphone.
+  authority. “Okay Nabu” selects the official Assist path while the microphone
+  is idle. Once a direct session owns it, later detector hits are ignored;
+  interruption and follow-up are driven only by bounded live-audio/VAD logic.
 - The device retains at most six idle microphone frames for the direct wake:
   384 ms, or 12 KiB of PCM16, in process memory only. Okay Computer atomically
   consumes it; Okay Nabu, stop, mute, disconnect, and teardown discard it. It

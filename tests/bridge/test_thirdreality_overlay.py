@@ -742,7 +742,7 @@ def test_normal_wake_discards_direct_preroll(load_overlay: Any) -> None:
     assert instance._codex_realtime_preroll is None
 
 
-def test_normal_wake_preempts_realtime_then_starts_official_assist(
+def test_wake_detector_false_positive_cannot_preempt_realtime_session(
     load_overlay: Any,
 ) -> None:
     support = _fake_realtime_support()
@@ -751,16 +751,20 @@ def test_normal_wake_preempts_realtime_then_starts_official_assist(
 
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    owner = instance._codex_realtime_owner
     _wake(instance, "okay nabu")
 
-    assert session.interrupted == 1
-    assert session.interrupt_preserve_session == [False]
-    assert getattr(instance, "_codex_realtime_owner", None) is None
-    assert instance.requests == ["okay nabu"]
-    assert instance.events == ["duck", "unduck", "request", "duck"]
+    assert session.interrupted == 0
+    assert session.interrupt_preserve_session == []
+    assert instance._codex_realtime_owner is owner
+    assert instance.requests == []
+    assert instance.events == ["duck"]
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" not in instance.state.active_wake_words
+    assert "stop" in instance.state.active_wake_words
+
+    instance.handle_audio(b"\x01\x00" * 8)
+    assert session.audio == [b"\x01\x00" * 8]
 
 
 def test_realtime_start_exception_falls_back_on_same_wake_call(
