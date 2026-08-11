@@ -331,6 +331,7 @@ def _fake_realtime_support(
     submit_entered: threading.Event | None = None,
     submit_release: threading.Event | None = None,
     media_transport: str = "bridge_pcm",
+    full_duplex: bool | None = None,
     prewarm_result: bool = True,
     wake_probability_cutoff: float | None = 0.85,
     wake_phrase: str = "okay computer",
@@ -342,6 +343,9 @@ def _fake_realtime_support(
         fallback_buffer_bytes=fallback_buffer_bytes,
         input_queue_bytes=input_queue_bytes,
         media_transport=media_transport,
+        full_duplex=(media_transport == "device_webrtc")
+        if full_duplex is None
+        else full_duplex,
         wake_probability_cutoff=wake_probability_cutoff,
         realtime_only=realtime_only,
     )
@@ -782,7 +786,7 @@ def test_realtime_wake_claims_mic_without_starting_home_assistant(
     assert not instance.requests
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" not in instance.state.active_wake_words
+    assert "stop" in instance.state.active_wake_words
 
     instance.handle_audio(b"\x01\x00" * 8)
     assert session.audio == [b"\x01\x00" * 8]
@@ -848,7 +852,7 @@ def test_wake_detector_false_positive_cannot_preempt_realtime_session(
     assert instance.events == ["duck"]
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" not in instance.state.active_wake_words
+    assert "stop" in instance.state.active_wake_words
 
     instance.handle_audio(b"\x01\x00" * 8)
     assert session.audio == [b"\x01\x00" * 8]
@@ -889,7 +893,7 @@ def test_terminal_owner_is_reaped_before_starting_next_realtime_wake(
     ]
     assert instance._pipeline_active
     assert instance._is_streaming_audio
-    assert "stop" not in instance.state.active_wake_words
+    assert "stop" in instance.state.active_wake_words
 
 
 def test_terminal_owner_cleanup_on_next_wake_is_idempotently_idle(
@@ -1289,7 +1293,7 @@ def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
     load_overlay: Any,
     stop_word_preexisting: bool,
 ) -> None:
-    support = _fake_realtime_support()
+    support = _fake_realtime_support(media_transport="device_webrtc")
     protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
     instance = protocol()
     if stop_word_preexisting:
@@ -1313,7 +1317,7 @@ def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
 def test_direct_owner_suspends_legacy_stop_detector_until_terminal_cleanup(
     load_overlay: Any,
 ) -> None:
-    support = _fake_realtime_support()
+    support = _fake_realtime_support(media_transport="device_webrtc")
     protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
     instance = protocol()
     instance.state.active_wake_words.add("stop")
@@ -1338,6 +1342,28 @@ def test_direct_owner_suspends_legacy_stop_detector_until_terminal_cleanup(
 
     assert instance._codex_realtime_owner is None
     assert "stop" in instance.state.active_wake_words
+
+
+def test_half_duplex_owner_retains_terminal_stop_detector(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        full_duplex=False,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+
+    assert "stop" in instance.state.active_wake_words
+
+    session.terminal = True
+    instance.handle_audio(_pcm_frame(1))
+
+    assert instance._codex_realtime_owner is None
+    assert "stop" not in instance.state.active_wake_words
 
 
 def test_realtime_opcode_mismatch_keeps_latency_patch_and_normal_audio_path(
