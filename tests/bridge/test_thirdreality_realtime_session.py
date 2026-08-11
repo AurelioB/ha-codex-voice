@@ -666,6 +666,71 @@ def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     assert connection.closed
 
 
+def test_direct_capture_signal_does_not_extend_idle_timeout_but_lifecycle_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MutableClock:
+        def __init__(self) -> None:
+            self.value = 10.0
+            self.calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return self.value
+
+    clock = MutableClock()
+    session, _connection, sidecar, _player, _sidecars = _start_direct_session(
+        monkeypatch,
+        clock=clock,
+        idle_timeout_seconds=5.0,
+        max_session_seconds=100.0,
+        ping_interval_seconds=60.0,
+    )
+    diagnostics = session._direct_diagnostics
+    assert diagnostics is not None
+    signal_capture = (500).to_bytes(2, "little", signed=True) * 4
+
+    for expected_packets, timestamp in enumerate(range(11, 15), start=1):
+        clock.value = float(timestamp)
+        assert session.submit_audio(signal_capture) is SubmitResult.ACCEPTED
+        session._wake_network.set()
+        assert _wait_for(
+            lambda expected_packets=expected_packets: (
+                len(sidecar.audio) == expected_packets
+            )
+        )
+
+    assert diagnostics.capture_signal_frames == 4
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "response.created", "generation": 0},
+        )
+    )
+    assert _wait_for(lambda: diagnostics.lifecycle_events.get("response.created") == 1)
+    calls_after_observation = clock.calls
+    assert _wait_for(lambda: clock.calls > calls_after_observation)
+
+    for expected_packets, timestamp in enumerate(range(15, 19), start=5):
+        clock.value = float(timestamp)
+        assert session.submit_audio(signal_capture) is SubmitResult.ACCEPTED
+        session._wake_network.set()
+        assert _wait_for(
+            lambda expected_packets=expected_packets: (
+                len(sidecar.audio) == expected_packets
+            )
+        )
+
+    # Provider lifecycle at t=14 extended the initial t=10 deadline, while
+    # signal-bearing local capture through t=18 did not extend it again.
+    assert session.state is SessionState.READY
+    clock.value = 19.0
+    session._wake_network.set()
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert diagnostics.capture_signal_frames == 8
+
+
 def test_direct_session_logs_content_free_capture_and_playback_metrics(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -852,11 +917,36 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
         ping_interval_seconds=60.0,
     )
 
-    assert len(records) == 1
-    priority, ready = records[0]
-    assert priority == session_module.syslog.LOG_INFO
+    assert _wait_for(
+        lambda: (
+            sum(
+                "direct_webrtc_status=ready" in message
+                for _priority, message in records
+            )
+            == 5
+        )
+    )
+    ready_records = [
+        message
+        for priority, message in records
+        if priority == session_module.syslog.LOG_INFO
+        and "direct_webrtc_status=ready" in message
+    ]
+    assert len(ready_records) == 5
+    assert {
+        next(field for field in message.split() if field.startswith("record="))
+        for message in ready_records
+    } == {
+        "record=state",
+        "record=media",
+        "record=levels",
+        "record=events_1",
+        "record=events_2",
+    }
+    ready = next(message for message in ready_records if "record=state" in message)
     assert ready.startswith("codex-voice direct_webrtc_status=ready ")
-    assert "phase=runtime handshake_ready=yes" in ready
+    assert "phase=runtime" in ready
+    assert "handshake_ready=yes" in ready
     assert "peer_answer_applied=yes" in ready
     assert "peer_connected=yes" in ready
     assert "peer_data_ready=yes" in ready
@@ -865,18 +955,25 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
     sensitive = "TOP-SECRET-TRANSCRIPT-AND-IDENTIFIER"
     capture = (500).to_bytes(2, "little", signed=True) * 4
     assert session.submit_audio(capture) is SubmitResult.ACCEPTED
-    sidecar.feed(
-        ControlMessage(
-            "lifecycle",
-            {"event_type": "capture.rtp_started", "generation": 0},
-        )
+    decisive_events = (
+        "capture.rtp_started",
+        "playback.rtp_started",
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "response.created",
+        "response.done",
+        "turn.created",
+        "turn.done",
+        "output_audio_buffer.started",
+        "output_audio_buffer.stopped",
     )
-    sidecar.feed(
-        ControlMessage(
-            "lifecycle",
-            {"event_type": "playback.rtp_started", "generation": 0},
+    for event_type in decisive_events:
+        sidecar.feed(
+            ControlMessage(
+                "lifecycle",
+                {"event_type": event_type, "generation": 0},
+            )
         )
-    )
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -898,16 +995,30 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
             "direct_webrtc_status=waiting_output" in item[1] for item in records
         )
     )
-    heartbeat = next(
-        item[1] for item in records if "direct_webrtc_status=waiting_output" in item[1]
+    heartbeat_records = [
+        message
+        for _priority, message in records
+        if "direct_webrtc_status=waiting_output" in message
+    ]
+    assert len(heartbeat_records) == 5
+    heartbeat_media = next(
+        message for message in heartbeat_records if "record=media" in message
     )
-    assert "capture_sent_packets=1" in heartbeat
-    assert "capture_sent_bytes=8" in heartbeat
-    assert "capture_signal_frames=1" in heartbeat
-    assert (
-        "lifecycle_events=capture.rtp_started:1,other:1,playback.rtp_started:1"
-    ) in heartbeat
-    assert "playback_signal_packets=0" in heartbeat
+    heartbeat_levels = next(
+        message for message in heartbeat_records if "record=levels" in message
+    )
+    assert "capture_sent_packets=1" in heartbeat_media
+    assert "capture_signal_frames=1" in heartbeat_media
+    assert "playback_signal_packets=0" in heartbeat_media
+    assert "capture_max_peak=500" in heartbeat_levels
+    assert "capture_max_rms=500" in heartbeat_levels
+    assert "playback_max_peak=0" in heartbeat_levels
+    assert "playback_max_rms=0" in heartbeat_levels
+    heartbeat_events = "\n".join(
+        message for message in heartbeat_records if "record=events_" in message
+    )
+    for event_type in decisive_events:
+        assert f"{event_type}=1" in heartbeat_events
 
     playback = (300).to_bytes(2, "little", signed=True) * 4
     sidecar.feed(
@@ -944,19 +1055,31 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
         for _priority, message in records
         if "direct_webrtc_status=terminal" in message
     ]
-    assert len(terminals) == 1
-    terminal = terminals[0]
-    assert "capture.rtp_started:1" in terminal
-    assert "playback.rtp_started:1" in terminal
-    assert "playback_signal_packets=1" in terminal
-    assert "playback_signal_bytes=8" in terminal
-    assert "outcome=stopped" in terminal
+    assert len(terminals) == 5
+    terminal_state = next(message for message in terminals if "record=state" in message)
+    terminal_media = next(message for message in terminals if "record=media" in message)
+    terminal_levels = next(
+        message for message in terminals if "record=levels" in message
+    )
+    terminal_events = "\n".join(
+        message for message in terminals if "record=events_" in message
+    )
+    assert "capture.rtp_started=1" in terminal_events
+    assert "playback.rtp_started=1" in terminal_events
+    assert "playback_signal_packets=1" in terminal_media
+    assert "capture_max_peak=500" in terminal_levels
+    assert "capture_max_rms=500" in terminal_levels
+    assert "playback_max_peak=300" in terminal_levels
+    assert "playback_max_rms=300" in terminal_levels
+    assert "outcome=stopped" in terminal_state
     emitted = "\n".join(message for _priority, message in records)
     assert sensitive not in emitted
     assert "secret-token" not in emitted
     assert "v=0" not in emitted
     assert all(
-        len(message) <= session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES
+        message.isascii()
+        and len(message.encode("ascii"))
+        <= session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES
         for _priority, message in records
     )
 
@@ -964,10 +1087,10 @@ def test_direct_syslog_reports_ready_waiting_output_and_terminal_aggregates(
 def test_direct_syslog_failure_does_not_change_media_session_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attempted_statuses: list[str] = []
+    attempted_records: list[tuple[str, str]] = []
 
     def fail_syslog(_priority: int, message: str) -> None:
-        attempted_statuses.append(message.split()[1])
+        attempted_records.append((message.split()[1], message.split()[2]))
         raise OSError("syslog unavailable")
 
     monkeypatch.setattr(session_module.syslog, "syslog", fail_syslog)
@@ -979,9 +1102,17 @@ def test_direct_syslog_failure_does_not_change_media_session_outcome(
     session.stop()
     assert session.join(1.0)
     assert session.state is SessionState.STOPPED
-    assert attempted_statuses == [
-        "direct_webrtc_status=ready",
-        "direct_webrtc_status=terminal",
+    assert attempted_records == [
+        ("direct_webrtc_status=ready", "record=state"),
+        ("direct_webrtc_status=ready", "record=media"),
+        ("direct_webrtc_status=ready", "record=levels"),
+        ("direct_webrtc_status=ready", "record=events_1"),
+        ("direct_webrtc_status=ready", "record=events_2"),
+        ("direct_webrtc_status=terminal", "record=state"),
+        ("direct_webrtc_status=terminal", "record=media"),
+        ("direct_webrtc_status=terminal", "record=levels"),
+        ("direct_webrtc_status=terminal", "record=events_1"),
+        ("direct_webrtc_status=terminal", "record=events_2"),
     ]
 
 
@@ -995,7 +1126,8 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
         lambda _priority, message: records.append(message),
     )
     diagnostics = session_module._DirectSessionDiagnostics(started_at=0.0)
-    diagnostics.phase = "peer_handshake"
+    sensitive = "secret-transcript-id-error-string"
+    diagnostics.phase = sensitive
     diagnostics.handshake_ready = True
     diagnostics.peer_answer_applied = True
     diagnostics.peer_connected = True
@@ -1007,6 +1139,7 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
     diagnostics.lifecycle_events["other"] = (
         session_module._DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX
     )
+    diagnostics.lifecycle_events[sensitive] = 10**20
     for field_name in (
         "capture_packets",
         "capture_bytes",
@@ -1039,12 +1172,52 @@ def test_direct_syslog_schema_rejects_dynamic_labels_and_stays_bounded(
         outcome="remote_stopped",
     )
 
-    assert len(records) == 1
-    assert len(records[0]) <= session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES
-    assert "capture_sent_packets=99999999" in records[0]
-    assert "capture_max_peak=32768" in records[0]
-    assert "outcome=remote_stopped" in records[0]
-    assert "secret" not in records[0]
+    assert len(records) == 5
+    assert session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES == 220
+    assert all(
+        record.isascii()
+        and len(record.encode("ascii"))
+        <= session_module._DIRECT_SYSLOG_RECORD_MAX_BYTES
+        for record in records
+    )
+    assert {
+        next(field for field in record.split() if field.startswith("record="))
+        for record in records
+    } == {
+        "record=state",
+        "record=media",
+        "record=levels",
+        "record=events_1",
+        "record=events_2",
+    }
+    state = next(record for record in records if "record=state" in record)
+    media = next(record for record in records if "record=media" in record)
+    levels = next(record for record in records if "record=levels" in record)
+    events = "\n".join(record for record in records if "record=events_" in record)
+    assert "phase=unknown" in state
+    assert "duration_ms=99999999" in state
+    assert "outcome=remote_stopped" in state
+    assert "capture_sent_packets=99999999" in media
+    assert "capture_signal_frames=99999999" in media
+    assert "playback_signal_packets=99999999" in media
+    assert "capture_max_peak=32768" in levels
+    assert "capture_max_rms=32768" in levels
+    assert "playback_max_peak=32768" in levels
+    assert "playback_max_rms=32768" in levels
+    for event_type in (
+        "capture.rtp_started",
+        "playback.rtp_started",
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "response.created",
+        "response.done",
+        "turn.created",
+        "turn.done",
+        "output_audio_buffer.started",
+        "output_audio_buffer.stopped",
+    ):
+        assert f"{event_type}=999999" in events
+    assert sensitive not in "\n".join(records)
 
 
 @pytest.mark.parametrize("boundary_name", ["stop", "interrupt"])

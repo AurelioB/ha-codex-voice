@@ -125,7 +125,7 @@ _DIRECT_SYSLOG_OUTCOMES = frozenset(
 )
 _DIRECT_SYSLOG_INTERVAL_SECONDS = 5.0
 _DIRECT_SYSLOG_COUNTER_MAX = 99_999_999
-_DIRECT_SYSLOG_RECORD_MAX_BYTES = 1_024
+_DIRECT_SYSLOG_RECORD_MAX_BYTES = 220
 
 
 class SessionState(Enum):
@@ -256,7 +256,7 @@ def _emit_direct_syslog_status(
     duration_ms: int,
     outcome: str,
 ) -> None:
-    """Emit one bounded fixed-vocabulary direct-media status record."""
+    """Emit compact fixed-schema direct-media status records."""
     if status not in _DIRECT_SYSLOG_STATUSES or outcome not in _DIRECT_SYSLOG_OUTCOMES:
         return
     phase = (
@@ -268,31 +268,69 @@ def _emit_direct_syslog_status(
     def bounded(value: int) -> int:
         return min(max(0, value), _DIRECT_SYSLOG_COUNTER_MAX)
 
-    with suppress(Exception):  # diagnostics must never affect live media
-        message = (
-            "codex-voice "
-            f"direct_webrtc_status={status} phase={phase} "
+    def pcm_level(value: int) -> int:
+        return min(32_768, bounded(value))
+
+    def lifecycle_count(event_type: str) -> int:
+        return min(
+            bounded(diagnostics.lifecycle_events.get(event_type, 0)),
+            _DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX,
+        )
+
+    # Keep the state needed to classify an incident in the first record and
+    # repeat the bounded status on every continuation. All labels and string
+    # values come from fixed vocabularies; only non-negative counters vary.
+    prefix = f"codex-voice direct_webrtc_status={status}"
+    records = (
+        (
+            f"{prefix} record=state phase={phase} outcome={outcome} "
+            f"duration_ms={bounded(duration_ms)} "
             f"handshake_ready={'yes' if diagnostics.handshake_ready else 'no'} "
             "peer_answer_applied="
             f"{'yes' if diagnostics.peer_answer_applied else 'no'} "
             f"peer_connected={'yes' if diagnostics.peer_connected else 'no'} "
-            f"peer_data_ready={'yes' if diagnostics.peer_data_ready else 'no'} "
+            f"peer_data_ready={'yes' if diagnostics.peer_data_ready else 'no'}"
+        ),
+        (
+            f"{prefix} record=media "
             f"capture_sent_packets={bounded(diagnostics.capture_packets)} "
-            f"capture_sent_bytes={bounded(diagnostics.capture_bytes)} "
-            f"capture_max_peak={min(32_768, bounded(diagnostics.capture_max_peak))} "
-            f"capture_max_rms={min(32_768, bounded(diagnostics.capture_max_rms))} "
             f"capture_signal_frames={bounded(diagnostics.capture_signal_frames)} "
-            f"lifecycle_events={diagnostics.lifecycle_summary()} "
             "playback_signal_packets="
-            f"{bounded(diagnostics.playback_signal_packets)} "
-            f"playback_signal_bytes={bounded(diagnostics.playback_signal_bytes)} "
-            f"playback_max_peak={min(32_768, bounded(diagnostics.playback_max_peak))} "
-            f"playback_max_rms={min(32_768, bounded(diagnostics.playback_max_rms))} "
-            f"duration_ms={bounded(duration_ms)} outcome={outcome}"
-        )
-        if len(message) > _DIRECT_SYSLOG_RECORD_MAX_BYTES:
-            return
-        syslog.syslog(syslog.LOG_INFO, message)
+            f"{bounded(diagnostics.playback_signal_packets)}"
+        ),
+        (
+            f"{prefix} record=levels "
+            f"capture_max_peak={pcm_level(diagnostics.capture_max_peak)} "
+            f"capture_max_rms={pcm_level(diagnostics.capture_max_rms)} "
+            f"playback_max_peak={pcm_level(diagnostics.playback_max_peak)} "
+            f"playback_max_rms={pcm_level(diagnostics.playback_max_rms)}"
+        ),
+        (
+            f"{prefix} record=events_1 "
+            f"capture.rtp_started={lifecycle_count('capture.rtp_started')} "
+            f"playback.rtp_started={lifecycle_count('playback.rtp_started')} "
+            "input_audio_buffer.speech_started="
+            f"{lifecycle_count('input_audio_buffer.speech_started')} "
+            "input_audio_buffer.speech_stopped="
+            f"{lifecycle_count('input_audio_buffer.speech_stopped')}"
+        ),
+        (
+            f"{prefix} record=events_2 "
+            f"response.created={lifecycle_count('response.created')} "
+            f"response.done={lifecycle_count('response.done')} "
+            f"turn.created={lifecycle_count('turn.created')} "
+            f"turn.done={lifecycle_count('turn.done')} "
+            "output_audio_buffer.started="
+            f"{lifecycle_count('output_audio_buffer.started')} "
+            "output_audio_buffer.stopped="
+            f"{lifecycle_count('output_audio_buffer.stopped')}"
+        ),
+    )
+    for message in records:
+        with suppress(Exception):  # diagnostics must never affect live media
+            encoded = message.encode("ascii")
+            if len(encoded) <= _DIRECT_SYSLOG_RECORD_MAX_BYTES:
+                syslog.syslog(syslog.LOG_INFO, message)
 
 
 class _DirectPendingOutput:
@@ -1598,6 +1636,8 @@ class RealtimeSession:
             while not required_states.issubset(ready_states):
                 self._raise_if_direct_startup_cancelled(handshake_deadline)
                 now = self._clock()
+                # Local signal may be persistent ambient noise. It remains a
+                # capture metric but cannot prove provider-side activity.
                 sample_index, _ = self._send_direct_audio(
                     sidecar,
                     pacer,
@@ -1768,7 +1808,7 @@ class RealtimeSession:
                     pending_ping = None
                     pong_deadline = None
                     continue
-                sample_index, input_semantic = self._send_direct_audio(
+                sample_index, _ = self._send_direct_audio(
                     sidecar,
                     pacer,
                     sample_index=sample_index,
@@ -1784,7 +1824,7 @@ class RealtimeSession:
                     raise SidecarError(  # noqa: TRY301
                         "sidecar emitted an unexpected runtime event"
                     )
-                if input_semantic or output_semantic:
+                if output_semantic:
                     last_semantic_activity = self._clock()
 
                 if now >= next_syslog_at:
