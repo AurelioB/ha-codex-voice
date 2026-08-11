@@ -385,8 +385,8 @@ def _validate_capture_gain(value: str | int | bool | float) -> None:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
-        or not isfinite(float(value))
-        or not 0.0 <= float(value) <= 12.0
+        or (isinstance(value, float) and not isfinite(value))
+        or not 0 <= value <= 12
     ):
         raise ProtocolError("sidecar capture gain is invalid")
 

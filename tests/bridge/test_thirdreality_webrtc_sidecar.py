@@ -35,6 +35,8 @@ from device.thirdreality.webrtc_sidecar.peer import (
     _apply_capture_gain_pcm16,
 )
 from device.thirdreality.webrtc_sidecar.protocol import (
+    CONTROL_KIND,
+    WIRE_VERSION,
     CaptureAudio,
     ControlMessage,
     PlaybackAudio,
@@ -135,11 +137,31 @@ def test_ipc_round_trips_strict_capture_gain(gain_db: float) -> None:
 
 @pytest.mark.parametrize(
     "gain_db",
-    [True, float("nan"), float("inf"), -0.01, 12.01],
+    [True, float("nan"), float("inf"), -0.01, 12.01, 10**400],
 )
 def test_ipc_rejects_invalid_capture_gain(gain_db: object) -> None:
     with pytest.raises(ProtocolError, match="capture gain"):
         encode_control("create_offer", direct_capture_gain_db=gain_db)  # type: ignore[arg-type]
+
+
+def _raw_control_packet(message_type: str, **values: object) -> bytes:
+    body = json.dumps(
+        {"type": message_type, **values},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return bytes((CONTROL_KIND, WIRE_VERSION)) + body
+
+
+def test_ipc_decode_rejects_huge_integer_capture_gain_as_protocol_error() -> None:
+    with pytest.raises(ProtocolError, match="capture gain"):
+        decode_packet(
+            _raw_control_packet(
+                "create_offer",
+                direct_capture_gain_db=10**400,
+            )
+        )
 
 
 def test_ipc_capture_metrics_have_one_bounded_content_free_shape() -> None:
@@ -562,6 +584,32 @@ async def test_runtime_fails_closed_when_audio_arrives_before_offer() -> None:
         assert await _recv_packet(parent) == ControlMessage(
             type="error",
             values={"code": "capture_outside_session"},
+        )
+        assert await asyncio.wait_for(run_task, timeout=1) == 1
+    finally:
+        parent.close()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_maps_huge_integer_capture_gain_to_protocol_error() -> None:
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parent.setblocking(False)
+    runtime = SidecarRuntime(child, peer_factory=FakePeer)
+    run_task = asyncio.create_task(runtime.run())
+    try:
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            _raw_control_packet(
+                "create_offer",
+                direct_capture_gain_db=10**400,
+            ),
+        )
+        assert await _recv_packet(parent) == ControlMessage(
+            type="error",
+            values={"code": "protocol_error"},
         )
         assert await asyncio.wait_for(run_task, timeout=1) == 1
     finally:
