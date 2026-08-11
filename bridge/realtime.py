@@ -76,6 +76,7 @@ class SignalingRealtimeSession:
         self._started = False
         self._closed = False
         self._stop_task: asyncio.Task[None] | None = None
+        self._stop_requires_confirmation: bool | None = None
 
     async def start(
         self,
@@ -139,6 +140,8 @@ class SignalingRealtimeSession:
             event_params = raw_params if isinstance(raw_params, Mapping) else {}
             if method == "thread/realtime/error":
                 raise ProtocolError("realtime provider error")
+            if method == "thread/realtime/closed":
+                raise ProtocolError("realtime provider closed during signaling")
             if method == "thread/realtime/started":
                 session_id = event_params.get("realtimeSessionId")
                 self.realtime_session_id = (
@@ -211,37 +214,74 @@ class SignalingRealtimeSession:
                 events.append(event)
 
     async def stop(self) -> None:
-        """Stop the remote session and close its subscription exactly once."""
+        """Best-effort stop the remote session and close its subscription once."""
         if self._stop_task is None:
             self._closed = True
+            self._stop_requires_confirmation = False
             self._stop_task = asyncio.create_task(
-                self._stop_once(),
+                self._stop_once(require_closed=False),
                 name=f"codex-realtime-signaling-stop-{self.thread_id}",
+            )
+        try:
+            await asyncio.shield(self._stop_task)
+        except Exception as err:  # noqa: BLE001 - cleanup is best effort
+            LOGGER.warning(
+                "Realtime signaling cleanup failed (app-server realtime stop): %s",
+                err,
+            )
+
+    async def stop_strict(self) -> None:
+        """Stop the remote session with an observable, bounded outcome.
+
+        A successful return is the boundary required before another realtime
+        session may safely reuse this thread. Any error, including a timeout,
+        means callers must treat the stop outcome as ambiguous and move the
+        replacement session to a different thread.
+        """
+        if self._stop_task is None:
+            self._closed = True
+            self._stop_requires_confirmation = True
+            self._stop_task = asyncio.create_task(
+                self._stop_once(require_closed=True),
+                name=f"codex-realtime-signaling-stop-{self.thread_id}",
+            )
+        elif self._stop_requires_confirmation is not True:
+            raise ProtocolError(
+                "realtime signaling stop lacks provider closure confirmation"
             )
         await asyncio.shield(self._stop_task)
 
-    async def _stop_once(self) -> None:
+    async def _stop_once(self, *, require_closed: bool) -> None:
         cleanup_timeout = max(0.0, min(self.timeout, _STOP_TIMEOUT_SECONDS))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cleanup_timeout
         try:
             if self._start_requested:
                 try:
-                    async with asyncio.timeout(cleanup_timeout):
+                    async with asyncio.timeout_at(deadline):
                         await self.rpc.call(
                             "thread/realtime/stop",
                             {"threadId": self.thread_id},
-                            timeout=cleanup_timeout,
+                            timeout=max(0.0, deadline - loop.time()),
                         )
+                        while require_closed:
+                            event = await self.subscription.get(
+                                timeout=max(0.0, deadline - loop.time())
+                            )
+                            self._raise_if_app_server_exited(event)
+                            if not self._belongs_to_thread(event):
+                                continue
+                            method = event.get("method")
+                            if method == "thread/realtime/error":
+                                raise ProtocolError(
+                                    "realtime provider error during stop"
+                                )
+                            if method == "thread/realtime/closed":
+                                break
                 except TimeoutError:
-                    LOGGER.warning(
-                        "Realtime signaling cleanup timed out after %.1f seconds",
-                        cleanup_timeout,
-                    )
-                except Exception as err:  # noqa: BLE001 - cleanup is best effort
-                    LOGGER.warning(
-                        "Realtime signaling cleanup failed (app-server realtime "
-                        "stop): %s",
-                        err,
-                    )
+                    raise TimeoutError(
+                        "realtime signaling stop outcome is ambiguous"
+                    ) from None
         finally:
             self.subscription.close()
 

@@ -78,7 +78,12 @@ class SidecarRuntime:
             from .peer import DeviceWebRtcPeer  # noqa: PLC0415
 
             peer_factory = DeviceWebRtcPeer
-        self._peer = peer_factory(
+        self._peer_factory = peer_factory
+        self._peer = self._new_peer()
+
+    def _new_peer(self) -> PeerLike:
+        """Construct one fresh peer while retaining the imported child runtime."""
+        return self._peer_factory(
             emit_lifecycle=self._emit_lifecycle,
             emit_playback=self._emit_playback,
             emit_state=self._emit_state,
@@ -118,10 +123,12 @@ class SidecarRuntime:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(receive_task, fatal_task, return_exceptions=True)
-            try:
-                await self._peer.stop()
-            except Exception:  # noqa: BLE001 - peer cleanup must not escape.
-                code = 1
+            if not self._stopped:
+                try:
+                    await self._peer.stop()
+                    self._stopped = True
+                except Exception:  # noqa: BLE001 - peer cleanup must not escape.
+                    code = 1
             self._transport.close()
         return code
 
@@ -153,7 +160,15 @@ class SidecarRuntime:
 
     async def _handle_control(self, message: ControlMessage) -> None:
         if message.type == "create_offer":
-            if self._offer_created or self._stopped:
+            if self._stopped:
+                try:
+                    self._peer = self._new_peer()
+                except Exception as exc:
+                    raise RuntimeErrorCode("offer_failed") from exc
+                self._offer_created = False
+                self._answer_applied = False
+                self._stopped = False
+            if self._offer_created:
                 raise RuntimeErrorCode("offer_state_invalid")
             try:
                 sdp = await self._peer.create_offer()

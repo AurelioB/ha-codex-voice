@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -26,9 +27,14 @@ from device.thirdreality.realtime_client.session import (
     SessionState,
     SubmitResult,
     _AudioPacer,
+    _AudioPacket,
+    _direct_answer_sdp,
+    _direct_rollover_answer_sdp,
+    _direct_rollover_context_retained,
     _pcm_has_local_barge_in_signal,
     _pcm_has_signal,
     _PcmPlayer,
+    _validate_direct_started,
     _validate_started,
     _verify_pulseaudio_aec,
 )
@@ -191,15 +197,35 @@ class _DirectRecordingPlayer(_LoopPlayer):
         self._active = False
 
 
+class _BlockingServicePlayer(_DirectRecordingPlayer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_service = threading.Event()
+        self.service_entered = threading.Event()
+        self.release_service = threading.Event()
+        self.service_calls = 0
+
+    def service(self) -> None:
+        self.service_calls += 1
+        if self.block_service.is_set():
+            self.service_entered.set()
+            assert self.release_service.wait(1.0)
+        super().service()
+
+
 class _FakeSidecar:
     def __init__(self) -> None:
+        self.process = _FakeProcess()
         self._incoming: deque[ControlMessage | PlaybackAudio] = deque()
         self._condition = threading.Condition()
         self.answers: list[str] = []
         self.audio: list[tuple[bytes, int, int]] = []
         self.ipc_sent: list[tuple[str, bytes | None]] = []
         self.interruptions = 0
+        self.offer_requests = 0
         self.stop_count = 0
+        self.fail_stop = False
+        self.close_timeouts: list[float] = []
         self.closed = False
 
     def wait_readable(self, timeout: float) -> bool:
@@ -216,6 +242,7 @@ class _FakeSidecar:
             self._condition.notify_all()
 
     def request_offer(self) -> None:
+        self.offer_requests += 1
         self.feed(
             ControlMessage(
                 "offer",
@@ -262,12 +289,35 @@ class _FakeSidecar:
 
     def stop(self) -> None:
         self.stop_count += 1
+        if self.fail_stop:
+            raise SidecarError("simulated sidecar stop failure")
+        self.feed(ControlMessage("stopped", {}))
 
     def close(self, *, timeout: float = 1.0) -> None:
-        del timeout
+        self.close_timeouts.append(timeout)
         with self._condition:
             self.closed = True
             self._condition.notify_all()
+
+
+class _BlockingDrainSidecar(_FakeSidecar):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_drain = threading.Event()
+        self.drain_entered = threading.Event()
+        self.release_drain = threading.Event()
+        self.drain_calls = 0
+
+    def drain_messages(
+        self,
+        *,
+        maximum: int = 64,
+    ) -> list[ControlMessage | PlaybackAudio]:
+        self.drain_calls += 1
+        if self.block_drain.is_set():
+            self.drain_entered.set()
+            assert self.release_drain.wait(1.0)
+        return super().drain_messages(maximum=maximum)
 
 
 class _FakeRealtimeConnection:
@@ -296,7 +346,7 @@ class _FakeRealtimeConnection:
                 lambda: bool(self._incoming) or self.closed,
                 timeout=max(0.0, timeout),
             )
-            return bool(self._incoming)
+            return bool(self._incoming) or self.closed
 
     def send_json(self, value: dict[str, object]) -> None:
         with self._condition:
@@ -328,6 +378,8 @@ class _FakeRealtimeConnection:
     def receive_message(self) -> Message:
         with self._condition:
             if not self._incoming:
+                if self.closed:
+                    raise WebSocketError("simulated peer disconnect")
                 raise AssertionError("receive_message called without readable input")
             return self._incoming.popleft()
 
@@ -358,17 +410,45 @@ def _wait_for(predicate: Any, timeout: float = 1.0) -> bool:
 def test_shutdown_closes_idle_prewarmed_sidecar_and_blocks_rewarm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sidecar = _FakeSidecar()
-    monkeypatch.setattr(session_module, "_PREWARMED_SIDECAR", sidecar)
+    sidecars = (_FakeSidecar(), _FakeSidecar())
+    monkeypatch.setattr(
+        session_module,
+        "_PREWARMED_SIDECARS",
+        deque(sidecars),
+    )
     monkeypatch.setattr(session_module, "_SHUTTING_DOWN", False)
 
     session_module.shutdown_all_sessions(timeout=0.0)
 
-    assert sidecar.closed
-    assert session_module._PREWARMED_SIDECAR is None
+    assert all(sidecar.closed for sidecar in sidecars)
+    assert not session_module._PREWARMED_SIDECARS
     assert session_module.prewarm_device_webrtc() is False
     with pytest.raises(SidecarError, match="shutting down"):
         session_module._take_prewarmed_sidecar()
+
+
+def test_prewarm_keeps_initial_and_first_rollover_sidecars_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = (_FakeSidecar(), _FakeSidecar())
+    pending = deque(created)
+
+    def launch() -> _FakeSidecar:
+        return pending.popleft()
+
+    monkeypatch.setattr(session_module, "_PREWARMED_SIDECARS", deque())
+    monkeypatch.setattr(session_module, "_SHUTTING_DOWN", False)
+    monkeypatch.setattr(
+        session_module.WebRtcSidecarClient,
+        "launch",
+        staticmethod(launch),
+    )
+
+    assert session_module.prewarm_device_webrtc() is True
+    assert tuple(session_module._PREWARMED_SIDECARS) == created
+    assert session_module._take_prewarmed_sidecar() is created[0]
+    assert session_module._take_prewarmed_sidecar() is created[1]
+    assert not session_module._PREWARMED_SIDECARS
 
 
 def _install_fake_loop_io(
@@ -420,30 +500,57 @@ def _direct_started() -> dict[str, object]:
 
 def _start_direct_session(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_first_standby: bool = False,
+    sidecar_created: Callable[[list[_FakeSidecar]], None] | None = None,
+    sidecar_builder: Callable[[], _FakeSidecar] = _FakeSidecar,
+    direct_player: _DirectRecordingPlayer | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    aec_verifier: Callable[[RealtimeConfig], None] | None = None,
+    **config_overrides: object,
 ) -> tuple[
     RealtimeSession,
     _FakeRealtimeConnection,
     _FakeSidecar,
     _DirectRecordingPlayer,
+    list[_FakeSidecar],
 ]:
     connection = _FakeRealtimeConnection()
-    sidecar = _FakeSidecar()
-    player = _DirectRecordingPlayer()
+    sidecars: list[_FakeSidecar] = []
+    factory_calls = 0
+
+    def make_sidecar() -> _FakeSidecar:
+        nonlocal factory_calls
+        factory_calls += 1
+        if fail_first_standby and factory_calls == 2:
+            raise SidecarError("simulated prewarm failure")
+        sidecar = sidecar_builder()
+        sidecars.append(sidecar)
+        if sidecar_created is not None:
+            sidecar_created(sidecars)
+        return sidecar
+
+    player = direct_player or _DirectRecordingPlayer()
     monkeypatch.setattr(
         session_module,
         "_socket_readable",
         lambda transport, timeout: transport.wait_readable(timeout),
     )
     session = RealtimeSession(
-        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        _duplex_config(
+            media_transport=DEVICE_WEBRTC_TRANSPORT,
+            **config_overrides,
+        ),
+        clock=clock,
         connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
-        aec_verifier=lambda _config: None,
+        aec_verifier=aec_verifier or (lambda _config: None),
         volume_guard=lambda _config: None,
-        sidecar_factory=lambda: sidecar,  # type: ignore[arg-type]
+        sidecar_factory=make_sidecar,  # type: ignore[arg-type]
         direct_player_factory=lambda _maximum, _sink: player,
     )
     session.start()
     assert _wait_for(lambda: bool(connection.json_sent))
+    sidecar = sidecars[0]
     start = connection.json_sent[0]
     assert start["protocol_version"] == 3
     assert start["transport"] == {
@@ -476,13 +583,41 @@ def _start_direct_session(
     assert connection.wait_for_json({"type": "transport_ready", "protocol_version": 3})
     connection.feed(Message("text", json.dumps(_direct_started())))
     assert _wait_for(lambda: session.ready)
-    return session, connection, sidecar, player
+    expected_sidecars = 1 if fail_first_standby else 2
+    assert _wait_for(lambda: len(sidecars) >= expected_sidecars)
+    return session, connection, sidecar, player, sidecars
+
+
+def test_direct_handshake_budget_starts_after_local_aec_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+
+    def prepare_aec(_config: RealtimeConfig) -> None:
+        # Device pactl verification and sink preparation are local preflight,
+        # not WebRTC signaling. They must not consume the configured network
+        # handshake budget, while max_session_seconds still spans both phases.
+        now[0] += 4.0
+
+    session, _connection, _sidecar, player, _sidecars = _start_direct_session(
+        monkeypatch,
+        handshake_timeout_seconds=2.0,
+        clock=lambda: now[0],
+        aec_verifier=prepare_aec,
+    )
+
+    assert session.ready
+    assert ("prepare", None) in player.events
+    session.stop()
+    assert session.join(1.0)
 
 
 def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, connection, sidecar, _player = _start_direct_session(monkeypatch)
+    session, connection, sidecar, _player, _sidecars = _start_direct_session(
+        monkeypatch
+    )
     frame = b"\x01\x00" * 1_024
 
     assert session.submit_audio(frame) is SubmitResult.ACCEPTED
@@ -500,17 +635,103 @@ def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     assert connection.closed
 
 
-def test_direct_webrtc_barge_in_fences_media_and_keeps_same_session(
+@pytest.mark.parametrize("boundary_name", ["stop", "interrupt"])
+def test_direct_explicit_boundary_waits_for_player_service_and_blocks_later_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary_name: str,
+) -> None:
+    player = _BlockingServicePlayer()
+    session, _connection, _sidecar, _player, _sidecars = _start_direct_session(
+        monkeypatch,
+        direct_player=player,
+    )
+    player.block_service.set()
+    assert player.service_entered.wait(1.0)
+    boundary_returned = threading.Event()
+
+    def apply_boundary() -> None:
+        getattr(session, boundary_name)()
+        boundary_returned.set()
+
+    boundary_thread = threading.Thread(target=apply_boundary)
+    boundary_thread.start()
+    try:
+        assert not boundary_returned.wait(0.05)
+        player.release_service.set()
+        assert boundary_returned.wait(1.0)
+        service_calls_at_boundary = player.service_calls
+        assert session.join(1.0)
+        assert player.service_calls == service_calls_at_boundary
+    finally:
+        player.release_service.set()
+        boundary_thread.join(timeout=1.0)
+        if not session.terminal:
+            session.stop()
+            assert session.join(1.0)
+
+
+def test_direct_explicit_boundary_waits_for_output_drain_and_blocks_later_playback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, connection, sidecar, player = _start_direct_session(monkeypatch)
-    sidecar.feed(
+    session, _connection, active, player, _sidecars = _start_direct_session(
+        monkeypatch,
+        sidecar_builder=_BlockingDrainSidecar,
+    )
+    assert isinstance(active, _BlockingDrainSidecar)
+    active.block_drain.set()
+    active.feed(
         ControlMessage(
             "lifecycle",
             {"event_type": "media.started", "generation": 1},
         )
     )
-    sidecar.feed(
+    active.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=b"\x03\x00" * 480,
+        )
+    )
+    assert active.drain_entered.wait(1.0)
+    boundary_returned = threading.Event()
+
+    def stop_session() -> None:
+        session.stop()
+        boundary_returned.set()
+
+    boundary_thread = threading.Thread(target=stop_session)
+    boundary_thread.start()
+    try:
+        assert not boundary_returned.wait(0.05)
+        active.release_drain.set()
+        assert boundary_returned.wait(1.0)
+        drains_at_boundary = active.drain_calls
+        audio_at_boundary = sum(event[0] == "audio" for event in player.events)
+        assert session.join(1.0)
+        assert active.drain_calls == drains_at_boundary
+        assert sum(event[0] == "audio" for event in player.events) == audio_at_boundary
+    finally:
+        active.release_drain.set()
+        boundary_thread.join(timeout=1.0)
+        if not session.terminal:
+            session.stop()
+            assert session.join(1.0)
+
+
+def test_direct_webrtc_barge_in_rolls_over_peer_and_replays_capture_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, old_sidecar, player, sidecars = _start_direct_session(
+        monkeypatch
+    )
+    old_sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    old_sidecar.feed(
         PlaybackAudio(
             generation=1,
             sample_index=0,
@@ -521,68 +742,189 @@ def test_direct_webrtc_barge_in_fences_media_and_keeps_same_session(
     assert _wait_for(lambda: ("audio", b"\x02\x00" * 480) in player.events)
     assert session.output_active
 
-    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
-    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
-    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
-    assert _wait_for(lambda: sidecar.interruptions == 1)
-    assert _wait_for(lambda: len(sidecar.audio) >= 2)
+    before = b"\x01\x00" * 256
+    speech_one = (2_000).to_bytes(2, "little", signed=True) * 512
+    speech_two = (2_100).to_bytes(2, "little", signed=True) * 768
+    during_handshake = b"\x02\x00" * 128
+    assert session.submit_audio(before) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech_one) is SubmitResult.ACCEPTED
+    assert _wait_for(lambda: len(old_sidecar.audio) == 2)
+    old_timestamps = [packet[2] for packet in old_sidecar.audio]
+
+    # The second qualifying AEC frame remains unsent when the network thread
+    # observes the detector request. The fresh peer receives disjoint sent
+    # preroll plus the unsent queue; the old provider may already have seen the
+    # onset, but receives nothing after the cut is processed.
+    assert session.submit_audio(speech_two) is SubmitResult.ACCEPTED
+    assert _wait_for(lambda: session.state is SessionState.INTERRUPTING)
+    assert _wait_for(lambda: ("abort", None) in player.events)
     assert not session.output_active
     assert session.ready
-    assert _wait_for(lambda: session.state is SessionState.INTERRUPTING)
+    assert not old_sidecar.closed
+    assert old_sidecar.stop_count >= 1
+    assert old_sidecar.interruptions == 0
     assert not connection.closed
+    old_audio_count = len(old_sidecar.audio)
 
-    old_audio_count = sum(event[0] == "audio" for event in player.events)
-    sidecar.feed(
-        PlaybackAudio(
-            generation=1,
-            sample_index=480,
-            media_timestamp=480,
-            pcm=b"\x03\x00" * 480,
+    rollover = next(
+        value for value in connection.json_sent if value.get("type") == "rollover"
+    )
+    assert rollover == {
+        "type": "rollover",
+        "protocol_version": 3,
+        "epoch": 2,
+        "transport": {
+            "type": "webrtc",
+            "sdp": (
+                "v=0\r\n"
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            ),
+        },
+    }
+    assert session.submit_audio(during_handshake) is SubmitResult.ACCEPTED
+    replacement = sidecars[1]
+    # Capture starts flowing through the offer-created replacement before the
+    # bridge/provider answer exists, preserving original timestamp freshness.
+    assert _wait_for(lambda: len(replacement.audio) == 4)
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
         )
     )
-    time.sleep(0.05)
-    assert sum(event[0] == "audio" for event in player.events) == old_audio_count
+    assert connection.wait_for_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    assert _wait_for(lambda: len(replacement.audio) == 4)
+    assert [packet[0] for packet in replacement.audio] == [
+        before,
+        speech_one,
+        speech_two,
+        during_handshake,
+    ]
+    assert [packet[1] for packet in replacement.audio] == [
+        0,
+        256,
+        768,
+        1_536,
+    ]
+    assert [packet[2] for packet in replacement.audio[:2]] == old_timestamps
+    assert [packet[2] for packet in replacement.audio] == sorted(
+        packet[2] for packet in replacement.audio
+    )
+    assert len(old_sidecar.audio) == old_audio_count
+    assert replacement.interruptions == 0
 
-    sidecar.feed(
-        ControlMessage(
-            "lifecycle",
-            {"event_type": "interrupt.fenced", "generation": 1},
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_started",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "context_retained": True,
+                }
+            ),
         )
     )
     assert _wait_for(lambda: session.state is SessionState.READY)
-    sidecar.feed(
+    assert session.ready
+    assert session.context_loss_rollovers == 0
+    assert len(sidecars) == 2
+    assert _wait_for(lambda: old_sidecar.offer_requests == 2)
+
+    audible_before_late_old_media = sum(event[0] == "audio" for event in player.events)
+    old_sidecar.feed(
         ControlMessage(
             "lifecycle",
             {"event_type": "media.started", "generation": 2},
         )
     )
-    sidecar.feed(
+    old_sidecar.feed(
         PlaybackAudio(
             generation=2,
-            sample_index=960,
+            sample_index=480,
+            media_timestamp=0,
+            pcm=b"\x09\x00" * 480,
+        )
+    )
+    time.sleep(0.05)
+    assert session.state is SessionState.READY
+    assert (
+        sum(event[0] == "audio" for event in player.events)
+        == audible_before_late_old_media
+    )
+
+    replacement.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    replacement.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
             media_timestamp=0,
             pcm=b"\x04\x00" * 480,
         )
     )
-    assert _wait_for(lambda: ("begin", 2) in player.events)
+    assert _wait_for(lambda: ("begin", 1) in player.events[1:])
     assert _wait_for(lambda: ("audio", b"\x04\x00" * 480) in player.events)
-    assert session.ready
 
     session.stop()
     assert session.join(1.0)
+    assert all(sidecar.closed for sidecar in sidecars)
 
 
-def test_direct_barge_interrupt_follows_exact_qualifying_capture_watermark(
+def test_direct_rollover_stop_send_failure_kills_old_peer_and_fails_before_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    allow_audio_send = threading.Event()
+    session, connection, old_sidecar, _player, sidecars = _start_direct_session(
+        monkeypatch
+    )
+    old_sidecar.fail_stop = True
+    old_sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
 
-    class GatedAudioPacer(_AudioPacer):
-        def due(self, now: float) -> bool:
-            return allow_audio_send.is_set() and super().due(now)
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert old_sidecar.stop_count >= 1
+    assert 0.0 in old_sidecar.close_timeouts
+    assert old_sidecar.closed
+    assert len(sidecars) == 2
+    assert sidecars[1].closed
+    assert not any(value.get("type") == "rollover" for value in connection.json_sent)
 
-    monkeypatch.setattr(session_module, "_AudioPacer", GatedAudioPacer)
-    session, connection, sidecar, player = _start_direct_session(monkeypatch)
+
+def test_direct_rollover_rejects_stale_bridge_epoch_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, player, sidecars = _start_direct_session(monkeypatch)
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -591,80 +933,847 @@ def test_direct_barge_interrupt_follows_exact_qualifying_capture_watermark(
     )
     assert _wait_for(lambda: session.output_active)
 
-    def frame(amplitude: int) -> bytes:
-        return amplitude.to_bytes(2, "little", signed=True) * 512
-
-    before = [frame(10), frame(20)]
-    qualifying = [frame(2_000), frame(2_200)]
-    after = frame(30)
-    for pcm in [*before, *qualifying, after]:
-        assert session.submit_audio(pcm) is SubmitResult.ACCEPTED
-
-    # The capture backlog is fully admitted but deliberately held from IPC.
-    # Playback still dies as soon as the network thread applies the detector
-    # request; its provider token must wait for the target capture watermark.
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert _wait_for(lambda: ("abort", None) in player.events)
-    assert not session.output_active
-    assert not sidecar.audio
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": 1,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
+        )
+    )
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert session.ready
+    assert connection.closed
+    assert sidecar.closed
+    assert sidecars[1].closed
     assert sidecar.interruptions == 0
-    assert not connection.closed
 
-    # Before the paced watermark reaches the child, its still-unmuted receiver
-    # may observe an ordinary quiet gap and open another stale generation. The
-    # parent must retire/drop it rather than terminating the same-peer session.
-    sidecar.feed(
+
+def _complete_direct_rollover(
+    connection: _FakeRealtimeConnection,
+    *,
+    epoch: int,
+    context_retained: bool,
+) -> None:
+    assert _wait_for(
+        lambda: any(
+            value.get("type") == "rollover" and value.get("epoch") == epoch
+            for value in connection.json_sent
+        )
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": epoch,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
+        )
+    )
+    assert connection.wait_for_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": epoch,
+        }
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_started",
+                    "protocol_version": 3,
+                    "epoch": epoch,
+                    "context_retained": context_retained,
+                }
+            ),
+        )
+    )
+
+
+def test_direct_repeated_rollovers_replenish_standby_and_keep_ready_latched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, first, player, sidecars = _start_direct_session(
+        monkeypatch,
+        input_queue_bytes=32_768,
+    )
+    ready_event = session._ready
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+    quiet = b"\x00\x00" * 1_024
+
+    first.feed(
         ControlMessage(
             "lifecycle",
-            {"event_type": "media.quiet", "generation": 1},
+            {"event_type": "media.started", "generation": 1},
         )
     )
-    sidecar.feed(
-        ControlMessage(
-            "lifecycle",
-            {"event_type": "media.started", "generation": 2},
-        )
-    )
-    stale_pcm = b"\x09\x00" * 480
-    sidecar.feed(
-        PlaybackAudio(
-            generation=2,
-            sample_index=0,
-            media_timestamp=0,
-            pcm=stale_pcm,
-        )
-    )
-    time.sleep(0.05)
-    assert not session.terminal
-    assert not any(event == ("audio", stale_pcm) for event in player.events)
-
-    allow_audio_send.set()
-    session._wake_network.set()
-    assert _wait_for(lambda: sidecar.interruptions == 1)
-    assert _wait_for(lambda: len(sidecar.audio) == 5)
-    through_watermark = [("audio", pcm) for pcm in [*before, *qualifying]]
-    assert sidecar.ipc_sent[:6] == [
-        *through_watermark,
-        ("interrupt", None),
-        ("audio", after),
-    ]
-    assert not connection.closed
-
-    sidecar.feed(
-        ControlMessage(
-            "lifecycle",
-            {"event_type": "interrupt.fenced", "generation": 2},
-        )
-    )
+    assert _wait_for(lambda: session.output_active)
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    _complete_direct_rollover(connection, epoch=2, context_retained=False)
     assert _wait_for(lambda: session.state is SessionState.READY)
+    assert session.context_loss_rollovers == 1
+    assert session._ready is ready_event and ready_event.is_set()
+    assert len(sidecars) == 2
+    second = sidecars[1]
+    assert not first.closed
+    assert _wait_for(lambda: first.offer_requests == 2)
+    assert second.offer_requests == 1
+
+    second.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    # A second interruption requires a new speech edge. Eight recorder frames
+    # of quiet rearm the detector after the first utterance retired its peer.
+    for _ in range(8):
+        assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    _complete_direct_rollover(connection, epoch=3, context_retained=True)
+    assert _wait_for(lambda: session.state is SessionState.READY)
+    assert session.context_loss_rollovers == 1
+    assert session._ready is ready_event and ready_event.is_set()
+    assert len(sidecars) == 2
+    assert not second.closed
+    assert _wait_for(lambda: second.offer_requests == 2)
 
     session.stop()
     assert session.join(1.0)
+    assert session.state is SessionState.STOPPED
+    assert all(sidecar.closed for sidecar in sidecars)
+    assert player.events.count(("abort", None)) >= 3
+
+
+def test_direct_barge_detector_rearms_only_after_quiet_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, first, _player, sidecars = _start_direct_session(
+        monkeypatch,
+        input_queue_bytes=65_536,
+    )
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+    quiet = b"\x00\x00" * 1_024
+
+    first.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    _complete_direct_rollover(connection, epoch=2, context_retained=True)
+    assert _wait_for(lambda: session.state is SessionState.READY)
+
+    replacement = sidecars[1]
+    replacement.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+
+    # The same uninterrupted utterance remains above threshold after the new
+    # response begins. It must not retire the replacement peer a second time.
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    time.sleep(0.05)
+    assert not any(
+        value.get("type") == "rollover" and value.get("epoch") == 3
+        for value in connection.json_sent
+    )
+
+    # Seven production-sized recorder callbacks (448 ms) are insufficient.
+    # Speech before the eighth remains part of the same local speech segment
+    # and resets the quiet count.
+    for _ in range(7):
+        assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    time.sleep(0.05)
+    assert not any(
+        value.get("type") == "rollover" and value.get("epoch") == 3
+        for value in connection.json_sent
+    )
+
+    # Eight consecutive production recorder callbacks (512 ms) of quiet rearm
+    # the detector. A genuinely new utterance may then interrupt normally.
+    for _ in range(8):
+        assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(
+            value.get("type") == "rollover" and value.get("epoch") == 3
+            for value in connection.json_sent
+        )
+    )
+
+    session.stop()
+    assert session.join(1.0)
+    assert all(sidecar.closed for sidecar in sidecars)
+
+
+def test_direct_recycled_sidecar_discards_retired_audio_before_stop_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module,
+        "_socket_readable",
+        lambda transport, timeout: transport.wait_readable(timeout),
+    )
+    session = RealtimeSession(
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        aec_verifier=lambda _config: None,
+    )
+    active = _FakeSidecar()
+    recycled = _FakeSidecar()
+    recycled.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=b"\x01\x00" * 480,
+        )
+    )
+    recycled.feed(ControlMessage("stopped", {}))
+
+    standby = session._start_direct_standby(  # type: ignore[arg-type]
+        active,  # type: ignore[arg-type]
+        recycled=recycled,  # type: ignore[arg-type]
+    )
+
+    assert standby is not None
+    assert standby.sidecar is recycled
+    assert recycled.offer_requests == 1
+    assert recycled.drain_messages() == [
+        ControlMessage(
+            "offer",
+            {
+                "sdp": (
+                    "v=0\r\n"
+                    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+                )
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            ControlMessage("stopped", {}),
+            PlaybackAudio(
+                generation=1,
+                sample_index=0,
+                media_timestamp=0,
+                pcm=b"\x01\x00" * 480,
+            ),
+        ],
+        [
+            ControlMessage("error", {"code": "peer_failed"}),
+            ControlMessage("stopped", {}),
+        ],
+        [ControlMessage("connected", {}), ControlMessage("stopped", {})],
+    ],
+)
+def test_direct_recycled_sidecar_rejects_ambiguous_stop_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    messages: list[ControlMessage | PlaybackAudio],
+) -> None:
+    monkeypatch.setattr(
+        session_module,
+        "_socket_readable",
+        lambda transport, timeout: transport.wait_readable(timeout),
+    )
+    session = RealtimeSession(
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        aec_verifier=lambda _config: None,
+    )
+    active = _FakeSidecar()
+    recycled = _FakeSidecar()
+    for message in messages:
+        recycled.feed(message)
+
+    standby = session._start_direct_standby(  # type: ignore[arg-type]
+        active,  # type: ignore[arg-type]
+        recycled=recycled,  # type: ignore[arg-type]
+    )
+
+    assert standby is None
+    assert recycled.closed
+    assert recycled.offer_requests == 0
+
+
+def test_direct_rollover_queue_overflow_fails_closed_without_dropping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PausedPacer(_AudioPacer):
+        def due(self, now: float) -> bool:
+            del now
+            return False
+
+    monkeypatch.setattr(session_module, "_AudioPacer", PausedPacer)
+    session, connection, sidecar, _player, sidecars = _start_direct_session(
+        monkeypatch,
+        input_queue_bytes=8_192,
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(lambda: session.state is SessionState.INTERRUPTING)
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.FULL
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert session.ready
+    assert connection.closed
+    assert all(candidate.closed for candidate in sidecars)
+
+
+@pytest.mark.parametrize("request_name", ["stop", "interrupt"])
+def test_direct_explicit_boundary_during_rollover_dominates_wait_and_keeps_ready_latched(
+    monkeypatch: pytest.MonkeyPatch,
+    request_name: str,
+) -> None:
+    session, connection, sidecar, _player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+
+    getattr(session, request_name)()
+
+    assert session.join(1.0)
+    assert session.state is SessionState.STOPPED
+    assert session.ready
+    assert connection.closed
+    assert all(candidate.closed for candidate in sidecars)
+
+
+def test_direct_disconnect_during_rollover_fails_closed_and_reaps_both_peers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, _player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+
+    connection.close()
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert session.ready
+    assert all(candidate.closed for candidate in sidecars)
+
+
+def test_direct_rollover_deadline_fails_closed_before_capture_can_age_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, _player, sidecars = _start_direct_session(
+        monkeypatch,
+        handshake_timeout_seconds=0.08,
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert session.ready
+    assert all(candidate.closed for candidate in sidecars)
+
+
+def test_direct_rollover_fails_closed_without_offer_warm_standby(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, _player, sidecars = _start_direct_session(
+        monkeypatch,
+        fail_first_standby=True,
+    )
+    assert sidecars == [sidecar]
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert len(sidecars) == 1
+    assert not any(value.get("type") == "rollover" for value in connection.json_sent)
+    assert sidecar.closed
+
+
+def test_direct_rollover_does_not_replace_dead_standby_with_third_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, active, _player, sidecars = _start_direct_session(
+        monkeypatch,
+    )
+    standby = sidecars[1]
+    assert _wait_for(lambda: not standby._incoming)
+    with standby._condition:
+        standby.process.returncode = 17
+        standby.closed = True
+        standby._condition.notify_all()
+    assert _wait_for(lambda: standby.closed)
+
+    active.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert len(sidecars) == 2
+    assert not any(value.get("type") == "rollover" for value in connection.json_sent)
+    assert all(candidate.closed for candidate in sidecars)
+
+
+def test_direct_rollover_does_not_replace_ambiguously_closed_live_standby(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, active, _player, sidecars = _start_direct_session(monkeypatch)
+    standby = sidecars[1]
+    assert _wait_for(lambda: not standby._incoming)
+    standby.feed(ControlMessage("connected", {}))
+    assert _wait_for(lambda: standby.closed)
+    assert standby.process.poll() is None
+
+    active.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert len(sidecars) == 2
+    assert not any(value.get("type") == "rollover" for value in connection.json_sent)
+    assert all(candidate.closed for candidate in sidecars)
+
+
+@pytest.mark.parametrize(
+    "started",
+    [
+        {
+            "type": "rollover_started",
+            "protocol_version": 3,
+            "epoch": 1,
+            "context_retained": True,
+        },
+        {
+            "type": "rollover_started",
+            "protocol_version": 3,
+            "epoch": 2,
+            "context_retained": True,
+            "unexpected": False,
+        },
+    ],
+)
+def test_direct_rollover_rejects_stale_or_malformed_started_message(
+    monkeypatch: pytest.MonkeyPatch,
+    started: dict[str, object],
+) -> None:
+    session, connection, sidecar, _player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
+        )
+    )
+    assert connection.wait_for_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    connection.feed(Message("text", json.dumps(started)))
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert session.ready
+    assert all(candidate.closed for candidate in sidecars)
+
+
+def test_direct_rollover_gates_replacement_playback_until_started_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
+        )
+    )
+    assert connection.wait_for_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    audible_before = sum(event[0] == "audio" for event in player.events)
+    replacement = sidecars[1]
+    replacement.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    replacement.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=b"\x07\x00" * 480,
+        )
+    )
+
+    time.sleep(0.02)
+    assert session.state is SessionState.INTERRUPTING
+    assert sum(event[0] == "audio" for event in player.events) == audible_before
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_started",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "context_retained": True,
+                }
+            ),
+        )
+    )
+
+    assert _wait_for(lambda: session.state is SessionState.READY)
+    assert _wait_for(
+        lambda: (
+            sum(event[0] == "audio" for event in player.events) == audible_before + 1
+        )
+    )
+    assert ("begin", 1) in player.events
+    assert ("audio", b"\x07\x00" * 480) in player.events
+    session.stop()
+    assert session.join(1.0)
+
+
+def test_direct_rollover_fails_closed_when_pre_ack_output_exceeds_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
+        )
+    )
+    assert connection.wait_for_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    audible_before = sum(event[0] == "audio" for event in player.events)
+    replacement = sidecars[1]
+    replacement.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    replacement.feed(
+        PlaybackAudio(
+            generation=1,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=b"\x07\x00" * 4_096,
+        )
+    )
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert sum(event[0] == "audio" for event in player.events) == audible_before
+    assert all(candidate.closed for candidate in sidecars)
+
+
+def test_direct_rollover_accepts_benign_lifecycle_races_before_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    replacement = sidecars[1]
+    replacement.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "session.started", "generation": 0},
+        )
+    )
+    time.sleep(0.02)
+    assert session.state is SessionState.INTERRUPTING
+
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_answer",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "transport": {
+                        "type": "webrtc",
+                        "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    },
+                }
+            ),
+        )
+    )
+    assert connection.wait_for_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    replacement.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "response.created", "generation": 0},
+        )
+    )
+    time.sleep(0.02)
+    assert session.state is SessionState.INTERRUPTING
+    assert not any(event[0] == "audio" for event in player.events)
+
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "rollover_started",
+                    "protocol_version": 3,
+                    "epoch": 2,
+                    "context_retained": True,
+                }
+            ),
+        )
+    )
+    assert _wait_for(lambda: session.state is SessionState.READY)
+    session.stop()
+    assert session.join(1.0)
+
+
+@pytest.mark.parametrize("event_type", ["error", "invalid_request_error", "x_error"])
+def test_direct_rollover_rejects_provider_error_lifecycle_before_started(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    session, connection, sidecar, _player, sidecars = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 512
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(
+        lambda: any(value.get("type") == "rollover" for value in connection.json_sent)
+    )
+    sidecars[1].feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": event_type, "generation": 0},
+        )
+    )
+
+    assert session.join(1.0)
+    assert session.state is SessionState.FAILED
+    assert all(candidate.closed for candidate in sidecars)
 
 
 def test_direct_provider_speech_started_is_informational_without_local_barge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, _connection, sidecar, player = _start_direct_session(monkeypatch)
+    session, _connection, sidecar, player, _sidecars = _start_direct_session(
+        monkeypatch
+    )
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -693,7 +1802,9 @@ def test_direct_provider_speech_started_is_informational_without_local_barge(
 def test_direct_webrtc_explicit_interrupt_closes_for_a_fresh_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, connection, sidecar, _player = _start_direct_session(monkeypatch)
+    session, connection, sidecar, _player, _sidecars = _start_direct_session(
+        monkeypatch
+    )
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -718,7 +1829,9 @@ def test_direct_webrtc_explicit_interrupt_closes_for_a_fresh_session(
 def test_direct_explicit_interrupt_closes_audio_admission_before_player_abort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, _connection, sidecar, player = _start_direct_session(monkeypatch)
+    session, _connection, sidecar, player, _sidecars = _start_direct_session(
+        monkeypatch
+    )
     abort_entered = threading.Event()
     release_abort = threading.Event()
     original_abort = player.abort
@@ -772,6 +1885,34 @@ def test_startup_audio_pacer_catches_up_at_bounded_2x_then_returns_to_1x() -> No
     assert pacer.due(10.095) is False
     assert pacer.due(10.096)
     assert pacer.delay(10.032) == pytest.approx(0.064)
+
+
+def test_direct_capture_age_bound_fails_before_restamping_stale_pcm() -> None:
+    session = RealtimeSession(
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT),
+        clock=lambda: 10.0,
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    packet = _AudioPacket(
+        data=b"\x01\x00" * 320,
+        captured_at=7.0,
+        capture_watermark=1,
+    )
+    assert session._audio.put(packet)
+    sidecar = _FakeSidecar()
+
+    with pytest.raises(SidecarError, match="age bound"):
+        session._send_direct_audio(
+            sidecar,  # type: ignore[arg-type]
+            _AudioPacer(),
+            sample_index=0,
+            now=10.0,
+            capture_ages_ms=deque(),
+        )
+
+    assert sidecar.audio == []
 
 
 def test_input_activity_ignores_floor_but_keeps_long_speech_alive() -> None:
@@ -1763,6 +2904,24 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
     assert session._suppressed_output_epoch is None
     assert player.events == [("begin", 1), ("finish", 1), ("begin", 2)]
 
+    # Because the stale request never committed an interruption, epoch 2 must
+    # accept a fresh speech edge without an artificial quiet rearm period.
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=2,
+        last_output_epoch=2,
+    ) == (None, 4)
+    assert session.output_active is False
+    assert session._suppressed_output_epoch == 2
+    assert player.events == [
+        ("begin", 1),
+        ("finish", 1),
+        ("begin", 2),
+        ("abort", None),
+    ]
+
 
 def test_full_duplex_rechecks_volume_ceiling_before_every_response() -> None:
     checks: list[int] = []
@@ -1884,6 +3043,90 @@ def test_started_requires_explicit_native_conversation_mode() -> None:
     wrong_mode["conversation_mode"] = "managed"
     with pytest.raises(WebSocketError, match="incompatible realtime protocol"):
         _validate_started(wrong_mode)
+
+
+@pytest.mark.parametrize("invalid_version", [2.0, True])
+def test_started_rejects_non_exact_protocol_version(invalid_version: object) -> None:
+    started = _started()
+    started["protocol_version"] = invalid_version
+
+    with pytest.raises(WebSocketError, match="incompatible realtime protocol"):
+        _validate_started(started)
+
+
+@pytest.mark.parametrize("invalid_version", [3.0, True])
+def test_direct_answer_rejects_non_exact_protocol_version(
+    invalid_version: object,
+) -> None:
+    answer = {
+        "type": "answer",
+        "protocol_version": invalid_version,
+        "transport": {"type": "webrtc", "sdp": "v=0\r\n"},
+    }
+
+    with pytest.raises(WebSocketError, match="incompatible WebRTC answer"):
+        _direct_answer_sdp(answer)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("protocol_version", 3.0),
+        ("protocol_version", True),
+        ("epoch", 1.0),
+        ("epoch", True),
+    ],
+)
+def test_direct_rollover_answer_rejects_non_exact_integers(
+    field: str,
+    invalid_value: object,
+) -> None:
+    answer = {
+        "type": "rollover_answer",
+        "protocol_version": 3,
+        "epoch": 1,
+        "transport": {"type": "webrtc", "sdp": "v=0\r\n"},
+    }
+    answer[field] = invalid_value
+
+    with pytest.raises(WebSocketError, match="incompatible rollover answer"):
+        _direct_rollover_answer_sdp(answer, epoch=1)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("protocol_version", 3.0),
+        ("protocol_version", True),
+        ("epoch", 1.0),
+        ("epoch", True),
+    ],
+)
+def test_direct_rollover_started_rejects_non_exact_integers(
+    field: str,
+    invalid_value: object,
+) -> None:
+    started = {
+        "type": "rollover_started",
+        "protocol_version": 3,
+        "epoch": 1,
+        "context_retained": True,
+    }
+    started[field] = invalid_value
+
+    with pytest.raises(WebSocketError, match="incompatible rollover start"):
+        _direct_rollover_context_retained(started, epoch=1)
+
+
+@pytest.mark.parametrize("invalid_version", [3.0, True])
+def test_direct_started_rejects_non_exact_protocol_version(
+    invalid_version: object,
+) -> None:
+    started = _direct_started()
+    started["protocol_version"] = invalid_version
+
+    with pytest.raises(WebSocketError, match="incompatible direct WebRTC protocol"):
+        _validate_direct_started(started)
 
 
 def test_started_requires_local_only_cancel_semantics() -> None:

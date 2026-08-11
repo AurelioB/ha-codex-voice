@@ -120,12 +120,24 @@ schemas, arguments, results, prompts, or conversation content.
 Device-facing v3 is the direct-media transport used by the new ThirdReality
 v1.1.7 client. The aarch64 Buildroot Linux speaker creates an `aiortc` offer
 with audio and `oai-events`; the bridge starts one tool-free native App Server
-v3 session with its managed login and returns the provider SDP answer. The
+realtime session with its managed login and returns the provider SDP answer.
+The operator may select documented WebRTC v1 or v3 at the bridge, with v3 as
+the supported default; the device cannot override it. The
 device must acknowledge its applied answer, connected peer, and open data
 channel before the bridge sends `started`. The bridge never constructs a v3
 media peer or accepts binary audio on that socket. It owns OAuth, App Server
 start/stop, SDP relay, unexpected-tool rejection, sanitized remote lifecycle,
-and one-thread cleanup only.
+and bounded cleanup of every thread created by the outer session only.
+
+The initial peer is implicit epoch 1. Its strict
+`start`/`answer`/`transport_ready`/`started` objects remain unchanged. Trusted
+AEC barge-in extends the same WebSocket with consecutive epoch-tagged
+`rollover`, `rollover_answer`, `rollover_transport_ready`, and
+`rollover_started` controls. Since the exact initial acknowledgement has no
+capability field, deploy the rollover-capable bridge before the new device. The
+new bridge remains compatible with the old device; the old bridge rejects a
+rollover message. Protocol and epoch values require exact JSON integers;
+booleans and floating-point values are rejected.
 
 “Okay Computer” enters this native, tool-free route; “Okay Nabu” remains on
 Home Assistant's official Assist flow. The bridge does not capture a Home
@@ -229,38 +241,38 @@ fresh-session fallback and socket teardown. On the v2 native path,
 same-socket continuation still requires a sanitized `response.cancelled` event
 correlated to the active provider response.
 
-V3 barge-in does not use a bridge interrupt acknowledgement. The device kills
-local `paplay` in the parent, drops queued media, and has the sidecar child mute
-decoded RTP while microphone RTP continues upstream. Provider response/output
-lifecycle never labels or gates that continuous media lane; only first decoded
-audio and an actual roughly 120 ms receiver gap create internal `media.started`
-and `media.quiet` boundaries. Only trusted AEC-filtered local barge-in may send
-the zero-field parent-to-child `response.interrupt` token; manual or non-speech
-preserving interruption must use a fresh session. The direct Frameless data
-channel sends no provider interrupt control and supplies no acknowledgement:
-live evidence produced only `session.started`, rejected public Realtime
-`session.update` VAD configuration, and produced no `speech_started`,
-`turn.done`, or transcript event. Same-peer reuse is therefore an explicitly
-empirical WebRTC auto-truncation invariant, not causal proof of provider
-cancellation or completed physical validation. The token follows the exact
-qualifying capture watermark. The child must consume through that watermark and
-4,000 samples beyond its token-time sender cursor (250 ms at 16 kHz), an
-overlapping 750 ms guard must elapse, and decoded RTP must be absent continuously
-until the sole decoded-audio consumer measures a fresh 500 ms silence interval
-after observing its barrier request. Every queued, ready, or later decoded
-frame is counted before resampling and restarts the window; stalled loop time
-does not count. Pinned aiortc 1.15 encoded-decoder and decoded-output wrappers
-expose queued/in-flight work before cross-thread scheduling, then discard
-jitter-buffer and resampler tails at the serialized final commit. On success, an open media
-generation emits `media.quiet` before `interrupt.fenced`; both IPC writes must
-succeed before unmute and `READY`. Provider ingress cannot spoof those internal
-names. A fixed absolute five-second deadline is checked after receiver proof,
-after optional `media.quiet`, and immediately before the final fenced commit;
-success and timeout are mutually exclusive. It never restarts.
-`media_fence_capture_timeout` means a capture proof was
-unmet; otherwise timeout emits `media_fence_timeout`. Timeout or lifecycle
-failure remains muted and requires a fresh peer/session.
-Physical v3 acceptance remains outstanding. See the normative
+V3 barge-in does not use a bridge or provider interrupt acknowledgement. The
+device immediately kills local `paplay`, retires the old sidecar, and sends no
+later capture to that peer. It retains the outer vendor owner/session/player,
+bridge WebSocket, and ready latch while a prewarmed child negotiates the next
+peer epoch. A bounded recent AEC pre-roll plus queued/live speech is sent once
+and in order to the replacement peer. Queue/age/timeout, sidecar, or invalid
+epoch failure ends the outer session closed; stop, mute, disconnect, and
+normal-wake preemption still end it. A device `stop` is normal termination
+during old-session closure and every answer/readiness phase, not a rollover
+protocol failure.
+
+The bridge stops the retired App Server realtime session and waits for the
+matching `thread/realtime/closed` notification. The stop RPC alone only
+enqueues close. A confirmed notification permits same-thread replacement with
+`includeStartupContext: true` and `context_retained: true`. Timeout, error, or
+an absent close starts an isolated thread and reports `context_retained: false`
+so a delayed old close cannot terminate the replacement. Retained context does
+not prove audible-history correctness; interrupted unheard assistant output may
+remain, and recent pre-roll may overlap audio already sent to the retired peer.
+
+Frameless v3 exposes no public cancel/truncate control or provider interruption
+acknowledgement. A synthetic same-peer canary was rejected when old RTP
+continued beyond the five-second media-fence deadline, so the former
+`response.interrupt`/`interrupt.fenced` experiment is not the production path.
+Fresh-peer rollover is a safe subscription-backed approximation, not exact
+ChatGPT same-session interruption, and adds measurable negotiation latency.
+The reference installation passed a physical v3 double-interruption canary at
+its qualified 60% setting in two exact-artifact runs: four local cuts were
+208–211 ms and four rollovers were 1.29–1.57 s. Each run recycled its same two
+worker PIDs without a cold replacement and retained context twice. That
+evidence is installation-specific; each deployment must still pass its own
+physical acceptance matrix. See the normative
 [v3 interruption contract](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 Bridge-owned v1/v2/STT/TTS audio adapters use Codex App Server's experimental
@@ -281,6 +293,10 @@ render sequence, but a new direct wake still pays for cold Codex thread
 creation, App Server/WebRTC negotiation, service admission, network latency,
 and provider response generation. The bridge does not claim parity with an
 already-open ChatGPT voice session.
+
+Current App Server documentation exposes WebRTC start/stop for realtime v1 and
+v3, not v2. The direct device route remains on tagged Frameless v3; a live v1
+subscription canary failed before startup and is not an operational fallback.
 
 The subscription realtime voice is conversational, not a verbatim
 text-to-speech API. `/v1/synthesize` sends a tightly constrained text turn but

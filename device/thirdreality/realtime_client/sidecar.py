@@ -5,6 +5,7 @@ from __future__ import annotations
 import socket
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -50,6 +51,8 @@ _SIDECAR_ENVIRONMENT = {
     "PATH": "/usr/bin:/bin",
     "PYTHONDONTWRITEBYTECODE": "1",
 }
+_DEFERRED_REAPERS: set[threading.Thread] = set()
+_DEFERRED_REAPERS_LOCK = threading.Lock()
 
 
 class SidecarError(RuntimeError):
@@ -191,6 +194,10 @@ class WebRtcSidecarClient:
     @property
     def closed(self) -> bool:
         """Return whether local ownership has been released."""
+        if not self._closed and not self._released and self._process.poll() is not None:
+            # subprocess.Popen.poll() performs waitpid(WNOHANG), so observing a
+            # completed child here also reaps it before the standby is reused.
+            self._closed = True
         return self._closed or self._released
 
     def fileno(self) -> int:
@@ -291,10 +298,13 @@ class WebRtcSidecarClient:
                     with suppress(SidecarError):
                         self._send(encode_control("shutdown"))
                 if not wait_for(0.5):
-                    self._process.terminate()
+                    with suppress(OSError):
+                        self._process.terminate()
                     if not wait_for(0.3):
-                        self._process.kill()
-                        wait_for()
+                        with suppress(OSError):
+                            self._process.kill()
+                        if not wait_for():
+                            _defer_process_reap(self._process)
         finally:
             self._closed = True
             self._released = True
@@ -320,6 +330,33 @@ class WebRtcSidecarClient:
         if return_code is not None:
             self._closed = True
             raise SidecarClosed(f"sidecar process exited with status {return_code}")
+
+
+def _defer_process_reap(process: ProcessLike) -> None:
+    """Transfer a killed child to a daemon waiter when the close budget expires."""
+
+    def reap() -> None:
+        try:
+            with suppress(Exception):
+                process.wait()
+        finally:
+            current = threading.current_thread()
+            with _DEFERRED_REAPERS_LOCK:
+                _DEFERRED_REAPERS.discard(current)
+
+    thread = threading.Thread(
+        target=reap,
+        name="codex-webrtc-sidecar-reaper",
+        daemon=True,
+    )
+    with _DEFERRED_REAPERS_LOCK:
+        _DEFERRED_REAPERS.add(thread)
+    try:
+        thread.start()
+    except Exception:
+        with _DEFERRED_REAPERS_LOCK:
+            _DEFERRED_REAPERS.discard(thread)
+        raise
 
 
 def validate_root_owned_path(path: Path, directory: bool) -> Path:

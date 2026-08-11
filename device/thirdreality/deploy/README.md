@@ -150,8 +150,14 @@ realtime configuration enable:
 ```
 
 These checks qualify only the AEC topology and acoustics. The earlier 25%
-reference measurements exercised v2 bridge PCM; they are not proof that the
-device-owned WebRTC v3 media/data path has passed physical acceptance.
+reference measurements exercised v2 bridge PCM; they are not themselves proof
+of the device-owned WebRTC v3 path. A separate reference-device v3 hardware
+double-interruption canary, run at that installation's qualified 60% setting,
+passed twice with the exact artifact: four local cuts were 208–211 ms and four
+rollovers were 1.29–1.57 s. Each run recycled its same two worker PIDs without
+a cold replacement and retained context twice. The 25%-default example above
+remains conservative, and 60% qualification is not transferable. Each
+installation still requires the complete acceptance matrix.
 
 Transport-only rollback sets `media_transport` to `bridge_pcm` and
 `full_duplex` to `false`, then removes the AEC route keys. Full AEC rollback

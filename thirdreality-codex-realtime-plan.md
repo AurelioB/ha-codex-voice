@@ -28,35 +28,59 @@ original greenfield plan:
 - The bridge owns the managed Codex login, App Server thread/realtime
   start/stop, SDP relay, unexpected-tool rejection, sanitized remote lifecycle,
   and cleanup. It is not a media proxy in v3.
+- Current App Server documentation supports realtime WebRTC start/stop for v1
+  and v3, not v2. This route remains on tagged Frameless v3; a live v1
+  subscription canary did not complete startup and is not a fallback.
 - Provider response/output lifecycle never labels or gates the normal RTP lane.
   First decoded audio and an actual roughly 120 ms receiver gap create
   transcript-free local media boundaries, preserving RTP-before-start prefixes
   and stopped-before-tail audio. Trusted AEC-filtered local barge-in immediately
-  kills `paplay`, drops queued media in the parent, locally mutes the receiver
-  in the child, and sends a zero-field local `response.interrupt`. Microphone
-  RTP continues. The direct Frameless channel sends no provider interrupt
-  control, rejects public `session.update` VAD configuration, and supplies no
-  acknowledgement; live evidence produced only `session.started`. Same-peer
-  reuse is an explicitly empirical WebRTC auto-truncation invariant. The token
-  follows the qualifying capture watermark; the child must consume through it
-  plus 250 ms beyond its sender cursor, wait an overlapping 750 ms guard, and
-  observe a receiver-owned fresh 500 ms decoded-RTP silence interval. Reserved
-  lifecycle writes must succeed before unmute. Its fixed absolute five-second
-  deadline stays muted and requires a fresh session on failure.
-  Manual/non-speech preserving interruption always requires a fresh session.
+  kills `paplay`, retires the old sidecar, and stops later capture to that peer.
+  The outer owner/session/player, bridge WebSocket, and ready latch remain while
+  a prewarmed child negotiates the next consecutive epoch. Bounded recent AEC
+  pre-roll and queued/live speech is sent once and in order to the replacement.
+  A committed interruption suppresses continuing-speech retriggers across the
+  peer boundary. Eight consecutive detector-quiet 64 ms callbacks (512 ms)
+  rearm the detector; signal before the eighth resets the quiet count.
+  The bridge reuses the old Codex thread only after a confirmed
+  `thread/realtime/closed` barrier; ambiguous closure isolates a new thread and
+  reports context loss. Context retention does not prove audible-history
+  correctness.
+- The direct Frameless channel has no public cancel/truncate control or
+  provider acknowledgement. A synthetic same-peer canary failed because old
+  RTP continued past the five-second media fence; the former
+  `response.interrupt`/`interrupt.fenced` experiment is rejected evidence, not
+  production behavior. Fresh-peer rollover is a safe subscription-backed
+  approximation rather than exact ChatGPT same-session interruption and adds a
+  measurable handoff. Queue/age/timeout, sidecar, or epoch errors fail the
+  outer session closed. Manual stop/mute/disconnect/normal-wake preemption ends
+  it, with no Home Assistant fallback or audio logs.
+  Freshness is rechecked at RTP consumption; standby health is re-polled; and
+  pre-ack replacement output remains inaudible within `output_queue_bytes`
+  until exact `rollover_started`. Stop stays normal in every phase, exact
+  integer controls reject float/bool values, and expired child close transfers
+  `waitpid` to a daemon reaper.
+  Exactly two prewarmed process slots alternate; an absent or invalid standby
+  terminates the outer session without a cold replacement or third child.
   Public Realtime v2 WebRTC is unsupported on this subscription route; project
   wire-v2 `bridge_pcm` remains the separate rollback.
   Exact sink set/verify happens once before direct-session negotiation, outside
-  response and interruption handling. Physical v3 validation remains pending.
+  response and interruption handling. The reference installation's physical v3
+  double-interruption canary passed at its qualified 60% setting, but every
+  deployment still requires its own acceptance matrix.
 - A direct v3 failure clears captured Okay Computer audio and returns idle; it
   never hands that audio to Home Assistant. Protocol v2 `bridge_pcm` remains
   the explicit rollback path and preserves its older pre-ready Assist replay.
 
 The v3 implementation, protocol, deterministic runtime installer, sidecar,
-queue bounds, cancellation, and cleanup have local automated coverage. An
-end-to-end physical v3 acceptance run is still outstanding. Earlier 25% AEC
-and barge-in canaries exercised the v2 bridge-PCM route and must not be cited as
-v3 validation.
+queue bounds, cancellation, and cleanup have local automated coverage. The
+reference installation's physical v3 double-interruption canary, run at its
+qualified 60% setting, passed twice with the exact artifact. Four cuts were
+208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its same two
+PIDs without a cold replacement and retained context twice. Earlier 25% AEC
+and barge-in canaries exercised the v2 bridge-PCM
+route; neither result transfers to another installation, and the public example
+remains at the conservative 25% default.
 
 ## Target architecture
 
@@ -95,7 +119,7 @@ shipped v1.1.7 overlay described above.
 | 1. Host-side mechanism spike | Build the gateway with a Realtime session and a `delegate_to_codex` tool. Implement Codex thread start/resume/status/cancel using the SDK or stable App Server calls. Use simulated audio initially. | Spoken request can launch a persistent Codex task and receive a concise spoken result. |
 | 2. Stock-firmware feasibility test | Use the existing HA/ESPHome satellite path to validate wake word, thread handoff, credentials, and UX. | Control-plane behavior works. This phase is explicitly not considered full-duplex acceptance. |
 | 3. Realtime firmware audio path | Fork the ThirdReality firmware; add a post-AEC microphone tap, authenticated WSS transport to the gateway, streaming PCM playback, and shared audio-focus routing. Preserve stock HA and Sendspin behavior. | Simultaneous capture/playback works for 30 minutes with usable echo cancellation and bounded memory. |
-| 4. Barge-in and task coordination | Keep microphone capture active during playback. On trusted AEC-filtered speech, immediately flush and mute local response audio, then use the empirically gated capture/guard/RTP-absence fence; do not claim a provider interruption acknowledgement. Manual/non-speech preserving interruption requires a fresh session. Do not cancel a running Codex task unless the user explicitly requests it. | User interruption silences playback within a target of 200 ms while background Codex work continues; same-peer continuation passes the physical auto-truncation canary or fails closed. |
+| 4. Barge-in and task coordination | Keep microphone capture active during playback. On trusted AEC-filtered speech, immediately flush local response audio and replace the media peer while retaining the outer owner/session. Replay only bounded, fresh capture; require an old-session close barrier before thread reuse. Manual stop/mute/disconnect still ends the outer session. | User interruption silences playback within a target of 200 ms; a fresh-peer canary proves ordered replay, stale-peer isolation, bounded handoff, and fail-closed context-loss fallback. |
 | 5. Home Assistant integration | Package the gateway as an add-on; add configuration, diagnostics, device/session entities, task status, and approval notifications. Optionally expose scoped HA entities through the [HA MCP server](https://www.home-assistant.io/integrations/mcp_server). | Install, configure, inspect, approve, and recover the system through HA. |
 | 6. Reliability and release | Add reconnect/resume, session expiry, queue limits, audio fault injection, API/CLI compatibility tests, OTA rollback, and operational documentation. | Wi-Fi and gateway restarts recover without losing the associated Codex thread. |
 

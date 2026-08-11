@@ -108,10 +108,12 @@ class ControlledStopRpc(SdpFirstRpc):
         *,
         block_stop: bool = False,
         stop_error: Exception | None = None,
+        emit_closed_on_stop: bool = False,
     ) -> None:
         super().__init__()
         self.block_stop = block_stop
         self.stop_error = stop_error
+        self.emit_closed_on_stop = emit_closed_on_stop
         self.stop_started = asyncio.Event()
         self.release_stop = asyncio.Event()
         self.stop_calls = 0
@@ -136,6 +138,13 @@ class ControlledStopRpc(SdpFirstRpc):
                 raise self.stop_error
             if self.block_stop:
                 await self.release_stop.wait()
+            if self.emit_closed_on_stop:
+                await self.subscription.events.put(
+                    {
+                        "method": "thread/realtime/closed",
+                        "params": {"threadId": params["threadId"]},
+                    }
+                )
         except asyncio.CancelledError:
             self.stop_cancelled = True
             raise
@@ -484,6 +493,38 @@ async def test_signaling_session_rejects_provider_error_and_conflicting_answers(
 
 
 @pytest.mark.asyncio
+async def test_signaling_session_rejects_provider_close_during_handshake() -> None:
+    rpc = SdpFirstRpc()
+
+    async def provider_closed(
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del timeout
+        rpc.calls.append((method, params))
+        if method == "thread/realtime/start":
+            await rpc.subscription.events.put(
+                {
+                    "method": "thread/realtime/closed",
+                    "params": {"threadId": "thread-1"},
+                }
+            )
+        return {}
+
+    rpc.call = provider_closed  # type: ignore[method-assign]
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+
+    with pytest.raises(
+        ProtocolError, match="realtime provider closed during signaling"
+    ):
+        await session.start("offer")
+
+    await session.stop()
+
+
+@pytest.mark.asyncio
 async def test_signaling_session_rejects_late_conflicting_answer() -> None:
     rpc = SdpFirstRpc()
     session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
@@ -614,6 +655,102 @@ async def test_signaling_stop_bounds_hung_remote_cleanup(
     session._start_requested = True
 
     await asyncio.wait_for(session.stop(), timeout=0.5)
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_cancelled is True
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_strict_stop_success_is_reusable_thread_boundary() -> None:
+    rpc = ControlledStopRpc(emit_closed_on_stop=True)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+    rpc.subscription.events.put_nowait(
+        {
+            "method": "thread/realtime/progress",
+            "params": {"threadId": "thread-1", "sequence": "before-closed"},
+        }
+    )
+
+    await session.stop_strict()
+    await session.stop_strict()
+
+    assert rpc.stop_calls == 1
+    assert rpc.subscription.closed is True
+    assert rpc.subscription.events.empty()
+
+
+@pytest.mark.asyncio
+async def test_signaling_strict_stop_waiter_cancellation_rejoins_one_stop() -> None:
+    rpc = ControlledStopRpc(block_stop=True, emit_closed_on_stop=True)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+    strict_waiter = asyncio.create_task(session.stop_strict())
+    await asyncio.wait_for(rpc.stop_started.wait(), timeout=0.2)
+
+    strict_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await strict_waiter
+    assert rpc.stop_cancelled is False
+
+    retired_cleanup = asyncio.create_task(session.stop())
+    await asyncio.sleep(0)
+    assert not retired_cleanup.done()
+    rpc.release_stop.set()
+    await retired_cleanup
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_cancelled is False
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_strict_stop_rpc_return_without_closed_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc()
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+
+    with pytest.raises(
+        TimeoutError, match="realtime signaling stop outcome is ambiguous"
+    ):
+        await session.stop_strict()
+
+    assert rpc.stop_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_strict_stop_propagates_error_without_second_attempt() -> None:
+    rpc = ControlledStopRpc(stop_error=RuntimeError("unknown stop outcome"))
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+
+    with pytest.raises(RuntimeError, match="unknown stop outcome"):
+        await session.stop_strict()
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_signaling_strict_stop_propagates_bounded_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc(block_stop=True)
+    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session._start_requested = True
+
+    with pytest.raises(
+        TimeoutError, match="realtime signaling stop outcome is ambiguous"
+    ):
+        await asyncio.wait_for(session.stop_strict(), timeout=0.5)
 
     assert rpc.stop_calls == 1
     assert rpc.stop_cancelled is True

@@ -23,24 +23,42 @@
 > remains the separate Assist/tool path. V2 `bridge_pcm` is retained for
 > rollback. Provider response/output lifecycle never gates the continuous RTP
 > lane; local media boundaries come from first decoded audio and actual receiver
-> quiet. Local interruption kills parent `paplay`, locally mutes RTP in the
-> child, and keeps microphone upload running. A preserving zero-field local
-> `response.interrupt` is restricted to trusted AEC-filtered barge-in. The
-> direct Frameless channel sends no provider interrupt control, rejects public
-> `session.update` VAD configuration, and supplies no acknowledgement; live
-> evidence produced only `session.started`. Same-peer reuse is an explicitly
-> empirical WebRTC auto-truncation invariant. Its token follows the qualifying
-> capture watermark; the child must consume through it plus 250 ms beyond its
-> sender cursor, wait an overlapping 750 ms guard, and observe 500 ms of
-> receiver-owned fresh decoded-RTP silence after the barrier request. Reserved
-> lifecycle writes must succeed before unmute. The fixed absolute five-second
-> deadline stays muted and requires a fresh session on failure. Manual/non-speech preserving
-> interruption always uses that fresh path. Normal media generations retain
-> their separate 120 ms quiet bound. Public Realtime v2 WebRTC is unsupported
-> on this subscription route; project wire-v2 `bridge_pcm` remains separate.
+> quiet. Trusted two-frame AEC barge-in kills parent `paplay`, retires the old
+> sidecar, and prevents later capture from reaching that peer. The outer
+> owner/session/player, bridge WebSocket, and ready latch remain while a
+> prewarmed child negotiates the next consecutive epoch. Bounded recent AEC
+> pre-roll plus queued/live speech is sent once and in order to the replacement.
+> A committed interruption suppresses continuing-speech retriggers across that
+> peer boundary. Eight consecutive detector-quiet 64 ms callbacks (512 ms)
+> rearm barge-in; signal before the eighth resets the quiet count.
+> The bridge reuses the Codex thread only after a confirmed old
+> `thread/realtime/closed` barrier; ambiguity isolates a new thread and reports
+> context loss. Retained context does not prove audible-history correctness.
+> The direct Frameless channel has no public cancel/truncate control or provider
+> acknowledgement. A synthetic same-peer canary failed because old RTP
+> continued past the five-second media fence, so the former
+> `response.interrupt`/`interrupt.fenced` experiment is rejected evidence, not
+> production behavior. Fresh-peer rollover is a safe subscription-backed
+> approximation, not exact ChatGPT same-session semantics, and adds measurable
+> negotiation latency. Queue/age/timeout, sidecar, or epoch failure closes the
+> outer session; manual stop/mute/disconnect/normal-wake preemption also ends it.
+> No path falls back to Home Assistant or logs audio. Public Realtime v2 WebRTC
+> remains unsupported; project wire-v2 `bridge_pcm` is separate.
+> Capture age is rechecked at RTP consumption, standby health is re-polled, and
+> replacement lifecycle/PCM stays inaudible inside `output_queue_bytes` until
+> exact `rollover_started`, then replays in order. Stop is normal in every
+> rollover phase; float/bool integer controls fail closed; expired child close
+> transfers final `waitpid` ownership to a daemon reaper.
+> Exactly two prewarmed process slots alternate. An absent or invalid standby
+> terminates the outer session; no cold replacement or third child is launched.
 > Exact sink preparation runs once before
 > direct-session negotiation, outside the response/interruption loop. No
-> end-to-end physical v3 acceptance is claimed yet.
+> universal physical qualification is claimed: the reference installation's
+> double-interruption canary passed twice with the exact artifact at its
+> qualified 60% setting. Four cuts were 208–211 ms and four rollovers were
+> 1.29–1.57 s; each run recycled its same two PIDs without a cold replacement
+> and retained context twice. Every installation still requires its own
+> acceptance matrix; the public example remains at 25%.
 
 Build this as a hybrid Home Assistant custom integration plus a local companion add-on:
 
@@ -69,6 +87,11 @@ relies on the experimental `thread/realtime/*` WebRTC surface, so the Codex
 version, generated protocol schema, and media behavior must be pinned and
 tested. See [Codex authentication](https://learn.chatgpt.com/docs/auth) and the
 [Codex App Server protocol](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/app-server/README.md).
+
+Current App Server documentation exposes realtime start/stop with WebRTC v1
+and v3; v2 WebRTC is unsupported. The direct ThirdReality route remains on
+tagged Frameless v3. A live v1 subscription canary did not complete startup and
+is not treated as an operational fallback.
 
 In the researched App Server version, managed ChatGPT authentication works through the WebRTC call-creation path. Its raw realtime WebSocket path still requires API-key authentication. Therefore, subscription mode must create a genuine WebRTC offer with an audio track/transceiver and the `oai-events` data channel; it cannot implement voice by sending PCM only through JSON-RPC. See the pinned [realtime conversation source](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/core/src/realtime_conversation.rs).
 
@@ -160,9 +183,10 @@ alternative, but it must never activate automatically.
 - Own the WebRTC peer, tracks, data channel, resampling, and media cancellation
   for the experimental STT/TTS adapters and v2 rollback. For ThirdReality v3,
   validate and relay the device SDP instead; the pinned device `aiortc` sidecar
-  owns local RTP muting and the empirical capture/guard/RTP-absence fence while
-  the bridge owns App Server start/stop and thread cleanup. The direct channel
-  supplies no provider interruption acknowledgement.
+  owns local playback abort, old-peer retirement, bounded capture replay, and
+  replacement-peer negotiation while the bridge owns App Server start/stop,
+  the old-session close barrier, and thread cleanup. The direct channel
+  supplies no provider interruption acknowledgement or public truncate control.
 - Expose a narrow authenticated local API to the HA component: login, logout, account status, conversation turn, transcribe stream, synthesize stream, cancel, and diagnostics.
 - Use App Server's managed device-code/browser login. Store the Codex credential cache only in the add-on's private persistent volume with restrictive permissions or a supported credential store.
 - Reject arbitrary Codex command execution, filesystem requests, external MCP configuration, and approval prompts at the bridge boundary.

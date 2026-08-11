@@ -52,9 +52,12 @@ from .errors import (
 )
 from .realtime import RealtimeSession, SignalingRealtimeSession
 from .realtime_wire import (
+    DirectWebRtcRollover,
     RealtimeDataControl,
     RealtimeWireProtocol,
     parse_data_control_event,
+    parse_direct_webrtc_rollover,
+    validate_direct_webrtc_rollover_ready,
 )
 from .runtime import IsolatedCodexRuntime, codex_child_environment
 from .tool_broker import (
@@ -129,6 +132,7 @@ THREAD_DISPOSAL_TOTAL_TIMEOUT_SECONDS = 5.0
 THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS = 4.0
 REALTIME_CONTROL_TIMEOUT_SECONDS = 5.0
 REALTIME_WEBSOCKET_SEND_TIMEOUT_SECONDS = 2.0
+DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS = 0.10
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
 REALTIME_OUTPUT_PREROLL_MILLISECONDS = 200
 REALTIME_OUTPUT_PREROLL_MAX_BYTES = (
@@ -4177,38 +4181,160 @@ async def _serve_direct_webrtc_session(
     first: Mapping[str, Any],
     wire_protocol: RealtimeWireProtocol,
 ) -> None:
-    """Signal one device-owned WebRTC session without proxying its media."""
+    """Keep one device socket alive while replacing direct-media peer epochs."""
     if not wire_protocol.uses_direct_webrtc:
         raise ProtocolError("direct WebRTC requires protocol_version 3")
     offer_sdp = wire_protocol.webrtc_offer_sdp
     if offer_sdp is None:
         raise ProtocolError("direct WebRTC start omitted its SDP offer")
 
-    session: SignalingRealtimeSession | None = None
-    thread_id: str | None = None
-    startup_abandoned = asyncio.Event()
+    thread_payload = dict(first)
+    thread_payload.pop("model", None)
+    thread_payload.pop("transport", None)
+    base_instructions = (
+        "Act as a natural realtime voice conversation partner. Respond directly "
+        "in conversational spoken language. Keep answers concise unless the user "
+        "asks for detail. Never inspect local files or invoke tools."
+    )
+    voice = first.get("voice")
+    normalized_voice = voice.lower() if isinstance(voice, str) and voice else None
+    prompt = first.get("prompt")
+    normalized_prompt = prompt if isinstance(prompt, str) else None
+    active_epoch: _DirectRealtimeEpoch | None = None
+    owned_thread_ids: set[str] = set()
+    retired_thread_tasks: set[asyncio.Task[None]] = set()
 
-    async def cleanup_owned_provider(
-        owned_session: SignalingRealtimeSession | None,
-        owned_thread_id: str | None,
-    ) -> None:
+    def retire_epoch(epoch: _DirectRealtimeEpoch) -> asyncio.Task[None]:
+        """Transfer an old provider and thread without delaying a new peer."""
+        task = asyncio.create_task(
+            _cleanup_direct_realtime_provider(
+                state,
+                epoch,
+                (epoch.thread_id,),
+            ),
+            name=f"codex-direct-webrtc-retire-{epoch.thread_id}",
+        )
+        retired_thread_tasks.add(task)
+        task.add_done_callback(retired_thread_tasks.discard)
+        state.track_realtime_provider_cleanup(task)
+        # Keep synchronous ownership in ``active_epoch``/``owned_thread_ids``
+        # until the tracked task has claimed both resources. Cancellation can
+        # then arrive at the next await without orphaning either one.
+        owned_thread_ids.discard(epoch.thread_id)
+        return task
+
+    async def negotiate_epoch(
+        epoch: int,
+        epoch_offer_sdp: str,
+        *,
+        reuse_thread_id: str | None,
+        include_startup_context: bool,
+    ) -> tuple[_DirectRealtimeEpoch, str]:
+        """Create and start one epoch while detecting an abandoned device."""
+        startup_abandoned = asyncio.Event()
+        candidate_thread_id = reuse_thread_id
+        candidate_session: SignalingRealtimeSession | None = None
+        answer_sdp: str | None = None
+        created_thread = False
+        cleanup_task: asyncio.Task[None] | None = None
+
+        async def cleanup_candidate() -> None:
+            if candidate_session is not None:
+                await candidate_session.stop()
+            if (
+                startup_abandoned.is_set()
+                and created_thread
+                and candidate_thread_id is not None
+            ):
+                owned_thread_ids.discard(candidate_thread_id)
+                await _dispose_thread(state.rpc, candidate_thread_id)
+
+        def start_candidate_cleanup() -> asyncio.Task[None]:
+            nonlocal cleanup_task
+            if cleanup_task is None:
+                cleanup_task = asyncio.create_task(
+                    cleanup_candidate(),
+                    name=f"codex-direct-webrtc-epoch-{epoch}-startup-cleanup",
+                )
+                state.track_realtime_provider_cleanup(cleanup_task)
+            return cleanup_task
+
+        async def start_provider() -> None:
+            nonlocal answer_sdp, candidate_session, candidate_thread_id
+            nonlocal created_thread
+            try:
+                if candidate_thread_id is None:
+                    candidate_thread_id = await state.start_thread(
+                        thread_payload,
+                        tools=[],
+                        base_instructions=base_instructions,
+                    )
+                    created_thread = True
+                    owned_thread_ids.add(candidate_thread_id)
+                if startup_abandoned.is_set():
+                    return
+                candidate_session = SignalingRealtimeSession(
+                    state.rpc,
+                    candidate_thread_id,
+                    version=state.config.realtime_version,
+                    timeout=state.config.request_timeout,
+                )
+                answer_sdp = await candidate_session.start(
+                    epoch_offer_sdp,
+                    prompt=normalized_prompt,
+                    voice=normalized_voice,
+                    include_startup_context=include_startup_context,
+                    client_managed_handoffs=False,
+                )
+            finally:
+                if startup_abandoned.is_set():
+                    await asyncio.shield(start_candidate_cleanup())
+
         try:
-            if owned_session is not None:
-                await owned_session.stop()
-        finally:
-            if owned_thread_id is not None:
-                await _dispose_thread(state.rpc, owned_thread_id)
+            await _start_realtime_provider_or_disconnect(
+                websocket,
+                start_provider(),
+                abandoned=startup_abandoned,
+                thread_pending=lambda: candidate_thread_id is None,
+                track_detached=state.track_realtime_startup_cleanup,
+                accept_stop=True,
+            )
+        except BaseException:
+            if not (
+                startup_abandoned.is_set()
+                and candidate_thread_id is None
+                and candidate_session is None
+            ):
+                await asyncio.shield(start_candidate_cleanup())
+            raise
+        assert candidate_thread_id is not None
+        assert candidate_session is not None
+        assert answer_sdp is not None
+        return (
+            _DirectRealtimeEpoch(
+                number=epoch,
+                thread_id=candidate_thread_id,
+                session=candidate_session,
+            ),
+            answer_sdp,
+        )
 
-    def start_provider_cleanup() -> asyncio.Task[None] | None:
-        nonlocal session, thread_id
-        owned_session = session
-        owned_thread_id = thread_id
-        session = None
-        thread_id = None
-        if owned_session is None and owned_thread_id is None:
-            return None
+    def start_provider_cleanup() -> asyncio.Task[None]:
+        """Transfer active direct-provider ownership before the first await."""
+        nonlocal active_epoch
+        epoch = active_epoch
+        active_epoch = None
+        thread_ids = tuple(
+            dict.fromkeys(
+                (
+                    *((epoch.thread_id,) if epoch is not None else ()),
+                    *owned_thread_ids,
+                )
+            )
+        )
+        owned_thread_ids.clear()
         cleanup_task = asyncio.create_task(
-            cleanup_owned_provider(owned_session, owned_thread_id),
+            _cleanup_direct_realtime_provider(state, epoch, thread_ids),
             name="codex-direct-webrtc-provider-cleanup",
         )
         state.track_realtime_provider_cleanup(cleanup_task)
@@ -4216,67 +4342,28 @@ async def _serve_direct_webrtc_session(
 
     async def close_provider() -> None:
         cleanup_task = start_provider_cleanup()
-        if cleanup_task is not None:
-            await asyncio.shield(cleanup_task)
-
-    answer_sdp: str | None = None
-
-    async def start_provider() -> None:
-        nonlocal answer_sdp, session, thread_id
-        try:
-            thread_payload = dict(first)
-            thread_payload.pop("model", None)
-            thread_payload.pop("transport", None)
-            thread_id = await state.start_thread(
-                thread_payload,
-                tools=[],
-                base_instructions=(
-                    "Act as a natural realtime voice conversation partner. Respond "
-                    "directly in conversational spoken language. Keep answers concise "
-                    "unless the user asks for detail. Never inspect local files or "
-                    "invoke tools."
-                ),
+        await asyncio.shield(cleanup_task)
+        if retired_thread_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(retired_thread_tasks)),
+                return_exceptions=True,
             )
-            if startup_abandoned.is_set():
-                return
-            session = SignalingRealtimeSession(
-                state.rpc,
-                thread_id,
-                version=state.config.realtime_version,
-                timeout=state.config.request_timeout,
-            )
-            voice = first.get("voice")
-            prompt = first.get("prompt")
-            answer_sdp = await session.start(
-                offer_sdp,
-                prompt=prompt if isinstance(prompt, str) else None,
-                voice=voice.lower() if isinstance(voice, str) and voice else None,
-                include_startup_context=False,
-                client_managed_handoffs=False,
-            )
-        finally:
-            if startup_abandoned.is_set():
-                await close_provider()
 
     try:
         LOGGER.info(
             "Realtime conversation route selected: route=native_direct selection=explicit"
         )
-        await _start_realtime_provider_or_disconnect(
-            websocket,
-            start_provider(),
-            abandoned=startup_abandoned,
-            thread_pending=lambda: thread_id is None,
-            track_detached=state.track_realtime_startup_cleanup,
+        active_epoch, answer_sdp = await negotiate_epoch(
+            1,
+            offer_sdp,
+            reuse_thread_id=None,
+            include_startup_context=False,
         )
-        assert session is not None
-        assert thread_id is not None
-        assert answer_sdp is not None
         await _send_realtime_json(
             websocket,
             {"type": "answer", **wire_protocol.answer_fields(answer_sdp)},
         )
-        await _wait_for_direct_transport_ready(websocket, session)
+        await _wait_for_direct_transport_ready(websocket, active_epoch.session)
         await _send_realtime_json(
             websocket,
             {
@@ -4285,14 +4372,172 @@ async def _serve_direct_webrtc_session(
                 **wire_protocol.started_fields(),
             },
         )
-        await _run_direct_realtime_socket(websocket, session)
+        while True:
+            rollover = await _run_direct_realtime_socket(
+                websocket,
+                active_epoch.session,
+                expected_epoch=active_epoch.number + 1,
+            )
+            if rollover is None:
+                return
+
+            previous = active_epoch
+            rollover_started_at = time.monotonic()
+            context_retained = True
+            try:
+                stop_completed = await _stop_direct_realtime_epoch_for_rollover(
+                    websocket, previous.session
+                )
+            except _DirectRolloverStopAmbiguous:
+                context_retained = False
+                retire_epoch(previous)
+                active_epoch = None
+                replacement_thread_id = None
+                LOGGER.warning(
+                    "Direct realtime epoch %d stop exceeded the fast confirmed "
+                    "boundary; moving epoch %d to an isolated thread",
+                    previous.number,
+                    rollover.epoch,
+                )
+            else:
+                if not stop_completed:
+                    return
+                active_epoch = None
+                replacement_thread_id = previous.thread_id
+
+            strict_stop_seconds = time.monotonic() - rollover_started_at
+            signaling_started_at = time.monotonic()
+            active_epoch, answer_sdp = await negotiate_epoch(
+                rollover.epoch,
+                rollover.offer_sdp,
+                reuse_thread_id=replacement_thread_id,
+                include_startup_context=context_retained,
+            )
+            await _send_realtime_json(websocket, rollover.answer_message(answer_sdp))
+            LOGGER.info(
+                "Direct realtime rollover timing: epoch=%d context_retained=%s "
+                "strict_stop_seconds=%.3f signaling_seconds=%.3f "
+                "answer_seconds=%.3f",
+                rollover.epoch,
+                context_retained,
+                strict_stop_seconds,
+                time.monotonic() - signaling_started_at,
+                time.monotonic() - rollover_started_at,
+            )
+            await _wait_for_direct_transport_ready(
+                websocket,
+                active_epoch.session,
+                rollover=rollover,
+            )
+            await _send_realtime_json(
+                websocket,
+                rollover.started_message(context_retained=context_retained),
+            )
     finally:
         await close_provider()
+
+
+@dataclass(slots=True)
+class _DirectRealtimeEpoch:
+    """Bridge-owned provider resources for one device peer epoch."""
+
+    number: int
+    thread_id: str
+    session: SignalingRealtimeSession = field(repr=False)
+
+
+class _DirectRolloverStopAmbiguous(Exception):
+    """The old provider epoch could not prove its terminal boundary."""
+
+
+async def _cleanup_direct_realtime_provider(
+    state: BridgeState,
+    epoch: _DirectRealtimeEpoch | None,
+    thread_ids: tuple[str, ...],
+) -> None:
+    """Stop one direct transport and dispose every synchronously claimed thread."""
+    try:
+        if epoch is not None:
+            await epoch.session.stop()
+    finally:
+        if thread_ids:
+            await asyncio.gather(
+                *(_dispose_thread(state.rpc, thread_id) for thread_id in thread_ids),
+                return_exceptions=True,
+            )
+
+
+async def _stop_direct_realtime_epoch_for_rollover(
+    websocket: web.WebSocketResponse,
+    session: SignalingRealtimeSession,
+) -> bool:
+    """Briefly await a proven stop while honoring device stop and ping.
+
+    A confirmed close may safely reuse the thread and retain its startup
+    context. A slower stop keeps running under transferred cleanup ownership,
+    while the latency-critical replacement starts on an isolated thread.
+    """
+    stop_task = asyncio.create_task(
+        session.stop_strict(), name="codex-direct-webrtc-strict-stop"
+    )
+    loop = asyncio.get_running_loop()
+    grace_deadline = loop.time() + DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS
+    try:
+        while True:
+            remaining = grace_deadline - loop.time()
+            if remaining <= 0:
+                raise _DirectRolloverStopAmbiguous
+            client_task = asyncio.create_task(
+                _receive_realtime_message(websocket, allow_binary=False),
+                name="codex-direct-webrtc-stop-client",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {stop_task, client_task},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise _DirectRolloverStopAmbiguous
+                if client_task in done:
+                    message = client_task.result()
+                    if not isinstance(message, Mapping):
+                        raise ProtocolError("direct WebRTC control must be JSON")
+                    message_type = message.get("type")
+                    if message_type == "stop":
+                        return False
+                    if message_type == "rollover":
+                        raise ProtocolError(
+                            "direct WebRTC rollover is already in progress"
+                        )
+                    if message_type != "ping":
+                        raise ProtocolError("unsupported direct WebRTC control")
+                    await _send_realtime_json(websocket, {"type": "pong"})
+                if stop_task in done:
+                    try:
+                        stop_task.result()
+                    except AppServerExited:
+                        raise
+                    except Exception as err:
+                        raise _DirectRolloverStopAmbiguous from err
+                    return True
+            finally:
+                if not client_task.done():
+                    client_task.cancel()
+                await asyncio.gather(client_task, return_exceptions=True)
+    finally:
+        if not stop_task.done():
+            # ``stop_strict`` shields its single authoritative stop operation;
+            # cancelling this waiter cannot launch a second remote stop.
+            stop_task.cancel()
+        await asyncio.gather(stop_task, return_exceptions=True)
 
 
 async def _wait_for_direct_transport_ready(
     websocket: web.WebSocketResponse,
     session: SignalingRealtimeSession,
+    *,
+    rollover: DirectWebRtcRollover | None = None,
 ) -> None:
     """Wait until the device confirms ICE, DTLS, SCTP, and media readiness."""
     deadline = time.monotonic() + REALTIME_DEVICE_TRANSPORT_READY_TIMEOUT_SECONDS
@@ -4334,9 +4579,17 @@ async def _wait_for_direct_transport_ready(
                     raise ProtocolError(
                         "device WebRTC transport readiness must be JSON"
                     )
-                if (
+                if message.get("type") == "stop":
+                    raise _RealtimeClientDisconnected
+                if rollover is not None:
+                    validate_direct_webrtc_rollover_ready(
+                        message, expected_epoch=rollover.epoch
+                    )
+                elif (
                     set(message) != {"type", "protocol_version"}
                     or message.get("type") != "transport_ready"
+                    or not isinstance(message.get("protocol_version"), int)
+                    or isinstance(message.get("protocol_version"), bool)
                     or message.get("protocol_version") != 3
                 ):
                     raise ProtocolError(
@@ -4353,20 +4606,26 @@ async def _wait_for_direct_transport_ready(
 async def _run_direct_realtime_socket(
     websocket: web.WebSocketResponse,
     session: SignalingRealtimeSession,
-) -> None:
-    """Keep the authenticated signaling lifeline open for one direct peer."""
+    *,
+    expected_epoch: int,
+) -> DirectWebRtcRollover | None:
+    """Keep one peer epoch alive and return its validated replacement request."""
 
-    async def client_controls() -> None:
+    async def client_controls() -> DirectWebRtcRollover | None:
         while True:
             message = await _receive_realtime_message(websocket, allow_binary=False)
             if not isinstance(message, Mapping):
                 raise ProtocolError("direct WebRTC control must be JSON")
             message_type = message.get("type")
             if message_type == "stop":
-                return
+                return None
             if message_type == "ping":
                 await _send_realtime_json(websocket, {"type": "pong"})
                 continue
+            if message_type == "rollover":
+                return parse_direct_webrtc_rollover(
+                    message, expected_epoch=expected_epoch
+                )
             raise ProtocolError("unsupported direct WebRTC control")
 
     async def provider_events() -> None:
@@ -4397,8 +4656,12 @@ async def _run_direct_realtime_socket(
         done, _ = await asyncio.wait(
             {client_task, provider_task}, return_when=asyncio.FIRST_COMPLETED
         )
-        for task in done:
-            task.result()
+        # A provider failure wins a simultaneous device request; replacement
+        # must never be acknowledged from a provider epoch already known dead.
+        if provider_task in done:
+            provider_task.result()
+            return None
+        return client_task.result()
     finally:
         for task in (client_task, provider_task):
             if not task.done():
@@ -4706,6 +4969,7 @@ async def _start_realtime_provider_or_disconnect(
     abandoned: asyncio.Event,
     thread_pending: Callable[[], bool],
     track_detached: Callable[[asyncio.Task[None]], None],
+    accept_stop: bool = False,
 ) -> None:
     """Abandon provider startup when its device disappears before acknowledgement."""
     startup_task: asyncio.Task[None] = asyncio.create_task(
@@ -4738,6 +5002,8 @@ async def _start_realtime_provider_or_disconnect(
                 WSMsgType.ERROR,
             }:
                 raise _RealtimeClientDisconnected
+            if accept_stop and _is_realtime_stop_frame(message):
+                raise _RealtimeClientDisconnected
             raise ProtocolError(
                 "realtime messages are not accepted before session startup completes"
             )
@@ -4758,6 +5024,17 @@ async def _start_realtime_provider_or_disconnect(
             startup_task.cancel()
         cleanup_tasks = (client_task,) if detached else (startup_task, client_task)
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+
+def _is_realtime_stop_frame(message: Any) -> bool:
+    """Return whether one already-received text frame is a normal stop control."""
+    if message.type != WSMsgType.TEXT:
+        return False
+    try:
+        value = json.loads(message.data)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(value, Mapping) and value.get("type") == "stop"
 
 
 async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machine

@@ -63,8 +63,9 @@ Assistant Assist and entity control. Qualified device AEC makes Okay Computer
 the full-duplex/barge-in route. A normal Okay Nabu wake can preempt direct
 mode and regain the microphone on the same vendor capture thread.
 
-For v3 the bridge owns the managed Codex login, one App Server realtime thread,
-SDP relay, lifecycle sideband, unexpected-tool rejection, and cleanup only. It
+For v3 the bridge owns the managed Codex login, one active App Server realtime
+thread per peer epoch, SDP relay, lifecycle sideband, unexpected-tool rejection,
+and cleanup only. It
 does not construct the peer or relay PCM/provider data. The device's isolated,
 hash-locked `aiortc` runtime owns the audio transceiver and ordered
 `oai-events` channel. Protocol v2 `bridge_pcm` remains an explicit rollback and
@@ -164,7 +165,8 @@ Threads start with `ephemeral: false`, but their persistence is confined to the
 temporary profile. This is intentional: App Server cannot apply
 `thread/delete` to an ephemeral thread. The bridge deletes one-shot STT, TTS,
 and realtime threads as soon as their session ends. A native device session
-owns one realtime thread. A legacy broker-managed session owns both a frontend
+owns one active realtime thread per peer epoch and cleans every replacement it
+created. A legacy broker-managed session owns both a frontend
 and executor thread, and its cleanup disposes both
 even if stopping or deleting the other resource fails. The bundled Home
 Assistant component does not retain STT sessions for TTS, and the released
@@ -306,9 +308,12 @@ session would occupy the single subscription speech lane without a documented
 quota-neutral idle lifetime. Experimental Codex adapter optimization is
 therefore limited to capture overlap and progressive TTS delivery. The
 recommended Wyoming providers do not use those remote adapters. The direct
-device may prewarm one local isolated `aiortc` child, but it does not create a
-Codex thread, open a bridge socket, negotiate WebRTC, or consume the remote
-speech lane until the explicit wake. See
+device prewarms exactly two reusable local isolated `aiortc` processes. One is
+active and one is the offer-warm standby; they alternate fresh PeerConnections,
+and recycle the retired epoch's process as standby. An absent or invalid standby
+ends the outer session without a cold replacement or third process. This local
+prewarm does not create a Codex thread, open a bridge socket, negotiate remote
+WebRTC, or consume the speech lane until the explicit wake. See
 [performance and ThirdReality tuning](performance.md) for the live measurements
 and acceptance criteria.
 
@@ -320,12 +325,17 @@ binary bridge-PCM contract; v3 carries strict SDP and JSON sideband only. For
 v3 the bridge owns the managed login and App Server signaling lifecycle but
 never constructs the media peer.
 
+Current App Server documentation exposes realtime start/stop with WebRTC for
+v1 and v3; v2 WebRTC is unsupported. The direct device path remains on tagged
+Frameless v3. A live subscription-backed v1 canary did not complete startup and
+is not treated as a fallback.
+
 The pinned ThirdReality v1.1.7 overlay targets Python 3.11 on aarch64 Buildroot
 Linux, not Android. Its standard-library controller remains in the existing
-root voice process. A separate, prewarmed child runs `aiortc` from a complete
-hash-locked runtime under `/usr/bin/python3 -I -S`, with root-owned immutable
-source/runtime paths and one bounded Unix sequenced-packet descriptor. The
-launcher gives it UID/GID 65534, no supplementary groups, and a minimal fixed
+root voice process. Exactly two reusable prewarmed children run `aiortc` from a
+complete hash-locked runtime under `/usr/bin/python3 -I -S`, with root-owned
+immutable source/runtime paths and one bounded Unix sequenced-packet descriptor
+per child. The launcher gives each child UID/GID 65534, no supplementary groups, and a minimal fixed
 environment. Mode-0755 directories and mode-0644 source/runtime files remain
 readable but immutable to it; the root-owned mode-0600 device configuration
 and staging archive do not. It is not a separately supervised device daemon or
@@ -370,6 +380,14 @@ for answer-applied, connected peer, and open `oai-events` before sending
 Home Assistant broker snapshot, so there is no transcript boundary, executor,
 or `appendSpeech` render handoff.
 
+The initial peer is implicit epoch 1 and its exact v3
+`start`/`answer`/`transport_ready`/`started` shapes do not change. Trusted AEC
+barge-in extends the existing authenticated WebSocket with consecutive
+`rollover`, `rollover_answer`, `rollover_transport_ready`, and
+`rollover_started` controls. Because the strict initial acknowledgement cannot
+advertise the extension, deployment is ordered bridge first, then device. A
+new bridge still accepts an old device; an old bridge rejects rollover.
+
 `device_webrtc` requires `full_duplex: true` plus a statically loaded
 PulseAudio `module-echo-cancel` with the exact configured allowlisted method,
 reviewed hardware masters, default AEC source/sink, already-open capture stream
@@ -379,7 +397,9 @@ automatic fallback. Stock v1.1.7 rejects WebRTC and Speex but loads Adrian, so
 its active configuration explicitly selects Adrian. Startup verifies the
 topology and ceiling before constructing the peer. Once per direct session,
 before the SDP offer or bridge connection, a fixed-argv `pactl` controller sets
-and verifies the dedicated sink to the exact raw playback setting. Direct
+and verifies the dedicated sink to the exact raw playback setting. The signaling
+handshake deadline starts only after that local AEC and player preparation
+finishes; the maximum-session deadline still spans the complete startup. Direct
 `paplay` uses that sink with raw stream volume 65536 (100% relative),
 non-blocking 20 ms writes, and 60 ms/20 ms latency/process arguments; it never
 enumerates or mutates a sink-input. No blocking volume subprocess runs from
@@ -392,57 +412,75 @@ gates, splits, or retires the normal RTP lane. First decoded audio emits
 internal `media.started`; every frame resets a receiver timer, and only an
 actual roughly 120 ms gap emits `media.quiet`. This continuous lane keeps
 RTP-before-start prefixes and stopped-before-tail audio. That normal-generation
-boundary is independent of the longer interruption fence below.
+boundary is not an interruption acknowledgement and does not authorize reuse
+of the peer.
 
 During v3 playback, two consecutive qualifying AEC-filtered capture frames
 immediately clear pending playback and SIGKILL `paplay` in the vendor-process
-parent. The second frame becomes an exact capture watermark; the zero-field
-local `response.interrupt` token follows its ordered IPC packet and precedes
-later capture, then the sidecar mutes decoded RTP. Only that trusted detector may enter the
-preserving fence; a manual or non-speech preserving interrupt requires a fresh
-session. Microphone capture and RTP continue while muted. This direct Frameless
-data channel is not the generic public Realtime client-event dialect: it sends
-no `response.cancel`, `output_audio_buffer.clear`, or substitute, and it rejects
-public Realtime `session.update` VAD configuration. Live evidence yielded only
-`session.started`, with no `speech_started`, `turn.done`, or transcript event,
-so no provider acknowledgement or causal interruption proof exists. Public
-Realtime v2 WebRTC is unsupported on this subscription-backed route; the
-project's historical wire-v2 `bridge_pcm` rollback remains separate.
+parent. It retires the old PeerConnection epoch and sends no later capture to that peer. The
+outer vendor owner, session/player objects, bridge WebSocket, and ready latch
+remain attached. The two reusable sidecar processes alternate active/standby
+roles, creating a fresh PeerConnection each epoch and recycling the retired
+epoch's process. Exactly those two prewarmed slots are used; an absent or
+invalid standby ends the outer session. Exactly 4 KiB (two 64 ms frames,
+128 ms) of recent AEC pre-roll through the trigger plus queued/live speech is
+sent once and in order to the replacement.
+The network thread arms a rearm gate only when that current-epoch interruption
+commits. Continuous speech cannot retire the replacement epoch; eight
+consecutive detector-quiet 64 ms capture callbacks (512 ms) establish a new
+speech edge. Qualifying signal before the eighth resets the quiet count, and
+rejected stale-epoch requests do not arm the gate.
 
-Same-peer reuse is an explicitly empirical WebRTC auto-truncation invariant.
-After the token, the child must consume through the qualifying watermark and
-4,000 samples beyond its token-time sender cursor (250 ms at 16 kHz), an
-overlapping 750 ms guard must elapse, and the sole decoded-audio consumer must
-measure a fresh continuous 500 ms of silence after observing its receiver-barrier
-request. A queued, ready, or later decoded frame is counted before resampling and
-restarts the 500 ms interval, while stalled loop time is excluded by responsive
-heartbeats. Hash-pinned aiortc 1.15 private encoded-decoder and decoded-output
-queues are wrapped before the decoder starts; queued/in-flight/processed serials
-are rechecked under lock while the jitter buffer and resampler tails are reset
-through the final no-await commit. When all
-conditions hold, an open normal media generation emits `media.quiet` before
-`interrupt.fenced`; both IPC writes must succeed before the child unmutes and
-the parent returns `READY`. Provider ingress cannot spoof those internal names.
-The fixed absolute five-second deadline is checked after the receiver proof,
-after optional `media.quiet`, and immediately before the final fenced commit;
-success and timeout are mutually exclusive. It never restarts. Timeout emits
-fatal `media_fence_capture_timeout` if either
-capture proof is unmet, otherwise `media_fence_timeout`; lifecycle failures and
-timeouts remain muted and require a fresh peer/session. The invariant still requires physical v3
-validation and requalification after provider or pinned-Codex changes; the
-normative contract and official Codex source link are in [wire
-v3](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
+Capture freshness is rechecked at actual RTP consumption; packets older than
+2.25 seconds are terminal. The standby is re-polled immediately before use, and
+an absent or invalid slot terminates the outer session without a cold launch.
+Replacement
+lifecycle plus PCM is ordered within configured `output_queue_bytes` and stays
+inaudible until the exact epoch-matching `rollover_started`, then enters the
+normal handlers in order. Exact integer fields reject floats/bools. `stop` is
+normal in every rollover phase, and a killed child whose close budget expires
+transfers final `waitpid` ownership to a daemon reaper. That device-process
+budget is independent of the bridge App Server barrier below.
 
-Capture-queue overflow never creates a synthetic watermark. Detection remains
-bounded on direct full-duplex overflow frames, but a trigger whose causal frame
-was not accepted tears down for a fresh session; only an accepted causal frame
-may enter the preserving fence.
+The bridge stops the old App Server realtime session and gives it 100 ms to
+produce the matching `thread/realtime/closed` notification. The stop RPC itself
+only enqueues close; the notification follows awaited input/fanout shutdown and
+is the same-thread reuse barrier. Confirmed closure starts the replacement with
+`includeStartupContext: true` and reports `context_retained: true`. Timeout,
+error, or an absent close transfers the old epoch to tracked isolated-thread
+cleanup, starts the replacement on a new thread, and reports false, preventing a
+delayed old close from killing the replacement. Context retention
+does not prove audible-history correctness: interrupted unheard assistant
+output can remain in provider context, and recent pre-roll can overlap samples
+seen by the old peer.
+
+Frameless v3 sends no public `response.cancel`,
+`output_audio_buffer.clear`, truncate substitute, or provider interruption
+acknowledgement. It also rejects public Realtime `session.update` VAD
+configuration. A synthetic same-peer canary was rejected after old RTP
+continued beyond the five-second media-fence deadline; the former
+`response.interrupt`/`interrupt.fenced` experiment is not the production path.
+Public Realtime v2 WebRTC is unsupported on this subscription-backed route;
+the historical wire-v2 `bridge_pcm` rollback is separate.
+
+Fresh-peer rollover is a safe subscription-backed approximation, not exact
+ChatGPT same-session interruption. Queue/age/timeout, sidecar, or epoch failure
+ends the outer session closed. Manual stop, mute, disconnect, and normal-wake
+preemption still end it. No failure forwards direct audio to Home Assistant or
+logs it. At that installation's qualified 60% setting, a reference-device
+physical double-interruption canary passed twice with the exact artifact. Four
+cuts were 208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its
+same two worker PIDs without a cold replacement and retained context twice.
+This passes that reference rollover canary, not the full per-installation
+acceptance matrix. The normative
+contract is [wire v3](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 The reference device's earlier 25% echo-residual/double-talk results exercised
-the v2 bridge-PCM route. They establish neither v3 end-to-end acceptance nor
-qualification for another speaker or higher volume. The v3 protocol, sidecar,
-runtime installer, queue, cancellation, and cleanup paths have automated local
-coverage, but the required physical v3 acceptance matrix is not yet claimed.
+the v2 bridge-PCM route. The public example also remains at 25%; the separate
+v3 reference qualification at 60% does not qualify another speaker or room.
+The v3 protocol, sidecar, runtime installer, queue, cancellation, and cleanup
+paths have automated local coverage plus the hardware canary above, but the
+full physical v3 acceptance matrix remains installation-specific.
 
 The explicit `media_transport: "bridge_pcm"` rollback retains v2 binary input,
 bridge-owned WebRTC media, bridge-side speaking epochs, a 2,250 ms live input

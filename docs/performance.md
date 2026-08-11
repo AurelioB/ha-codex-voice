@@ -13,8 +13,17 @@ media-player buffering all affect a turn.
 > The current Okay Computer implementation uses wire v3 and a device-owned
 > `aiortc` peer on the aarch64 Buildroot Linux speaker. The bridge carries
 > OAuth/App Server signaling and sideband only; RTP and `oai-events` bypass it.
-> V3 clears captured direct audio on failure and has no claimed end-to-end
-> physical acceptance run yet. Measurements below that mention bridge PCM,
+> V3 clears captured direct audio on failure. Its reference-device hardware
+> double-interruption canary passed twice with exact gzip artifact SHA-256
+> `5209f6bda3625b50c7413772414a74e12765c6fba2fa23155f79c24d1936e615`
+> at that installation's qualified 60% setting. Cuts were 210/211 ms and
+> 211/208 ms; rollovers were 1,408/1,303 ms and 1,569/1,292 ms. Each run
+> recycled its same two worker PIDs without a cold replacement, and all four
+> rollovers retained context. A subsequent strict boundary run proved that
+> seven quiet callbacks do not rearm while eight do; it recorded 209/211 ms
+> cuts and 1,432/1,276 ms rollovers with the same two PIDs and retained context
+> twice. This is not the full per-installation acceptance matrix.
+> Measurements below that mention bridge PCM,
 > bridge audio queues, v2 interrupt acknowledgements, or Assist replay are
 > retained historical v2/adapter results and do not validate v3.
 
@@ -58,7 +67,8 @@ The Milestone 2 ThirdReality client is a separate path selected by “Okay
 Computer.” “Okay Nabu” retains the standard Assist pipeline and all Home
 Assistant entity control. The current client always requests
 `conversation_mode: "native"`; the bridge echoes it, ignores any Home Assistant
-broker snapshot, and creates one tool-free App Server realtime thread. The
+broker snapshot, and creates one active tool-free App Server realtime thread
+per peer epoch. The
 device creates the WebRTC offer, audio transceiver, and `oai-events` data
 channel; the bridge relays SDP but never carries v3 PCM. There is no finite
 transcript gate, isolated executor, or `thread/realtime/appendSpeech` render
@@ -72,6 +82,10 @@ endpointing/response generation, and begin physical playback. Report wake to
 audible playback separately. The experimental App Server surface provides no
 latency or availability SLA, and an already-open ChatGPT voice session is not
 an equivalent cold-start comparison.
+
+Current App Server documentation supports realtime start/stop with WebRTC v1
+and v3, not v2. This route remains on tagged Frameless v3; a live v1
+subscription canary did not complete startup and is not a latency fallback.
 
 The explicit `bridge_pcm` rollback and older strict-v2 clients that omit
 `conversation_mode` retain the prior
@@ -91,8 +105,8 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge v2 WebRTC input track | 2,250 ms | V2 rollback only; v3 media bypasses the bridge |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | V1/v2/adapters only; v3 provider audio stays on the device peer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds v2 child input and the v3 direct player's configured buffer allowance |
-| V3 decoded-receiver quiet boundary | About 120 ms without an audio frame | Splits only normal media generations; it is independent of the interruption fence |
-| V3 empirical interruption fence | Fixed absolute 5 s | Trusted local-AEC token follows the qualifying watermark; requires consumption through it plus 250 ms beyond the sender cursor, an overlapping 750 ms guard, and a receiver-owned fresh 500 ms decoded-RTP silence interval; failure remains muted and requires a fresh session |
+| V3 decoded-receiver quiet boundary | About 120 ms without an audio frame | Splits only normal media generations; it is not an interruption acknowledgement |
+| V3 fresh-peer rollover | 4 KiB / 128 ms recent AEC pre-roll; eight detector-quiet 64 ms frames (512 ms) to rearm after a committed interruption; 2.25 s maximum capture age rechecked at RTP consumption; configured handshake deadline | Stops local output immediately; one uninterrupted local speech segment retires only one peer; exactly two reusable sidecar slots alternate fresh PeerConnections; an absent/invalid standby terminates the outer session without a cold launch; pre-ack output is inaudible within `output_queue_bytes`; negotiation remains measurable |
 | Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked once at direct-session preflight | Keeps boot-time writers aligned; exact set/verify runs once before negotiation, with no live-loop volume monitor |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
 | Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
@@ -114,7 +128,11 @@ clears both copies and returns idle without invoking Assist. Only the v2
 rollback preserves the official Assist fallback.
 
 The 2× catch-up does not shorten the cold handshake or provider response time.
-Time to first audible v3 output must therefore separate wake to SDP answer,
+For initial v3 startup, the signaling handshake deadline begins only after local
+AEC preflight and exact player/sink preparation finish; the maximum-session
+deadline still includes those local steps. Rollover gets its own configured
+handshake interval, bounded by the remaining outer-session lifetime. Time to
+first audible v3 output must therefore separate wake to SDP answer,
 answer to `transport_ready`/`started`, started to the first receiver-owned
 `media.started`, and decoded PCM to audible playback. Reporting only catch-up
 would hide the dominant remote stages. For a legacy managed path, also separate
@@ -147,48 +165,65 @@ Provider response/output lifecycle never labels or gates the normal RTP lane.
 The decoded receiver opens a local media epoch on first audio and closes it
 only after an actual roughly 120 ms quiet gap, preserving RTP-before-start
 prefixes and stopped-before-tail audio. This normal-generation boundary is
-independent of the longer interruption fence.
+not an interruption acknowledgement and does not authorize peer reuse.
 
 With those checks active, capture continues during playback. Two consecutive
 qualifying AEC-filtered 64 ms frames immediately kill `paplay` and drop queued
-playback IPC in the parent. The second frame becomes an exact capture watermark;
-its ordered IPC packet is immediately followed by the zero-field local
-`response.interrupt` token and no later capture, then the sidecar mutes decoded
-RTP. Capture and microphone RTP continue
-during the local fence. Only this trusted local-AEC path may preserve the peer;
-manual or non-speech interruption must take a fresh-session path. The direct
-Frameless data channel sends no provider interrupt control, rejects public
-Realtime `session.update` VAD configuration, and supplies no acknowledgement.
-Live evidence yielded only `session.started`, with no speech-start,
-turn-completion, or transcript event. Public Realtime v2 WebRTC/client-event
-semantics are unsupported on this subscription-backed route.
+playback IPC in the parent, retire the old PeerConnection epoch, and prevent
+later capture from reaching it. The outer vendor owner/session/player, bridge WebSocket, and
+ready latch remain attached. Exactly 4 KiB (two 64 ms frames, 128 ms) of recent
+AEC pre-roll is merged with the bounded live queue and delivered once and in
+capture order to the fresh PeerConnection in the standby process. Exactly two
+reusable sidecar processes alternate active/standby roles; the retired epoch's
+process is recycled for the next epoch. An absent or invalid standby ends the
+outer session without cold-launching a replacement or third process.
+Capture older than 2.25 seconds, queue pressure, handshake timeout, sidecar
+failure, or an invalid epoch closes the outer session.
+After the network thread commits an interruption, it suppresses further
+triggers from the same uninterrupted local speech segment across the replacement
+boundary. Eight consecutive detector-quiet callbacks (512 ms) rearm it for a
+new speech edge; qualifying signal before the eighth resets the quiet count,
+and a stale output-epoch request does not arm the gate.
 
-Same-peer reuse is an explicitly empirical WebRTC auto-truncation invariant,
-not a causally proven provider boundary. From the token, the child must consume
-through the qualifying watermark and 4,000 samples beyond its token-time sender
-cursor (250 ms at 16 kHz), an overlapping 750 ms minimum guard must elapse, and
-the sole decoded-audio consumer must measure a fresh continuous 500 ms of
-silence after observing its receiver-barrier request. Queued, ready, and later
-frames are counted before resampling and restart the interval. Only responsive
-20 ms receiver heartbeats accumulate silence. A pinned aiortc 1.15 private-queue
-boundary records encoded/in-flight decode and decoded output before cross-thread
-scheduling, then resets jitter-buffer and resampler tails at the serialized
-final no-await commit. When all conditions hold, an open normal media generation
-emits `media.quiet` before `interrupt.fenced`; both IPC writes must succeed
-before the child unmutes and the parent returns `READY`. Provider ingress cannot
-spoof those internal names. A fixed absolute five-second deadline is checked
-after receiver proof, after optional `media.quiet`, and immediately before the
-final fenced commit; success and timeout are mutually exclusive. It never
-restarts. `media_fence_capture_timeout` means a
-capture proof was unmet; otherwise timeout emits `media_fence_timeout`.
-Timeout or lifecycle failure remains muted and requires a fresh peer/session.
-An unfenceable trigger on a full capture queue immediately takes that fresh
-path; no synthetic watermark is assigned.
-These physical auto-truncation and muting behaviors remain
-acceptance items and must be requalified after provider or pinned-Codex changes.
-Qualification must include ordinary mid-response output gaps; a 500 ms natural
-gap followed by resumed old output disables same-peer reuse in favor of a fresh
-session.
+The age check runs again when the RTP sender actually consumes a packet, so a
+frame cannot become stale while waiting behind negotiation. Replacement
+lifecycle and PCM received before the exact `rollover_started` share an ordered
+`output_queue_bytes` bound and remain inaudible until that acknowledgement;
+they are then replayed in order. Standby health is re-polled immediately before
+use; an absent or invalid slot terminates the outer session. Float/bool
+integer controls fail closed, while `stop` is normal during
+every rollover phase. A killed child that exceeds its close budget transfers
+eventual `waitpid` to a daemon reaper rather than blocking the realtime thread.
+That device-process budget is independent of the bridge App Server barrier below.
+
+The bridge gives the old realtime session 100 ms to produce its
+`thread/realtime/closed` notification. Confirmed closure retains startup context
+on the same thread; ambiguous closure transfers the old epoch to tracked
+isolated-thread cleanup and starts the replacement on a new thread so a delayed
+old stop cannot kill it.
+Neither result proves audible-history correctness, and interrupted unheard
+assistant speech may remain in retained provider context.
+
+The direct Frameless channel supplies no public cancel/truncate control or
+provider interruption acknowledgement. A synthetic same-peer canary was
+rejected when old RTP continued beyond the five-second media fence; the former
+`response.interrupt`/`interrupt.fenced` experiment is not production behavior.
+Fresh-peer rollover is a safe subscription-backed approximation, not exact
+ChatGPT same-session semantics. Measure local stop latency separately from
+rollover offer, old-session close barrier, replacement readiness, and first new
+audible PCM; fresh WebRTC/provider negotiation cannot be optimized away.
+The reference-device double-interruption canary now passes at that
+installation's qualified 60% setting in two consecutive exact-artifact runs.
+Local cuts were 210/211 ms and 211/208 ms; fresh-peer rollovers were
+1,408/1,303 ms and 1,569/1,292 ms. Each run recycled its same two worker PIDs
+without a cold replacement and retained context twice. Each installation must
+still repeat the complete physical acceptance matrix. A separate strict
+seven-versus-eight-quiet-callback run also passed at 209/211 ms local cuts and
+1,432/1,276 ms rollovers, with the same two PIDs reused and context retained
+twice. The retired
+PeerConnection's stop acknowledgement followed replacement negotiation before
+its existing worker was recycled. That device event is distinct from the
+bridge's independent 100 ms App Server close-confirmation barrier.
 
 For legacy broker-managed sessions, every new utterance invalidates the previous
 executor/output generation. Frontend cancellation is requested only after an
@@ -222,30 +257,34 @@ double-talk at the configured sink/playback values, self-echo rejection, exact
 once-per-session pre-negotiation raw sink-volume preparation, absence of live
 response/interruption `pactl` work, playback sink pinning, fixed `paplay`
 arguments and immediate abort, RTP-before-start and stopped-before-tail
-preservation, continued microphone upload during local mute, absence of public
-Realtime cancel/clear controls, rejection of public `session.update` VAD
-configuration, trusted-AEC-only local interrupt tokens ordered after the
-qualifying capture watermark, consumption through that watermark plus 250 ms
-beyond the token-time sender cursor, the overlapping 750 ms guard, 500 ms of
-receiver-owned fresh decoded-RTP silence, reserved
-internal lifecycle names, successful completion and fixed absolute five-second
-fail-closed timeout, manual-interrupt fresh-session behavior, and no
-captured-audio Assist handoff.
+preservation, absence of public Realtime cancel/clear controls, trusted-AEC-only
+fresh-peer rollover, immediate old-peer retirement, no later capture to the old
+peer, consecutive epochs, bounded 4 KiB / 128 ms recent pre-roll and live queue
+replay, 2.25-second capture-age rejection, configured handshake timeout that
+starts after local AEC/player preparation, exactly-once ordered replacement
+writes, outer-session retention, bridge close-barrier thread reuse within the
+100 ms grace, tracked isolated-thread cleanup after ambiguity, exactly two
+alternating reusable sidecar process slots with terminal failure for an absent
+or invalid standby and no cold/third launch,
+post-interruption suppression of a continuing-speech retrigger, seven quiet
+callbacks being insufficient, signal resetting the partial quiet count, eight
+consecutive detector-quiet 64 ms callbacks rearming a later speech edge,
+manual stop/mute/disconnect teardown, and no captured-audio Assist handoff or logging.
 It must also verify TCP ADB port 5555
 before and after every device restart or reboot; the overlay never changes the
 ADB service.
 
 ### Physical quick-command regression canary
 
-One post-deployment 2026-08-09 physical canary replayed the exact sample that
+One pre-v3 bridge-PCM post-deployment 2026-08-09 physical canary replayed the exact sample that
 had previously failed, with 308 ms of silence between the Okay Computer wake
 phrase and its command. Device-local input playback began at 21:52:39 and ended
 at 21:52:42. The bridge completed its handshake in 1.308 s, the command was
 captured, and device-local answer playback began at 21:52:45.
 
-This is an end-to-end regression result for that short-gap clipping case. It is
-one controlled run, not a benchmark distribution, percentile, or general
-latency guarantee.
+This is an end-to-end v2 regression result for that short-gap clipping case. It
+is one controlled run, not a benchmark distribution, percentile, v3 rollover
+acceptance, or general latency guarantee.
 
 ## Local STT measurement
 
@@ -636,8 +675,9 @@ The bridge does not keep an always-on remote speech session waiting for a
 future wake word. Home Assistant exposes no custom STT-provider callback before
 wake detection; the earliest reliable component hook is the STT stream itself,
 which already overlaps setup with capture. The ThirdReality direct client can
-start at its own wake callback, but that is still a cold, explicitly owned
-session—not a pre-wake or automatically replenished prewarm.
+start its remote session only at its own wake callback, so the Codex/App
+Server/WebRTC conversation remains cold and explicitly owned even though two
+local sidecar processes are already warm.
 
 Always-on remote prewarming would also:
 
@@ -650,11 +690,13 @@ Always-on remote prewarming would also:
 
 The official [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
 provides usage and rate-limit observability, but no idle realtime-session cost
-or lifetime guarantee. Any future prewarm experiment must therefore be
+or lifetime guarantee. Any future *remote* prewarm experiment must therefore be
 explicit, one-shot, short-lived, owner/profile-bound, and measured against a
-no-prewarm control. It must not silently replenish itself. Preparing only
-local SDP/ICE state is a lower-risk future experiment, but is not currently
-implemented.
+no-prewarm control. It must not silently replenish itself. The implemented
+local-only design keeps exactly two reusable isolated processes: one active and
+one offer-warm standby. They alternate fresh PeerConnections; an absent or
+invalid standby ends the outer session without a cold or third launch. The pool
+consumes no remote speech lane before wake.
 
 ## ThirdReality safe performance settings
 
@@ -670,11 +712,13 @@ an older patched cue was 0.399592 s. The stock/default turn-taking path has no
 active acoustic echo cancellation, so listening during either audible cue
 would also capture the device's own acknowledgement. The optional static
 PulseAudio AEC path is qualified for full-duplex response playback, not used as
-a reason to restore the wake cue. The stock v1.1.7 reference device passed its
-bounded Adrian canaries at 25%, but each installation and every increase above
-its previously qualified values remains unqualified until its own physical
-double-talk and echo-rejection canaries pass at the configured values (up to
-the explicit 60% maximum).
+a reason to restore the wake cue. The stock v1.1.7 reference device's historical
+v2 Adrian canaries passed at 25%. Its separate v3 rollover canary passed at that
+installation's qualified 60% setting. Neither result transfers: each installation
+and every increase above its previously qualified values remains unqualified
+until its own physical double-talk and echo-rejection canaries pass at the
+configured values (up to the explicit 60% maximum). The public example remains
+at the conservative 25% default.
 
 The pinned overlay therefore skips audible-cue playback and uses the listening
 LED as best-effort visual acknowledgement. This avoids both self-audio and the
@@ -833,23 +877,11 @@ For the measured device in this project, TCP ADB is an explicit normal-OS
 remote-administration requirement: canary, reboot, and rollback procedures must
 leave port 5555 enabled and verify that the administration path can reconnect.
 
-Only deployments that do not require TCP ADB should turn it off. Use a local
-or serial console—not the TCP session being disabled—and create or edit
-`/etc/default/adbd`. Preserve any existing settings in that file, especially a
-custom `UDC_NAME`, and set:
-
-```sh
-ADB_TCP_PORT=
-```
-
-Reboot, or restart `S55adbd` from a console that does not depend on that daemon;
-restarting it can terminate both TCP and USB ADB sessions. Then verify from the
-device and from a different LAN host that nothing listens on TCP port 5555 and
-that `adb connect DEVICE_IP:5555` fails. Reboot and verify again. Firmware
-updates may replace or ignore local overrides, so repeat this check after every
-update. Also block 5555 at the network boundary. If neither USB nor TCP ADB is
-required, disable the entire `S55adbd` boot service using a recoverable,
-firmware-appropriate mechanism and verify it remains disabled after reboot.
+This project's device requires TCP ADB for recovery. Do not stop `adbd`, clear
+`ADB_TCP_PORT`, restart the ADB service as part of voice deployment, or disable
+`S55adbd`. Keep port 5555 enabled and verify the designated administration host
+can reconnect before and after every voice restart, reboot, rollback, and
+firmware update. Apply protection at the network boundary instead.
 
 The tagged board configuration also enables Dropbear SSH, and the official
 v1.2.1 instructions publish a fixed root password. Do not leave that default

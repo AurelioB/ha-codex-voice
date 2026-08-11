@@ -18,8 +18,12 @@ CAPTURE_SAMPLE_RATE = 16_000
 PLAYBACK_SAMPLE_RATE = 24_000
 PCM_SAMPLE_WIDTH = 2
 MAX_CAPTURE_QUEUE_FRAMES = 32
-MAX_CAPTURE_QUEUE_MILLISECONDS = 1_000
-MAX_CAPTURE_AGE_MILLISECONDS = 1_500
+# An offer-created replacement accepts capture while the bridge retires and
+# renegotiates the provider. The 32 x 64 ms queue stays capped at 2.048 seconds;
+# a separate 2.25-second timestamp proof permits one bounded scheduler pause
+# and still rejects stale packets before admission and at RTP consumption.
+MAX_CAPTURE_QUEUE_MILLISECONDS = 2_048
+MAX_CAPTURE_AGE_MILLISECONDS = 2_250
 _MAX_CAPTURE_QUEUE_SAMPLES = (
     CAPTURE_SAMPLE_RATE * MAX_CAPTURE_QUEUE_MILLISECONDS // 1_000
 )
@@ -77,6 +81,7 @@ class CaptureAudioTrack(MediaStreamTrack):
         self,
         *,
         on_consumed: Callable[[int], None] | None = None,
+        on_fatal: Callable[[str], None] | None = None,
     ) -> None:
         """Create an empty bounded track on the active sidecar event loop."""
         if _IMPORT_ERROR is not None or AudioFrame is None:
@@ -93,6 +98,7 @@ class CaptureAudioTrack(MediaStreamTrack):
         self._consumed_samples = 0
         self._consumed_sample_end: int | None = None
         self._on_consumed = on_consumed
+        self._on_fatal = on_fatal
 
     @property
     def consumed_samples(self) -> int:
@@ -153,9 +159,21 @@ class CaptureAudioTrack(MediaStreamTrack):
         value = await self._queue.get()
         if value is None:
             raise MediaStreamError
-        self._queued_samples -= len(value.pcm) // PCM_SAMPLE_WIDTH
-        assert AudioFrame is not None
         samples = len(value.pcm) // PCM_SAMPLE_WIDTH
+        self._queued_samples -= samples
+        if time.monotonic_ns() - value.capture_monotonic_ns > (
+            _MAX_CAPTURE_AGE_NANOSECONDS
+        ):
+            # Offer-created peers can accumulate capture before the remote SDP
+            # activates RTP. Admission freshness is therefore insufficient:
+            # prove freshness again at the sender's actual consumption point.
+            if self._on_fatal is not None:
+                self._on_fatal("capture_audio_stale")
+            self.stop()
+            raise PeerBackpressure(
+                "capture packet exceeded its age bound before RTP consumption"
+            )
+        assert AudioFrame is not None
         frame = AudioFrame(format="s16", layout="mono", samples=samples)
         frame.planes[0].update(value.pcm)
         frame.sample_rate = CAPTURE_SAMPLE_RATE
@@ -175,12 +193,10 @@ class CaptureAudioTrack(MediaStreamTrack):
             return
         self._stopped = True
         super().stop()
-        try:
-            self._queue.put_nowait(None)
-        except asyncio.QueueFull:
-            while not self._queue.empty():
-                self._queue.get_nowait()
-            self._queue.put_nowait(None)
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        self._queued_samples = 0
+        self._queue.put_nowait(None)
 
 
 LifecycleEmitter = Callable[[dict[str, str | int]], None]
@@ -487,7 +503,10 @@ class DeviceWebRtcPeer:
         self._playback_sample_index = 0
         self._consumer_tasks: set[asyncio.Task[None]] = set()
         self._ice_gathering_complete = asyncio.Event()
-        self.input_track = CaptureAudioTrack(on_consumed=self._note_capture_consumed)
+        self.input_track = CaptureAudioTrack(
+            on_consumed=self._note_capture_consumed,
+            on_fatal=self._safe_fatal,
+        )
         self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
         self.pc.addTransceiver(self.input_track, direction="sendrecv")
         self.data_channel = self.pc.createDataChannel("oai-events", ordered=True)

@@ -16,6 +16,7 @@ DEVICE_WEBRTC_PROTOCOL_VERSION = 3
 BINARY_AUDIO_TRANSPORT = "binary"
 DEVICE_WEBRTC_TRANSPORT = "webrtc"
 MAX_WEBRTC_SDP_BYTES = 16 * 1024
+MAX_DIRECT_WEBRTC_EPOCHS = 1_024
 V2_START_FIELDS = frozenset(
     {
         "audio_transport",
@@ -41,6 +42,8 @@ V3_START_FIELDS = frozenset(
     }
 )
 V3_TRANSPORT_FIELDS = frozenset({"sdp", "type"})
+V3_ROLLOVER_FIELDS = frozenset({"epoch", "protocol_version", "transport", "type"})
+V3_ROLLOVER_READY_FIELDS = frozenset({"epoch", "protocol_version", "type"})
 LEGACY_PCM_START_FIELDS = frozenset(
     {"audio_transport", "input_channels", "input_sample_rate"}
 )
@@ -80,6 +83,35 @@ class RealtimeDataControl:
 
     def wire_value(self) -> dict[str, str]:
         return {"type": "control", "event_type": self.event_type}
+
+
+@dataclass(frozen=True, slots=True)
+class DirectWebRtcRollover:
+    """One exact device request to replace a direct-media peer epoch."""
+
+    epoch: int
+    offer_sdp: str
+
+    def answer_message(self, sdp: str) -> dict[str, Any]:
+        """Build the exact answer shape for this replacement epoch."""
+        return {
+            "type": "rollover_answer",
+            "protocol_version": DEVICE_WEBRTC_PROTOCOL_VERSION,
+            "epoch": self.epoch,
+            "transport": {
+                "type": DEVICE_WEBRTC_TRANSPORT,
+                "sdp": _validated_webrtc_sdp(sdp, description="answer"),
+            },
+        }
+
+    def started_message(self, *, context_retained: bool) -> dict[str, Any]:
+        """Build the exact post-readiness acknowledgement for this epoch."""
+        return {
+            "type": "rollover_started",
+            "protocol_version": DEVICE_WEBRTC_PROTOCOL_VERSION,
+            "epoch": self.epoch,
+            "context_retained": context_retained,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +243,62 @@ def sanitized_data_control_event(value: str | bytes) -> dict[str, str] | None:
     """Return an allowlisted content-free provider control event."""
     control = parse_data_control_event(value)
     return control.wire_value() if control is not None else None
+
+
+def parse_direct_webrtc_rollover(
+    value: Mapping[str, Any], *, expected_epoch: int
+) -> DirectWebRtcRollover:
+    """Validate an exact, strictly consecutive direct-peer rollover request."""
+    if expected_epoch > MAX_DIRECT_WEBRTC_EPOCHS:
+        raise ProtocolError("direct WebRTC rollover epoch limit reached")
+    if set(value) != V3_ROLLOVER_FIELDS:
+        raise ProtocolError("malformed direct WebRTC rollover request")
+    protocol_version = value.get("protocol_version")
+    if (
+        value.get("type") != "rollover"
+        or not isinstance(protocol_version, int)
+        or isinstance(protocol_version, bool)
+        or protocol_version != DEVICE_WEBRTC_PROTOCOL_VERSION
+    ):
+        raise ProtocolError("malformed direct WebRTC rollover request")
+    epoch = value.get("epoch")
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        raise ProtocolError("direct WebRTC rollover epoch must be an integer")
+    if epoch > MAX_DIRECT_WEBRTC_EPOCHS:
+        raise ProtocolError("direct WebRTC rollover epoch limit reached")
+    if epoch != expected_epoch:
+        raise ProtocolError(f"direct WebRTC rollover epoch must be {expected_epoch}")
+    transport = value.get("transport")
+    if not isinstance(transport, Mapping) or set(transport) != V3_TRANSPORT_FIELDS:
+        raise ProtocolError("malformed direct WebRTC rollover transport")
+    if transport.get("type") != DEVICE_WEBRTC_TRANSPORT:
+        raise ProtocolError("direct WebRTC rollover transport must be WebRTC")
+    return DirectWebRtcRollover(
+        epoch=epoch,
+        offer_sdp=_validated_webrtc_sdp(transport.get("sdp"), description="offer"),
+    )
+
+
+def validate_direct_webrtc_rollover_ready(
+    value: Mapping[str, Any], *, expected_epoch: int
+) -> None:
+    """Validate the exact readiness acknowledgement for one replacement epoch."""
+    protocol_version = value.get("protocol_version")
+    epoch = value.get("epoch")
+    if (
+        set(value) != V3_ROLLOVER_READY_FIELDS
+        or value.get("type") != "rollover_transport_ready"
+        or not isinstance(protocol_version, int)
+        or isinstance(protocol_version, bool)
+        or protocol_version != DEVICE_WEBRTC_PROTOCOL_VERSION
+        or not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or epoch != expected_epoch
+    ):
+        raise ProtocolError(
+            "expected protocol_version 3 rollover_transport_ready "
+            f"acknowledgement for epoch {expected_epoch}"
+        )
 
 
 def parse_data_control_event(value: str | bytes) -> RealtimeDataControl | None:

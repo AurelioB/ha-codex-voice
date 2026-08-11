@@ -6,6 +6,7 @@ import asyncio
 import json
 import queue as thread_queue
 import socket
+import subprocess
 import threading
 import time
 from fractions import Fraction
@@ -24,9 +25,11 @@ from device.thirdreality.webrtc_sidecar import peer as peer_module
 from device.thirdreality.webrtc_sidecar.peer import (
     MAX_CAPTURE_AGE_MILLISECONDS,
     MAX_CAPTURE_QUEUE_FRAMES,
+    MAX_CAPTURE_QUEUE_MILLISECONDS,
     CaptureAudioTrack,
     DeviceWebRtcPeer,
     PeerBackpressure,
+    PeerError,
 )
 from device.thirdreality.webrtc_sidecar.protocol import (
     CaptureAudio,
@@ -264,6 +267,55 @@ def test_launcher_audio_send_is_nonblocking_and_fails_on_pressure() -> None:
         )
 
 
+def test_sidecar_zero_budget_close_transfers_child_to_bounded_reaper() -> None:
+    class DeferredExitProcess(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reaped = threading.Event()
+
+        def poll(self) -> int | None:
+            return self.return_code
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("sidecar", timeout)
+            self.return_code = -9
+            self.reaped.set()
+            return self.return_code
+
+    process = DeferredExitProcess()
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = WebRtcSidecarClient(parent, process)
+    try:
+        started_at = time.monotonic()
+        client.close(timeout=0.0)
+
+        assert time.monotonic() - started_at < 0.1
+        assert process.terminated
+        assert process.killed
+        assert process.reaped.wait(1.0)
+        assert process.waits[-1] is None
+        assert client.closed
+    finally:
+        child.close()
+
+
+def test_sidecar_closed_health_poll_detects_completed_standby_child() -> None:
+    process = FakeProcess()
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = WebRtcSidecarClient(parent, process)
+    try:
+        assert client.closed is False
+        process.return_code = 17
+
+        assert client.closed is True
+        client.close(timeout=0.0)
+        assert process.waits == []
+    finally:
+        child.close()
+
+
 class FakePeer:
     def __init__(
         self,
@@ -390,6 +442,16 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
         assert await _recv_packet(parent) == ControlMessage(type="stopped", values={})
         await asyncio.get_running_loop().sock_sendall(
             parent,
+            encode_control("create_offer"),
+        )
+        assert await _recv_packet(parent) == ControlMessage(
+            type="offer",
+            values={"sdp": "v=0\r\na=fake-offer\r\n"},
+        )
+        assert len(peers) == 2
+        assert peers[0].stop_count == 1
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
             encode_control("shutdown"),
         )
         assert await _recv_packet(parent) == ControlMessage(
@@ -397,7 +459,7 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
             values={},
         )
         assert await asyncio.wait_for(run_task, timeout=1) == 0
-        assert peers[0].stop_count >= 1
+        assert peers[1].stop_count == 1
     finally:
         parent.close()
         if not run_task.done():
@@ -545,6 +607,36 @@ def test_capture_track_queue_is_bounded_and_never_drops_silently() -> None:
         track.stop()
 
 
+def test_capture_track_duration_bound_covers_one_prewarmed_rollover() -> None:
+    assert MAX_CAPTURE_QUEUE_MILLISECONDS == 2_048
+    track = CaptureAudioTrack()
+    captured_at = time.monotonic_ns()
+    sample_index = 0
+    try:
+        # The pinned recorder emits at most 32 64-ms frames while a fresh peer
+        # awaits its answer. Their exact 2.048 seconds remain RAM-bounded, while
+        # the independent 2.25-second timestamp check still rejects stale PCM.
+        for packet_index in range(32):
+            track.feed(
+                CaptureAudio(
+                    sample_index=sample_index,
+                    capture_monotonic_ns=captured_at + packet_index,
+                    pcm=b"\x00\x00" * 1_024,
+                )
+            )
+            sample_index += 1_024
+        with pytest.raises(PeerBackpressure, match="duration bound"):
+            track.feed(
+                CaptureAudio(
+                    sample_index=32_768,
+                    capture_monotonic_ns=captured_at + 32,
+                    pcm=b"\x00\x00",
+                )
+            )
+    finally:
+        track.stop()
+
+
 def test_capture_track_rejects_stale_audio_instead_of_replaying_it_late() -> None:
     track = CaptureAudioTrack()
     try:
@@ -559,6 +651,89 @@ def test_capture_track_rejects_stale_audio_instead_of_replaying_it_late() -> Non
             )
     finally:
         track.stop()
+
+
+@pytest.mark.asyncio
+async def test_capture_track_revalidates_age_when_rtp_sender_consumes_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at = 10_000_000_000
+    now = [captured_at]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    track = CaptureAudioTrack()
+    track.feed(
+        CaptureAudio(
+            sample_index=0,
+            capture_monotonic_ns=captured_at,
+            pcm=b"\x01\x00" * 320,
+        )
+    )
+
+    now[0] += (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
+    with pytest.raises(PeerBackpressure, match="before RTP consumption"):
+        await track.recv()
+
+    assert track.consumed_samples == 0
+    assert track._queued_samples == 0
+    with pytest.raises(PeerError, match="stopped"):
+        track.feed(
+            CaptureAudio(
+                sample_index=320,
+                capture_monotonic_ns=now[0],
+                pcm=b"\x01\x00" * 320,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_capture_track_accepts_exact_age_bound_at_rtp_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at = 20_000_000_000
+    now = [captured_at]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    track = CaptureAudioTrack()
+    try:
+        track.feed(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=captured_at,
+                pcm=b"\x01\x00" * 320,
+            )
+        )
+        now[0] += MAX_CAPTURE_AGE_MILLISECONDS * 1_000_000
+
+        frame = await track.recv()
+
+        assert frame.samples == 320
+        assert track.consumed_samples == 320
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_delayed_capture_consumption_emits_terminal_peer_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at = 30_000_000_000
+    now = [captured_at]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    peer, emitted = _fake_device_peer(monkeypatch)
+    peer.input_track.feed(
+        CaptureAudio(
+            sample_index=0,
+            capture_monotonic_ns=captured_at,
+            pcm=b"\x01\x00" * 320,
+        )
+    )
+
+    now[0] += (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
+    with pytest.raises(PeerBackpressure, match="before RTP consumption"):
+        await peer.input_track.recv()
+
+    assert emitted == [("fatal", "capture_audio_stale")]
+    assert peer._failed
+    assert peer._muted
 
 
 class FakeChannel:
@@ -658,6 +833,63 @@ def _fake_device_peer(
     peer._decoder_queue = decoder_tracker
     peer._audio_receiver = receiver
     return peer, emitted
+
+
+@pytest.mark.asyncio
+async def test_runtime_reports_delayed_capture_consumption_as_terminal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at = 40_000_000_000
+    now = [captured_at]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parent.setblocking(False)
+    peers: list[DeviceWebRtcPeer] = []
+
+    def peer_factory(**callbacks: Any) -> DeviceWebRtcPeer:
+        peer, _emitted = _fake_device_peer(monkeypatch)
+        peer._emit_lifecycle = callbacks["emit_lifecycle"]
+        peer._emit_playback = callbacks["emit_playback"]
+        peer._emit_state = callbacks["emit_state"]
+        peer._emit_fatal = callbacks["emit_fatal"]
+        peers.append(peer)
+        return peer
+
+    runtime = SidecarRuntime(child, peer_factory=peer_factory)
+    run_task = asyncio.create_task(runtime.run())
+    try:
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("create_offer"),
+        )
+        offer = await _recv_packet(parent)
+        assert isinstance(offer, ControlMessage)
+        assert offer.type == "offer"
+
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_capture_audio(
+                b"\x01\x00" * 320,
+                sample_index=0,
+                capture_monotonic_ns=captured_at,
+            ),
+        )
+        await _wait_for(lambda: peers[0].input_track.latest_sample_end == 320)
+        now[0] += (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
+
+        with pytest.raises(PeerBackpressure, match="before RTP consumption"):
+            await peers[0].input_track.recv()
+
+        assert await _recv_packet(parent) == ControlMessage(
+            type="error",
+            values={"code": "capture_audio_stale"},
+        )
+        assert await asyncio.wait_for(run_task, timeout=1) == 1
+    finally:
+        parent.close()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
 
 
 def test_peer_creates_audio_sendrecv_and_ordered_oai_events(

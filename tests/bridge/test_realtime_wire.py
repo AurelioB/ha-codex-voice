@@ -6,10 +6,13 @@ import pytest
 
 from bridge.errors import ProtocolError
 from bridge.realtime_wire import (
+    MAX_DIRECT_WEBRTC_EPOCHS,
     MAX_WEBRTC_SDP_BYTES,
     RealtimeWireProtocol,
     parse_data_control_event,
+    parse_direct_webrtc_rollover,
     sanitized_data_control_event,
+    validate_direct_webrtc_rollover_ready,
 )
 
 VALID_WEBRTC_OFFER = (
@@ -137,6 +140,158 @@ def test_direct_webrtc_answer_preserves_ice_but_never_adds_auth_credentials() ->
     assert "oauth" not in encoded.casefold()
     assert "bearer" not in encoded.casefold()
     assert "call_id" not in encoded
+
+
+def test_direct_webrtc_rollover_round_trip_uses_exact_epoch_shapes() -> None:
+    request = parse_direct_webrtc_rollover(
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": 2,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        expected_epoch=2,
+    )
+
+    assert request.epoch == 2
+    assert request.offer_sdp == VALID_WEBRTC_OFFER
+    assert request.answer_message(VALID_WEBRTC_ANSWER) == {
+        "type": "rollover_answer",
+        "protocol_version": 3,
+        "epoch": 2,
+        "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_ANSWER},
+    }
+    assert request.started_message(context_retained=True) == {
+        "type": "rollover_started",
+        "protocol_version": 3,
+        "epoch": 2,
+        "context_retained": True,
+    }
+    validate_direct_webrtc_rollover_ready(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        },
+        expected_epoch=2,
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": 1,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": 3,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": True,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": 2.0,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        {
+            "type": "rollover",
+            "protocol_version": 3.0,
+            "epoch": 2,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        {
+            "type": "rollover",
+            "protocol_version": True,
+            "epoch": 2,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+        },
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": 2,
+            "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+            "unexpected": True,
+        },
+        {
+            "type": "rollover",
+            "protocol_version": 3,
+            "epoch": 2,
+            "transport": {
+                "type": "webrtc",
+                "sdp": VALID_WEBRTC_OFFER,
+                "token": "must-not-pass",
+            },
+        },
+    ],
+)
+def test_direct_webrtc_rollover_rejects_stale_skipped_or_malformed_epoch(
+    message: dict[str, object],
+) -> None:
+    with pytest.raises(ProtocolError):
+        parse_direct_webrtc_rollover(message, expected_epoch=2)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 1,
+        },
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2.0,
+        },
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3.0,
+            "epoch": 2,
+        },
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": True,
+            "epoch": 2,
+        },
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+            "extra": True,
+        },
+        {"type": "transport_ready", "protocol_version": 3, "epoch": 2},
+    ],
+)
+def test_direct_webrtc_rollover_ready_requires_exact_current_epoch(
+    message: dict[str, object],
+) -> None:
+    with pytest.raises(ProtocolError, match="rollover_transport_ready"):
+        validate_direct_webrtc_rollover_ready(message, expected_epoch=2)
+
+
+def test_direct_webrtc_rollover_bounds_epoch_churn() -> None:
+    with pytest.raises(ProtocolError, match="epoch limit reached"):
+        parse_direct_webrtc_rollover(
+            {
+                "type": "rollover",
+                "protocol_version": 3,
+                "epoch": MAX_DIRECT_WEBRTC_EPOCHS + 1,
+                "transport": {"type": "webrtc", "sdp": VALID_WEBRTC_OFFER},
+            },
+            expected_epoch=MAX_DIRECT_WEBRTC_EPOCHS + 1,
+        )
 
 
 @pytest.mark.parametrize(
