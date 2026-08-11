@@ -6207,6 +6207,55 @@ async def test_realtime_v3_provider_close_during_runtime_stops_active_epoch(
 
 
 @pytest.mark.asyncio
+async def test_realtime_v3_rejected_runtime_tool_call_stops_active_epoch(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-request-runtime-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "callId": "call-runtime-1",
+                "tool": "must_not_run",
+                "arguments": {"private": "never forward"},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "provider_tool_rejected",
+    }
+    assert fake_rpc.responses == [
+        (
+            "provider-request-runtime-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": (
+                            '{"error":"direct_voice_has_no_tools","do_not_retry":true}'
+                        ),
+                    }
+                ],
+                "success": False,
+            },
+        )
+    ]
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
 async def test_realtime_v3_provider_failure_wins_simultaneous_device_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

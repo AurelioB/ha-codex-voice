@@ -4644,7 +4644,17 @@ async def _run_direct_realtime_socket(
                     {"type": "stopped", "reason": "remote_closed"},
                 )
                 return
-            await _reject_direct_provider_tool_call(session, event)
+            if await _reject_direct_provider_tool_call(session, event):
+                # Native direct voice starts without tools.  Once transport is
+                # live, a provider tool request cannot make forward progress:
+                # continuing would leave the device listening indefinitely
+                # after the rejected call.  End this epoch so the device can
+                # release its LED/microphone owner and accept a fresh wake.
+                await _send_realtime_json(
+                    websocket,
+                    {"type": "stopped", "reason": "provider_tool_rejected"},
+                )
+                return
 
     client_task = asyncio.create_task(
         client_controls(), name="codex-direct-webrtc-client-controls"
