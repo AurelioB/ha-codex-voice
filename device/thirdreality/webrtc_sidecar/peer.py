@@ -937,8 +937,7 @@ class DeviceWebRtcPeer:
         self._cancel_timer("_fence_quiet_timer")
 
     def _note_receiver_audio(self) -> None:
-        """Reset independent generation and fence quiet windows for decoded RTP."""
-        self._start_receiver_quiet_window()
+        """Reset the interruption-fence quiet window for any decoded RTP."""
         fence = self._fence
         if fence is not None and not fence.timed_out:
             fence.last_decoded_at = asyncio.get_running_loop().time()
@@ -1200,8 +1199,13 @@ class DeviceWebRtcPeer:
                 continue
             size = output.samples * PCM_SAMPLE_WIDTH
             pcm = bytes(output.planes[0])[:size]
-            if not pcm or self._muted:
+            if not pcm or self._muted or not any(pcm):
                 continue
+            # The provider keeps its remote RTP track alive with exact digital
+            # silence between responses. Only signal-bearing PCM represents
+            # audible media: silent keepalive frames must not open a generation,
+            # feed playback, arm local barge-in, or extend semantic activity.
+            self._start_receiver_quiet_window()
             if not self._media_generation_open:
                 self._generation += 1
                 self._media_generation_open = True

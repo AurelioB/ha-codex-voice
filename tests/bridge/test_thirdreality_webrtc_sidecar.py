@@ -1112,6 +1112,42 @@ async def test_peer_preserves_rtp_before_any_provider_start(
 
 
 @pytest.mark.asyncio
+async def test_peer_exact_zero_pcm_waits_for_first_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        for pts in range(0, 1_920, 480):
+            track.frames.put_nowait(_remote_frame(0, pts=pts))
+        await _wait_for(lambda: track.received == 4)
+
+        assert emitted == []
+        assert peer._generation == 0
+        assert not peer._media_generation_open
+
+        track.frames.put_nowait(_remote_frame(11, pts=1_920))
+        await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
+
+        assert emitted == [
+            ("lifecycle", {"event_type": "media.started", "generation": 1}),
+            (
+                "playback",
+                PlaybackAudio(
+                    generation=1,
+                    sample_index=0,
+                    media_timestamp=1_920,
+                    pcm=b"\x0b\x00" * 480,
+                ),
+            ),
+        ]
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
 async def test_peer_retains_rtp_tail_after_provider_output_stopped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1215,6 +1251,56 @@ async def test_peer_receiver_quiet_gap_starts_next_media_generation(
             (2, 480),
         ]
     finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_exact_zero_pcm_does_not_extend_open_media_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.05)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    zero_feeder: asyncio.Task[None] | None = None
+    try:
+        track.frames.put_nowait(_remote_frame(12, pts=0))
+        await _wait_for(lambda: any(kind == "playback" for kind, _ in emitted))
+
+        async def feed_continuous_zero_pcm() -> None:
+            for pts in range(480, 96_480, 480):
+                track.frames.put_nowait(_remote_frame(0, pts=pts))
+                await asyncio.sleep(0.005)
+
+        zero_feeder = asyncio.create_task(feed_continuous_zero_pcm())
+        await _wait_for(lambda: track.received >= 2)
+        await _wait_for(
+            lambda: any(
+                kind == "lifecycle" and value["event_type"] == "media.quiet"
+                for kind, value in emitted
+            )
+        )
+
+        assert not zero_feeder.done()
+        assert not peer._media_generation_open
+        assert [
+            (value["event_type"], value["generation"])
+            for kind, value in emitted
+            if kind == "lifecycle"
+        ] == [("media.started", 1), ("media.quiet", 1)]
+        assert [value for kind, value in emitted if kind == "playback"] == [
+            PlaybackAudio(
+                generation=1,
+                sample_index=0,
+                media_timestamp=0,
+                pcm=b"\x0c\x00" * 480,
+            )
+        ]
+    finally:
+        if zero_feeder is not None:
+            zero_feeder.cancel()
+            await asyncio.gather(zero_feeder, return_exceptions=True)
         await _close_audio_peer(peer, task)
 
 
@@ -2073,8 +2159,10 @@ async def test_peer_late_rtp_resets_fence_quiet_and_preserves_media_sequence(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("frame_value", [0, 15])
 async def test_peer_continuous_rtp_hits_fixed_timeout_and_stays_muted(
     monkeypatch: pytest.MonkeyPatch,
+    frame_value: int,
 ) -> None:
     monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
     monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
@@ -2095,7 +2183,7 @@ async def test_peer_continuous_rtp_hits_fixed_timeout_and_stays_muted(
         deadline = asyncio.get_running_loop().time() + 0.07
         pts = 0
         while asyncio.get_running_loop().time() < deadline:
-            track.frames.put_nowait(_remote_frame(15, pts=pts))
+            track.frames.put_nowait(_remote_frame(frame_value, pts=pts))
             pts += 480
             await asyncio.sleep(0.005)
 
