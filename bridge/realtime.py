@@ -59,10 +59,14 @@ class SignalingRealtimeSession:
         rpc: Any,
         thread_id: str,
         *,
+        version: str = "v3",
         timeout: float = 90.0,
     ) -> None:
+        if version not in {"v1", "v3"}:
+            raise ProtocolError("WebRTC realtime version must be v1 or v3")
         self.rpc = rpc
         self.thread_id = thread_id
+        self.version = version
         self.timeout = timeout
         self.subscription = rpc.subscribe()
         self.realtime_session_id: str | None = None
@@ -82,7 +86,7 @@ class SignalingRealtimeSession:
         include_startup_context: bool = False,
         client_managed_handoffs: bool = False,
     ) -> str:
-        """Start realtime v3 and return App Server's exact SDP answer."""
+        """Start realtime and return App Server's exact SDP answer."""
         if self._closed:
             raise ProtocolError("realtime signaling session is closed")
         if self._start_requested:
@@ -97,7 +101,7 @@ class SignalingRealtimeSession:
             "includeStartupContext": include_startup_context,
             "clientManagedHandoffs": client_managed_handoffs,
             "transport": {"type": "webrtc", "sdp": offer_sdp},
-            "version": "v3",
+            "version": self.version,
         }
         if prompt is not None:
             params["prompt"] = prompt

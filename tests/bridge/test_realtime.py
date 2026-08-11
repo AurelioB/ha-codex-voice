@@ -268,15 +268,17 @@ class BacklogRpc(SdpFirstRpc):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["v1", "v3"])
 async def test_signaling_session_relays_exact_external_offer_and_answer(
     monkeypatch: pytest.MonkeyPatch,
+    version: str,
 ) -> None:
     def local_peer_must_not_be_created() -> Any:
         raise AssertionError("signaling-only session constructed a local peer")
 
     monkeypatch.setattr(realtime_module, "WebRtcPeer", local_peer_must_not_be_created)
     rpc = SdpFirstRpc()
-    session = SignalingRealtimeSession(rpc, "thread-1", timeout=1)
+    session = SignalingRealtimeSession(rpc, "thread-1", version=version, timeout=1)
     offer = "v=0\r\na=device-owned-offer:exact whitespace \r\n"
 
     answer = await session.start(
@@ -295,7 +297,7 @@ async def test_signaling_session_relays_exact_external_offer_and_answer(
             "includeStartupContext": False,
             "clientManagedHandoffs": False,
             "transport": {"type": "webrtc", "sdp": offer},
-            "version": "v3",
+            "version": version,
             "prompt": "Responde en español de México.",
             "voice": "cove",
         },
@@ -306,6 +308,16 @@ async def test_signaling_session_relays_exact_external_offer_and_answer(
         {"threadId": "thread-1"},
     )
     assert rpc.subscription.closed is True
+
+
+@pytest.mark.parametrize("version", ["", "v2", "V3"])
+def test_signaling_session_rejects_unsupported_version(version: str) -> None:
+    class SubscribeMustNotRun:
+        def subscribe(self) -> None:
+            raise AssertionError("invalid version created a subscription")
+
+    with pytest.raises(ProtocolError, match="WebRTC realtime version must be v1 or v3"):
+        SignalingRealtimeSession(SubscribeMustNotRun(), "thread-1", version=version)
 
 
 @pytest.mark.asyncio

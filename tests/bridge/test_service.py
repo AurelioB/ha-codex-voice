@@ -5270,6 +5270,7 @@ async def test_realtime_v3_relays_device_sdp_without_constructing_bridge_peer(
     await device.send_json({"type": "transport_ready", "protocol_version": 3})
     started = await started_receive
     assert started["type"] == "started"
+    assert started["version"] == "v3"
     assert started["protocol_version"] == 3
     assert started["transport"] == "webrtc"
     assert started["audio_over_bridge"] is False
@@ -5287,6 +5288,40 @@ async def test_realtime_v3_relays_device_sdp_without_constructing_bridge_peer(
         while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
             await asyncio.sleep(0)
     await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_direct_webrtc_uses_configured_provider_v1(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", realtime_version="v1"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    realtime_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    )
+    assert realtime_start["version"] == "v1"
+
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    started = await device.receive_json(timeout=1)
+    assert started["type"] == "started"
+    assert started["version"] == "v3"
+    assert started["protocol_version"] == 3
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(app)
 
 
 @pytest.mark.asyncio

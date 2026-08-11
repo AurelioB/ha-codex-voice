@@ -4242,6 +4242,7 @@ async def _serve_direct_webrtc_session(
             session = SignalingRealtimeSession(
                 state.rpc,
                 thread_id,
+                version=state.config.realtime_version,
                 timeout=state.config.request_timeout,
             )
             voice = first.get("voice")
