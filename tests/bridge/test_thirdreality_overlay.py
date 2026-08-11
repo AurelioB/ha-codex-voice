@@ -838,6 +838,7 @@ def test_wake_detector_false_positive_cannot_preempt_realtime_session(
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
     owner = instance._codex_realtime_owner
+    assert not session.terminal
     _wake(instance, "okay nabu")
 
     assert session.interrupted == 0
@@ -851,6 +852,76 @@ def test_wake_detector_false_positive_cannot_preempt_realtime_session(
 
     instance.handle_audio(b"\x01\x00" * 8)
     assert session.audio == [b"\x01\x00" * 8]
+
+
+def test_terminal_owner_is_reaped_before_starting_next_realtime_wake(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    led_states: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        module,
+        "_nonblocking_led_fire",
+        lambda state, to_idle=False: led_states.append((state, to_idle)),
+    )
+    instance = protocol()
+    _wake(instance, "okay computer")
+    stale_owner = instance._codex_realtime_owner
+    stale_session = support.sessions[0]  # type: ignore[attr-defined]
+    instance.handle_audio(_pcm_frame(1))
+    stale_session.terminal = True
+
+    _wake(instance, "okay computer")
+
+    assert len(support.sessions) == 2  # type: ignore[attr-defined]
+    assert stale_owner.released
+    assert list(stale_owner.fallback_audio) == []
+    assert stale_owner.fallback_bytes == 0
+    assert instance._codex_realtime_owner is not stale_owner
+    assert instance._codex_realtime_owner.session is support.sessions[1]  # type: ignore[attr-defined]
+    assert instance.events == ["duck", "unduck", "duck"]
+    assert led_states == [
+        ("listening", False),
+        ("idle", True),
+        ("listening", False),
+    ]
+    assert instance._pipeline_active
+    assert instance._is_streaming_audio
+    assert "stop" in instance.state.active_wake_words
+
+
+def test_terminal_owner_cleanup_on_next_wake_is_idempotently_idle(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support()
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    led_states: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        module,
+        "_nonblocking_led_fire",
+        lambda state, to_idle=False: led_states.append((state, to_idle)),
+    )
+    instance = protocol()
+    _wake(instance, "okay computer")
+    stale_owner = instance._codex_realtime_owner
+    stale_owner.session.terminal = True
+    instance.state.muted = True
+
+    _wake(instance, "okay computer")
+    module._detach_realtime_owner(instance, stale_owner, unduck=True)
+    instance.stop()
+
+    assert len(support.sessions) == 1  # type: ignore[attr-defined]
+    assert stale_owner.released
+    assert instance._codex_realtime_owner is None
+    assert not instance._pipeline_active
+    assert not instance._is_streaming_audio
+    assert "stop" not in instance.state.active_wake_words
+    assert instance.events.count("unduck") == 1
+    assert led_states.count(("idle", True)) == 1
 
 
 def test_realtime_start_exception_falls_back_on_same_wake_call(

@@ -537,6 +537,16 @@ def _detach_realtime_owner(
         _nonblocking_led_fire("idle", to_idle=True)
 
 
+def _reconcile_realtime_owner(instance: Any) -> _RealtimeOwner | None:
+    """Release a terminal owner and return only a still-live owner."""
+    with _realtime_state_lock(instance):
+        owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+        if owner is None or not owner.session.terminal:
+            return owner
+        _detach_realtime_owner(instance, owner, unduck=owner.ducked)
+        return getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
+
+
 def _interrupt_realtime_owner(instance: Any, owner: _RealtimeOwner) -> None:
     """Interrupt and release one current owner without starting HA fallback."""
     with _realtime_state_lock(instance):
@@ -871,7 +881,7 @@ def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
         # vendor implementation detail: treating one of its false positives as
         # an intentional route switch would tear down realtime before VAD can
         # provide barge-in or a follow-up turn.
-        if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not None:
+        if _reconcile_realtime_owner(instance) is not None:
             _LOGGER.debug("Ignoring wake word - realtime session active")
             return
 
