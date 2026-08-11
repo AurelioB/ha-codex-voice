@@ -91,8 +91,8 @@ The shipped bounds are intentionally small and fail closed:
 | Bridge v2 WebRTC input track | 2,250 ms | V2 rollback only; v3 media bypasses the bridge |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | V1/v2/adapters only; v3 provider audio stays on the device peer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds v2 child input and the v3 direct player's configured buffer allowance |
-| V3 decoded-receiver quiet boundary | About 120 ms without an audio frame | Splits only the continuous RTP media lane; provider lifecycle is not a media gate |
-| V3 interruption fence | 1 s sidecar deadline | Requires provider control settlement plus a fresh full quiet window begun at the fence; timeout fails continuation to a fresh session |
+| V3 decoded-receiver quiet boundary | About 120 ms without an audio frame | Splits only normal media generations; it is independent of the interruption fence |
+| V3 empirical interruption fence | Fixed absolute 5 s | Trusted local-AEC token follows the qualifying watermark; requires consumption through it plus 250 ms beyond the sender cursor, an overlapping 750 ms guard, and a receiver-owned fresh 500 ms decoded-RTP silence interval; failure remains muted and requires a fresh session |
 | Full-duplex AEC sink ceiling | Static startup value, matching vendor media-player preference, and configured guard, 1–60% (25% default), checked once at direct-session preflight | Keeps boot-time writers aligned; exact set/verify runs once before negotiation, with no live-loop volume monitor |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
 | Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
@@ -143,23 +143,52 @@ separately. No sink-input is enumerated or mutated, and no `pactl` process runs
 on `response.created`, playback begin/resume, or interruption. V2 instead
 derives its `paplay` stream volume from the configured percentage.
 
-Provider lifecycle never labels or gates RTP. The decoded receiver opens a
-local media epoch on first audio and closes it only after an actual roughly
-120 ms quiet gap, preserving RTP-before-start prefixes and stopped-before-tail
-audio.
+Provider response/output lifecycle never labels or gates the normal RTP lane.
+The decoded receiver opens a local media epoch on first audio and closes it
+only after an actual roughly 120 ms quiet gap, preserving RTP-before-start
+prefixes and stopped-before-tail audio. This normal-generation boundary is
+independent of the longer interruption fence.
 
 With those checks active, capture continues during playback. Two consecutive
-qualifying AEC-filtered 64 ms frames immediately kill `paplay`, drop queued
-playback IPC, and mute decoded RTP. Generated event IDs normally limit cancel
-to an in-progress response and clear to active output. Actual RTP received
-before both SCTP lifecycle states forces an unkeyed cancel followed by clear. A
-causal cancel-no-op is recoverable; clear and unmatched provider errors fail
-closed. Provider VAD `speech_started` sends neither duplicate. Same-peer
-continuation requires both control settlement and a fresh full receiver-quiet
-window started at the fence to emit `interrupt.fenced` within the one-second
-deadline. A late frame restarts that entire window; otherwise a fresh session
-is required. These independent RTP/SCTP and physical-muting behaviors remain
-acceptance items.
+qualifying AEC-filtered 64 ms frames immediately kill `paplay` and drop queued
+playback IPC in the parent. The second frame becomes an exact capture watermark;
+its ordered IPC packet is immediately followed by the zero-field local
+`response.interrupt` token and no later capture, then the sidecar mutes decoded
+RTP. Capture and microphone RTP continue
+during the local fence. Only this trusted local-AEC path may preserve the peer;
+manual or non-speech interruption must take a fresh-session path. The direct
+Frameless data channel sends no provider interrupt control, rejects public
+Realtime `session.update` VAD configuration, and supplies no acknowledgement.
+Live evidence yielded only `session.started`, with no speech-start,
+turn-completion, or transcript event. Public Realtime v2 WebRTC/client-event
+semantics are unsupported on this subscription-backed route.
+
+Same-peer reuse is an explicitly empirical WebRTC auto-truncation invariant,
+not a causally proven provider boundary. From the token, the child must consume
+through the qualifying watermark and 4,000 samples beyond its token-time sender
+cursor (250 ms at 16 kHz), an overlapping 750 ms minimum guard must elapse, and
+the sole decoded-audio consumer must measure a fresh continuous 500 ms of
+silence after observing its receiver-barrier request. Queued, ready, and later
+frames are counted before resampling and restart the interval. Only responsive
+20 ms receiver heartbeats accumulate silence. A pinned aiortc 1.15 private-queue
+boundary records encoded/in-flight decode and decoded output before cross-thread
+scheduling, then resets jitter-buffer and resampler tails at the serialized
+final no-await commit. When all conditions hold, an open normal media generation
+emits `media.quiet` before `interrupt.fenced`; both IPC writes must succeed
+before the child unmutes and the parent returns `READY`. Provider ingress cannot
+spoof those internal names. A fixed absolute five-second deadline is checked
+after receiver proof, after optional `media.quiet`, and immediately before the
+final fenced commit; success and timeout are mutually exclusive. It never
+restarts. `media_fence_capture_timeout` means a
+capture proof was unmet; otherwise timeout emits `media_fence_timeout`.
+Timeout or lifecycle failure remains muted and requires a fresh peer/session.
+An unfenceable trigger on a full capture queue immediately takes that fresh
+path; no synthetic watermark is assigned.
+These physical auto-truncation and muting behaviors remain
+acceptance items and must be requalified after provider or pinned-Codex changes.
+Qualification must include ordinary mid-response output gaps; a 500 ms natural
+gap followed by resumed old output disables same-peer reuse in favor of a fresh
+session.
 
 For legacy broker-managed sessions, every new utterance invalidates the previous
 executor/output generation. Frontend cancellation is requested only after an
@@ -193,9 +222,14 @@ double-talk at the configured sink/playback values, self-echo rejection, exact
 once-per-session pre-negotiation raw sink-volume preparation, absence of live
 response/interruption `pactl` work, playback sink pinning, fixed `paplay`
 arguments and immediate abort, RTP-before-start and stopped-before-tail
-preservation, pre-SCTP-RTP unkeyed cancel/clear, conditional event-ID-scoped
-controls otherwise, provider-VAD no-duplicate-control behavior, fresh
-post-fence quiet proof, successful and timed-out media fences, and no
+preservation, continued microphone upload during local mute, absence of public
+Realtime cancel/clear controls, rejection of public `session.update` VAD
+configuration, trusted-AEC-only local interrupt tokens ordered after the
+qualifying capture watermark, consumption through that watermark plus 250 ms
+beyond the token-time sender cursor, the overlapping 750 ms guard, 500 ms of
+receiver-owned fresh decoded-RTP silence, reserved
+internal lifecycle names, successful completion and fixed absolute five-second
+fail-closed timeout, manual-interrupt fresh-session behavior, and no
 captured-audio Assist handoff.
 It must also verify TCP ADB port 5555
 before and after every device restart or reboot; the overlay never changes the
@@ -531,9 +565,9 @@ request and is not a warm-TTS latency measurement.
 
 A later causal probe observed non-empty assistant transcript and output events
 before the user transcript completed. The bridge rejected that session for
-reuse while still returning the valid STT result. Codex 0.146.0's tagged
+reuse while still returning the valid STT result. Codex 0.147.0's tagged
 [Frameless Bidi outbound message
-definitions](https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs#L42-L84)
+definitions](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs#L50-L85)
 include session close and context/delegation appends but no response-cancel
 control. There is therefore no retained-session latency claim, and automatic
 handoff remains disabled. A future implementation must first expose a supported

@@ -16,7 +16,7 @@ and releases use semantic versioning.
   Buildroot Linux target, bounded transcript-free sequenced-packet IPC, direct
   continuous-RTP media boundaries based on first audio/receiver quiet, exact
   once-per-session pre-negotiation AEC sink-volume preparation, fixed-argv
-  non-blocking `paplay`, and provable same-peer interruption fences.
+  non-blocking `paplay`, and empirically gated same-peer interruption fences.
 - Add a complete hash-locked `aarch64-manylinux_2_28` runtime, reproducible
   manifest archive builder, atomic root-owned device installer, exact-version
   import/SDP smoke test as UID/GID 65534 on root installs, unprivileged sidecar
@@ -35,15 +35,34 @@ and releases use semantic versioning.
 - Make direct v3 startup and runtime failures clear bounded Okay Computer audio
   and return idle instead of replaying captured audio into Home Assistant.
   Okay Nabu remains the separate official Assist/home-control route.
-- Make v3 provider lifecycle control-only: it never labels or gates RTP, so
-  RTP-before-start prefixes and stopped-before-tail audio remain in one decoded
-  lane. Local/explicit interruption immediately SIGKILLs `paplay`, drops queued
-  media, and conditionally sends event-ID-scoped cancel/clear. Actual RTP that
-  precedes provider SCTP lifecycle forces an unkeyed cancel plus clear;
-  provider VAD sends neither duplicate. Same-peer continuation requires
-  provider settlement plus a fresh post-fence receiver-quiet window to prove
-  `interrupt.fenced`, otherwise a fresh session is required. Cancel-no-op
-  errors are recoverable; clear/unmatched errors fail closed.
+- Make v3 response/output lifecycle control-only: it never labels or gates the
+  normal RTP lane, so RTP-before-start prefixes and stopped-before-tail audio
+  remain in one decoded lane. Local/explicit interruption immediately SIGKILLs
+  `paplay` in the parent, drops queued media, and locally mutes decoded RTP in
+  the sidecar while capture continues upstream. The subscription-backed Codex
+  Frameless Bidi path sends no public-Realtime cancel/clear client controls,
+  rejects public `session.update` VAD configuration, and supplies no provider
+  interrupt acknowledgement. Live direct evidence observed only
+  `session.started`, not speech-start, turn-completion, or transcript events.
+  Public Realtime v2 WebRTC/client-event semantics are unsupported on this
+  subscription route; the project's historical wire-v2 rollback is separate.
+  A preserving zero-field `response.interrupt` is restricted to trusted local
+  AEC barge-in and follows its exact qualifying capture watermark. Its
+  explicitly empirical WebRTC auto-truncation fence requires consumption
+  through that watermark plus 250 ms beyond the token-time sender cursor, an
+  overlapping 750 ms minimum guard, and a receiver-owned fresh 500 ms
+  decoded-RTP silence interval accumulated only across responsive heartbeats.
+  Pinned aiortc 1.15 private boundaries serialize encoded/in-flight decode,
+  decoded output, muted processing, jitter/resampler tail reset, and the final
+  commit across event-loop stalls. Decoder termination is never silence. Full-queue
+  speech detection fails to a fresh peer instead of inventing a capture
+  watermark. Reserved internal lifecycle writes
+  must succeed before unmute. The absolute five-second deadline is rechecked
+  immediately before its final commit and never restarts. A missing capture proof reports
+  `media_fence_capture_timeout`; other fence timeout reports
+  `media_fence_timeout`. Both stay muted and require a fresh session.
+  Manual/non-speech preserving interruption always takes that fresh path.
+  Normal media generations retain their independent 120 ms quiet bound.
 - Distinguish prior v2/AEC physical canaries from the new v3 path. V3 has local
   automated coverage but no claimed end-to-end physical acceptance yet.
 

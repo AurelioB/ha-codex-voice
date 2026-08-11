@@ -226,14 +226,16 @@ The reference implementation:
   arbitrary nested values, and raw data-channel messages do not cross that IPC
   boundary.
 
-Provider SCTP lifecycle does not label, admit, gate, split, or retire RTP. The
-decoded receiver owns one continuous media lane. Its first audio frame opens a
-monotonic local media generation and emits transcript-free `media.started`
-immediately before that PCM crosses IPC. Every decoded frame resets a receiver
-timer; only about 120 ms with no decoded audio emits `media.quiet` and closes
-that media generation. A later frame opens the next generation. This actual
-receiver boundary preserves audio that arrives before an SCTP output-start
-event and tail audio that arrives after an SCTP stopped event.
+Provider SCTP response/output lifecycle does not label, admit, gate, split, or
+retire the normal RTP lane. The decoded receiver owns one continuous media
+lane. Its first audio frame opens a monotonic local media generation and emits
+transcript-free `media.started` immediately before that PCM crosses IPC. Every
+decoded frame resets a receiver timer; only about 120 ms with no decoded audio
+emits `media.quiet` and closes that media generation. A later frame opens the
+next generation. This actual receiver boundary preserves audio that arrives
+before an SCTP output-start event and tail audio that arrives after an SCTP
+stopped event. This roughly 120 ms normal-generation boundary is independent of
+the interruption fence below.
 
 Direct playback owns at most one fixed-argv `paplay` child with raw 24 kHz,
 mono, signed-16-bit input, `--latency-msec=60`, and
@@ -259,49 +261,125 @@ sanitize remote failure, reject any unexpected provider tool call with
 session and thread. That control plane does not put the bridge in the media
 path.
 
-## Barge-in and cancellation
+## Barge-in and interruption
 
 Qualified full-duplex AEC keeps device capture active during provider
-playback. Two consecutive locally qualifying AEC-filtered capture frames, or
-an explicit preserving interrupt, immediately kill the local `paplay` child,
-drop its queued PCM and already queued playback IPC, and ask the sidecar to
-fence continuation. The sidecar mutes decoded RTP while the fence is pending.
+playback. Exactly two consecutive locally qualifying AEC-filtered capture
+frames are the trusted preserving-interrupt trigger. The vendor-process parent
+immediately drops queued playback PCM and IPC, closes player stdin, and sends
+SIGKILL to the active `paplay` child. The second qualifying capture frame is an
+exact monotonic watermark. The parent keeps the input backlog paced, sends the
+zero-field local IPC packet `{"type":"response.interrupt"}` immediately after
+the packet carrying that watermark, and sends no later capture packet before
+the token. The sidecar then mutes decoded RTP. Capture remains live, the child
+continues consuming it, and microphone RTP continues to the provider while the
+fence is pending. This packet is internal and never crosses the provider data
+channel.
+Manual, explicit non-speech, stop, normal-wake preemption, mute, disconnect,
+and vendor-owner teardown cannot enter this preserving fence; after local
+playback abort they must tear down and require a fresh peer/session.
 
-The sidecar uses generated client event IDs and the provider state it has
-actually observed. Normally it sends `response.cancel` only when a response is
-in progress and `output_audio_buffer.clear` only when provider output is
-active; when both are valid, cancel precedes clear on the ordered `oai-events`
-channel. RTP and SCTP are independently ordered, however. If decoded RTP has
-already arrived before any response/output lifecycle, that actual media is
-authoritative evidence of output: an explicit interrupt sends cancel then
-clear, ignores any stale caller-supplied response identifier, and omits
-`response_id` from cancel. Both controls still carry generated `event_id`
-values. Outside that fail-safe case, either, both, or neither control may be
-valid. A causally matched cancel-no-op error is recoverable. A clear error or
-any unmatched provider error fails closed.
+This subscription-backed Codex connection speaks tagged **Frameless Bidi**,
+not the generic public Realtime API client-event dialect. The pinned
+[Codex 0.147 `RealtimeOutboundMessage`
+enum](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs#L50-L85)
+contains audio/context/session messages but no `response.cancel` or
+`output_audio_buffer.clear`. The device therefore sends neither event and must
+not borrow an equivalent public-Realtime client control. Public Realtime v2
+WebRTC and its client-event/`session.update` dialect are unsupported on this
+ChatGPT-subscription direct route; live attempts to configure VAD with
+`session.update` were rejected. This does not deprecate this project's separate
+historical wire-v2 `bridge_pcm` rollback.
 
-Provider `input_audio_buffer.speech_started` has different ownership: provider
-VAD already performs automatic cancellation/truncation. That event kills local
-playback and starts the same media fence, but sends no duplicate cancel or
-clear.
+The direct Frameless data channel provides no provider interruption
+acknowledgement. Live evidence observed only `session.started`; it produced no
+`speech_started`, `turn.done`, or transcript event. Consequently neither SCTP
+lifecycle nor receiver quiet can causally prove that the provider interrupted
+the old response. Same-peer reuse is instead an explicitly **empirical WebRTC
+auto-truncation invariant** for the pinned route, not a protocol guarantee,
+remote-cancellation claim, or completed physical validation.
 
-Same-peer continuation is allowed only after both the required provider
-control settlement and a fresh, complete receiver-quiescence window that began
-at the interruption fence have been observed. A quiet state cached before the
-fence is insufficient; the sidecar starts a new roughly 120 ms window at the
-fence, and every decoded frame while muted restarts the full interval. The
-child then emits transcript-free `interrupt.fenced`, unmutes, and lets the next
-decoded audio open a fresh media generation. If it cannot prove that fence by
-its bounded deadline, it fails the direct session so a later utterance must use
-a fresh peer/thread. SCTP lifecycle never labels or gates RTP in this process.
-These media-fence behaviors have automated coverage, but the repository does
-not claim a physical v3 ordering/barge-in canary yet. Unlike v2, there is no
-bridge `interrupt` acknowledgement or bridge-side `remote_cancelled` claim in
-this protocol.
+On receipt of the trusted local token, the child snapshots the outbound capture
+cursor, the newest pre-token capture sample end, and a monotonic absolute
+deadline. It derives one required consumed end equal to the greater of the
+pre-token watermark and the snapshot cursor plus 4,000 samples. It may emit
+`interrupt.fenced` only after all four of these conditions hold:
 
-Stop, normal-wake preemption, mute, disconnect, or vendor-owner teardown uses a
-non-preserving interrupt: playback is aborted, the device peer is stopped, and
-the device sends the bridge `stop` control for remote cleanup.
+1. the outbound WebRTC track has consumed through the pre-token watermark,
+   proving that the two qualifying frames reached the sender;
+2. it has also consumed at least 4,000 samples beyond the token-time cursor
+   (250 ms at 16 kHz); queued-but-unconsumed capture does not count;
+3. at least 750 ms has elapsed since the token; and
+4. after the capture proof holds, the sole decoded-audio consumer has observed
+   a receiver-barrier request and then measured a fresh continuous 500 ms with
+   no decoded RTP frame. The interval begins in the consumer, not in the fence
+   timer; every queued, ready, or subsequently delivered frame resets it. Only
+   responsive 20 ms receiver heartbeats accumulate silence; a scheduling slip
+   resets the complete interval rather than counting stalled wall time.
+
+The exact pinned aiortc 1.15 receiver boundary is part of condition 4. During
+the synchronous `track` callback, before aiortc starts its decoder worker, the
+sidecar verifies and wraps both the empty unbounded encoded-frame decoder queue
+and `RemoteStreamTrack._queue`. The synchronous wrappers publish monotonic
+producer, in-flight/completed-decode, and processed-output serials before any
+cross-thread scheduling can hide them. Decoder termination is terminal state,
+not silence. The fence requires both queues to be quiet and drained for 500 ms.
+At the serialized final commit it replaces the verified audio
+`JitterBuffer(capacity=16, prefetch=4)` to discard retained encoded tail and
+recreates the receiver-owned PyAV resampler to discard its filter tail. If the
+pinned version, private queue/jitter shape, ordering canary, or serial sequence
+differs, the direct session fails closed. This deliberately private boundary is
+safe only because the runtime and every wheel are hash pinned.
+
+The conditions overlap; their durations are not added. Every decoded RTP frame
+is recorded before resampling and restarts only the 500 ms absence interval. It
+does not restart either capture requirement, the 750 ms guard, or the deadline.
+Thus the earliest successful fence is 750 ms after the token when the capture,
+fresh receiver-silence, and guard conditions are also satisfied. The
+normal-generation roughly 120 ms `media.quiet` boundary remains separate and
+cannot satisfy the 500 ms fence condition.
+
+When all four conditions hold, the child first emits `media.quiet` if a normal
+media generation remains open. Only after that IPC write and transcript-free
+`interrupt.fenced` both succeed may it unmute decoded RTP and permit the parent
+to return `READY`. Internal lifecycle names are reserved and rejected on
+provider ingress, so provider data cannot forge either boundary. One fixed
+absolute five-second deadline begins at the local token, is checked after the
+receiver proof, after an optional `media.quiet`, and immediately before the
+final `interrupt.fenced` write. A successful ordered `interrupt.fenced` write
+is the commit point, so one fence cannot report both success and timeout. The
+decoder and output producer locks are held across jitter reset and the no-await
+`media.quiet`/`interrupt.fenced` writes and unmute, preventing queued or
+in-flight decode from crossing that decision. The deadline never restarts. If
+the conditions do not all hold before it—or a
+lifecycle write fails—the child remains muted and the direct session fails
+closed. It emits the content-free fatal
+`media_fence_capture_timeout` when either capture condition is unmet; otherwise
+it emits `media_fence_timeout`. Neither diagnostic restarts or extends the
+deadline, and a later utterance requires a fresh peer/thread. Continuing
+provider RTP through that deadline disables same-peer reuse rather than
+weakening the fence.
+
+If the bounded parent capture queue is full, unaccepted audio never receives a
+capture watermark. The direct client still runs the bounded detector over that
+frame. If it completes the two-frame trigger on an unaccepted frame, it cannot
+authorize this preserving fence: it immediately selects the fresh-session
+teardown path. A later accepted frame may complete a sequence started by a
+full-queue frame, but the fence then uses only that accepted frame's real
+watermark. Quiet full-queue frames reset the sequence.
+
+This invariant must be requalified after provider behavior or the pinned Codex
+version changes and under real double-talk/RTP timing. Qualification must cover
+ordinary mid-response gaps: if decoded output can pause for 500 ms and later
+resume without barge-in, same-peer reuse is unqualified and must remain disabled
+in favor of a fresh session. The repository's automated coverage is not an
+end-to-end physical v3 acceptance claim. Unlike project wire v2, v3 has no
+bridge `interrupt` acknowledgement or bridge-side `remote_cancelled` claim.
+
+Stop, normal-wake preemption, mute, disconnect, manual interruption, or
+vendor-owner teardown uses a non-preserving interrupt: playback is aborted, the
+device peer is stopped, and the device sends the bridge `stop` control for
+remote cleanup.
 
 ## Sideband controls and termination
 

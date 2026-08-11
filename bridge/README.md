@@ -230,18 +230,38 @@ same-socket continuation still requires a sanitized `response.cancelled` event
 correlated to the active provider response.
 
 V3 barge-in does not use a bridge interrupt acknowledgement. The device kills
-local `paplay`, drops queued media, and mutes decoded RTP. Provider lifecycle
-never labels or gates that continuous media lane; only first decoded audio and
-an actual roughly 120 ms receiver gap create internal `media.started` and
-`media.quiet` boundaries. For explicit interruption, generated event IDs
-normally scope cancel to an in-progress response and clear to active output.
-Decoded RTP that arrives before provider SCTP lifecycle instead forces both
-controls, with no `response_id` on the cancel. A cancel-no-op is recoverable,
-while clear/unmatched errors fail closed. Provider VAD `speech_started` sends
-no duplicate control. The peer continues only after control settlement plus a
-fresh full receiver-quiet window begun at the fence emit `interrupt.fenced`;
-otherwise the bounded fence requires a fresh session. Physical v3 acceptance
-remains outstanding.
+local `paplay` in the parent, drops queued media, and has the sidecar child mute
+decoded RTP while microphone RTP continues upstream. Provider response/output
+lifecycle never labels or gates that continuous media lane; only first decoded
+audio and an actual roughly 120 ms receiver gap create internal `media.started`
+and `media.quiet` boundaries. Only trusted AEC-filtered local barge-in may send
+the zero-field parent-to-child `response.interrupt` token; manual or non-speech
+preserving interruption must use a fresh session. The direct Frameless data
+channel sends no provider interrupt control and supplies no acknowledgement:
+live evidence produced only `session.started`, rejected public Realtime
+`session.update` VAD configuration, and produced no `speech_started`,
+`turn.done`, or transcript event. Same-peer reuse is therefore an explicitly
+empirical WebRTC auto-truncation invariant, not causal proof of provider
+cancellation or completed physical validation. The token follows the exact
+qualifying capture watermark. The child must consume through that watermark and
+4,000 samples beyond its token-time sender cursor (250 ms at 16 kHz), an
+overlapping 750 ms guard must elapse, and decoded RTP must be absent continuously
+until the sole decoded-audio consumer measures a fresh 500 ms silence interval
+after observing its barrier request. Every queued, ready, or later decoded
+frame is counted before resampling and restarts the window; stalled loop time
+does not count. Pinned aiortc 1.15 encoded-decoder and decoded-output wrappers
+expose queued/in-flight work before cross-thread scheduling, then discard
+jitter-buffer and resampler tails at the serialized final commit. On success, an open media
+generation emits `media.quiet` before `interrupt.fenced`; both IPC writes must
+succeed before unmute and `READY`. Provider ingress cannot spoof those internal
+names. A fixed absolute five-second deadline is checked after receiver proof,
+after optional `media.quiet`, and immediately before the final fenced commit;
+success and timeout are mutually exclusive. It never restarts.
+`media_fence_capture_timeout` means a capture proof was
+unmet; otherwise timeout emits `media_fence_timeout`. Timeout or lifecycle
+failure remains muted and requires a fresh peer/session.
+Physical v3 acceptance remains outstanding. See the normative
+[v3 interruption contract](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 Bridge-owned v1/v2/STT/TTS audio adapters use Codex App Server's experimental
 WebRTC v3 path. Their peer creates a real paced outbound audio track and
@@ -250,8 +270,10 @@ relays the device's offer and never creates that bridge peer. App Server
 supplies the remote SDP answer and lifecycle notifications. Codex 0.147.0 or
 newer is required for the managed frontend's
 delegation acknowledgement control. This is the subscription-compatible path.
-Raw Realtime v2 WebSockets require API-key authentication and are intentionally
-not used.
+The public Realtime v2 WebRTC/client-event dialect is unsupported on this
+subscription-backed direct route; raw Realtime v2 WebSockets require API-key
+authentication and are intentionally not used. That restriction is unrelated
+to this project's retained historical wire-v2 `bridge_pcm` rollback.
 
 This App Server realtime surface is experimental and not the documented OpenAI
 Realtime API. Native selection removes the bridge-created transcript/executor/

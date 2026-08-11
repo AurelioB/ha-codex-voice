@@ -223,21 +223,9 @@ class WebRtcSidecarClient:
             )
         )
 
-    def cancel_response(self, response_id: str | None = None) -> None:
-        """Request provider cancellation over the direct data channel."""
-        if response_id is None:
-            packet = encode_control("response.cancel")
-        else:
-            packet = encode_control("response.cancel", response_id=response_id)
-        self._send(packet)
-
-    def interrupt_response(self, response_id: str | None = None) -> None:
-        """Cancel and truncate the provider's WebRTC output buffer."""
-        if response_id is None:
-            packet = encode_control("response.interrupt")
-        else:
-            packet = encode_control("response.interrupt", response_id=response_id)
-        self._send(packet)
+    def interrupt_response(self) -> None:
+        """Fence local playback while provider server VAD handles interruption."""
+        self._send(encode_control("response.interrupt"))
 
     def stop(self) -> None:
         """Stop the active peer while retaining the isolated child process."""

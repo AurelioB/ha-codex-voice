@@ -21,14 +21,26 @@
 > RTP audio and `oai-events` travel directly between the device and provider.
 > The bridge still owns Codex OAuth/App Server signaling and cleanup. Okay Nabu
 > remains the separate Assist/tool path. V2 `bridge_pcm` is retained for
-> rollback. Provider lifecycle never gates the continuous RTP lane; local media
-> boundaries come from first decoded audio and actual receiver quiet. Local
-> interruption normally uses conditional event-ID-scoped cancel/clear; actual
-> RTP before SCTP lifecycle forces an unkeyed cancel plus clear, while provider
-> VAD sends neither duplicate. Same-peer continuation requires control
-> settlement and a fresh post-fence quiet window. Exact sink preparation runs
-> once before direct-session negotiation, outside the response/interruption
-> loop. No end-to-end physical v3 acceptance is claimed yet.
+> rollback. Provider response/output lifecycle never gates the continuous RTP
+> lane; local media boundaries come from first decoded audio and actual receiver
+> quiet. Local interruption kills parent `paplay`, locally mutes RTP in the
+> child, and keeps microphone upload running. A preserving zero-field local
+> `response.interrupt` is restricted to trusted AEC-filtered barge-in. The
+> direct Frameless channel sends no provider interrupt control, rejects public
+> `session.update` VAD configuration, and supplies no acknowledgement; live
+> evidence produced only `session.started`. Same-peer reuse is an explicitly
+> empirical WebRTC auto-truncation invariant. Its token follows the qualifying
+> capture watermark; the child must consume through it plus 250 ms beyond its
+> sender cursor, wait an overlapping 750 ms guard, and observe 500 ms of
+> receiver-owned fresh decoded-RTP silence after the barrier request. Reserved
+> lifecycle writes must succeed before unmute. The fixed absolute five-second
+> deadline stays muted and requires a fresh session on failure. Manual/non-speech preserving
+> interruption always uses that fresh path. Normal media generations retain
+> their separate 120 ms quiet bound. Public Realtime v2 WebRTC is unsupported
+> on this subscription route; project wire-v2 `bridge_pcm` remains separate.
+> Exact sink preparation runs once before
+> direct-session negotiation, outside the response/interruption loop. No
+> end-to-end physical v3 acceptance is claimed yet.
 
 Build this as a hybrid Home Assistant custom integration plus a local companion add-on:
 
@@ -148,8 +160,9 @@ alternative, but it must never activate automatically.
 - Own the WebRTC peer, tracks, data channel, resampling, and media cancellation
   for the experimental STT/TTS adapters and v2 rollback. For ThirdReality v3,
   validate and relay the device SDP instead; the pinned device `aiortc` sidecar
-  owns media and data-channel cancellation while the bridge owns App Server
-  start/stop and thread cleanup.
+  owns local RTP muting and the empirical capture/guard/RTP-absence fence while
+  the bridge owns App Server start/stop and thread cleanup. The direct channel
+  supplies no provider interruption acknowledgement.
 - Expose a narrow authenticated local API to the HA component: login, logout, account status, conversation turn, transcribe stream, synthesize stream, cancel, and diagnostics.
 - Use App Server's managed device-code/browser login. Store the Codex credential cache only in the add-on's private persistent volume with restrictive permissions or a supported credential store.
 - Reject arbitrary Codex command execution, filesystem requests, external MCP configuration, and approval prompts at the bridge boundary.

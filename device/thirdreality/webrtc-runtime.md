@@ -30,6 +30,15 @@ use the public PyPI index, disable keyring and ambient `uv` configuration, and
 verify every wheel hash. Standard proxy and CA variables may be forwarded to
 `uv`; application tokens and credentials are not.
 
+The exact aiortc pin is also a correctness boundary, not merely packaging. The
+direct interruption fence installs verified wrappers around the 1.15 audio
+receiver's private encoded-decoder and decoded-output queues during the
+synchronous track callback, before its decoder starts, and resets the verified
+`JitterBuffer(capacity=16, prefetch=4)` at commit. A different version or
+private queue/jitter shape fails closed. PyAV is likewise pinned because the
+receiver discards its resampler instance at that boundary to remove filter-tail
+state.
+
 ## Build
 
 Run this from a clean checkout on a trusted build host with `uv` installed:

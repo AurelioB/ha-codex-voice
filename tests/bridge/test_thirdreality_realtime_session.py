@@ -197,8 +197,8 @@ class _FakeSidecar:
         self._condition = threading.Condition()
         self.answers: list[str] = []
         self.audio: list[tuple[bytes, int, int]] = []
-        self.cancellations: list[str | None] = []
-        self.interruptions: list[str | None] = []
+        self.ipc_sent: list[tuple[str, bytes | None]] = []
+        self.interruptions = 0
         self.stop_count = 0
         self.closed = False
 
@@ -243,6 +243,7 @@ class _FakeSidecar:
         capture_monotonic_ns: int,
     ) -> None:
         self.audio.append((pcm, sample_index, capture_monotonic_ns))
+        self.ipc_sent.append(("audio", pcm))
 
     def drain_messages(
         self,
@@ -255,17 +256,9 @@ class _FakeSidecar:
                 for _ in range(min(maximum, len(self._incoming)))
             ]
 
-    def cancel_response(self, response_id: str | None = None) -> None:
-        self.cancellations.append(response_id)
-
-    def interrupt_response(self, response_id: str | None = None) -> None:
-        self.interruptions.append(response_id)
-        self.feed(
-            ControlMessage(
-                "lifecycle",
-                {"event_type": "interrupt.fenced", "generation": 0},
-            )
-        )
+    def interrupt_response(self) -> None:
+        self.interruptions += 1
+        self.ipc_sent.append(("interrupt", None))
 
     def stop(self) -> None:
         self.stop_count += 1
@@ -507,20 +500,10 @@ def test_direct_webrtc_negotiates_on_device_and_never_relays_pcm(
     assert connection.closed
 
 
-def test_direct_webrtc_barge_in_flushes_cancels_and_keeps_same_session(
+def test_direct_webrtc_barge_in_fences_media_and_keeps_same_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, connection, sidecar, player = _start_direct_session(monkeypatch)
-    sidecar.feed(
-        ControlMessage(
-            "lifecycle",
-            {
-                "event_type": "response.created",
-                "generation": 0,
-                "response_id": "resp_1",
-            },
-        )
-    )
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -541,9 +524,11 @@ def test_direct_webrtc_barge_in_flushes_cancels_and_keeps_same_session(
     speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
-    assert _wait_for(lambda: sidecar.interruptions == ["resp_1"])
+    assert _wait_for(lambda: sidecar.interruptions == 1)
+    assert _wait_for(lambda: len(sidecar.audio) >= 2)
     assert not session.output_active
     assert session.ready
+    assert _wait_for(lambda: session.state is SessionState.INTERRUPTING)
     assert not connection.closed
 
     old_audio_count = sum(event[0] == "audio" for event in player.events)
@@ -561,13 +546,10 @@ def test_direct_webrtc_barge_in_flushes_cancels_and_keeps_same_session(
     sidecar.feed(
         ControlMessage(
             "lifecycle",
-            {
-                "event_type": "response.created",
-                "generation": 1,
-                "response_id": "resp_2",
-            },
+            {"event_type": "interrupt.fenced", "generation": 1},
         )
     )
+    assert _wait_for(lambda: session.state is SessionState.READY)
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -590,20 +572,128 @@ def test_direct_webrtc_barge_in_flushes_cancels_and_keeps_same_session(
     assert session.join(1.0)
 
 
-def test_direct_webrtc_explicit_interrupt_resumes_same_data_channel(
+def test_direct_barge_interrupt_follows_exact_qualifying_capture_watermark(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session, connection, sidecar, _player = _start_direct_session(monkeypatch)
+    allow_audio_send = threading.Event()
+
+    class GatedAudioPacer(_AudioPacer):
+        def due(self, now: float) -> bool:
+            return allow_audio_send.is_set() and super().due(now)
+
+    monkeypatch.setattr(session_module, "_AudioPacer", GatedAudioPacer)
+    session, connection, sidecar, player = _start_direct_session(monkeypatch)
     sidecar.feed(
         ControlMessage(
             "lifecycle",
-            {
-                "event_type": "response.created",
-                "generation": 0,
-                "response_id": "resp_1",
-            },
+            {"event_type": "media.started", "generation": 1},
         )
     )
+    assert _wait_for(lambda: session.output_active)
+
+    def frame(amplitude: int) -> bytes:
+        return amplitude.to_bytes(2, "little", signed=True) * 512
+
+    before = [frame(10), frame(20)]
+    qualifying = [frame(2_000), frame(2_200)]
+    after = frame(30)
+    for pcm in [*before, *qualifying, after]:
+        assert session.submit_audio(pcm) is SubmitResult.ACCEPTED
+
+    # The capture backlog is fully admitted but deliberately held from IPC.
+    # Playback still dies as soon as the network thread applies the detector
+    # request; its provider token must wait for the target capture watermark.
+    assert _wait_for(lambda: ("abort", None) in player.events)
+    assert not session.output_active
+    assert not sidecar.audio
+    assert sidecar.interruptions == 0
+    assert not connection.closed
+
+    # Before the paced watermark reaches the child, its still-unmuted receiver
+    # may observe an ordinary quiet gap and open another stale generation. The
+    # parent must retire/drop it rather than terminating the same-peer session.
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.quiet", "generation": 1},
+        )
+    )
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 2},
+        )
+    )
+    stale_pcm = b"\x09\x00" * 480
+    sidecar.feed(
+        PlaybackAudio(
+            generation=2,
+            sample_index=0,
+            media_timestamp=0,
+            pcm=stale_pcm,
+        )
+    )
+    time.sleep(0.05)
+    assert not session.terminal
+    assert not any(event == ("audio", stale_pcm) for event in player.events)
+
+    allow_audio_send.set()
+    session._wake_network.set()
+    assert _wait_for(lambda: sidecar.interruptions == 1)
+    assert _wait_for(lambda: len(sidecar.audio) == 5)
+    through_watermark = [("audio", pcm) for pcm in [*before, *qualifying]]
+    assert sidecar.ipc_sent[:6] == [
+        *through_watermark,
+        ("interrupt", None),
+        ("audio", after),
+    ]
+    assert not connection.closed
+
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "interrupt.fenced", "generation": 2},
+        )
+    )
+    assert _wait_for(lambda: session.state is SessionState.READY)
+
+    session.stop()
+    assert session.join(1.0)
+
+
+def test_direct_provider_speech_started_is_informational_without_local_barge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, _connection, sidecar, player = _start_direct_session(monkeypatch)
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "media.started", "generation": 1},
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+
+    sidecar.feed(
+        ControlMessage(
+            "lifecycle",
+            {"event_type": "input_audio_buffer.speech_started", "generation": 1},
+        )
+    )
+    time.sleep(0.05)
+
+    assert session.output_active
+    assert session.state is SessionState.READY
+    assert sidecar.interruptions == 0
+    assert not any(event[0] == "abort" for event in player.events[1:])
+
+    session.stop()
+    assert session.join(1.0)
+
+
+def test_direct_webrtc_explicit_interrupt_closes_for_a_fresh_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, connection, sidecar, _player = _start_direct_session(monkeypatch)
     sidecar.feed(
         ControlMessage(
             "lifecycle",
@@ -614,19 +704,18 @@ def test_direct_webrtc_explicit_interrupt_resumes_same_data_channel(
 
     session.interrupt()
 
-    assert _wait_for(lambda: sidecar.interruptions == ["resp_1"])
-    assert _wait_for(lambda: session.state is SessionState.READY)
-    assert not connection.closed
+    assert session.join(1.0)
+    assert session.state is SessionState.STOPPED
+    assert sidecar.interruptions == 0
+    assert connection.closed
     assert (
         connection.json_sent.count({"type": "transport_ready", "protocol_version": 3})
         == 1
     )
-
-    session.stop()
-    assert session.join(1.0)
+    assert connection.json_sent.count({"type": "stop"}) == 1
 
 
-def test_direct_interrupt_preserves_audio_admitted_after_atomic_boundary(
+def test_direct_explicit_interrupt_closes_audio_admission_before_player_abort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, _connection, sidecar, player = _start_direct_session(monkeypatch)
@@ -648,14 +737,12 @@ def test_direct_interrupt_preserves_audio_admitted_after_atomic_boundary(
     assert abort_entered.wait(1.0)
 
     frame = b"\x05\x00" * 1_024
-    assert session.submit_audio(frame) is SubmitResult.ACCEPTED
+    assert session.submit_audio(frame) is SubmitResult.CLOSED
     release_abort.set()
 
-    assert _wait_for(lambda: any(value[0] == frame for value in sidecar.audio))
-    assert _wait_for(lambda: session.state is SessionState.READY)
-
-    session.stop()
     assert session.join(1.0)
+    assert not any(value[0] == frame for value in sidecar.audio)
+    assert sidecar.interruptions == 0
 
 
 def test_startup_audio_pacer_never_bursts_delayed_capture_blocks() -> None:
@@ -714,6 +801,87 @@ def test_input_queue_is_nonblocking_bounded_and_pcm_aligned() -> None:
     assert session.submit_audio(b"b" * 2_048) is SubmitResult.ACCEPTED
     assert session.submit_audio(b"c" * 2) is SubmitResult.FULL
     assert session.submit_audio(b"odd") is SubmitResult.INVALID
+
+
+def test_direct_full_queue_speech_trigger_fails_closed_without_fake_watermark() -> None:
+    session = RealtimeSession(
+        _duplex_config(
+            media_transport=DEVICE_WEBRTC_TRANSPORT,
+            input_queue_bytes=2_048,
+        ),
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    session._set_local_output_epoch(1)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.FULL
+
+    assert session.state is SessionState.STOPPING
+    assert session._interrupt_requested.is_set()
+    assert session._interrupt_preserve_session is False
+    assert session._audio.bytes == 0
+    assert session._local_barge_in_requested_epoch is None
+    assert session._local_barge_in_requested_watermark is None
+
+
+def test_direct_full_then_accepted_speech_uses_accepted_causal_watermark() -> None:
+    session = RealtimeSession(
+        _duplex_config(
+            media_transport=DEVICE_WEBRTC_TRANSPORT,
+            input_queue_bytes=2_048,
+        ),
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    session._set_local_output_epoch(1)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+    quiet = b"\0" * 2_048
+
+    assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.FULL
+    packet, _remaining = session._audio.pop()
+    assert packet is not None and packet.capture_watermark == 1
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+
+    player = _RecordingPlayer()
+    player.begin(1)
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=1,
+        last_output_epoch=1,
+    ) == (None, 2)
+    assert not session._interrupt_requested.is_set()
+    assert session.state is SessionState.READY
+
+
+def test_direct_full_quiet_frame_resets_overflow_barge_counter() -> None:
+    session = RealtimeSession(
+        _duplex_config(
+            media_transport=DEVICE_WEBRTC_TRANSPORT,
+            input_queue_bytes=2_048,
+        ),
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    session._set_local_output_epoch(1)
+    speech = (2_000).to_bytes(2, "little", signed=True) * 1_024
+    quiet = b"\0" * 2_048
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(quiet) is SubmitResult.FULL
+    packet, _remaining = session._audio.pop()
+    assert packet is not None
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+
+    assert session._local_barge_in_requested_epoch is None
+    assert session._local_barge_in_requested_watermark is None
+    assert not session._interrupt_requested.is_set()
+    assert session.state is SessionState.READY
 
 
 def test_message_bound_accepts_exactly_one_fixed_recorder_frame() -> None:
@@ -1443,14 +1611,11 @@ def test_local_barge_in_flushes_after_two_speech_frames_without_stopping() -> No
     assert session.output_active
     assert session._audio.bytes == 8_192
 
-    assert (
-        session._flush_local_barge_in(
-            player,
-            output_epoch=epoch,
-            last_output_epoch=last_epoch,
-        )
-        is None
-    )
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=epoch,
+        last_output_epoch=last_epoch,
+    ) == (None, 4)
     assert session.output_active is False
     # The utterance stays intact for provider VAD and same-session continuation.
     assert session._audio.bytes == 8_192
@@ -1480,25 +1645,19 @@ def test_local_barge_in_counter_survives_faster_no_request_network_polls() -> No
     # The network loop polls every 20 ms while recorder frames arrive every
     # 64 ms. Empty polls must not erase the first qualifying frame.
     for _ in range(3):
-        assert (
-            session._flush_local_barge_in(
-                player,
-                output_epoch=epoch,
-                last_output_epoch=last_epoch,
-            )
-            == 1
-        )
-        assert session.output_active
-
-    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
-    assert (
-        session._flush_local_barge_in(
+        assert session._flush_local_barge_in(
             player,
             output_epoch=epoch,
             last_output_epoch=last_epoch,
-        )
-        is None
-    )
+        ) == (1, None)
+        assert session.output_active
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=epoch,
+        last_output_epoch=last_epoch,
+    ) == (None, 2)
     assert session.output_active is False
     assert session._suppressed_output_epoch == 1
     assert player.events == [("begin", 1), ("abort", None)]
@@ -1595,14 +1754,11 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
     assert not transition_thread.is_alive()
     assert submit_results == [SubmitResult.ACCEPTED]
     assert transition_results == [(None, 2, 2, True)]
-    assert (
-        session._flush_local_barge_in(
-            player,
-            output_epoch=2,
-            last_output_epoch=2,
-        )
-        == 2
-    )
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=2,
+        last_output_epoch=2,
+    ) == (2, None)
     assert session.output_active
     assert session._suppressed_output_epoch is None
     assert player.events == [("begin", 1), ("finish", 1), ("begin", 2)]
@@ -1814,6 +1970,134 @@ def test_stopping_transition_is_atomic_with_audio_admission_and_clear(
     assert session.state is SessionState.STOPPING
     assert session._audio.bytes == 0
     assert session.submit_audio(b"b" * 2_048) is SubmitResult.CLOSED
+
+
+@pytest.mark.parametrize("request_name", ["interrupt", "stop"])
+@pytest.mark.parametrize("media_path", ["direct", "bridge"])
+def test_explicit_boundary_cannot_overtake_a_dequeued_audio_send(
+    monkeypatch: pytest.MonkeyPatch,
+    request_name: str,
+    media_path: str,
+) -> None:
+    config = (
+        _duplex_config(media_transport=DEVICE_WEBRTC_TRANSPORT)
+        if media_path == "direct"
+        else _config()
+    )
+    session = RealtimeSession(config, aec_verifier=lambda _config: None)
+    with session._state_lock:
+        session._state = SessionState.READY
+    frame = b"s" * 2_048
+    assert session.submit_audio(frame) is SubmitResult.ACCEPTED
+
+    pop_entered = threading.Event()
+    release_pop = threading.Event()
+    original_pop = session._audio.pop
+
+    def blocking_pop() -> Any:
+        packet, remaining = original_pop()
+        assert packet is not None
+        pop_entered.set()
+        assert release_pop.wait(1.0)
+        return packet, remaining
+
+    monkeypatch.setattr(session._audio, "pop", blocking_pop)
+    sidecar = _FakeSidecar()
+    connection = _FakeRealtimeConnection()
+
+    def send_once() -> None:
+        if media_path == "direct":
+            session._send_direct_audio(
+                sidecar,  # type: ignore[arg-type]
+                _AudioPacer(),
+                sample_index=0,
+                now=time.monotonic(),
+                capture_ages_ms=deque(),
+            )
+        else:
+            session._send_bridge_audio(connection)  # type: ignore[arg-type]
+
+    def sent_count() -> int:
+        if media_path == "direct":
+            return len(sidecar.audio)
+        return len(connection.binary_sent)
+
+    send_thread = threading.Thread(target=send_once, daemon=True)
+    send_thread.start()
+    assert pop_entered.wait(1.0)
+
+    boundary_started = threading.Event()
+    boundary_returned = threading.Event()
+    sends_seen_at_boundary: list[int] = []
+
+    def request_boundary() -> None:
+        boundary_started.set()
+        getattr(session, request_name)()
+        sends_seen_at_boundary.append(sent_count())
+        boundary_returned.set()
+
+    boundary_thread = threading.Thread(target=request_boundary, daemon=True)
+    boundary_thread.start()
+    try:
+        assert boundary_started.wait(1.0)
+        # Dequeue and send share the transition lock, so the explicit boundary
+        # cannot return while this already-popped packet is still held.
+        assert not boundary_returned.wait(0.05)
+    finally:
+        release_pop.set()
+    send_thread.join(1.0)
+    boundary_thread.join(1.0)
+
+    assert not send_thread.is_alive()
+    assert not boundary_thread.is_alive()
+    assert sends_seen_at_boundary == [1]
+    assert sent_count() == 1
+    assert session._audio.bytes == 0
+    assert session.state is SessionState.STOPPING
+
+
+def test_blocking_bridge_send_does_not_block_microphone_admission() -> None:
+    session = RealtimeSession(_config())
+    with session._state_lock:
+        session._state = SessionState.READY
+    first = b"a" * 2_048
+    second = b"b" * 2_048
+    assert session.submit_audio(first) is SubmitResult.ACCEPTED
+
+    send_entered = threading.Event()
+    release_send = threading.Event()
+    connection = _FakeRealtimeConnection()
+
+    def blocking_send(value: bytes) -> None:
+        send_entered.set()
+        assert release_send.wait(1.0)
+        connection.binary_sent.append(value)
+
+    connection.send_binary = blocking_send  # type: ignore[method-assign]
+    send_thread = threading.Thread(
+        target=lambda: session._send_bridge_audio(connection),  # type: ignore[arg-type]
+        daemon=True,
+    )
+    send_thread.start()
+    assert send_entered.wait(1.0)
+
+    admitted: list[SubmitResult] = []
+    admission_thread = threading.Thread(
+        target=lambda: admitted.append(session.submit_audio(second)),
+        daemon=True,
+    )
+    admission_thread.start()
+    assert _wait_for(lambda: admitted == [SubmitResult.ACCEPTED])
+
+    release_send.set()
+    send_thread.join(1.0)
+    admission_thread.join(1.0)
+    assert not send_thread.is_alive()
+    assert not admission_thread.is_alive()
+    assert connection.binary_sent == [first]
+    assert session._audio.bytes == len(second)
+
+    session.stop()
 
 
 def test_network_thread_runs_v2_audio_turn_and_drains_before_stop(

@@ -24,11 +24,13 @@ _SAFE_ROLE = frozenset({"assistant", "developer", "system", "tool", "user"})
 _SAFE_RESPONSE_STATUS = frozenset(
     {"in_progress", "completed", "cancelled", "failed", "incomplete"}
 )
+_INTERNAL_LIFECYCLE_TYPES = frozenset(
+    {"media.started", "media.quiet", "interrupt.fenced"}
+)
 _PARENT_CONTROL_TYPES = frozenset(
     {
         "create_offer",
         "set_answer",
-        "response.cancel",
         "response.interrupt",
         "stop",
         "shutdown",
@@ -179,7 +181,7 @@ def sanitize_provider_lifecycle(message: str | bytes) -> dict[str, str | int] | 
     if not isinstance(decoded, dict):
         return None
     event_type = _safe_token(decoded.get("type"))
-    if event_type is None:
+    if event_type is None or event_type in _INTERNAL_LIFECYCLE_TYPES:
         return None
 
     item = decoded.get("item") if isinstance(decoded.get("item"), dict) else {}
@@ -210,6 +212,14 @@ def sanitize_provider_lifecycle(message: str | bytes) -> dict[str, str | int] | 
     error_event_id = _safe_token(error.get("event_id"))
     if error_event_id is not None:
         result["error_event_id"] = error_event_id
+    for output_key, value in (
+        ("error_type", error.get("type")),
+        ("error_code", error.get("code")),
+        ("error_param", error.get("param")),
+    ):
+        token = _safe_token(value)
+        if token is not None:
+            result[output_key] = token
     return result
 
 
@@ -275,8 +285,7 @@ def _validate_control(
     allowed: dict[str, frozenset[str]] = {
         "create_offer": frozenset(),
         "set_answer": frozenset({"sdp"}),
-        "response.cancel": frozenset({"response_id"}),
-        "response.interrupt": frozenset({"response_id"}),
+        "response.interrupt": frozenset(),
         "stop": frozenset(),
         "shutdown": frozenset(),
         "offer": frozenset({"sdp"}),
@@ -294,6 +303,9 @@ def _validate_control(
                 "provider_generation",
                 "response_status",
                 "error_event_id",
+                "error_type",
+                "error_code",
+                "error_param",
             }
         ),
         "stopped": frozenset(),
@@ -325,6 +337,9 @@ def _validate_control(
             raise ProtocolError("sidecar lifecycle response status is invalid")
         if "error_event_id" in values and _safe_token(values["error_event_id"]) is None:
             raise ProtocolError("sidecar lifecycle error identifier is invalid")
+        for key in ("error_type", "error_code", "error_param"):
+            if key in values and _safe_token(values[key]) is None:
+                raise ProtocolError("sidecar lifecycle error token is invalid")
         for key in ("generation", "provider_generation"):
             if key in values:
                 value = values[key]

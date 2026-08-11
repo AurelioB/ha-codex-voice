@@ -35,12 +35,8 @@ class PeerLike(Protocol):
         """Queue one timestamped capture packet."""
         ...
 
-    def cancel_response(self, response_id: str | None = None) -> None:
-        """Send one provider response cancellation."""
-        ...
-
-    def interrupt_response(self, response_id: str | None = None) -> None:
-        """Cancel and clear one provider WebRTC output buffer."""
+    def interrupt_response(self) -> None:
+        """Fence local playback while provider server VAD interrupts output."""
         ...
 
     async def stop(self) -> None:
@@ -178,23 +174,11 @@ class SidecarRuntime:
             self._answer_applied = True
             self._send(encode_control("answer.applied"))
             return
-        if message.type == "response.cancel":
-            if not self._answer_applied or self._stopped:
-                raise RuntimeErrorCode("cancel_state_invalid")
-            response_id = message.values.get("response_id")
-            assert response_id is None or isinstance(response_id, str)
-            try:
-                self._peer.cancel_response(response_id)
-            except Exception as exc:
-                raise RuntimeErrorCode("cancel_failed") from exc
-            return
         if message.type == "response.interrupt":
             if not self._answer_applied or self._stopped:
                 raise RuntimeErrorCode("interrupt_state_invalid")
-            response_id = message.values.get("response_id")
-            assert response_id is None or isinstance(response_id, str)
             try:
-                self._peer.interrupt_response(response_id)
+                self._peer.interrupt_response()
             except Exception as exc:
                 raise RuntimeErrorCode("interrupt_failed") from exc
             return

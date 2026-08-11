@@ -115,6 +115,7 @@ class SubmitResult(Enum):
 class _AudioPacket:
     data: bytes
     captured_at: float
+    capture_watermark: int
 
 
 @dataclass(slots=True)
@@ -125,9 +126,6 @@ class _DirectPlaybackState:
     newest_generation: int = 0
     retired_generation: int = 0
     expected_sample_index: int | None = None
-    active_response_id: str | None = None
-    response_in_progress: bool = False
-    output_buffer_active: bool = False
     interruption_pending: bool = False
 
 
@@ -677,7 +675,10 @@ class RealtimeSession:
             )
         )
         self._audio = _BoundedAudioQueue(config.input_queue_bytes)
+        self._accepted_capture_watermark = 0
+        self._sent_capture_watermark = 0
         self._state = SessionState.NEW
+        self._audio_send_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._ready = threading.Event()
         self._terminal = threading.Event()
@@ -688,6 +689,7 @@ class RealtimeSession:
         self._output_active = threading.Event()
         self._local_output_epoch: int | None = None
         self._local_barge_in_requested_epoch: int | None = None
+        self._local_barge_in_requested_watermark: int | None = None
         self._local_barge_in_frames = 0
         self._local_barge_in_lock = threading.Lock()
         self._suppressed_output_epoch: int | None = None
@@ -753,7 +755,7 @@ class RealtimeSession:
         # Half-duplex remains the default. Full-duplex construction requires
         # explicit AEC routing, and _run verifies that live PulseAudio topology
         # before opening the bridge socket.
-        packet = _AudioPacket(value, self._clock())
+        captured_at = self._clock()
         with self._state_lock:
             if self._state not in {
                 SessionState.CONNECTING,
@@ -763,41 +765,75 @@ class RealtimeSession:
                 return SubmitResult.CLOSED
             if self._output_active.is_set() and not self._config.full_duplex:
                 return SubmitResult.GATED
+            capture_watermark = self._accepted_capture_watermark + 1
+            packet = _AudioPacket(value, captured_at, capture_watermark)
             if not self._audio.put(packet):
+                if (
+                    self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
+                    and self._detect_local_barge_in(
+                        value,
+                        capture_watermark=None,
+                    )
+                ):
+                    # The causal speech frame was not admitted, so a same-peer
+                    # fence could never prove that the provider consumed it.
+                    # Kill output through the normal direct-session teardown
+                    # path instead of fabricating a capture watermark.
+                    self._interrupt_preserve_session = False
+                    self._interrupt_requested.set()
+                    self._state = SessionState.STOPPING
+                    self._audio.clear()
+                    self._reset_local_barge_in_detection()
+                    self._wake_network.set()
                 return SubmitResult.FULL
+            self._accepted_capture_watermark = capture_watermark
             # Keep admission and detection on the same side of an interrupt or
             # stop transition. The transition owns the same state lock and can
             # therefore clear every packet and pending detector result admitted
             # before it, while later submissions observe STOPPING.
-            self._detect_local_barge_in(value)
+            self._detect_local_barge_in(
+                value,
+                capture_watermark=capture_watermark,
+            )
         self._wake_network.set()
         return SubmitResult.ACCEPTED
 
-    def _detect_local_barge_in(self, value: bytes) -> None:
-        """Flush local playback quickly after bounded AEC-filtered speech."""
+    def _detect_local_barge_in(
+        self,
+        value: bytes,
+        *,
+        capture_watermark: int | None,
+    ) -> bool:
+        """Detect bounded AEC-filtered speech; report an unfenceable trigger."""
         if not self._config.full_duplex:
-            return
+            return False
         with self._local_barge_in_lock:
             output_epoch = self._local_output_epoch
             if output_epoch is None:
+                self._local_barge_in_requested_watermark = None
                 self._local_barge_in_frames = 0
-                return
+                return False
             if self._local_barge_in_requested_epoch is not None:
-                return
+                return False
             if _pcm_has_local_barge_in_signal(value):
                 self._local_barge_in_frames += 1
             else:
                 self._local_barge_in_frames = 0
             if self._local_barge_in_frames < _LOCAL_BARGE_IN_FRAMES:
-                return
+                return False
             self._local_barge_in_frames = 0
+            if capture_watermark is None:
+                return True
             self._local_barge_in_requested_epoch = output_epoch
+            self._local_barge_in_requested_watermark = capture_watermark
+            return False
 
     def _set_local_output_epoch(self, output_epoch: int | None) -> None:
         """Publish one network-thread-owned playback generation to capture."""
         with self._local_barge_in_lock:
             self._local_output_epoch = output_epoch
             self._local_barge_in_requested_epoch = None
+            self._local_barge_in_requested_watermark = None
             self._local_barge_in_frames = 0
             if output_epoch is None:
                 self._output_active.clear()
@@ -808,6 +844,7 @@ class RealtimeSession:
         """Discard detector state without changing network-owned playback."""
         with self._local_barge_in_lock:
             self._local_barge_in_requested_epoch = None
+            self._local_barge_in_requested_watermark = None
             self._local_barge_in_frames = 0
 
     def _flush_local_barge_in(
@@ -816,16 +853,18 @@ class RealtimeSession:
         *,
         output_epoch: int | None,
         last_output_epoch: int,
-    ) -> int | None:
-        """Apply one capture-thread barge request on the player-owning thread."""
+    ) -> tuple[int | None, int | None]:
+        """Apply a capture request and return output plus its send watermark."""
         with self._local_barge_in_lock:
             requested_epoch = self._local_barge_in_requested_epoch
             if requested_epoch is None:
                 # Network polls run more frequently than the fixed recorder
                 # callback. No request is not a detector boundary: preserve a
                 # qualifying partial count until the next microphone frame.
-                return output_epoch
+                return output_epoch, None
+            requested_watermark = self._local_barge_in_requested_watermark
             self._local_barge_in_requested_epoch = None
+            self._local_barge_in_requested_watermark = None
             self._local_barge_in_frames = 0
             matches_current_output = requested_epoch == output_epoch or (
                 output_epoch is None
@@ -836,26 +875,28 @@ class RealtimeSession:
                 not matches_current_output
                 or requested_epoch != self._local_output_epoch
             ):
-                return output_epoch
+                return output_epoch, None
             # Disable capture-side detection before the potentially blocking
             # player reap. Only this network-thread path mutates playback state.
             self._local_output_epoch = None
             self._output_active.clear()
         player.abort()
         assert requested_epoch is not None
+        assert requested_watermark is not None
         self._suppressed_output_epoch = requested_epoch
-        return None
+        return None, requested_watermark
 
     def interrupt(self, *, preserve_session: bool = True) -> None:
         """Flush local output and request bounded provider interruption.
 
-        A session is resumed only after the bridge explicitly confirms remote
-        cancellation. Device teardown callers pass ``preserve_session=False``
-        so a successful provider cancel cannot outlive the vendor owner.
+        Explicit direct-session interruption always closes the peer because it
+        has no AEC-qualified speech evidence. Automatic local barge-in uses the
+        separate media fence in the direct network loop. Bridge-PCM sessions
+        retain their negotiated same-session interruption behavior.
         """
         if self._terminal.is_set():
             return
-        with self._state_lock:
+        with self._audio_send_lock, self._state_lock:
             if self._interrupt_requested.is_set():
                 self._interrupt_preserve_session = (
                     self._interrupt_preserve_session and preserve_session
@@ -863,7 +904,10 @@ class RealtimeSession:
             else:
                 self._interrupt_preserve_session = preserve_session
             self._interrupt_requested.set()
-            if not self._interrupt_preserve_session:
+            if (
+                not self._interrupt_preserve_session
+                or self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
+            ):
                 self._state = SessionState.STOPPING
             elif self._state in {SessionState.CONNECTING, SessionState.READY}:
                 self._state = (
@@ -879,7 +923,7 @@ class RealtimeSession:
         """Request bounded normal session shutdown."""
         if self._terminal.is_set():
             return
-        with self._state_lock:
+        with self._audio_send_lock, self._state_lock:
             self._stop_requested.set()
             if self._state in {
                 SessionState.CONNECTING,
@@ -905,6 +949,35 @@ class RealtimeSession:
             self._run_device_webrtc()
             return
         self._run_bridge_pcm()
+
+    def _send_bridge_audio(
+        self,
+        connection: WebSocketConnection,
+    ) -> tuple[_AudioPacket | None, int]:
+        """Send one queued bridge frame on the explicit-stop boundary."""
+        # A distinct send boundary lets the recorder keep admitting capture
+        # while a bounded WebSocket write blocks. Stop/interrupt acquire this
+        # lock before changing state, so a transition that returns has either
+        # waited for this reserved send or prevented its dequeue.
+        with self._audio_send_lock:
+            with self._state_lock:
+                if (
+                    self._stop_requested.is_set()
+                    or self._interrupt_requested.is_set()
+                    or self._state
+                    not in {
+                        SessionState.CONNECTING,
+                        SessionState.READY,
+                        SessionState.INTERRUPTING,
+                    }
+                ):
+                    return None, 0
+                packet, remaining_packets = self._audio.pop()
+                if packet is None:
+                    return None, 0
+            connection.send_binary(packet.data)
+            self._sent_capture_watermark = packet.capture_watermark
+            return packet, remaining_packets
 
     def _run_bridge_pcm(  # noqa: C901
         self,
@@ -988,7 +1061,7 @@ class RealtimeSession:
                     connection.send_json({"type": "stop"})
                     return
                 else:
-                    output_epoch = self._flush_local_barge_in(
+                    output_epoch, _ = self._flush_local_barge_in(
                         player,
                         output_epoch=output_epoch,
                         last_output_epoch=last_output_epoch,
@@ -998,9 +1071,8 @@ class RealtimeSession:
                 if output_epoch is None and not player.active:
                     self._set_local_output_epoch(None)
                 if not interrupt_sent and pacer.due(now):
-                    packet, remaining_packets = self._audio.pop()
+                    packet, remaining_packets = self._send_bridge_audio(connection)
                     if packet is not None:
-                        connection.send_binary(packet.data)
                         if _pcm_has_signal(packet.data):
                             last_semantic_activity = self._clock()
                         # A bounded 2x catch-up drains only a startup backlog;
@@ -1234,6 +1306,7 @@ class RealtimeSession:
             next_ping_at = last_semantic_activity + self._config.ping_interval_seconds
             pending_ping: bytes | None = None
             pong_deadline: float | None = None
+            pending_interrupt_watermark: int | None = None
 
             while True:
                 now = self._clock()
@@ -1256,50 +1329,43 @@ class RealtimeSession:
                             state.retired_generation,
                             state.active_generation,
                         )
-                    with self._state_lock:
-                        preserve_session = self._interrupt_preserve_session
-                        if preserve_session:
-                            self._interrupt_requested.clear()
-                    if not preserve_session:
-                        self._audio.clear()
-                        sidecar.stop()
-                        connection.send_json({"type": "stop"})
-                        return
-                    # The child owns the ordered provider lifecycle and decides
-                    # whether cancel, clear, both, or neither are currently
-                    # valid. Send unconditionally so queued lifecycle cannot
-                    # make a local-state race lose the interruption.
-                    state.interruption_pending = True
-                    sidecar.interrupt_response(state.active_response_id)
-                    state.active_generation = None
-                    last_semantic_activity = now
-                elif self._stop_requested.is_set():
+                    self._audio.clear()
+                    sidecar.stop()
+                    connection.send_json({"type": "stop"})
+                    return
+                if self._stop_requested.is_set():
                     player.abort()
                     self._set_local_output_epoch(None)
                     self._audio.clear()
                     sidecar.stop()
                     connection.send_json({"type": "stop"})
                     return
-                else:
-                    previous_generation = state.active_generation
-                    active_generation = self._flush_local_barge_in(
-                        player,
-                        output_epoch=previous_generation,
-                        last_output_epoch=state.newest_generation,
+                previous_generation = state.active_generation
+                active_generation, requested_watermark = self._flush_local_barge_in(
+                    player,
+                    output_epoch=previous_generation,
+                    last_output_epoch=state.newest_generation,
+                )
+                if previous_generation is not None and active_generation is None:
+                    state.retired_generation = max(
+                        state.retired_generation,
+                        previous_generation,
                     )
-                    if previous_generation is not None and active_generation is None:
-                        state.retired_generation = max(
-                            state.retired_generation,
-                            previous_generation,
-                        )
-                        state.interruption_pending = True
-                        sidecar.interrupt_response(state.active_response_id)
-                        state.active_generation = None
-                        with self._state_lock:
-                            if self._state is SessionState.READY:
-                                self._state = SessionState.INTERRUPTING
-                        last_semantic_activity = now
+                    state.interruption_pending = True
+                    state.active_generation = None
+                    assert requested_watermark is not None
+                    pending_interrupt_watermark = requested_watermark
+                    with self._state_lock:
+                        if self._state is SessionState.READY:
+                            self._state = SessionState.INTERRUPTING
+                    last_semantic_activity = now
 
+                if (
+                    pending_interrupt_watermark is not None
+                    and self._sent_capture_watermark >= pending_interrupt_watermark
+                ):
+                    sidecar.interrupt_response()
+                    pending_interrupt_watermark = None
                 sample_index, input_semantic = self._send_direct_audio(
                     sidecar,
                     pacer,
@@ -1307,6 +1373,16 @@ class RealtimeSession:
                     now=now,
                     capture_ages_ms=capture_ages_ms,
                 )
+                if (
+                    pending_interrupt_watermark is not None
+                    and self._sent_capture_watermark >= pending_interrupt_watermark
+                ):
+                    # The sidecar uses one ordered SOCK_SEQPACKET channel for
+                    # capture and controls. Fence only after the exact second
+                    # qualifying AEC frame crosses that channel. Playback was
+                    # already killed above while the backlog stayed paced.
+                    sidecar.interrupt_response()
+                    pending_interrupt_watermark = None
                 controls, output_semantic = self._drain_direct_sidecar(
                     sidecar,
                     player,
@@ -1530,14 +1606,33 @@ class RealtimeSession:
         """Send at most one timestamped frame, preserving bounded startup catch-up."""
         if not pacer.due(now):
             return sample_index, False
-        packet, remaining_packets = self._audio.pop()
-        if packet is None:
-            return sample_index, False
-        sidecar.send_audio(
-            packet.data,
-            sample_index=sample_index,
-            capture_monotonic_ns=max(0, int(packet.captured_at * 1_000_000_000)),
-        )
+        # Linearize dequeue and the non-blocking IPC send with explicit stop
+        # and interrupt. A transition that returns has either cleared this
+        # packet before dequeue or waited until its send completed.
+        with self._state_lock:
+            if (
+                self._stop_requested.is_set()
+                or self._interrupt_requested.is_set()
+                or self._state
+                not in {
+                    SessionState.CONNECTING,
+                    SessionState.READY,
+                    SessionState.INTERRUPTING,
+                }
+            ):
+                return sample_index, False
+            packet, remaining_packets = self._audio.pop()
+            if packet is None:
+                return sample_index, False
+            sidecar.send_audio(
+                packet.data,
+                sample_index=sample_index,
+                capture_monotonic_ns=max(
+                    0,
+                    int(packet.captured_at * 1_000_000_000),
+                ),
+            )
+            self._sent_capture_watermark = packet.capture_watermark
         capture_ages_ms.append(max(0.0, (now - packet.captured_at) * 1_000))
         sample_index += len(packet.data) // 2
         pacer.sent(
@@ -1600,7 +1695,7 @@ class RealtimeSession:
             raise SidecarError("playback arrived outside its active media epoch")
         player.enqueue(message.pcm)
 
-    def _handle_direct_lifecycle(  # noqa: C901 - strict lifecycle state machine
+    def _handle_direct_lifecycle(
         self,
         message: ControlMessage,
         sidecar: WebRtcSidecarClient,
@@ -1614,15 +1709,26 @@ class RealtimeSession:
             raise SidecarError("sidecar lifecycle metadata is invalid")
         if generation < 0:
             raise SidecarError("sidecar lifecycle generation is invalid")
-        response_id = message.values.get("response_id")
-        if response_id is not None and not isinstance(response_id, str):
-            raise SidecarError("sidecar response identifier is invalid")
-
         if event_type == "media.started":
             if generation <= 0:
                 raise SidecarError("media generation must be positive")
             if state.interruption_pending:
-                raise SidecarError("media resumed before its interruption fence")
+                # The parent kills playback before the paced capture backlog
+                # reaches the qualifying-frame watermark. Until the child sees
+                # the ordered interrupt token it can legitimately observe a
+                # normal 120 ms gap and open another stale generation. Retire
+                # every such generation locally; its playback packets are then
+                # dropped by the generation gate. The child fence remains the
+                # sole authority that can later return this session to READY.
+                if generation <= state.retired_generation:
+                    return False
+                if generation <= state.newest_generation:
+                    raise SidecarError("muted media generation did not advance")
+                if state.active_generation is not None:
+                    raise SidecarError("muted media generation overlapped output")
+                state.newest_generation = generation
+                state.retired_generation = generation
+                return True
             if generation <= state.retired_generation:
                 return False
             if generation <= state.newest_generation:
@@ -1654,51 +1760,6 @@ class RealtimeSession:
             with self._state_lock:
                 if self._state is SessionState.INTERRUPTING:
                     self._state = SessionState.READY
-            return True
-
-        if event_type in {"response.created", "response.started"}:
-            state.response_in_progress = True
-            if response_id is not None:
-                state.active_response_id = response_id
-            return True
-
-        if event_type in {
-            "response.cancelled",
-            "response.completed",
-            "response.done",
-        }:
-            if response_id is None or response_id == state.active_response_id:
-                state.response_in_progress = False
-            return True
-
-        if event_type in {"output_audio_buffer.started", "speaking.started"}:
-            state.output_buffer_active = True
-            if response_id is not None:
-                state.active_response_id = response_id
-            return True
-
-        if event_type in {
-            "output_audio_buffer.cleared",
-            "output_audio_buffer.stopped",
-            "speaking.stopped",
-        }:
-            if response_id is None or response_id == state.active_response_id:
-                state.output_buffer_active = False
-            return True
-
-        if event_type == "input_audio_buffer.speech_started":
-            if state.active_generation is not None:
-                state.retired_generation = max(
-                    state.retired_generation,
-                    state.active_generation,
-                )
-            state.interruption_pending = True
-            player.abort()
-            self._set_local_output_epoch(None)
-            state.active_generation = None
-            with self._state_lock:
-                if self._state is SessionState.READY:
-                    self._state = SessionState.INTERRUPTING
             return True
 
         if event_type == "error":

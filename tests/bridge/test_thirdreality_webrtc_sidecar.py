@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue as thread_queue
 import socket
+import threading
 import time
 from fractions import Fraction
 from pathlib import Path
@@ -104,6 +106,17 @@ def test_ipc_rejects_malformed_packets(packet: bytes) -> None:
         decode_packet(packet)
 
 
+def test_ipc_exposes_interrupt_but_not_unsupported_provider_cancel() -> None:
+    assert decode_packet(encode_control("response.interrupt")) == ControlMessage(
+        type="response.interrupt",
+        values={},
+    )
+    with pytest.raises(ProtocolError):
+        encode_control("response.interrupt", response_id="resp_1")
+    with pytest.raises(ProtocolError):
+        encode_control("response.cancel", response_id="resp_1")
+
+
 def test_provider_lifecycle_sanitizer_never_forwards_transcripts_or_arguments() -> None:
     lifecycle = sanitize_provider_lifecycle(
         json.dumps(
@@ -140,6 +153,19 @@ def test_provider_lifecycle_sanitizer_rejects_content_disguised_as_identifier() 
         '{"type":"response.created","response_id":"contains spaces and text"}'
     )
     assert lifecycle == {"event_type": "response.created"}
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ["media.started", "media.quiet", "interrupt.fenced"],
+)
+def test_provider_lifecycle_sanitizer_rejects_internal_namespace_spoofing(
+    event_type: str,
+) -> None:
+    assert (
+        sanitize_provider_lifecycle(json.dumps({"type": event_type, "generation": 4}))
+        is None
+    )
 
 
 def test_launcher_uses_isolated_interpreter_and_explicit_runtime_path(
@@ -253,8 +279,7 @@ class FakePeer:
         self.emit_fatal = emit_fatal
         self.captures: list[CaptureAudio] = []
         self.answers: list[str] = []
-        self.cancellations: list[str | None] = []
-        self.interruptions: list[str | None] = []
+        self.interruptions = 0
         self.stop_count = 0
 
     async def create_offer(self) -> str:
@@ -268,11 +293,8 @@ class FakePeer:
     def feed_capture(self, value: CaptureAudio) -> None:
         self.captures.append(value)
 
-    def cancel_response(self, response_id: str | None = None) -> None:
-        self.cancellations.append(response_id)
-
-    def interrupt_response(self, response_id: str | None = None) -> None:
-        self.interruptions.append(response_id)
+    def interrupt_response(self) -> None:
+        self.interruptions += 1
 
     async def stop(self) -> None:
         self.stop_count += 1
@@ -284,7 +306,7 @@ async def _recv_packet(transport: socket.socket) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_runtime_drives_offer_answer_audio_cancel_and_clean_shutdown() -> None:
+async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() -> None:
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     parent.setblocking(False)
     peers: list[FakePeer] = []
@@ -332,13 +354,13 @@ async def test_runtime_drives_offer_answer_audio_cancel_and_clean_shutdown() -> 
         )
         await asyncio.get_running_loop().sock_sendall(
             parent,
-            encode_control("response.interrupt", response_id="resp_123"),
+            encode_control("response.interrupt"),
         )
         async with asyncio.timeout(1):
             while not peers[0].captures or not peers[0].interruptions:
                 await asyncio.sleep(0)
         assert peers[0].captures == [capture]
-        assert peers[0].interruptions == ["resp_123"]
+        assert peers[0].interruptions == 1
 
         playback = PlaybackAudio(
             generation=2,
@@ -484,12 +506,17 @@ async def test_capture_track_preserves_sample_clock_without_second_realtime_pace
                 pcm=b"\x02\x00" * 320,
             )
         )
+        assert track.sender_sample_cursor == 1_000
         first, second = await asyncio.gather(track.recv(), track.recv())
         assert first.sample_rate == 16_000
         assert first.samples == 320
         assert first.pts == 0
         assert second.pts == 320
         assert first.time_base == second.time_base == Fraction(1, 16_000)
+        assert track.consumed_samples == 640
+        assert track.latest_sample_end == 1_640
+        assert track.consumed_sample_end == 1_640
+        assert track.sender_sample_cursor == 1_640
     finally:
         track.stop()
 
@@ -561,6 +588,7 @@ class FakePeerConnection:
         self.iceGatheringState = "complete"
         self.connectionState = "new"
         self.localDescription = SimpleNamespace(sdp="v=0\r\na=device\r\n")
+        self.receivers: list[Any] = []
 
     def on(self, event: str) -> Any:
         def decorate(handler: Any) -> Any:
@@ -578,6 +606,9 @@ class FakePeerConnection:
         self.channel = FakeChannel()
         return self.channel
 
+    def getReceivers(self) -> list[Any]:
+        return self.receivers
+
     async def createOffer(self) -> object:
         return object()
 
@@ -593,6 +624,8 @@ class FakePeerConnection:
 
 def _fake_device_peer(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    emit_lifecycle: Any | None = None,
 ) -> tuple[DeviceWebRtcPeer, list[Any]]:
     emitted: list[Any] = []
 
@@ -602,12 +635,28 @@ def _fake_device_peer(
 
     monkeypatch.setattr(peer_module, "RTCConfiguration", Configuration)
     monkeypatch.setattr(peer_module, "RTCPeerConnection", FakePeerConnection)
+    if emit_lifecycle is None:
+
+        def lifecycle_emitter(value: dict[str, str | int]) -> None:
+            emitted.append(("lifecycle", value))
+
+    else:
+        lifecycle_emitter = emit_lifecycle
     peer = DeviceWebRtcPeer(
-        emit_lifecycle=lambda value: emitted.append(("lifecycle", value)),
+        emit_lifecycle=lifecycle_emitter,
         emit_playback=lambda value: emitted.append(("playback", value)),
         emit_state=lambda value: emitted.append(("state", value)),
         emit_fatal=lambda value: emitted.append(("fatal", value)),
     )
+    decoder_tracker = peer_module._TrackedDecoderQueue(thread_queue.Queue())
+    receiver = SimpleNamespace(track=None)
+    receiver._RTCRtpReceiver__decoder_queue = decoder_tracker
+    receiver._RTCRtpReceiver__jitter_buffer = peer_module.JitterBuffer(
+        capacity=16,
+        prefetch=4,
+    )
+    peer._decoder_queue = decoder_tracker
+    peer._audio_receiver = receiver
     return peer, emitted
 
 
@@ -631,15 +680,53 @@ class PassthroughResampler:
         return [frame]
 
 
+class BufferingResampler:
+    def __init__(self, **kwargs: Any) -> None:
+        assert kwargs == {"format": "s16", "layout": "mono", "rate": 24_000}
+
+    def resample(self, frame: object) -> list[object]:
+        del frame
+        return []
+
+
+class OneFrameDelayResampler:
+    def __init__(self, **kwargs: Any) -> None:
+        assert kwargs == {"format": "s16", "layout": "mono", "rate": 24_000}
+        self._previous: object | None = None
+
+    def resample(self, frame: object) -> list[object]:
+        previous = self._previous
+        self._previous = frame
+        return [] if previous is None else [previous]
+
+
 class QueuedRemoteTrack:
+    kind = "audio"
+
     def __init__(self) -> None:
-        self.frames: asyncio.Queue[object] = asyncio.Queue()
+        self._queue = peer_module._TrackedRemoteQueue(asyncio.Queue())
         self.received = 0
 
+    @property
+    def frames(self) -> Any:
+        return self._queue
+
     async def recv(self) -> object:
-        value = await self.frames.get()
+        value = await self._queue.get()
+        if value is None:
+            raise peer_module.MediaStreamError
         self.received += 1
         return value
+
+
+class RawRemoteTrack:
+    kind = "audio"
+
+    def __init__(self) -> None:
+        self._queue: Any = asyncio.Queue()
+
+    async def recv(self) -> object:
+        return await self._queue.get()
 
 
 def _remote_frame(value: int, *, pts: int) -> object:
@@ -670,6 +757,51 @@ async def _close_audio_peer(
     await peer.stop()
 
 
+@pytest.mark.asyncio
+async def test_peer_track_handler_installs_pinned_decoder_queue_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = RawRemoteTrack()
+    receiver = SimpleNamespace(track=track)
+    receiver._RTCRtpReceiver__decoder_queue = thread_queue.Queue()
+    receiver._RTCRtpReceiver__jitter_buffer = peer_module.JitterBuffer(
+        capacity=16,
+        prefetch=4,
+    )
+    peer.pc.receivers = [receiver]
+    peer._decoder_queue = None
+    peer._audio_receiver = None
+
+    peer.pc.handlers["track"](track)
+    await asyncio.sleep(0)
+
+    assert isinstance(track._queue, peer_module._TrackedRemoteQueue)
+    assert isinstance(
+        receiver._RTCRtpReceiver__decoder_queue,
+        peer_module._TrackedDecoderQueue,
+    )
+    assert peer._receiver_queue is track._queue
+    assert peer._remote_audio_track_seen
+    assert not any(kind == "fatal" for kind, _value in emitted)
+    await peer.stop()
+
+
+def test_peer_track_handler_rejects_nonempty_untracked_decoder_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = RawRemoteTrack()
+    track._queue.put_nowait(_remote_frame(27, pts=0))
+
+    peer.pc.handlers["track"](track)
+
+    assert emitted == [("fatal", "unsupported_receiver_boundary")]
+    assert not peer._remote_audio_track_seen
+    peer.input_track.stop()
+
+
 def test_peer_sanitizes_fixed_response_status_and_causal_error_id() -> None:
     assert sanitize_provider_lifecycle(
         json.dumps(
@@ -694,6 +826,8 @@ def test_peer_sanitizes_fixed_response_status_and_causal_error_id() -> None:
                 "error": {
                     "event_id": "codex_device_cancel_1",
                     "type": "invalid_request_error",
+                    "code": "buffer_not_active",
+                    "param": "output_audio_buffer",
                     "message": "private provider details",
                 },
             }
@@ -701,6 +835,9 @@ def test_peer_sanitizes_fixed_response_status_and_causal_error_id() -> None:
     ) == {
         "event_type": "error",
         "error_event_id": "codex_device_cancel_1",
+        "error_type": "invalid_request_error",
+        "error_code": "buffer_not_active",
+        "error_param": "output_audio_buffer",
     }
     assert sanitize_provider_lifecycle(
         '{"type":"response.done","response":{"status":"private text"}}'
@@ -743,47 +880,6 @@ async def test_peer_preserves_rtp_before_any_provider_start(
 
 
 @pytest.mark.asyncio
-async def test_peer_interrupts_rtp_before_provider_start_lifecycle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
-    peer, emitted = _fake_device_peer(monkeypatch)
-    track = QueuedRemoteTrack()
-    task = asyncio.create_task(peer._consume_remote_audio(track))
-    try:
-        track.frames.put_nowait(_remote_frame(18, pts=0))
-        await _wait_for(lambda: track.received == 1)
-        emitted.clear()
-
-        peer.interrupt_response("stale_parent_response")
-        controls = [json.loads(value) for value in peer.data_channel.sent]
-        assert [value["type"] for value in controls] == [
-            "response.cancel",
-            "output_audio_buffer.clear",
-        ]
-        assert "response_id" not in controls[0]
-
-        track.frames.put_nowait(_remote_frame(19, pts=480))
-        await _wait_for(lambda: track.received == 2)
-        assert not any(kind == "playback" for kind, _ in emitted)
-        _provider_event(
-            peer,
-            type="output_audio_buffer.cleared",
-            response_id="actual_response",
-        )
-        await _wait_for(
-            lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-                for kind, value in emitted
-            )
-        )
-        assert not any(kind == "fatal" for kind, _ in emitted)
-    finally:
-        await _close_audio_peer(peer, task)
-
-
-@pytest.mark.asyncio
 async def test_peer_retains_rtp_tail_after_provider_output_stopped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -794,10 +890,14 @@ async def test_peer_retains_rtp_tail_after_provider_output_stopped(
     try:
         _provider_event(peer, type="output_audio_buffer.started", response_id="resp_1")
         track.frames.put_nowait(_remote_frame(4, pts=0))
-        await _wait_for(lambda: track.received == 1)
+        await _wait_for(
+            lambda: len([kind for kind, _value in emitted if kind == "playback"]) == 1
+        )
         _provider_event(peer, type="output_audio_buffer.stopped", response_id="resp_1")
         track.frames.put_nowait(_remote_frame(5, pts=480))
-        await _wait_for(lambda: track.received == 2)
+        await _wait_for(
+            lambda: len([kind for kind, _value in emitted if kind == "playback"]) == 2
+        )
 
         playback = [value for kind, value in emitted if kind == "playback"]
         assert [(value.generation, value.sample_index) for value in playback] == [
@@ -805,35 +905,6 @@ async def test_peer_retains_rtp_tail_after_provider_output_stopped(
             (1, 480),
         ]
         assert playback[-1].pcm == b"\x05\x00" * 480
-    finally:
-        await _close_audio_peer(peer, task)
-
-
-@pytest.mark.asyncio
-async def test_peer_interrupts_post_stopped_rtp_tail_without_invalid_clear(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
-    peer, emitted = _fake_device_peer(monkeypatch)
-    track = QueuedRemoteTrack()
-    task = asyncio.create_task(peer._consume_remote_audio(track))
-    try:
-        _provider_event(peer, type="output_audio_buffer.started", response_id="resp_1")
-        _provider_event(peer, type="output_audio_buffer.stopped", response_id="resp_1")
-        track.frames.put_nowait(_remote_frame(20, pts=0))
-        await _wait_for(lambda: track.received == 1)
-        emitted.clear()
-
-        peer.interrupt_response("resp_1")
-        assert peer.data_channel.sent == []
-        await _wait_for(
-            lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-                for kind, value in emitted
-            )
-        )
-        assert not any(kind == "fatal" for kind, _ in emitted)
     finally:
         await _close_audio_peer(peer, task)
 
@@ -848,7 +919,9 @@ async def test_peer_new_response_start_does_not_relabel_old_rtp_tail(
     task = asyncio.create_task(peer._consume_remote_audio(track))
     try:
         track.frames.put_nowait(_remote_frame(6, pts=0))
-        await _wait_for(lambda: track.received == 1)
+        await _wait_for(
+            lambda: len([kind for kind, _value in emitted if kind == "playback"]) == 1
+        )
         _provider_event(
             peer,
             type="response.created",
@@ -856,7 +929,9 @@ async def test_peer_new_response_start_does_not_relabel_old_rtp_tail(
         )
         _provider_event(peer, type="output_audio_buffer.started", response_id="resp_2")
         track.frames.put_nowait(_remote_frame(7, pts=480))
-        await _wait_for(lambda: track.received == 2)
+        await _wait_for(
+            lambda: len([kind for kind, _value in emitted if kind == "playback"]) == 2
+        )
 
         playback = [value for kind, value in emitted if kind == "playback"]
         assert [value.generation for value in playback] == [1, 1]
@@ -883,7 +958,14 @@ async def test_peer_receiver_quiet_gap_starts_next_media_generation(
             )
         )
         track.frames.put_nowait(_remote_frame(9, pts=480))
-        await _wait_for(lambda: track.received == 2)
+        await _wait_for(
+            lambda: any(
+                kind == "lifecycle"
+                and value["event_type"] == "media.started"
+                and value["generation"] == 2
+                for kind, value in emitted
+            )
+        )
 
         lifecycle = [
             (value["event_type"], value["generation"])
@@ -904,62 +986,848 @@ async def test_peer_receiver_quiet_gap_starts_next_media_generation(
         await _close_audio_peer(peer, task)
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    ["error", "invalid_request_error", "server_error"],
+)
+def test_peer_provider_errors_are_sanitized_and_fatal_without_local_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    peer, emitted = _fake_device_peer(monkeypatch)
+    try:
+        _provider_event(
+            peer,
+            type=event_type,
+            error={
+                "event_id": "codex_device_cancel_legacy",
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "param": "type",
+                "message": "private provider details",
+            },
+        )
+        assert emitted == [
+            (
+                "lifecycle",
+                {
+                    "event_type": "error",
+                    "generation": 0,
+                    "error_event_id": "codex_device_cancel_legacy",
+                    "error_type": "invalid_request_error",
+                    "error_code": "invalid_value",
+                    "error_param": "type",
+                },
+            ),
+            ("fatal", "provider_error"),
+        ]
+        assert "private" not in json.dumps(emitted)
+        assert peer.data_channel.sent == []
+    finally:
+        peer.input_track.stop()
+
+
+def test_peer_drops_provider_spoofs_of_internal_lifecycle_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer, emitted = _fake_device_peer(monkeypatch)
+    try:
+        for event_type in ("media.started", "media.quiet", "interrupt.fenced"):
+            _provider_event(peer, type=event_type, generation=0xFFFFFFFF)
+        assert emitted == []
+    finally:
+        peer.input_track.stop()
+
+
+async def _consume_capture(
+    peer: DeviceWebRtcPeer,
+    *,
+    sample_index: int,
+    samples: int,
+) -> None:
+    _feed_capture(peer, sample_index=sample_index, samples=samples)
+    await _consume_queued_capture(peer, samples=samples)
+
+
+def _feed_capture(
+    peer: DeviceWebRtcPeer,
+    *,
+    sample_index: int,
+    samples: int,
+) -> None:
+    peer.feed_capture(
+        CaptureAudio(
+            sample_index=sample_index,
+            capture_monotonic_ns=time.monotonic_ns(),
+            pcm=b"\x01\x00" * samples,
+        )
+    )
+
+
+async def _consume_queued_capture(
+    peer: DeviceWebRtcPeer,
+    *,
+    samples: int,
+) -> None:
+    frame = await peer.input_track.recv()
+    assert frame.samples == samples
+
+
+async def _prime_capture_sender(
+    peer: DeviceWebRtcPeer,
+    *,
+    samples: int = 320,
+) -> int:
+    """Establish a sender cursor, returning its next contiguous sample index."""
+    await _consume_capture(peer, sample_index=0, samples=samples)
+    return samples
+
+
+def _use_fast_fence(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    guard: float = 0.03,
+    quiet: float = 0.02,
+    timeout: float = 0.20,
+) -> None:
+    monkeypatch.setattr(peer_module, "MEDIA_FENCE_MINIMUM_GUARD_SECONDS", guard)
+    monkeypatch.setattr(peer_module, "MEDIA_FENCE_QUIET_SECONDS", quiet)
+    monkeypatch.setattr(peer_module, "MEDIA_FENCE_TIMEOUT_SECONDS", timeout)
+
+
+def _has_fenced(emitted: list[Any]) -> bool:
+    return any(
+        kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
+        for kind, value in emitted
+    )
+
+
 @pytest.mark.asyncio
-async def test_peer_explicit_interrupt_waits_for_clear_and_receiver_quiet(
+async def test_peer_overdue_deadline_wins_after_event_loop_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch, guard=0.10, quiet=0.10, timeout=0.03)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        fence = peer._fence
+        assert fence is not None
+        assert fence.deadline - fence.started_at == pytest.approx(0.03)
+
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        assert fence.capture_complete
+
+        time.sleep(0.06)  # noqa: ASYNC251 - deliberately stall the event loop.
+        peer._maybe_complete_fence()
+
+        assert emitted == [("fatal", "media_fence_timeout")]
+        assert fence.timed_out
+        assert peer._muted
+        assert not _has_fenced(emitted)
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_event", ["media.quiet", "interrupt.fenced"])
+async def test_peer_lifecycle_emission_failure_seals_fence_until_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_event: str,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 1.0)
+    _use_fast_fence(monkeypatch, guard=0.005, quiet=0.005, timeout=0.05)
+    attempted: list[str] = []
+
+    def emit_lifecycle(value: dict[str, str | int]) -> None:
+        event_type = value["event_type"]
+        assert isinstance(event_type, str)
+        attempted.append(event_type)
+        if event_type == failed_event:
+            raise RuntimeError("simulated IPC emission failure")
+
+    peer, emitted = _fake_device_peer(
+        monkeypatch,
+        emit_lifecycle=emit_lifecycle,
+    )
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        track.frames.put_nowait(_remote_frame(20, pts=0))
+        await _wait_for(lambda: "media.started" in attempted)
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+
+        await _wait_for(lambda: ("fatal", "lifecycle_output_failed") in emitted)
+        fence = peer._fence
+        assert fence is not None and fence.lifecycle_failed
+        assert peer._muted
+        assert peer._failed
+        assert peer._fence_timeout_timer is None
+        if failed_event == "media.quiet":
+            assert "interrupt.fenced" not in attempted
+
+        await asyncio.sleep(0.06)
+        assert [value for value in emitted if value[0] == "fatal"] == [
+            ("fatal", "lifecycle_output_failed")
+        ]
+        assert peer._fence is fence
+        assert not fence.timed_out
+        assert peer._muted
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_successful_fenced_write_commits_before_deadline_overrun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch, guard=0.005, quiet=0.005, timeout=0.05)
+    emitted: list[Any] = []
+
+    def slow_fenced_write(value: dict[str, str | int]) -> None:
+        emitted.append(("lifecycle", value))
+        if value["event_type"] == "interrupt.fenced":
+            time.sleep(0.06)
+
+    peer, fatals = _fake_device_peer(
+        monkeypatch,
+        emit_lifecycle=slow_fenced_write,
+    )
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+
+        await _wait_for(lambda: _has_fenced(emitted))
+        await asyncio.sleep(0)
+        assert peer._fence is None
+        assert not peer._muted
+        assert not any(kind == "fatal" for kind, _value in fatals)
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_latched_fatal_wins_over_already_awakened_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
+    _use_fast_fence(monkeypatch, guard=0.0, quiet=0.005, timeout=0.20)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    barrier_entered = asyncio.Event()
+    release_barrier = asyncio.Event()
+
+    async def controlled_barrier(*, not_before: float) -> None:
+        assert not_before > 0
+        barrier_entered.set()
+        await release_barrier.wait()
+
+    peer._receiver_drain_barrier = controlled_barrier  # type: ignore[method-assign]
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await _wait_for(barrier_entered.is_set)
+
+        # Wake completion first, then latch terminal failure before its task is
+        # scheduled. The old ordering could subsequently unmute the same peer.
+        release_barrier.set()
+        peer._safe_fatal("connection_failed")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert emitted == [("fatal", "connection_failed")]
+        assert peer._failed
+        assert peer._muted
+        assert not _has_fenced(emitted)
+
+        track.frames.put_nowait(_remote_frame(28, pts=0))
+        await _wait_for(lambda: track.received == 1)
+        await asyncio.sleep(0)
+        assert not any(kind == "playback" for kind, _value in emitted)
+        assert peer._muted
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_media_started_emission_failure_never_leaks_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+
+    def reject_lifecycle(_value: dict[str, str | int]) -> None:
+        raise RuntimeError("simulated IPC emission failure")
+
+    peer, emitted = _fake_device_peer(
+        monkeypatch,
+        emit_lifecycle=reject_lifecycle,
+    )
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        track.frames.put_nowait(_remote_frame(24, pts=0))
+        await _wait_for(lambda: bool(emitted))
+
+        assert emitted == [("fatal", "lifecycle_output_failed")]
+        assert peer._muted
+        assert not peer._media_generation_open
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_counts_receiver_activity_before_buffering_resampler_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", BufferingResampler)
+    _use_fast_fence(monkeypatch, guard=0.005, quiet=0.05, timeout=0.30)
     peer, emitted = _fake_device_peer(monkeypatch)
     track = QueuedRemoteTrack()
     task = asyncio.create_task(peer._consume_remote_audio(track))
     try:
-        _provider_event(
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
             peer,
-            type="response.created",
-            response={"id": "resp_1", "status": "in_progress"},
+            sample_index=next_sample_index + 320,
+            samples=3_680,
         )
-        _provider_event(peer, type="output_audio_buffer.started", response_id="resp_1")
-        track.frames.put_nowait(_remote_frame(10, pts=0))
+
+        await asyncio.sleep(0.03)
+        track.frames.put_nowait(_remote_frame(21, pts=0))
         await _wait_for(lambda: track.received == 1)
-        emitted.clear()
+        await asyncio.sleep(0.03)
+        assert not _has_fenced(emitted)
+        assert not any(kind == "playback" for kind, _value in emitted)
 
-        peer.interrupt_response("resp_1")
-        controls = [json.loads(value) for value in peer.data_channel.sent]
-        assert [value["type"] for value in controls] == [
-            "response.cancel",
-            "output_audio_buffer.clear",
+        await _wait_for(lambda: _has_fenced(emitted))
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_fence_discards_pre_fence_resampler_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", OneFrameDelayResampler)
+    _use_fast_fence(monkeypatch, guard=0.005, quiet=0.005, timeout=0.20)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        track.frames.put_nowait(_remote_frame(29, pts=0))
+        await _wait_for(lambda: track.frames.quiet_and_drained(quiet_seconds=0.0))
+        assert not any(kind == "playback" for kind, _value in emitted)
+
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await _wait_for(lambda: _has_fenced(emitted))
+
+        track.frames.put_nowait(_remote_frame(30, pts=480))
+        await _wait_for(lambda: track.frames.quiet_and_drained(quiet_seconds=0.0))
+        assert not any(kind == "playback" for kind, _value in emitted)
+
+        track.frames.put_nowait(_remote_frame(31, pts=960))
+        await _wait_for(lambda: any(kind == "playback" for kind, _value in emitted))
+        assert [value.pcm for kind, value in emitted if kind == "playback"] == [
+            b"\x1e\x00" * 480
         ]
-        assert controls[0]["response_id"] == "resp_1"
-        assert controls[0]["event_id"] != controls[1]["event_id"]
-        assert all(" " not in value["event_id"] for value in controls)
+    finally:
+        await _close_audio_peer(peer, task)
 
-        track.frames.put_nowait(_remote_frame(11, pts=480))
-        await _wait_for(lambda: track.received == 2)
-        assert not any(kind == "playback" for kind, _ in emitted)
-        _provider_event(peer, type="output_audio_buffer.cleared", response_id="resp_1")
+
+@pytest.mark.asyncio
+async def test_peer_fence_replaces_retained_pinned_jitter_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch, guard=0.005, quiet=0.005, timeout=0.20)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    receiver = peer._audio_receiver
+    assert receiver is not None
+    original = receiver._RTCRtpReceiver__jitter_buffer
+    original._origin = 7
+    original._packets[7] = object()
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await _wait_for(lambda: _has_fenced(emitted))
+
+        replacement = receiver._RTCRtpReceiver__jitter_buffer
+        assert replacement is not original
+        assert peer._is_supported_empty_jitter_buffer(replacement)
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_receiver_drain_barrier_processes_queued_ready_rtp_while_muted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.20)
+    _use_fast_fence(monkeypatch, guard=0.0, quiet=0.02, timeout=0.20)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+
+    class AdversarialBarrierQueue(asyncio.Queue[Any]):
+        injected = False
+
+        def put_nowait(self, item: Any) -> None:
+            super().put_nowait(item)
+            if not self.injected:
+                self.injected = True
+                # Reproduce aiortc's worker-thread -> run_coroutine_threadsafe
+                # scheduling depth. The decoded frame becomes ready multiple
+                # turns after the fence requested its receiver proof.
+                asyncio.get_running_loop().call_soon(
+                    lambda: asyncio.get_running_loop().call_soon(
+                        asyncio.create_task,
+                        track.frames.put(_remote_frame(22, pts=0)),
+                    )
+                )
+
+    peer._receiver_barriers = AdversarialBarrierQueue()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        _feed_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+
+        await _consume_queued_capture(peer, samples=3_680)
+        assert peer._muted
+        assert not _has_fenced(emitted)
+
+        await _wait_for(lambda: track.received == 1)
+        assert not any(kind == "playback" for kind, _value in emitted)
+        assert not _has_fenced(emitted)
+
+        await _wait_for(lambda: _has_fenced(emitted))
+        track.frames.put_nowait(_remote_frame(23, pts=480))
+        await _wait_for(lambda: any(kind == "playback" for kind, _value in emitted))
+        playback = [value for kind, value in emitted if kind == "playback"]
+        assert [value.pcm for value in playback] == [b"\x17\x00" * 480]
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_decoder_thread_production_during_loop_stall_resets_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.20)
+    _use_fast_fence(monkeypatch, guard=0.0, quiet=0.02, timeout=0.20)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    barrier_requested = threading.Event()
+
+    class ObservedBarrierQueue(asyncio.Queue[Any]):
+        def put_nowait(self, item: Any) -> None:
+            super().put_nowait(item)
+            barrier_requested.set()
+
+    peer._receiver_barriers = ObservedBarrierQueue()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    worker: threading.Thread | None = None
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await _wait_for(barrier_requested.is_set)
+
+        loop = asyncio.get_running_loop()
+
+        def decoder_worker_put() -> None:
+            time.sleep(0.005)
+            future = asyncio.run_coroutine_threadsafe(
+                track.frames.put(_remote_frame(25, pts=0)),
+                loop,
+            )
+            future.result(timeout=1.0)
+
+        worker = threading.Thread(target=decoder_worker_put, daemon=True)
+        worker.start()
+        time.sleep(0.05)  # noqa: ASYNC251 - reproduce a stalled sidecar loop.
+
+        await _wait_for(lambda: track.received == 1)
+        await asyncio.sleep(0)
+        assert not any(kind == "playback" for kind, _value in emitted)
+        assert not _has_fenced(emitted)
+
+        await _wait_for(lambda: _has_fenced(emitted))
+        track.frames.put_nowait(_remote_frame(26, pts=480))
+        await _wait_for(lambda: any(kind == "playback" for kind, _value in emitted))
+        assert [value.pcm for kind, value in emitted if kind == "playback"] == [
+            b"\x1a\x00" * 480
+        ]
+    finally:
+        if worker is not None:
+            await asyncio.to_thread(worker.join, 1.0)
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_decoder_thread_terminal_during_loop_stall_never_fences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    _use_fast_fence(monkeypatch, guard=0.0, quiet=0.02, timeout=0.20)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    barrier_requested = threading.Event()
+
+    class ObservedBarrierQueue(asyncio.Queue[Any]):
+        def put_nowait(self, item: Any) -> None:
+            super().put_nowait(item)
+            barrier_requested.set()
+
+    peer._receiver_barriers = ObservedBarrierQueue()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    peer._consumer_tasks.add(task)
+    task.add_done_callback(peer._consumer_done)
+    worker: threading.Thread | None = None
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await _wait_for(barrier_requested.is_set)
+
+        loop = asyncio.get_running_loop()
+
+        def decoder_worker_end() -> None:
+            time.sleep(0.005)
+            future = asyncio.run_coroutine_threadsafe(track.frames.put(None), loop)
+            future.result(timeout=1.0)
+
+        worker = threading.Thread(target=decoder_worker_end, daemon=True)
+        worker.start()
+        time.sleep(0.05)  # noqa: ASYNC251 - reproduce a stalled sidecar loop.
+
+        await _wait_for(lambda: ("fatal", "remote_audio_failed") in emitted)
+        assert peer._failed
+        assert peer._muted
+        assert not _has_fenced(emitted)
+    finally:
+        if worker is not None:
+            await asyncio.to_thread(worker.join, 1.0)
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_terminal_decoder_queue_blocks_fence_until_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch, guard=0.0, quiet=0.005, timeout=0.05)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        decoder_queue = peer._decoder_queue
+        assert decoder_queue is not None
+        decoder_queue.put_nowait(None)
+
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+
+        await _wait_for(lambda: ("fatal", "media_fence_timeout") in emitted)
+        assert peer._failed
+        assert peer._muted
+        assert not _has_fenced(emitted)
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_inflight_decoder_work_must_finish_before_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    _use_fast_fence(monkeypatch, guard=0.0, quiet=0.01, timeout=0.30)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    decoder_queue = peer._decoder_queue
+    assert decoder_queue is not None
+    decoder_started = threading.Event()
+    release_decoder = threading.Event()
+    worker_errors: list[BaseException] = []
+    loop = asyncio.get_running_loop()
+
+    def decoder_worker() -> None:
+        try:
+            decoder_queue.put_nowait("encoded-old-response")
+            assert decoder_queue.get() == "encoded-old-response"
+            decoder_started.set()
+            assert release_decoder.wait(1.0)
+            future = asyncio.run_coroutine_threadsafe(
+                track.frames.put(_remote_frame(32, pts=0)),
+                loop,
+            )
+            future.result(timeout=1.0)
+            assert decoder_queue.get() is None
+        except BaseException as error:  # noqa: BLE001 - thread test boundary.
+            worker_errors.append(error)
+
+    worker = threading.Thread(target=decoder_worker, daemon=True)
+    worker.start()
+    try:
+        assert decoder_started.wait(1.0)
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+
+        await asyncio.sleep(0.04)
+        assert not _has_fenced(emitted)
+
+        release_decoder.set()
+        await _wait_for(lambda: track.received == 1)
+        assert not any(kind == "playback" for kind, _value in emitted)
+        await _wait_for(lambda: _has_fenced(emitted))
+    finally:
+        release_decoder.set()
+        decoder_queue.put_nowait(None)
+        await asyncio.to_thread(worker.join, 1.0)
+        await _close_audio_peer(peer, task)
+    assert not worker.is_alive()
+    assert not worker_errors
+
+
+@pytest.mark.asyncio
+async def test_peer_capture_timeout_when_progress_stops_before_token_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch, guard=0.005, quiet=0.005, timeout=0.05)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    try:
+        # The token may legitimately arrive before aiortc's first sender pull.
+        # The first queued sample is then the sender cursor, not an unavailable
+        # proof, while the full pre-token queue remains the watermark.
+        next_sample_index = 8_000
+        _feed_capture(peer, sample_index=next_sample_index, samples=4_000)
+        _feed_capture(peer, sample_index=next_sample_index + 4_000, samples=2_000)
+        peer.interrupt_response()
+        fence = peer._fence
+        assert fence is not None
+        assert fence.required_consumed_end == next_sample_index + 6_000
+
+        await _consume_queued_capture(peer, samples=4_000)
+        assert peer.input_track.consumed_sample_end == next_sample_index + 4_000
+        assert not fence.capture_complete
+        await _wait_for(lambda: ("fatal", "media_fence_capture_timeout") in emitted)
+
+        assert not _has_fenced(emitted)
+        assert fence.timed_out
+        assert peer._muted
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_local_interrupt_requires_guard_quiet_and_capture_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=2_000)
+        peer.data_channel.readyState = "closed"
+        peer.interrupt_response()
+        assert peer.data_channel.sent == []
+
+        await asyncio.sleep(0.04)
+        assert not _has_fenced(emitted)
+
+        # Provider lifecycle is observational only on the live Frameless
+        # surface and cannot replace actual outbound microphone progress.
+        _provider_event(peer, type="input_audio_buffer.speech_started")
+        await _consume_queued_capture(peer, samples=2_000)
+        assert peer.input_track.consumed_samples == 2_320
+        assert not _has_fenced(emitted)
+
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 2_000,
+            samples=2_000,
+        )
+        assert peer.input_track.consumed_samples == 4_320
+        await _wait_for(lambda: _has_fenced(emitted))
+        assert [
+            value["event_type"] for kind, value in emitted if kind == "lifecycle"
+        ] == ["input_audio_buffer.speech_started", "interrupt.fenced"]
+        assert not any(kind == "fatal" for kind, _ in emitted)
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_interrupt_requires_fresh_guard_after_preexisting_rtp_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.005)
+    _use_fast_fence(monkeypatch, guard=0.04, quiet=0.015)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        track.frames.put_nowait(_remote_frame(10, pts=0))
         await _wait_for(
             lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
+                kind == "lifecycle" and value["event_type"] == "media.quiet"
                 for kind, value in emitted
             )
         )
-        track.frames.put_nowait(_remote_frame(12, pts=960))
-        await _wait_for(lambda: track.received == 3)
+        emitted.clear()
 
-        ordered = [
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        started_at = asyncio.get_running_loop().time()
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await asyncio.sleep(0.025)
+        assert not _has_fenced(emitted)
+
+        await _wait_for(lambda: _has_fenced(emitted))
+        assert asyncio.get_running_loop().time() - started_at >= 0.035
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "interrupt.fenced", "generation": 1},
+            )
+        ]
+    finally:
+        await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_late_rtp_resets_fence_quiet_and_preserves_media_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.20)
+    _use_fast_fence(monkeypatch, guard=0.02, quiet=0.03)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    track = QueuedRemoteTrack()
+    task = asyncio.create_task(peer._consume_remote_audio(track))
+    try:
+        track.frames.put_nowait(_remote_frame(10, pts=0))
+        await _wait_for(lambda: any(kind == "playback" for kind, _value in emitted))
+        emitted.clear()
+
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        await asyncio.sleep(0.015)
+        track.frames.put_nowait(_remote_frame(11, pts=480))
+        await _wait_for(lambda: track.received == 2)
+        await asyncio.sleep(0.02)
+        assert not _has_fenced(emitted)
+        assert not any(kind == "playback" for kind, _ in emitted)
+
+        await _wait_for(lambda: _has_fenced(emitted))
+        track.frames.put_nowait(_remote_frame(12, pts=960))
+        await _wait_for(lambda: any(kind == "playback" for kind, _value in emitted))
+
+        assert [
             value["event_type"] if kind == "lifecycle" else "playback"
             for kind, value in emitted
-        ]
-        assert ordered == [
-            "output_audio_buffer.cleared",
-            "media.quiet",
-            "interrupt.fenced",
-            "media.started",
-            "playback",
-        ]
-        playback = [value for kind, value in emitted if kind == "playback"]
-        assert playback == [
+        ] == ["media.quiet", "interrupt.fenced", "media.started", "playback"]
+        assert [value for kind, value in emitted if kind == "playback"] == [
             PlaybackAudio(
                 generation=2,
                 sample_index=480,
@@ -967,248 +1835,117 @@ async def test_peer_explicit_interrupt_waits_for_clear_and_receiver_quiet(
                 pcm=b"\x0c\x00" * 480,
             )
         ]
-    finally:
-        await _close_audio_peer(peer, task)
-
-
-@pytest.mark.asyncio
-async def test_peer_completed_response_interrupt_sends_output_clear_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
-    peer, emitted = _fake_device_peer(monkeypatch)
-    try:
-        _provider_event(
-            peer,
-            type="response.created",
-            response={"id": "resp_1", "status": "in_progress"},
-        )
-        _provider_event(peer, type="output_audio_buffer.started", response_id="resp_1")
-        _provider_event(
-            peer,
-            type="response.done",
-            response={"id": "resp_1", "status": "completed"},
-        )
-        emitted.clear()
-
-        peer.interrupt_response("resp_1")
-        assert [json.loads(value)["type"] for value in peer.data_channel.sent] == [
-            "output_audio_buffer.clear"
-        ]
-        _provider_event(peer, type="output_audio_buffer.cleared", response_id="resp_1")
-        await _wait_for(
-            lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-                for kind, value in emitted
-            )
-        )
-        assert [
-            value["event_type"] for kind, value in emitted if kind == "lifecycle"
-        ] == [
-            "output_audio_buffer.cleared",
-            "interrupt.fenced",
-        ]
-    finally:
-        await peer.stop()
-
-
-@pytest.mark.parametrize("error_type", ["error", "invalid_request_error"])
-@pytest.mark.asyncio
-async def test_peer_cancel_noop_error_is_recoverable_and_connection_stays_live(
-    monkeypatch: pytest.MonkeyPatch,
-    error_type: str,
-) -> None:
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
-    peer, emitted = _fake_device_peer(monkeypatch)
-    try:
-        _provider_event(
-            peer,
-            type="response.created",
-            response={"id": "resp_1", "status": "in_progress"},
-        )
-        emitted.clear()
-        peer.interrupt_response("resp_1")
-        cancel = json.loads(peer.data_channel.sent[-1])
-        assert cancel["type"] == "response.cancel"
-
-        _provider_event(
-            peer,
-            type=error_type,
-            error={
-                "event_id": cancel["event_id"],
-                "message": "private cancel details",
-            },
-        )
-        await _wait_for(
-            lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-                for kind, value in emitted
-            )
-        )
-        _provider_event(peer, type="session.updated")
-        assert not any(kind == "fatal" for kind, _ in emitted)
-        assert [
-            value["event_type"] for kind, value in emitted if kind == "lifecycle"
-        ] == [
-            "interrupt.fenced",
-            "session.updated",
-        ]
-        assert "private" not in json.dumps(emitted)
-    finally:
-        await peer.stop()
-
-
-@pytest.mark.asyncio
-async def test_peer_clear_correlated_error_is_content_free_fatal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    peer, emitted = _fake_device_peer(monkeypatch)
-    try:
-        _provider_event(peer, type="output_audio_buffer.started", response_id="resp_1")
-        emitted.clear()
-        peer.interrupt_response("resp_1")
-        clear = json.loads(peer.data_channel.sent[-1])
-
-        _provider_event(
-            peer,
-            type="server_error",
-            error={
-                "event_id": clear["event_id"],
-                "message": "private clear details",
-            },
-        )
-        assert emitted == [("fatal", "output_clear_failed")]
-        assert "private" not in json.dumps(emitted)
-    finally:
-        await peer.stop()
-
-
-@pytest.mark.asyncio
-async def test_peer_provider_speech_started_fences_without_client_controls(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
-    peer, emitted = _fake_device_peer(monkeypatch)
-    track = QueuedRemoteTrack()
-    task = asyncio.create_task(peer._consume_remote_audio(track))
-    try:
-        track.frames.put_nowait(_remote_frame(13, pts=0))
-        await _wait_for(lambda: track.received == 1)
-        emitted.clear()
-        _provider_event(peer, type="input_audio_buffer.speech_started")
         assert peer.data_channel.sent == []
-
-        track.frames.put_nowait(_remote_frame(14, pts=480))
-        await _wait_for(
-            lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-                for kind, value in emitted
-            )
-        )
-        assert [
-            value["event_type"] for kind, value in emitted if kind == "lifecycle"
-        ] == [
-            "input_audio_buffer.speech_started",
-            "media.quiet",
-            "interrupt.fenced",
-        ]
-        assert not any(kind == "playback" for kind, _ in emitted)
     finally:
         await _close_audio_peer(peer, task)
 
 
 @pytest.mark.asyncio
-async def test_peer_interrupt_without_receiver_gap_fails_content_free(
+async def test_peer_continuous_rtp_hits_fixed_timeout_and_stays_muted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.02)
-    monkeypatch.setattr(peer_module, "MEDIA_FENCE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.01)
+    _use_fast_fence(monkeypatch, guard=0.01, quiet=0.02, timeout=0.05)
     peer, emitted = _fake_device_peer(monkeypatch)
     track = QueuedRemoteTrack()
     task = asyncio.create_task(peer._consume_remote_audio(track))
     try:
-        track.frames.put_nowait(_remote_frame(15, pts=0))
-        await _wait_for(lambda: track.received == 1)
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
         peer.interrupt_response()
-
-        deadline = asyncio.get_running_loop().time() + 0.08
-        pts = 480
+        await _consume_queued_capture(peer, samples=320)
+        await _consume_capture(
+            peer,
+            sample_index=next_sample_index + 320,
+            samples=3_680,
+        )
+        deadline = asyncio.get_running_loop().time() + 0.07
+        pts = 0
         while asyncio.get_running_loop().time() < deadline:
             track.frames.put_nowait(_remote_frame(15, pts=pts))
             pts += 480
             await asyncio.sleep(0.005)
+
         await _wait_for(lambda: ("fatal", "media_fence_timeout") in emitted)
-        assert ("fatal", "media_fence_timeout") in emitted
-        assert not any(
-            kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-            for kind, value in emitted
-        )
+        await asyncio.sleep(0.025)
+        assert not _has_fenced(emitted)
+        assert not any(kind == "playback" for kind, _ in emitted)
+        assert peer._muted
+        assert peer._fence is not None and peer._fence.timed_out
     finally:
         await _close_audio_peer(peer, task)
 
 
 @pytest.mark.asyncio
-async def test_peer_interrupt_without_control_settlement_fails_content_free(
+async def test_peer_duplicate_interrupt_does_not_restart_fence_or_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(peer_module, "MEDIA_FENCE_TIMEOUT_SECONDS", 0.01)
+    _use_fast_fence(monkeypatch, guard=0.20, quiet=0.20, timeout=0.04)
     peer, emitted = _fake_device_peer(monkeypatch)
     try:
-        _provider_event(
-            peer,
-            type="response.created",
-            response={"id": "resp_1", "status": "in_progress"},
-        )
-        emitted.clear()
-        peer.interrupt_response("resp_1")
+        next_sample_index = await _prime_capture_sender(peer)
+        _feed_capture(peer, sample_index=next_sample_index, samples=320)
+        peer.interrupt_response()
+        fence = peer._fence
+        quiet_timer = peer._fence_quiet_timer
+        timeout_timer = peer._fence_timeout_timer
+        await asyncio.sleep(0.02)
 
-        await _wait_for(lambda: ("fatal", "media_fence_timeout") in emitted)
-        assert emitted == [("fatal", "media_fence_timeout")]
+        peer.interrupt_response()
+        assert peer._fence is fence
+        assert peer._fence_quiet_timer is quiet_timer
+        assert peer._fence_timeout_timer is timeout_timer
+        assert peer.data_channel.sent == []
+
+        await _wait_for(lambda: ("fatal", "media_fence_capture_timeout") in emitted)
+        assert emitted == [("fatal", "media_fence_capture_timeout")]
     finally:
         await peer.stop()
 
 
 @pytest.mark.asyncio
-async def test_peer_interrupt_requires_fresh_post_fence_receiver_quiet(
+async def test_peer_provider_speech_started_is_informational_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(peer_module, "AudioResampler", PassthroughResampler)
-    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.02)
+    monkeypatch.setattr(peer_module, "MEDIA_QUIET_SECONDS", 0.20)
     peer, emitted = _fake_device_peer(monkeypatch)
     track = QueuedRemoteTrack()
     task = asyncio.create_task(peer._consume_remote_audio(track))
     try:
-        peer.interrupt_response()
-        assert not any(
-            kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-            for kind, value in emitted
-        )
+        _provider_event(peer, type="input_audio_buffer.speech_started")
+        track.frames.put_nowait(_remote_frame(13, pts=0))
+        await _wait_for(lambda: any(kind == "playback" for kind, _value in emitted))
 
-        # A late packet from the retired output arrives during the new quiet
-        # proof window. It is muted and restarts the complete interval.
-        await asyncio.sleep(0.01)
-        track.frames.put_nowait(_remote_frame(16, pts=0))
-        await _wait_for(lambda: track.received == 1)
-        await asyncio.sleep(0.015)
-        assert not any(
-            kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-            for kind, value in emitted
-        )
-        await _wait_for(
-            lambda: any(
-                kind == "lifecycle" and value["event_type"] == "interrupt.fenced"
-                for kind, value in emitted
-            )
-        )
-        assert not any(kind == "playback" for kind, _ in emitted)
-
-        track.frames.put_nowait(_remote_frame(17, pts=480))
-        await _wait_for(lambda: track.received == 2)
+        assert peer._fence is None
+        assert not peer._muted
         assert [
             value["event_type"] if kind == "lifecycle" else "playback"
             for kind, value in emitted
-        ] == ["interrupt.fenced", "media.started", "playback"]
+        ] == ["input_audio_buffer.speech_started", "media.started", "playback"]
+        assert not _has_fenced(emitted)
     finally:
         await _close_audio_peer(peer, task)
+
+
+@pytest.mark.asyncio
+async def test_peer_stop_cancels_every_fence_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fast_fence(monkeypatch, guard=0.02, quiet=0.02, timeout=0.03)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    peer.interrupt_response()
+    quiet_timer = peer._fence_quiet_timer
+    timeout_timer = peer._fence_timeout_timer
+    assert quiet_timer is not None
+    assert timeout_timer is not None
+
+    await peer.stop()
+    assert peer._media_quiet_timer is None
+    assert peer._fence_quiet_timer is None
+    assert peer._fence_timeout_timer is None
+    assert quiet_timer.cancelled()
+    assert timeout_timer.cancelled()
+    await asyncio.sleep(0.04)
+    assert emitted == []

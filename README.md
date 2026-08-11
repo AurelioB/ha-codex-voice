@@ -114,16 +114,20 @@ not part of the component-only HACS ZIP.
   Every new installation—and every increase above a previously qualified
   level—still requires the documented physical qualification.
   On locally detected or explicit v3 interruption, the client clears queued
-  playback, immediately SIGKILLs `paplay`, and mutes decoded RTP while the
-  sidecar proves a continuation fence. It normally cancels only an in-progress
-  response and clears only active output, using causal event IDs. Actual RTP
-  received before SCTP lifecycle is the fail-safe exception: the sidecar sends
-  both controls and leaves the cancel unkeyed rather than attaching a stale
-  response ID. Provider VAD `speech_started` sends neither duplicate.
-  Same-peer continuation requires provider control settlement plus a fresh,
-  full receiver-quiescence gap that begins after the fence, otherwise the
-  bounded fence fails to a fresh session. This still requires the documented
-  physical canary.
+  playback and immediately SIGKILLs `paplay`; the sidecar child locally mutes
+  stale decoded RTP while microphone upload continues. A preserving local
+  `response.interrupt` token is allowed only after trusted AEC-filtered device
+  barge-in, never for a manual or non-speech interrupt. The direct Frameless
+  data channel supplies no interruption acknowledgement and rejects public
+  Realtime client controls. Same-peer unmute and `READY` use an explicitly
+  empirical WebRTC auto-truncation invariant: the token follows the exact
+  qualifying capture watermark, the child must consume through that watermark
+  and at least 250 ms beyond its token-time sender cursor, an overlapping
+  750 ms guard must elapse, and the sole receiver must measure a fresh 500 ms
+  decoded-RTP silence interval after observing its barrier request. The fixed
+  five-second deadline never
+  unmutes on timeout and requires a fresh session.
+  This still requires the documented physical canary.
 - The v3 implementation and pinned runtime have automated protocol/static
   coverage, but this repository does not yet claim an end-to-end physical v3
   acceptance run. Wire v2 `bridge_pcm` remains documented and supported for
@@ -432,25 +436,53 @@ most 12 KiB of direct-only pre-roll inside that bound, and reserves at least 32
 KiB for post-wake capture. Accepted backlog catches up at no more than 2× before
 returning to realtime pacing. The isolated sidecar preserves timestamped 16 kHz
 mono PCM16 input, decodes provider output to bounded 24 kHz mono PCM16 playback,
-and fails rather than dropping on IPC or queue pressure. Provider lifecycle
-events do not label or gate RTP: first decoded audio emits internal
-`media.started`, and only an actual roughly 120 ms receiver gap emits
-`media.quiet`. This preserves RTP-before-start prefixes and stopped-before-tail
-audio. V3 never enters the bridge's v2 2,250 ms media queue.
+and fails rather than dropping on IPC or queue pressure. Provider
+response/output lifecycle does not label or gate the normal RTP lane: first
+decoded audio emits internal `media.started`, and only an actual roughly 120 ms
+receiver gap emits `media.quiet`. This preserves RTP-before-start prefixes and
+stopped-before-tail audio. That normal-generation 120 ms boundary is separate
+from the longer interrupt fence described below. V3 never enters the bridge's
+v2 2,250 ms media queue.
 
 Qualified full duplex detects two consecutive AEC-filtered speech frames and
-immediately kills local `paplay`, drops queued playback IPC, and mutes decoded
-RTP. Generated event IDs make cancel-no-op errors recoverable: cancel is
-normally sent only for an in-progress response, while clear is normally sent
-only for active output. If decoded RTP precedes all SCTP lifecycle, however,
-actual media forces both controls and the cancel carries no `response_id`;
-clear or unmatched errors fail closed. Provider
-`input_audio_buffer.speech_started` sends no duplicate control. The peer can
-continue only after provider control settlement plus a fresh roughly 120 ms
-receiver-quiescence window started at the fence produce `interrupt.fenced`;
-every late decoded frame restarts that window. Failure to prove the bound
-requires a fresh session. This design still needs physical validation under
-independent RTP/SCTP ordering.
+immediately kills local `paplay` in the parent, drops queued playback IPC, and
+asks the sidecar child to mute decoded RTP. Capture and microphone RTP continue
+through that local fence. Generic public Realtime API client controls are not
+valid on this subscription-backed Codex data channel: the pinned
+[Codex 0.147 Frameless Bidi outbound
+enum](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs#L50-L85)
+defines no `response.cancel` or `output_audio_buffer.clear`, and the direct
+route rejects public Realtime `session.update` VAD configuration. Live evidence
+observed only provider `session.started`, with no `speech_started`, `turn.done`,
+or transcript event; no provider acknowledgement can causally prove
+interruption. Public Realtime v2 WebRTC/client-event semantics are unsupported
+on this ChatGPT-subscription direct route; that does not affect the separate
+historical project wire-v2 `bridge_pcm` rollback. Same-peer reuse is therefore
+labeled an explicitly empirical WebRTC auto-truncation invariant for the
+pinned route, not a protocol guarantee or completed physical validation.
+The zero-field trusted local-AEC token is ordered immediately after the capture
+packet containing the second qualifying frame and before any later capture.
+The child must consume through that pre-token watermark and at least 4,000
+samples beyond its token-time sender cursor (250 ms at 16 kHz), at least 750 ms
+must elapse, and the sole decoded-audio consumer must measure a fresh continuous
+500 ms of silence after observing its receiver-barrier request. These conditions
+overlap; every queued, ready, or subsequently delivered frame is counted before
+resampling and restarts the 500 ms window; stalled loop time does not count. A
+pinned aiortc 1.15 boundary tracks encoded/in-flight decode and decoded output
+before cross-thread scheduling, then discards jitter-buffer and resampler tails
+at the serialized final no-await commit. On success, an open normal media
+generation emits `media.quiet` first; only successful `media.quiet` and
+`interrupt.fenced` IPC writes permit unmute and return the parent to `READY`.
+Provider ingress cannot use those reserved internal names. The absolute
+five-second deadline is checked after the receiver proof, after optional
+`media.quiet`, and immediately before the final fenced commit; success and
+timeout are mutually exclusive. Timeout or lifecycle failure stays muted and
+requires a fresh peer/session. A full capture queue never fabricates a
+watermark: an unfenceable speech trigger takes the fresh-session path.
+`media_fence_capture_timeout` means either capture proof was unmet;
+`media_fence_timeout` means capture progressed but the media fence did not.
+Neither restarts the deadline. Manual or non-speech preserving interrupts must
+take the fresh-session path.
 
 V3 failures never hand captured Okay Computer audio to Home Assistant. Startup,
 runtime, transport, backpressure, or playback failure clears the direct queues

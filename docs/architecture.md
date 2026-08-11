@@ -387,25 +387,56 @@ enumerates or mutates a sink-input. No blocking volume subprocess runs from
 guarded installer and later vendor media-player preference must agree on the
 sink volume, and nothing may mutate it while a direct session is live.
 
-Provider lifecycle observes control state but never labels, gates, splits, or
-retires RTP. First decoded audio emits internal `media.started`; every frame
-resets a receiver timer, and only an actual roughly 120 ms gap emits
-`media.quiet`. This continuous lane keeps RTP-before-start prefixes and
-stopped-before-tail audio.
+Provider response/output lifecycle observes control state but never labels,
+gates, splits, or retires the normal RTP lane. First decoded audio emits
+internal `media.started`; every frame resets a receiver timer, and only an
+actual roughly 120 ms gap emits `media.quiet`. This continuous lane keeps
+RTP-before-start prefixes and stopped-before-tail audio. That normal-generation
+boundary is independent of the longer interruption fence below.
 
-During v3 playback, two consecutive qualifying AEC-filtered capture frames or
-an explicit preserving interrupt immediately clear pending playback, SIGKILL
-`paplay`, and mute decoded RTP. Generated event IDs normally scope cancel to a
-response actually in progress and clear to output actually active. Actual RTP
-that precedes both SCTP states instead forces an unkeyed cancel followed by
-clear. A causal cancel-no-op is recoverable; clear or unmatched errors fail
-closed. Provider `input_audio_buffer.speech_started` starts the fence without
-duplicate control. Only provider control settlement plus a fresh full
-receiver-quiet window begun at the fence emit `interrupt.fenced` and permit
-same-peer continuation; a cached pre-fence quiet state is insufficient, and
-late RTP restarts the window. Failure to prove the bounded fence requires a
-fresh session. These independent RTP/SCTP behaviors still require physical v3
-validation.
+During v3 playback, two consecutive qualifying AEC-filtered capture frames
+immediately clear pending playback and SIGKILL `paplay` in the vendor-process
+parent. The second frame becomes an exact capture watermark; the zero-field
+local `response.interrupt` token follows its ordered IPC packet and precedes
+later capture, then the sidecar mutes decoded RTP. Only that trusted detector may enter the
+preserving fence; a manual or non-speech preserving interrupt requires a fresh
+session. Microphone capture and RTP continue while muted. This direct Frameless
+data channel is not the generic public Realtime client-event dialect: it sends
+no `response.cancel`, `output_audio_buffer.clear`, or substitute, and it rejects
+public Realtime `session.update` VAD configuration. Live evidence yielded only
+`session.started`, with no `speech_started`, `turn.done`, or transcript event,
+so no provider acknowledgement or causal interruption proof exists. Public
+Realtime v2 WebRTC is unsupported on this subscription-backed route; the
+project's historical wire-v2 `bridge_pcm` rollback remains separate.
+
+Same-peer reuse is an explicitly empirical WebRTC auto-truncation invariant.
+After the token, the child must consume through the qualifying watermark and
+4,000 samples beyond its token-time sender cursor (250 ms at 16 kHz), an
+overlapping 750 ms guard must elapse, and the sole decoded-audio consumer must
+measure a fresh continuous 500 ms of silence after observing its receiver-barrier
+request. A queued, ready, or later decoded frame is counted before resampling and
+restarts the 500 ms interval, while stalled loop time is excluded by responsive
+heartbeats. Hash-pinned aiortc 1.15 private encoded-decoder and decoded-output
+queues are wrapped before the decoder starts; queued/in-flight/processed serials
+are rechecked under lock while the jitter buffer and resampler tails are reset
+through the final no-await commit. When all
+conditions hold, an open normal media generation emits `media.quiet` before
+`interrupt.fenced`; both IPC writes must succeed before the child unmutes and
+the parent returns `READY`. Provider ingress cannot spoof those internal names.
+The fixed absolute five-second deadline is checked after the receiver proof,
+after optional `media.quiet`, and immediately before the final fenced commit;
+success and timeout are mutually exclusive. It never restarts. Timeout emits
+fatal `media_fence_capture_timeout` if either
+capture proof is unmet, otherwise `media_fence_timeout`; lifecycle failures and
+timeouts remain muted and require a fresh peer/session. The invariant still requires physical v3
+validation and requalification after provider or pinned-Codex changes; the
+normative contract and official Codex source link are in [wire
+v3](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
+
+Capture-queue overflow never creates a synthetic watermark. Detection remains
+bounded on direct full-duplex overflow frames, but a trigger whose causal frame
+was not accepted tears down for a fresh session; only an accepted causal frame
+may enter the preserving fence.
 
 The reference device's earlier 25% echo-residual/double-talk results exercised
 the v2 bridge-PCM route. They establish neither v3 end-to-end acceptance nor

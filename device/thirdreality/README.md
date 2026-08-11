@@ -22,14 +22,18 @@ starting the normal Home Assistant path, mute/disconnect, or otherwise releasing
 the vendor owner flushes local playback and tears down the remote session. A
 later wake after teardown creates a fresh WebSocket, peer, and realtime thread.
 In v3, bounded local AEC-filtered speech detection clears queued playback and
-immediately SIGKILLs the active `paplay` child. The sidecar mutes decoded RTP,
-normally sends cancel only for an in-progress response and clear only for active
-output, then waits for provider control settlement plus a fresh full
-receiver-quiescence window started at the fence. If actual RTP arrived before
-SCTP lifecycle established either state, the sidecar instead sends both
-controls and omits `response_id` from cancel. Provider VAD `speech_started`
-starts the same fence without duplicate controls. Only `interrupt.fenced`
-permits the same peer to continue; a fence failure requires a fresh session.
+immediately SIGKILLs the active `paplay` child in the parent. The sidecar child
+locally mutes decoded RTP while microphone upload continues. Only that trusted
+AEC detector may send the zero-field local `response.interrupt` token; a manual
+or non-speech preserving interrupt must use a fresh session. The direct
+Frameless data channel supplies no provider interruption acknowledgement and
+rejects public Realtime controls. The token is ordered immediately after the
+second qualifying capture frame. Same-peer reuse is an explicitly empirical
+WebRTC auto-truncation invariant: the child must consume through that watermark
+and 250 ms beyond its token-time sender cursor, an overlapping 750 ms guard must
+elapse, and the receiver must measure a fresh 500 ms decoded-RTP silence
+interval after observing its barrier request. The fixed absolute five-second deadline never restarts;
+timeout remains muted and requires a fresh peer and session.
 
 V3 direct mode has no captured-audio handoff to Home Assistant. If the AEC
 preflight, pinned runtime, sidecar, SDP exchange, WebRTC transport, data channel,
@@ -128,29 +132,61 @@ receiver-quiescence media boundary can reuse that child so RTP tail is not
 discarded. Interruption clears pending PCM, closes stdin, and issues immediate
 SIGKILL without blocking the realtime loop; reap remains separately bounded.
 
-Provider lifecycle does not label, gate, or retire RTP. The decoded receiver is
-one continuous media lane: its first frame emits transcript-free
-`media.started`, every frame resets the quiet timer, and only about 120 ms of
-actual receiver silence emits `media.quiet`. A later frame opens a new local
-media generation. This preserves prefixes received before provider output-start
-and tails received after provider stopped events.
+Provider response/output lifecycle does not label, gate, or retire the normal
+RTP lane. The decoded receiver is one continuous media lane: its first frame
+emits transcript-free `media.started`, every frame resets the quiet timer, and
+only about 120 ms of actual receiver silence emits `media.quiet`. A later frame
+opens a new local media generation. This preserves prefixes received before
+provider output-start and tails received after provider stopped events. This
+normal-generation quiet boundary is independent of the longer interruption
+fence below.
 
 While verified full duplex is active, capture remains continuous during
 playback. Two consecutive 64 ms AEC-filtered microphone frames that meet the
-bounded peak and sustained-energy checks kill local playback and ask the
-sidecar to fence continuation. Generated event IDs make a causally matched
-cancel-no-op recoverable; a clear error or unmatched provider error fails
-closed. Normally cancel requires an observed in-progress response and clear
-requires active output. Actual decoded RTP before those SCTP states is
-authoritative evidence of possible provider output, so an explicit interrupt
-sends an unkeyed cancel followed by clear. Provider
-`input_audio_buffer.speech_started` sends no duplicate cancel or clear. The
-child remains muted until required provider control settles and a complete
-roughly 120 ms receiver-quiet window has elapsed after the fence; every late
-frame restarts that proof window. It then emits `interrupt.fenced`. Failure to
-prove that fence by its deadline forces a fresh session. These behaviors have
+bounded peak and sustained-energy checks kill local playback in the parent and
+drop queued playback IPC. The parent keeps capture paced, marks the second frame
+as an exact watermark, and sends the zero-field local `response.interrupt` token
+immediately after that packet and before any later capture. That trusted
+detector is the only preserving entry to the fence. The child mutes stale
+decoded RTP but continues consuming capture for upstream microphone RTP. The
+device sends no cancel, clear, or interruption event to the provider. The direct Frameless data channel rejects public
+Realtime `session.update` VAD configuration; live evidence produced only
+`session.started`, with no `speech_started`, `turn.done`, or transcript event.
+It therefore provides no acknowledgement or causal proof of remote
+interruption. The public Realtime v2 WebRTC/client-event dialect is unsupported
+on this subscription-backed route.
+
+Same-peer continuation relies on an explicitly empirical WebRTC
+auto-truncation invariant. From the trusted token, the child must consume
+through the pre-token qualifying watermark and at least 4,000 samples beyond
+its token-time sender cursor (250 ms at 16 kHz), at least 750 ms must elapse,
+and the sole decoded-audio consumer must measure a fresh continuous 500 ms of
+silence after observing its receiver-barrier request. Every queued, ready, or
+later decoded frame is counted before resampling and resets that interval;
+stalled event-loop wall time does not count. The hash-pinned aiortc 1.15 track
+callback wraps its verified empty encoded-decoder and decoded-output queues
+before the decoder starts. Queue/in-flight serials and producer-side silence are
+rechecked under their locks; the retained jitter-buffer and resampler tails are
+discarded through the no-await final commit and unmute. Decoder termination is
+terminal, never silence.
+These conditions overlap
+rather than add. When all hold, an open normal media generation emits
+`media.quiet` first; only successful `media.quiet` and `interrupt.fenced` IPC
+writes permit unmute and let the parent return `READY`. Provider events cannot
+forge those reserved internal names. One fixed absolute five-second deadline
+is checked after receiver proof, after optional `media.quiet`, and immediately
+before the final fenced commit; success and timeout are mutually exclusive. It
+never restarts. Timeout emits fatal
+`media_fence_capture_timeout` if either capture proof is unmet, otherwise
+`media_fence_timeout`; lifecycle failure also stays muted. All failures require
+a fresh peer/session. Manual or non-speech preserving
+interruption cannot use this invariant and must take that fresh-session path.
+Capture overflow never fabricates a watermark: if the two-frame trigger ends on
+an unaccepted frame, the parent immediately takes the fresh-session path.
+These behaviors have
 automated coverage but still require a physical v3 canary under independent
-RTP/SCTP delivery.
+RTP/SCTP delivery. See the
+[wire-v3 interruption contract](../../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 The v2 path retains its older bridge-mediated interruption acknowledgements,
 fresh-session fallback, and optional omitted-mode managed compatibility. Those
@@ -265,9 +301,11 @@ reuse the Home Assistant bridge token, a Home Assistant access token, or Codex
 `auth.json`. Both packaged transports hardcode `conversation_mode: "native"`.
 The v2 rollback client also emits
 `User-Agent: ha-codex-voice-thirdreality/2` for its compatibility interrupt
-contract; v3
-barge-in stays on the device-to-provider data channel and does not use that
-bridge acknowledgement.
+contract. V3 barge-in uses a local parent-to-child `response.interrupt` IPC
+packet only after trusted AEC-filtered local speech. Microphone RTP continues,
+but the direct Frameless channel sends no provider client control and supplies
+no bridge or provider acknowledgement. Manual/non-speech preserving
+interruption requires a fresh session.
 
 The device never receives tool schemas, tool calls, results, or a Home
 Assistant credential. Okay Computer is always native and tool-free; use Okay
@@ -517,10 +555,14 @@ SDP negotiation, absence of bridge PCM in v3, bounded sidecar IPC and media
 queues, receiver-owned `media.started`/`media.quiet` boundaries,
 PulseAudio AEC preflight and once-per-session pre-negotiation sink preparation,
 continuous full-duplex capture, RTP-before-start and stopped-before-tail
-ordering, pre-SCTP-RTP unkeyed cancel/clear, event-ID-scoped fences,
-provider-VAD no-duplicate control, fixed-argv non-blocking
-`paplay`, immediate abort SIGKILL, retained v2 native/managed interruption
-acknowledgements and fresh-session fallback, deterministic hash-locked runtime
+ordering, continued capture during local RTP fences, trusted-AEC-only
+`response.interrupt`, exact qualifying-capture watermark ordering, 250 ms of
+post-token child capture consumption, the overlapping 750 ms guard, a
+receiver-owned fresh 500 ms decoded-RTP silence interval, reserved internal
+lifecycle names, lifecycle-write failure, and the fixed absolute five-second
+fail-closed deadline, fixed-argv non-blocking `paplay`,
+immediate abort SIGKILL, retained v2 native/managed interruption acknowledgements and
+fresh-session fallback, deterministic hash-locked runtime
 build/install/rollback validation, guarded static-AEC installation and
 rollback, interrupt cleanup, timer interruption, serialized non-blocking LED
 execution, newest-state overload coalescing, DBus timeout/nonzero handling,
@@ -559,21 +601,28 @@ On the physical device, verify these independently:
    must target only that sink, use raw stream volume 65536, accept non-blocking
    20 ms writes with the reviewed 60 ms/20 ms settings, and never enumerate or
    mutate a sink-input.
-8. During native v3 speech, exercise early, middle, and late local and
-   provider-VAD barge-in plus RTP-before-output-start and
+8. During native v3 speech, exercise early, middle, and late trusted local
+   AEC barge-in plus RTP-before-output-start and
    stopped-before-audio-tail timing. Prefix and tail audio must remain intact
    during normal playback. Interruption must drop queued PCM and SIGKILL
-   `paplay` immediately. Cancel normally requires an in-progress response and
-   clear normally requires active output. When actual RTP arrives before SCTP
-   lifecycle, an explicit interrupt must send cancel then clear and omit
-   `response_id` from cancel. Provider `speech_started` must send neither
-   duplicate. A cancel-no-op may recover only through its generated event ID;
-   clear/unmatched errors must fail closed. Same-peer continuation is valid
-   only after provider control settlement, a complete post-fence receiver-quiet
-   window, and `interrupt.fenced`; late RTP must restart the window, and a
-   missed fence deadline must require a fresh session. Repeat under adverse
-   timing because automated fence tests do not physically validate independent
-   RTP/SCTP ordering.
+   `paplay` immediately in the parent, locally mute decoded RTP in the child,
+   and continue microphone upload. The device data channel must
+   send no `response.cancel`, `output_audio_buffer.clear`, or borrowed public
+   Realtime client control; public Realtime `session.update` VAD configuration
+   must remain rejected. Verify the observed direct data channel is not treated
+   as an acknowledgement source when it yields only `session.started` and no
+   speech-start, turn-completion, or transcript event. Same-peer unmute and
+   `READY` may use only the explicitly empirical auto-truncation fence: the
+   token must follow the exact qualifying capture watermark; the child must
+   consume through that watermark and 4,000 samples beyond its token-time
+   sender cursor; an overlapping 750 ms guard and a receiver-owned fresh 500 ms
+   decoded-RTP silence interval must follow. Successful
+   lifecycle writes then emit `interrupt.fenced`. Late RTP must restart the
+   500 ms interval only. The
+   absolute five-second deadline must not restart; timeout must stay muted and
+   require a fresh peer/session. Verify that manual/non-speech preserving
+   interruption cannot enter this fence. Repeat under adverse timing because
+   automated fence tests do not physically validate the invariant.
 9. A deliberately missing AEC module or mismatched default source/sink must fail
    direct startup before sending microphone audio to the bridge or provider,
    must not hand captured audio to Home Assistant, and must leave a later Okay
@@ -592,7 +641,7 @@ controlled run validates only that historical v2 clipping regression; it is
 not a latency distribution, benchmark, or v3 validation.
 
 Reject the overlay if it clips initial phonemes, plays or forwards cue audio,
-leaks microphone audio after cancellation, echoes its own response, fails to
+leaks microphone audio after session teardown, echoes its own response, fails to
 return to idle, leaves stale player/LED/duck state, destabilizes wake detection,
 or breaks the standard Home Assistant path.
 

@@ -159,21 +159,48 @@ sides of a narrow bridge API.
   stream values. The reference device's bounded 25% pass exercised the prior
   v2 path; it is not v3 validation, transferable evidence for another device,
   or evidence for an increase up to the explicit 60% maximum.
-- Provider lifecycle never labels or gates direct RTP; local media boundaries
-  come only from first decoded audio and an actual roughly 120 ms receiver
-  quiet gap. Local/explicit v3 interruption drops queued media, immediately
-  SIGKILLs `paplay`, and mutes decoded RTP. Generated event IDs normally
-  constrain cancel to an in-progress response and clear to active output. If
-  decoded RTP precedes both provider SCTP states, actual media instead forces
-  an unkeyed cancel followed by clear. Only a causally matched cancel-no-op is
-  recoverable; clear or unmatched provider errors fail closed. Provider VAD
-  `speech_started` sends neither duplicate control. Same-peer continuation
-  requires provider control settlement plus a fresh full receiver-quiet window
-  begun after the fence to emit `interrupt.fenced`; cached pre-fence quiet is
-  insufficient, late RTP resets the window, and failure by the bounded deadline
-  requires a fresh session. These protections still require physical validation
-  under independent RTP/SCTP ordering. On the native v2 rollback path, resume still
-  requires a sanitized provider
+- Provider response/output lifecycle never labels or gates the normal direct
+  RTP lane; local media boundaries come only from first decoded audio and an
+  actual roughly 120 ms receiver quiet gap. Trusted AEC-filtered local v3
+  barge-in drops queued media, immediately SIGKILLs `paplay` in the privileged
+  parent, locally mutes decoded RTP in the unprivileged sidecar, and sends the
+  zero-field local `response.interrupt` token. Microphone upload deliberately
+  continues. The device sends no `response.cancel`,
+  `output_audio_buffer.clear`, outbound interruption event, or other client
+  control borrowed from the generic public Realtime API; those messages are
+  outside this tagged outbound schema. The direct route also rejects public
+  Realtime `session.update` VAD configuration. Live evidence yielded only
+  `session.started`, with no `speech_started`, `turn.done`, or transcript event,
+  so the data channel offers no provider acknowledgement or causal proof.
+  Public Realtime v2 WebRTC/client-event semantics are unsupported here.
+  Same-peer reuse is instead an explicitly empirical WebRTC auto-truncation
+  invariant. The token follows the exact qualifying capture watermark. The
+  child must consume through that watermark and 4,000 samples beyond its
+  token-time sender cursor (250 ms at 16 kHz), an overlapping 750 ms guard must
+  elapse, and the sole decoded-audio consumer must measure a fresh continuous
+  500 ms of silence after observing its receiver-barrier request. Every queued,
+  ready, or later decoded frame is recorded before resampling and restarts that
+  interval; stalled loop time is excluded by responsive heartbeats. The exact
+  hash-pinned aiortc 1.15 private encoded-decoder and decoded-output queues are
+  wrapped before its decoder starts. Queued/in-flight/processed serials precede
+  cross-thread scheduling and are rechecked under lock; verified jitter-buffer
+  and resampler tails are discarded through the final no-await lifecycle writes
+  and unmute. Decoder termination is terminal, not silence. On success, an open normal
+  media generation emits `media.quiet` before `interrupt.fenced`; both writes
+  must succeed before unmute and `READY`. Provider ingress cannot spoof those
+  reserved names. The absolute five-second deadline is checked after receiver
+  proof, after optional `media.quiet`, and immediately before the final fenced
+  commit; success and timeout are mutually exclusive. It never restarts.
+  `media_fence_capture_timeout` means a capture
+  proof was unmet; otherwise timeout reports `media_fence_timeout`. Timeout or
+  lifecycle failure stays muted and requires a fresh peer/session. Manual or
+  non-speech preserving interruption is ineligible for this invariant and must
+  use that fresh path. These controls never assign a watermark to dropped
+  capture: an overflow trigger whose causal frame was not accepted also uses
+  the fresh-session path. These
+  protections still require physical validation and requalification after
+  provider or pinned-Codex changes. On the native v2
+  rollback path, resume still requires a sanitized provider
   `response.cancelled` event correlated to the exact active response. On the
   legacy broker-managed path, a new utterance invalidates the bridge generation
   and best-effort cancellation cannot reopen the local output gate. Before Home
