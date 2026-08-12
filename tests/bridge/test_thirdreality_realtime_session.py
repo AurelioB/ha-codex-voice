@@ -7385,7 +7385,7 @@ def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
 
 
 @pytest.mark.parametrize("missing_decision", [False, True])
-def test_bridge_native_unmatched_capture_during_output_is_silent_without_cut(
+def test_bridge_native_unmatched_capture_during_output_is_raw_without_local_cut(
     monkeypatch: pytest.MonkeyPatch,
     missing_decision: bool,
 ) -> None:
@@ -7426,11 +7426,12 @@ def test_bridge_native_unmatched_capture_during_output_is_silent_without_cut(
         assert session.submit_audio(capture) is SubmitResult.ACCEPTED
         packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
         assert packet is not None and packet.data is capture
-        assert packet.suppress_bridge
+        assert not packet.suppress_bridge
 
+    expected_provider_pcm = session_module._apply_capture_gain_pcm16(capture, 12.0)
     assert [value for value, _sent_at in connection.binary_sent] == [
-        bytes(len(capture)),
-        bytes(len(capture)),
+        expected_provider_pcm,
+        expected_provider_pcm,
     ]
     assert session._local_barge_in_requested_epoch is None
     assert session._flush_local_barge_in(

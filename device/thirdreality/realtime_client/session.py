@@ -2385,9 +2385,12 @@ class RealtimeSession:
                 self._config.media_transport == BRIDGE_PCM_TRANSPORT
                 and output_epoch is not None
             )
+            bridge_decision_matches_output = (
+                decision is not None and decision.epoch == output_epoch
+            )
             bridge_positive_near_end = (
-                decision is not None
-                and decision.epoch == output_epoch
+                bridge_decision_matches_output
+                and decision is not None
                 and decision.kind is _EchoDecisionKind.NEAR_END
                 and decision.reference_matched
                 and decision.interrupt_qualified
@@ -2395,13 +2398,19 @@ class RealtimeSession:
             if bridge_output_guarded:
                 # V2 keeps one provider peer across interruptions, so it cannot
                 # replay raw capture on a fresh peer after deciding which voice
-                # produced it. While render is active, require affirmative
-                # epoch-scoped near-end evidence before either the local cut or
-                # provider egress sees a frame. Missing/stale/untrained render
-                # deliberately returns an unmatched NEAR_END decision; treating
-                # that fail-open result as speech lets loud playback cancel
-                # itself after two recorder callbacks.
-                suppress_bridge = not bridge_positive_near_end
+                # produced it. Suppress only affirmative echo/ambiguous render
+                # evidence. An unmatched, untrained, or missing decision stays
+                # raw so the provider's semantic speech events remain the
+                # fallback, but it cannot trigger the two-frame local cut.
+                suppress_bridge = bool(
+                    bridge_decision_matches_output
+                    and decision is not None
+                    and decision.kind
+                    in {
+                        _EchoDecisionKind.ECHO,
+                        _EchoDecisionKind.AMBIGUOUS,
+                    }
+                )
             elif provider_candidate and output_epoch is not None:
                 if decision is None:
                     suppress = transitioning or settling
@@ -2511,6 +2520,7 @@ class RealtimeSession:
             if (
                 not has_signal
                 or render_suppressed_for_bridge
+                or (bridge_output_guarded and not bridge_positive_near_end)
                 or (decision is not None and decision.kind is _EchoDecisionKind.ECHO)
             ):
                 self._local_barge_in_frames = 0
