@@ -5307,6 +5307,12 @@ async def test_realtime_v3_relays_device_sdp_without_constructing_bridge_peer(
         },
     }
     assert fake_rpc.peers == []
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert thread_start["dynamicTools"] == [
+        bridge_service.DIRECT_END_CONVERSATION_TOOL
+    ]
     realtime_start = next(
         params for method, params in fake_rpc.calls if method == "thread/realtime/start"
     )
@@ -5533,9 +5539,12 @@ async def test_realtime_v3_rollover_stop_error_uses_unblocked_isolated_thread(
         params for method, params in fake_rpc.calls if method == "thread/start"
     ]
     assert len(thread_starts) == 2
-    assert all("dynamicTools" not in params for params in thread_starts)
     assert all(
-        "Never inspect local files or invoke tools" in params["baseInstructions"]
+        params["dynamicTools"] == [bridge_service.DIRECT_END_CONVERSATION_TOOL]
+        for params in thread_starts
+    )
+    assert all(
+        "Your only tool is end_conversation" in params["baseInstructions"]
         for params in thread_starts
     )
 
@@ -6134,7 +6143,8 @@ async def test_realtime_v3_rejects_tool_call_while_waiting_for_transport_ready(
                     {
                         "type": "inputText",
                         "text": (
-                            '{"error":"direct_voice_has_no_tools","do_not_retry":true}'
+                            '{"error":"direct_voice_tool_not_allowed",'
+                            '"do_not_retry":true}'
                         ),
                     }
                 ],
@@ -6243,11 +6253,61 @@ async def test_realtime_v3_rejected_runtime_tool_call_stops_active_epoch(
                     {
                         "type": "inputText",
                         "text": (
-                            '{"error":"direct_voice_has_no_tools","do_not_retry":true}'
+                            '{"error":"direct_voice_tool_not_allowed",'
+                            '"do_not_retry":true}'
                         ),
                     }
                 ],
                 "success": False,
+            },
+        )
+    ]
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_end_conversation_tool_stops_active_epoch(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-end-request-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "callId": "end-call-1",
+                "tool": "end_conversation",
+                "arguments": {},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    assert fake_rpc.responses == [
+        (
+            "provider-end-request-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": '{"status":"conversation_ended"}',
+                    }
+                ],
+                "success": True,
             },
         )
     ]

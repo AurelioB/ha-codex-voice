@@ -17,13 +17,14 @@ import weakref
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from math import isqrt
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from .config import (
     DEVICE_WEBRTC_TRANSPORT,
+    NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
     RealtimeConfig,
     realtime_start_message,
@@ -48,8 +49,33 @@ _INPUT_ACTIVITY_SIGNAL_PEAK = 256
 _LOCAL_BARGE_IN_SIGNAL_PEAK = 1_024
 _LOCAL_BARGE_IN_SIGNAL_RMS = 384
 _LOCAL_BARGE_IN_FRAMES = 2
+_LOCAL_BARGE_IN_AMBIGUOUS_FRAMES = 4
 _LOCAL_BARGE_IN_REARM_QUIET_FRAMES = 8
 _LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS = 0.512
+_LOCAL_BARGE_IN_ANCHOR_REPAIR_SETTLE_SECONDS = 0.128
+_LOCAL_BARGE_IN_ANCHOR_REPAIR_MAX_EVIDENCE_FRAMES = 8
+_RENDER_ECHO_FEATURE_RATE = 4_000
+_RENDER_ECHO_RENDER_DOWNSAMPLE = 6
+_RENDER_ECHO_CAPTURE_DOWNSAMPLE = 4
+_RENDER_ECHO_RING_SAMPLES = 4_096
+_RENDER_ECHO_NOMINAL_PLAYOUT_SECONDS = 0.060
+_RENDER_ECHO_DISCONTINUITY_SECONDS = 0.100
+_RENDER_ECHO_MIN_DELAY_SAMPLES = 20 * _RENDER_ECHO_FEATURE_RATE // 1_000
+_RENDER_ECHO_MAX_DELAY_SAMPLES = 320 * _RENDER_ECHO_FEATURE_RATE // 1_000
+_RENDER_ECHO_COARSE_STEP_SAMPLES = 4 * _RENDER_ECHO_FEATURE_RATE // 1_000
+_RENDER_ECHO_REFINE_STEP_SAMPLES = _RENDER_ECHO_FEATURE_RATE // 1_000
+_RENDER_ECHO_FIR_TAPS = 24
+_RENDER_ECHO_CALIBRATION_FRAMES = 3
+_RENDER_ECHO_LOCKED_DELAY_RADIUS_SAMPLES = 24 * _RENDER_ECHO_FEATURE_RATE // 1_000
+_RENDER_ECHO_MIN_RMS = 64
+_RENDER_ECHO_CORRELATION_PERMILLE = 600
+_RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE = 350
+_RENDER_ECHO_MAX_RESIDUAL_PERCENT = 45
+_RENDER_ECHO_NEAR_END_RESIDUAL_PERCENT = 55
+_RENDER_ECHO_NEAR_END_RESIDUAL_RMS = 256
+_RENDER_ECHO_NLMS_STEP = 0.05
+_RENDER_ECHO_NLMS_LEAKAGE = 0.9995
+_PLAYBACK_VOLUME_RAMP_SAMPLES = 24_000 * 40 // 1_000
 _MAX_INPUT_CATCH_UP_RATE = 2.0
 _PACTL_ARGV = ("/usr/bin/pactl",)
 _PULSE_ECHO_CANCEL_MODULE = "module-echo-cancel"
@@ -58,6 +84,8 @@ _PULSE_SINK_MASTER = "alsa_output.hw_0_1"
 _PULSE_NATIVE_DRIVER = "protocol-native.c"
 _PULSE_VOLUME_RAW = re.compile(r"([0-9]+)\s*/\s*[0-9]+%\s*/")
 _PULSE_VOLUME_NORM = 65_536
+_PHYSICAL_ANCHOR_REPAIR_TIMEOUT_SECONDS = 0.075
+_MEDIA_ANCHOR_REPAIR_TIMEOUT_SECONDS = 0.250
 _PAPLAY_ARGV = (
     "/usr/bin/paplay",
     "--raw",
@@ -70,6 +98,7 @@ _PAPLAY_ARGV = (
 _NETWORK_TICK_SECONDS = 0.02
 _DIRECT_HANDSHAKE_TICK_SECONDS = 0.01
 _DIRECT_CAPTURE_MAX_AGE_SECONDS = 2.25
+_DIRECT_STARTUP_CAPTURE_MAX_AGE_SECONDS = 5.0
 # Retain the two 64 ms / 2 KiB recorder frames that prove local speech. A
 # larger history spends the replacement peer's independent 2.25-second RTP
 # freshness budget without adding useful onset evidence.
@@ -114,6 +143,12 @@ _DIRECT_SEMANTIC_LIFECYCLE_EVENTS = frozenset(
 )
 _DIRECT_DIAGNOSTIC_LIFECYCLE_EVENTS = _CONTROL_EVENTS | frozenset(
     {
+        "capture.direction.inactive",
+        "capture.direction.recvonly",
+        "capture.direction.sendonly",
+        "capture.direction.sendrecv",
+        "capture.direction.unknown",
+        "capture.outbound_active",
         "capture.rtp_started",
         "error",
         "interrupt.fenced",
@@ -201,11 +236,39 @@ class SubmitResult(Enum):
     INVALID = "invalid"
 
 
+class _EchoDecisionKind(Enum):
+    """Content-free result from the local render-aware double-talk guard."""
+
+    ECHO = "echo"
+    NEAR_END = "near_end"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True, slots=True)
+class _EchoDecision:
+    """One epoch-scoped render comparison without retained capture content."""
+
+    kind: _EchoDecisionKind
+    epoch: int
+    correlation_permille: int = 0
+    delay_ms: int = 0
+    reference_matched: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _CaptureDisposition:
+    """One raw capture frame's local and current-peer routing outcome."""
+
+    local_interrupt: bool = False
+    suppress_peer_epoch: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class _AudioPacket:
     data: bytes
     captured_at: float
     capture_watermark: int
+    suppress_peer_epoch: int | None = None
 
 
 @dataclass(slots=True)
@@ -249,8 +312,15 @@ class _DirectSessionDiagnostics:
     playback_signal_bytes: int = 0
     playback_max_peak: int = 0
     playback_max_rms: int = 0
+    echo_rejected_frames: int = 0
+    echo_near_end_frames: int = 0
+    echo_ambiguous_frames: int = 0
+    provider_suppressed_frames: int = 0
+    echo_max_correlation_permille: int = 0
+    echo_last_delay_ms: int = 0
     lifecycle_events: dict[str, int] = field(default_factory=dict)
     failure_code: str | None = None
+    _echo_lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
 
     def observe_peer_state(self, value: str) -> None:
         """Retain only the three fixed initial peer-readiness milestones."""
@@ -280,6 +350,50 @@ class _DirectSessionDiagnostics:
         self.playback_signal_bytes += len(value)
         self.playback_max_peak = max(self.playback_max_peak, peak)
         self.playback_max_rms = max(self.playback_max_rms, rms)
+
+    def observe_echo_decision(self, decision: _EchoDecision) -> None:
+        """Retain only bounded content-free render-comparison aggregates."""
+        with self._echo_lock:
+            if decision.kind is _EchoDecisionKind.ECHO:
+                self.echo_rejected_frames = min(
+                    self.echo_rejected_frames + 1,
+                    _DIRECT_SYSLOG_COUNTER_MAX,
+                )
+            elif decision.kind is _EchoDecisionKind.NEAR_END:
+                self.echo_near_end_frames = min(
+                    self.echo_near_end_frames + 1,
+                    _DIRECT_SYSLOG_COUNTER_MAX,
+                )
+            else:
+                self.echo_ambiguous_frames = min(
+                    self.echo_ambiguous_frames + 1,
+                    _DIRECT_SYSLOG_COUNTER_MAX,
+                )
+            self.echo_max_correlation_permille = max(
+                self.echo_max_correlation_permille,
+                min(1_000, max(0, decision.correlation_permille)),
+            )
+            self.echo_last_delay_ms = min(320, max(0, decision.delay_ms))
+
+    def observe_provider_suppression(self) -> None:
+        """Count one equal-length silence substitution without retaining PCM."""
+        with self._echo_lock:
+            self.provider_suppressed_frames = min(
+                self.provider_suppressed_frames + 1,
+                _DIRECT_SYSLOG_COUNTER_MAX,
+            )
+
+    def echo_summary(self) -> tuple[int, int, int, int, int, int]:
+        """Snapshot capture-thread counters for network-thread diagnostics."""
+        with self._echo_lock:
+            return (
+                self.echo_rejected_frames,
+                self.echo_near_end_frames,
+                self.echo_ambiguous_frames,
+                self.provider_suppressed_frames,
+                self.echo_max_correlation_permille,
+                self.echo_last_delay_ms,
+            )
 
     def observe_capture_metrics(
         self,
@@ -371,6 +485,15 @@ def _emit_direct_syslog_status(
             _DIRECT_DIAGNOSTIC_LIFECYCLE_COUNT_MAX,
         )
 
+    (
+        echo_rejected_frames,
+        echo_near_end_frames,
+        echo_ambiguous_frames,
+        provider_suppressed_frames,
+        echo_max_correlation_permille,
+        echo_last_delay_ms,
+    ) = diagnostics.echo_summary()
+
     # Keep the state needed to classify an incident in the first record and
     # repeat the bounded status on every continuation. All labels and string
     # values come from fixed vocabularies; only non-negative counters vary.
@@ -405,6 +528,31 @@ def _emit_direct_syslog_status(
             f"post_gain_max_rms={pcm_level(diagnostics.post_gain_max_rms)} "
             f"clipped_samples={bounded(diagnostics.clipped_samples)} "
             f"clipped_frames={bounded(diagnostics.clipped_frames)}"
+        ),
+        (
+            f"{prefix} record=echo "
+            f"rejected={bounded(echo_rejected_frames)} "
+            f"near={bounded(echo_near_end_frames)} "
+            f"ambiguous={bounded(echo_ambiguous_frames)} "
+            f"provider_suppressed={bounded(provider_suppressed_frames)} "
+            "max_corr_pm="
+            f"{min(1_000, bounded(echo_max_correlation_permille))} "
+            f"delay_ms={min(320, bounded(echo_last_delay_ms))}"
+        ),
+        (
+            f"{prefix} record=transport "
+            "direction_sendrecv="
+            f"{lifecycle_count('capture.direction.sendrecv')} "
+            "direction_sendonly="
+            f"{lifecycle_count('capture.direction.sendonly')} "
+            "direction_recvonly="
+            f"{lifecycle_count('capture.direction.recvonly')} "
+            "direction_inactive="
+            f"{lifecycle_count('capture.direction.inactive')} "
+            "direction_unknown="
+            f"{lifecycle_count('capture.direction.unknown')} "
+            "outbound_active="
+            f"{lifecycle_count('capture.outbound_active')}"
         ),
         (
             f"{prefix} record=events_1 "
@@ -493,6 +641,20 @@ class _BoundedAudioQueue:
             self._bytes -= len(packet.data)
             return packet, len(self._items)
 
+    def replace_tail(
+        self,
+        expected: _AudioPacket,
+        replacement: _AudioPacket,
+    ) -> bool:
+        """Annotate the newest admitted packet without changing queue pressure."""
+        if len(expected.data) != len(replacement.data):
+            return False
+        with self._lock:
+            if not self._items or self._items[-1] is not expected:
+                return False
+            self._items[-1] = replacement
+            return True
+
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
@@ -566,6 +728,540 @@ class _PlayerLike(Protocol):
     def active(self) -> bool: ...
 
 
+class _PlaybackAttenuator:
+    """Apply bounded click-free software volume below one fixed AEC anchor."""
+
+    def __init__(self, anchor_percent: int) -> None:
+        if type(anchor_percent) is not int or not 1 <= anchor_percent <= 100:
+            raise ValueError("playback volume anchor is invalid")
+        self._anchor_percent = anchor_percent
+        self._current_gain = 1.0
+        self._target_gain = 1.0
+        self._ramp_remaining = 0
+        self._lock = threading.Lock()
+
+    def request(self, volume_percent: int, *, ramp: bool) -> int:
+        """Set a non-amplifying target and return the safely clamped percent."""
+        if type(volume_percent) is not int:
+            raise ValueError("playback volume must be an integer")
+        applied = min(max(0, volume_percent), self._anchor_percent)
+        ratio = applied / self._anchor_percent
+        # PulseAudio's user-facing software volume follows its cubic curve.
+        # Reproduce that curve below the fixed AEC anchor so a requested 30%
+        # remains perceptually equivalent to the device's prior 30% setting.
+        target_gain = ratio * ratio * ratio
+        with self._lock:
+            if not ramp:
+                self._target_gain = target_gain
+                self._current_gain = target_gain
+                self._ramp_remaining = 0
+            elif self._target_gain == target_gain:
+                return applied
+            elif self._current_gain == target_gain:
+                self._target_gain = target_gain
+                self._ramp_remaining = 0
+            else:
+                self._target_gain = target_gain
+                self._ramp_remaining = _PLAYBACK_VOLUME_RAMP_SAMPLES
+        return applied
+
+    def scale(self, value: bytes) -> bytes:
+        """Attenuate aligned mono PCM16 without ever amplifying or clipping it."""
+        if not isinstance(value, bytes) or len(value) % 2:
+            raise ValueError("playback PCM must contain aligned bytes")
+        if not value:
+            return value
+        with self._lock:
+            current = self._current_gain
+            target = self._target_gain
+            remaining = self._ramp_remaining
+            if remaining == 0:
+                if target == 1.0:
+                    return value
+                return _scale_pcm16(value, target)
+
+            samples = len(value) // 2
+            ramp_samples = min(samples, remaining)
+            step = (target - current) / remaining
+            scaled = bytearray(len(value))
+            for index, (sample,) in enumerate(struct.iter_unpack("<h", value)):
+                if index < ramp_samples:
+                    gain = current + step * (index + 1)
+                else:
+                    gain = target
+                struct.pack_into("<h", scaled, index * 2, round(sample * gain))
+            self._ramp_remaining = remaining - ramp_samples
+            self._current_gain = (
+                target if self._ramp_remaining == 0 else current + step * ramp_samples
+            )
+            return bytes(scaled)
+
+
+class _RenderEchoGuard:
+    """Reject render-correlated local barge-in without touching capture PCM."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._epoch: int | None = None
+        self._render_samples: deque[int] = deque()
+        self._render_start_time: float | None = None
+        self._render_end_time: float | None = None
+        self._render_sample_tail: list[int] = []
+        self._fir = [0.0] * _RENDER_ECHO_FIR_TAPS
+        self._fir_valid_frames = 0
+        self._calibration_delays: deque[int] = deque(
+            maxlen=_LOCAL_BARGE_IN_ANCHOR_REPAIR_MAX_EVIDENCE_FRAMES
+        )
+        self._stable_delay_samples: int | None = None
+        self._repair_generation = 0
+        self._repair_active = False
+        self._repair_qualified = False
+        self._repair_seeded = False
+        self._model_updates_frozen = threading.Event()
+
+    def freeze_model_updates(self, timeout: float) -> bool:
+        """Linearize a capture-adaptation fence within one caller budget."""
+        self._model_updates_frozen.set()
+        if not self._lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        self._lock.release()
+        return True
+
+    def thaw_model_updates(self) -> None:
+        """Allow capture adaptation after the transition boundary is published."""
+        self._model_updates_frozen.clear()
+
+    def begin_epoch(self, epoch: int, *, reset: bool) -> None:
+        """Publish an output epoch and isolate its partial render framing."""
+        with self._lock:
+            if reset:
+                self._clear_render_locked(reset_model=True)
+            else:
+                self._render_sample_tail.clear()
+            self._epoch = epoch
+
+    def deactivate(self) -> None:
+        """Stop classifying while retaining a reusable player's recent tail."""
+        with self._lock:
+            self._epoch = None
+
+    def reset(self) -> None:
+        """Forget all render/model state at an abort or peer boundary."""
+        with self._lock:
+            self._epoch = None
+            self._clear_render_locked(reset_model=True)
+
+    def repair_boundary(self, epoch: int | None) -> bool:
+        """Start an untrusted post-repair model generation from a safe FIR seed."""
+        with self._lock:
+            had_seed = (
+                self._fir_valid_frames >= _RENDER_ECHO_CALIBRATION_FRAMES
+                and self._stable_delay_samples is not None
+            )
+            seed = list(self._fir) if had_seed else None
+            self._clear_render_locked(reset_model=True)
+            if seed is not None:
+                self._fir = seed
+            self._repair_generation += 1
+            self._repair_active = True
+            self._repair_qualified = False
+            self._repair_seeded = had_seed
+            self._epoch = epoch
+            return had_seed
+
+    def repair_status(self, epoch: int) -> tuple[bool, bool]:
+        """Return whether the current epoch belongs to a repair generation."""
+        with self._lock:
+            if self._epoch != epoch or not self._repair_active:
+                return False, False
+            return True, self._repair_qualified
+
+    def observe_render(self, value: bytes, *, written_at: float) -> None:
+        """Retain bounded 4 kHz features from exact PCM accepted by paplay."""
+        if not value:
+            return
+        samples = [sample for (sample,) in struct.iter_unpack("<h", value)]
+        with self._lock:
+            combined = self._render_sample_tail + samples
+            usable = (
+                len(combined) // _RENDER_ECHO_RENDER_DOWNSAMPLE
+            ) * _RENDER_ECHO_RENDER_DOWNSAMPLE
+            self._render_sample_tail = combined[usable:]
+            if not usable:
+                return
+            features = [
+                sum(combined[index : index + _RENDER_ECHO_RENDER_DOWNSAMPLE])
+                // _RENDER_ECHO_RENDER_DOWNSAMPLE
+                for index in range(0, usable, _RENDER_ECHO_RENDER_DOWNSAMPLE)
+            ]
+            proposed_start = written_at + _RENDER_ECHO_NOMINAL_PLAYOUT_SECONDS
+            render_end = self._render_end_time
+            if (
+                render_end is None
+                or proposed_start > render_end + _RENDER_ECHO_DISCONTINUITY_SECONDS
+            ):
+                # A reusable paplay child may remain alive across an ordinary
+                # inter-response gap. Rebase only the timestamped render ring;
+                # the already qualified acoustic model remains valid for the
+                # next media epoch. Hard epoch/session boundaries call reset().
+                self._clear_render_locked(reset_model=False)
+                self._render_start_time = proposed_start
+                self._render_end_time = proposed_start
+                render_end = proposed_start
+            elif proposed_start > render_end:
+                gap_samples = round(
+                    (proposed_start - render_end) * _RENDER_ECHO_FEATURE_RATE
+                )
+                if gap_samples:
+                    self._append_render_locked([0] * gap_samples)
+            self._append_render_locked(features)
+
+    def classify(  # noqa: C901 - one bounded render/capture decision pipeline
+        self,
+        value: bytes,
+        *,
+        captured_at: float,
+        output_epoch: int,
+        calibrating: bool,
+        update_model: bool = True,
+    ) -> _EchoDecision | None:
+        """Classify one signal-bearing capture frame against recent render."""
+        capture_samples = [sample for (sample,) in struct.iter_unpack("<h", value)]
+        usable = (
+            len(capture_samples) // _RENDER_ECHO_CAPTURE_DOWNSAMPLE
+        ) * _RENDER_ECHO_CAPTURE_DOWNSAMPLE
+        if not usable:
+            return None
+        capture = tuple(
+            sum(capture_samples[index : index + _RENDER_ECHO_CAPTURE_DOWNSAMPLE])
+            // _RENDER_ECHO_CAPTURE_DOWNSAMPLE
+            for index in range(0, usable, _RENDER_ECHO_CAPTURE_DOWNSAMPLE)
+        )
+        with self._lock:
+            if self._epoch != output_epoch:
+                return None
+            render = tuple(self._render_samples)
+            render_start_time = self._render_start_time
+            weights = tuple(self._fir)
+            fir_valid_frames = self._fir_valid_frames
+            stable_delay = self._stable_delay_samples
+            repair_generation = self._repair_generation
+            repair_pending = self._repair_active and not self._repair_qualified
+            repair_seeded = self._repair_seeded
+        if render_start_time is None or not render:
+            return _EchoDecision(_EchoDecisionKind.NEAR_END, output_epoch)
+        calibrated = (
+            fir_valid_frames >= _RENDER_ECHO_CALIBRATION_FRAMES
+            and stable_delay is not None
+        )
+        training = calibrating or repair_pending
+        if not training and not calibrated:
+            # An untrained same-frame fit could erase genuine double-talk.
+            return _EchoDecision(_EchoDecisionKind.NEAR_END, output_epoch)
+
+        capture_mean = sum(capture) // len(capture)
+        centered_capture = tuple(sample - capture_mean for sample in capture)
+        capture_energy = sum(sample * sample for sample in centered_capture)
+        if capture_energy == 0:
+            return _EchoDecision(_EchoDecisionKind.NEAR_END, output_epoch)
+        capture_start_time = captured_at - len(capture) / _RENDER_ECHO_FEATURE_RATE
+        render_floor_energy = _RENDER_ECHO_MIN_RMS * _RENDER_ECHO_MIN_RMS * len(capture)
+
+        def correlation_at(
+            delay_samples: int,
+        ) -> tuple[int, int, int, int, int] | None:
+            reference_time = (
+                capture_start_time - delay_samples / _RENDER_ECHO_FEATURE_RATE
+            )
+            start = round(
+                (reference_time - render_start_time) * _RENDER_ECHO_FEATURE_RATE
+            )
+            if start < 0 or start + len(capture) > len(render):
+                return None
+            reference_mean = sum(render[start : start + len(capture)]) // len(capture)
+            reference_energy = 0
+            dot = 0
+            for index, capture_sample in enumerate(centered_capture):
+                render_sample = render[start + index] - reference_mean
+                reference_energy += render_sample * render_sample
+                dot += capture_sample * render_sample
+            if reference_energy < render_floor_energy:
+                return None
+            denominator = isqrt(capture_energy * reference_energy)
+            if denominator == 0:
+                return None
+            correlation = min(1_000, abs(dot) * 1_000 // denominator)
+            return correlation, start, dot, reference_energy, reference_mean
+
+        if calibrated and not repair_pending:
+            assert stable_delay is not None
+            minimum_delay = max(
+                _RENDER_ECHO_MIN_DELAY_SAMPLES,
+                stable_delay - _RENDER_ECHO_LOCKED_DELAY_RADIUS_SAMPLES,
+            )
+            maximum_delay = min(
+                _RENDER_ECHO_MAX_DELAY_SAMPLES,
+                stable_delay + _RENDER_ECHO_LOCKED_DELAY_RADIUS_SAMPLES,
+            )
+        else:
+            minimum_delay = _RENDER_ECHO_MIN_DELAY_SAMPLES
+            maximum_delay = _RENDER_ECHO_MAX_DELAY_SAMPLES
+
+        best: tuple[int, int, int, int, int, int] | None = None
+        for delay in range(
+            minimum_delay,
+            maximum_delay + 1,
+            _RENDER_ECHO_COARSE_STEP_SAMPLES,
+        ):
+            candidate = correlation_at(delay)
+            if candidate is None:
+                continue
+            correlation, start, dot, reference_energy, reference_mean = candidate
+            if best is None or correlation > best[0]:
+                best = (
+                    correlation,
+                    delay,
+                    start,
+                    dot,
+                    reference_energy,
+                    reference_mean,
+                )
+        if best is None:
+            # Missing, stale, or quiet render must not erase genuine speech.
+            return _EchoDecision(_EchoDecisionKind.NEAR_END, output_epoch)
+
+        coarse_delay = best[1]
+        refine_radius = _RENDER_ECHO_COARSE_STEP_SAMPLES
+        for delay in range(
+            max(minimum_delay, coarse_delay - refine_radius),
+            min(maximum_delay, coarse_delay + refine_radius) + 1,
+            _RENDER_ECHO_REFINE_STEP_SAMPLES,
+        ):
+            candidate = correlation_at(delay)
+            if candidate is None:
+                continue
+            correlation, start, dot, reference_energy, reference_mean = candidate
+            if correlation > best[0]:
+                best = (
+                    correlation,
+                    delay,
+                    start,
+                    dot,
+                    reference_energy,
+                    reference_mean,
+                )
+
+        (
+            correlation,
+            delay_samples,
+            reference_start,
+            dot,
+            reference_energy,
+            reference_mean,
+        ) = best
+        enough_history = reference_start >= _RENDER_ECHO_FIR_TAPS - 1
+        if not training and not enough_history:
+            return _EchoDecision(
+                _EchoDecisionKind.NEAR_END,
+                output_epoch,
+                correlation_permille=correlation,
+                delay_ms=round(delay_samples * 1_000 / _RENDER_ECHO_FEATURE_RATE),
+                reference_matched=True,
+            )
+        residual_energy = capture_energy
+        if (calibrated or repair_pending) and enough_history:
+            residual_energy = 0
+            for index, capture_sample in enumerate(centered_capture):
+                prediction = 0.0
+                for tap, coefficient in enumerate(weights):
+                    prediction += coefficient * (
+                        render[reference_start + index - tap] - reference_mean
+                    )
+                error = capture_sample - prediction
+                residual_energy += round(error * error)
+        residual_percent = min(100, residual_energy * 100 // capture_energy)
+        residual_rms = isqrt(residual_energy // len(centered_capture))
+
+        residual_near_end = (
+            residual_percent >= _RENDER_ECHO_NEAR_END_RESIDUAL_PERCENT
+            and residual_rms >= _RENDER_ECHO_NEAR_END_RESIDUAL_RMS
+        )
+        if repair_pending:
+            residual_is_trusted = repair_seeded or fir_valid_frames >= 2
+            if correlation <= _RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE or (
+                residual_is_trusted and residual_near_end
+            ):
+                kind = _EchoDecisionKind.NEAR_END
+            elif correlation >= _RENDER_ECHO_CORRELATION_PERMILLE:
+                kind = _EchoDecisionKind.ECHO
+            else:
+                kind = _EchoDecisionKind.AMBIGUOUS
+        elif training:
+            kind = (
+                _EchoDecisionKind.ECHO
+                if correlation >= _RENDER_ECHO_CORRELATION_PERMILLE
+                else _EchoDecisionKind.AMBIGUOUS
+            )
+        elif (
+            correlation >= _RENDER_ECHO_CORRELATION_PERMILLE
+            and residual_percent <= _RENDER_ECHO_MAX_RESIDUAL_PERCENT
+        ):
+            kind = _EchoDecisionKind.ECHO
+        elif (
+            correlation <= _RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE
+            or residual_near_end
+        ):
+            kind = _EchoDecisionKind.NEAR_END
+        else:
+            kind = _EchoDecisionKind.AMBIGUOUS
+
+        if (
+            update_model
+            and repair_pending
+            and enough_history
+            and kind is not _EchoDecisionKind.ECHO
+        ):
+            with self._lock:
+                if (
+                    not self._model_updates_frozen.is_set()
+                    and self._epoch == output_epoch
+                    and self._repair_generation == repair_generation
+                    and not self._repair_qualified
+                ):
+                    self._fir_valid_frames = 0
+                    self._calibration_delays.clear()
+
+        if (
+            update_model
+            and training
+            and kind is _EchoDecisionKind.ECHO
+            and enough_history
+        ):
+            updated = list(weights)
+            if not fir_valid_frames:
+                updated[0] = max(-4.0, min(4.0, dot / reference_energy))
+            for index, capture_sample in enumerate(centered_capture):
+                if index % 4:
+                    continue
+                reference_vector = [
+                    render[reference_start + index - tap] - reference_mean
+                    for tap in range(_RENDER_ECHO_FIR_TAPS)
+                ]
+                prediction = sum(
+                    coefficient * sample
+                    for coefficient, sample in zip(
+                        updated,
+                        reference_vector,
+                        strict=True,
+                    )
+                )
+                error = capture_sample - prediction
+                norm = 1 + sum(sample * sample for sample in reference_vector)
+                adjustment = _RENDER_ECHO_NLMS_STEP * error / norm
+                for tap, sample in enumerate(reference_vector):
+                    updated[tap] = max(
+                        -4.0,
+                        min(
+                            4.0,
+                            updated[tap] * _RENDER_ECHO_NLMS_LEAKAGE
+                            + adjustment * sample,
+                        ),
+                    )
+            with self._lock:
+                if (
+                    not self._model_updates_frozen.is_set()
+                    and self._epoch == output_epoch
+                ):
+                    self._fir = updated
+                    if (
+                        repair_pending
+                        and self._repair_generation == repair_generation
+                        and not self._repair_qualified
+                    ):
+                        proposed_delays = [*self._calibration_delays, delay_samples]
+                        if (
+                            proposed_delays
+                            and max(proposed_delays) - min(proposed_delays)
+                            > _RENDER_ECHO_LOCKED_DELAY_RADIUS_SAMPLES
+                        ):
+                            self._fir_valid_frames = 0
+                            self._calibration_delays.clear()
+                        candidate_number = self._fir_valid_frames + 1
+                        independently_valid = (
+                            candidate_number <= 2
+                            or residual_percent <= _RENDER_ECHO_MAX_RESIDUAL_PERCENT
+                        )
+                        if independently_valid:
+                            self._fir_valid_frames = candidate_number
+                            self._calibration_delays.append(delay_samples)
+                            if self._fir_valid_frames >= 2:
+                                # Keep residual discrimination after a later
+                                # near-end frame resets only the consecutive
+                                # qualification proof. Otherwise sustained
+                                # double-talk would loop ECHO/ECHO/NEAR_END.
+                                self._repair_seeded = True
+                        else:
+                            # A third-frame residual failure breaks the proof
+                            # sequence. Keep the just-updated FIR only as the
+                            # next generation's untrusted training seed.
+                            self._fir_valid_frames = 0
+                            self._calibration_delays.clear()
+                        if self._fir_valid_frames >= _RENDER_ECHO_CALIBRATION_FRAMES:
+                            ordered_delays = sorted(self._calibration_delays)
+                            self._stable_delay_samples = ordered_delays[
+                                len(ordered_delays) // 2
+                            ]
+                            self._repair_qualified = True
+                            self._repair_seeded = False
+                    else:
+                        self._fir_valid_frames = min(
+                            self._fir_valid_frames + 1,
+                            _DIRECT_SYSLOG_COUNTER_MAX,
+                        )
+                        self._calibration_delays.append(delay_samples)
+                        ordered_delays = sorted(self._calibration_delays)
+                        self._stable_delay_samples = ordered_delays[
+                            len(ordered_delays) // 2
+                        ]
+
+        return _EchoDecision(
+            kind,
+            output_epoch,
+            correlation_permille=correlation,
+            delay_ms=round(delay_samples * 1_000 / _RENDER_ECHO_FEATURE_RATE),
+            reference_matched=True,
+        )
+
+    def _append_render_locked(self, samples: list[int]) -> None:
+        """Append continuous features and retain one exact bounded timeline."""
+        if not samples:
+            return
+        if self._render_start_time is None or self._render_end_time is None:
+            raise RuntimeError("render timeline was not initialized")
+        self._render_samples.extend(samples)
+        self._render_end_time += len(samples) / _RENDER_ECHO_FEATURE_RATE
+        overflow = len(self._render_samples) - _RENDER_ECHO_RING_SAMPLES
+        for _ in range(max(0, overflow)):
+            self._render_samples.popleft()
+        if overflow > 0:
+            self._render_start_time += overflow / _RENDER_ECHO_FEATURE_RATE
+
+    def _clear_render_locked(self, *, reset_model: bool) -> None:
+        """Clear bounded render framing while holding the guard lock."""
+        self._render_samples.clear()
+        self._render_start_time = None
+        self._render_end_time = None
+        self._render_sample_tail.clear()
+        if reset_model:
+            self._fir = [0.0] * _RENDER_ECHO_FIR_TAPS
+            self._fir_valid_frames = 0
+            self._calibration_delays.clear()
+            self._stable_delay_samples = None
+            self._repair_active = False
+            self._repair_qualified = False
+            self._repair_seeded = False
+
+
 class _PcmPlayer:
     """Own one fixed-argv paplay child and its bounded non-blocking stdin."""
 
@@ -577,6 +1273,9 @@ class _PcmPlayer:
         volume_percent: int | None = None,
         exact_sink_volume: bool = False,
         volume_controller: SinkVolumeController | None = None,
+        pcm_transform: Callable[[bytes], bytes] | None = None,
+        write_observer: Callable[[bytes], None] | None = None,
+        write_allowed: Callable[[], bool] | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     ) -> None:
         self._maximum_bytes = maximum_bytes
@@ -585,6 +1284,9 @@ class _PcmPlayer:
         self._exact_sink_volume = exact_sink_volume
         self._volume_percent = volume_percent
         self._volume_controller = volume_controller or PactlSinkVolumeController()
+        self._pcm_transform = pcm_transform
+        self._write_observer = write_observer
+        self._write_allowed = write_allowed
         self._volume = (
             None
             if volume_percent is None
@@ -597,6 +1299,7 @@ class _PcmPlayer:
         self._process: subprocess.Popen[bytes] | None = None
         self._stdin: Any = None
         self._pending = bytearray()
+        self._staged = bytearray()
         self._finish_when_drained = False
         self._epoch: int | None = None
         self._volume_prepared = False
@@ -670,7 +1373,7 @@ class _PcmPlayer:
     def enqueue(self, value: bytes) -> None:
         if self._process is None or self._stdin is None or self._epoch is None:
             raise WebSocketError("audio arrived outside a speaking epoch")
-        if len(self._pending) + len(value) > self._maximum_bytes:
+        if len(self._pending) + len(self._staged) + len(value) > self._maximum_bytes:
             raise WebSocketError("playback queue exceeded its bound")
         self._pending.extend(value)
 
@@ -686,22 +1389,44 @@ class _PcmPlayer:
         if process is None:
             return
         if process.poll() is not None:
-            if self._pending:
+            if self._pending or self._staged:
                 raise WebSocketError("paplay exited before consuming output")
             self._reap_finished()
             return
-        if self._pending and self._stdin is not None:
+        if not self._staged and self._pending:
+            raw = bytes(self._pending[:_PLAYER_WRITE_BYTES])
             try:
-                written = os.write(
-                    self._stdin.fileno(), self._pending[:_PLAYER_WRITE_BYTES]
-                )
+                staged = self._pcm_transform(raw) if self._pcm_transform else raw
+            except Exception as exc:
+                raise WebSocketError("playback PCM transform failed") from exc
+            if not isinstance(staged, bytes) or len(staged) != len(raw):
+                raise WebSocketError("playback PCM transform changed framing")
+            del self._pending[: len(raw)]
+            self._staged.extend(staged)
+        if self._staged and self._stdin is not None:
+            # This is the final PCM crossing boundary. The session-level check
+            # can race a capture-thread fail-close after player.service() is
+            # entered; re-check its atomic fence immediately before os.write.
+            if self._write_allowed is not None and not self._write_allowed():
+                return
+            try:
+                written = os.write(self._stdin.fileno(), self._staged)
             except BlockingIOError:
                 written = 0
             except (BrokenPipeError, OSError) as exc:
                 raise WebSocketError("paplay rejected output") from exc
             if written:
-                del self._pending[:written]
-        if self._finish_when_drained and not self._pending and self._stdin is not None:
+                accepted = bytes(self._staged[:written])
+                del self._staged[:written]
+                if self._write_observer is not None:
+                    with suppress(Exception):
+                        self._write_observer(accepted)
+        if (
+            self._finish_when_drained
+            and not self._pending
+            and not self._staged
+            and self._stdin is not None
+        ):
             self._stdin.close()
             self._stdin = None
         if process.poll() is not None:
@@ -713,6 +1438,7 @@ class _PcmPlayer:
         self._process = None
         self._stdin = None
         self._pending.clear()
+        self._staged.clear()
         self._finish_when_drained = False
         self._epoch = None
         if process is not None:
@@ -736,7 +1462,7 @@ class _PcmPlayer:
     @property
     def active(self) -> bool:
         """Return whether queued or child-buffered output can still be audible."""
-        return self._process is not None or bool(self._pending)
+        return self._process is not None or bool(self._pending) or bool(self._staged)
 
     def _reap_finished(self) -> None:
         assert self._process is not None
@@ -798,6 +1524,9 @@ def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
     """
     if not config.full_duplex:
         return
+    native_capture = config.capture_backend == NATIVE_AEC3_CAPTURE
+    if native_capture and os.environ.get("CODEX_AEC3_ACTIVE") != "1":
+        raise WebSocketError("native AEC3 capture is not active")
     source = config.pulse_aec_source
     sink = config.pulse_aec_sink
     method = config.pulse_aec_method
@@ -814,15 +1543,16 @@ def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
     if not _has_expected_aec_module(modules, source=source, sink=sink, method=method):
         raise WebSocketError("PulseAudio echo cancellation is not active")
 
-    sources = _pactl_output(("list", "short", "sources"), timeout=timeout)
-    source_index = _pulse_object_index(sources, source)
-    source_outputs = _pactl_output(
-        ("--format=json", "list", "source-outputs"), timeout=timeout
-    )
-    if source_index is None or not _process_capture_uses_source(
-        source_outputs, source_index=source_index, process_id=os.getpid()
-    ):
-        raise WebSocketError("PulseAudio echo cancellation is not active")
+    if not native_capture:
+        sources = _pactl_output(("list", "short", "sources"), timeout=timeout)
+        source_index = _pulse_object_index(sources, source)
+        source_outputs = _pactl_output(
+            ("--format=json", "list", "source-outputs"), timeout=timeout
+        )
+        if source_index is None or not _process_capture_uses_source(
+            source_outputs, source_index=source_index, process_id=os.getpid()
+        ):
+            raise WebSocketError("PulseAudio echo cancellation is not active")
 
     _verify_aec_sink_volume(config)
 
@@ -839,6 +1569,54 @@ def _verify_aec_sink_volume(config: RealtimeConfig) -> None:
         sink_volume, ceiling=config.aec_sink_volume_ceiling_percent
     ):
         raise WebSocketError("PulseAudio echo cancellation is not active")
+
+
+def _repair_aec_sink_volume(
+    config: RealtimeConfig,
+    *,
+    transaction_timeout_seconds: float = _MEDIA_ANCHOR_REPAIR_TIMEOUT_SECONDS,
+) -> bool:
+    """Restore the direct sink's exact anchor and report whether it drifted."""
+    sink = config.pulse_aec_sink
+    if sink is None:
+        raise WebSocketError("PulseAudio echo cancellation is not configured")
+    deadline = time.monotonic() + transaction_timeout_seconds
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise WebSocketError("PulseAudio playback anchor repair timed out")
+        return value
+
+    sink_volume = _pactl_output(("get-sink-volume", sink), timeout=remaining())
+    remaining()
+    channels = _sink_volume_channels(sink_volume)
+    if not channels or any(channel != channels[0] for channel in channels):
+        raise WebSocketError("PulseAudio playback anchor could not be verified")
+    raw_anchor = _PULSE_VOLUME_NORM * config.playback_volume_percent // 100
+    if all(channel == raw_anchor for channel in channels):
+        return False
+
+    def run_bounded(
+        arguments: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[bytes]:
+        kwargs["timeout"] = remaining()
+        kwargs.pop("check", None)
+        result = subprocess.run(arguments, check=False, **kwargs)
+        remaining()
+        return result
+
+    try:
+        PactlSinkVolumeController(run=run_bounded).set_and_verify(
+            sink,
+            config.playback_volume_percent,
+        )
+    except PulsePlaybackError as exc:
+        raise WebSocketError(
+            "PulseAudio playback anchor could not be repaired"
+        ) from exc
+    return True
 
 
 def _has_expected_aec_module(
@@ -907,9 +1685,14 @@ def _process_capture_uses_source(
 
 
 def _sink_volume_within_ceiling(value: str, *, ceiling: int) -> bool:
-    channels = [int(match) for match in _PULSE_VOLUME_RAW.findall(value)]
+    channels = _sink_volume_channels(value)
     raw_ceiling = _PULSE_VOLUME_NORM * ceiling // 100
     return bool(channels) and all(channel <= raw_ceiling for channel in channels)
+
+
+def _sink_volume_channels(value: str) -> list[int]:
+    """Return every raw PulseAudio channel value from one bounded probe."""
+    return [int(match) for match in _PULSE_VOLUME_RAW.findall(value)]
 
 
 def _pactl_output(arguments: tuple[str, ...], *, timeout: float) -> str:
@@ -941,10 +1724,30 @@ def _pactl_output(arguments: tuple[str, ...], *, timeout: float) -> str:
 
 _SESSIONS: weakref.WeakSet[RealtimeSession] = weakref.WeakSet()
 _SESSIONS_LOCK = threading.Lock()
-_PREWARM_LOCK = threading.Lock()
+_PREWARM_LOCK = threading.Condition()
 _PREWARMED_SIDECAR_COUNT = 2
+_SIDECAR_SLOT_WAIT_SECONDS = 1.0
+_SIDECAR_SLOT_POLL_SECONDS = 0.02
 _PREWARMED_SIDECARS: deque[WebRtcSidecarClient] = deque()
+_GLOBAL_SIDECAR_PROCESSES: dict[int, WebRtcSidecarClient] = {}
 _SHUTTING_DOWN = False
+
+
+def _prune_global_sidecars_locked() -> None:
+    """Forget only children whose process exit has actually been observed."""
+    for identity, sidecar in tuple(_GLOBAL_SIDECAR_PROCESSES.items()):
+        if sidecar.process.poll() is not None:
+            _GLOBAL_SIDECAR_PROCESSES.pop(identity, None)
+
+
+def _launch_global_sidecar_locked() -> WebRtcSidecarClient:
+    """Launch one child only when the hard process-wide slot cap permits it."""
+    _prune_global_sidecars_locked()
+    if len(_GLOBAL_SIDECAR_PROCESSES) >= _PREWARMED_SIDECAR_COUNT:
+        raise SidecarError("all device WebRTC process slots are occupied")
+    sidecar = WebRtcSidecarClient.launch()
+    _GLOBAL_SIDECAR_PROCESSES[id(sidecar)] = sidecar
+    return sidecar
 
 
 def prewarm_device_webrtc() -> bool:
@@ -952,10 +1755,12 @@ def prewarm_device_webrtc() -> bool:
     with _PREWARM_LOCK:
         if _SHUTTING_DOWN:
             return False
+        _prune_global_sidecars_locked()
         retained: deque[WebRtcSidecarClient] = deque()
         while _PREWARMED_SIDECARS:
             current = _PREWARMED_SIDECARS.popleft()
             if not current.closed and current.process.poll() is None:
+                _GLOBAL_SIDECAR_PROCESSES[id(current)] = current
                 retained.append(current)
                 continue
             with suppress(Exception):
@@ -963,25 +1768,36 @@ def prewarm_device_webrtc() -> bool:
         _PREWARMED_SIDECARS.extend(retained)
         while len(_PREWARMED_SIDECARS) < _PREWARMED_SIDECAR_COUNT:
             try:
-                _PREWARMED_SIDECARS.append(WebRtcSidecarClient.launch())
+                candidate = _launch_global_sidecar_locked()
             except Exception:  # noqa: BLE001 - optional prewarm fails closed on wake
                 _LOGGER.warning("ThirdReality WebRTC prewarm failed", exc_info=False)
                 return False
+            _PREWARMED_SIDECARS.append(candidate)
         return True
 
 
 def _take_prewarmed_sidecar() -> WebRtcSidecarClient:
-    """Transfer the warm peer to one session, cold-launching if unavailable."""
+    """Transfer a warm peer without exceeding the global two-child cap."""
+    deadline = time.monotonic() + _SIDECAR_SLOT_WAIT_SECONDS
     with _PREWARM_LOCK:
-        if _SHUTTING_DOWN:
-            raise SidecarError("device WebRTC process is shutting down")
-        sidecar = _PREWARMED_SIDECARS.popleft() if _PREWARMED_SIDECARS else None
-    if sidecar is not None:
-        if not sidecar.closed and sidecar.process.poll() is None:
-            return sidecar
-        with suppress(Exception):
-            sidecar.close()
-    return WebRtcSidecarClient.launch()
+        while True:
+            if _SHUTTING_DOWN:
+                raise SidecarError("device WebRTC process is shutting down")
+            _prune_global_sidecars_locked()
+            while _PREWARMED_SIDECARS:
+                sidecar = _PREWARMED_SIDECARS.popleft()
+                if not sidecar.closed and sidecar.process.poll() is None:
+                    _GLOBAL_SIDECAR_PROCESSES[id(sidecar)] = sidecar
+                    return sidecar
+                with suppress(Exception):
+                    sidecar.close()
+                _prune_global_sidecars_locked()
+            if len(_GLOBAL_SIDECAR_PROCESSES) < _PREWARMED_SIDECAR_COUNT:
+                return _launch_global_sidecar_locked()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SidecarError("all device WebRTC process slots are occupied")
+            _PREWARM_LOCK.wait(min(_SIDECAR_SLOT_POLL_SECONDS, remaining))
 
 
 def _close_prewarmed_sidecar(*, timeout: float = 1.0) -> None:
@@ -995,6 +1811,9 @@ def _close_prewarmed_sidecar(*, timeout: float = 1.0) -> None:
     for sidecar in sidecars:
         with suppress(Exception):
             sidecar.close(timeout=max(0.0, deadline - time.monotonic()))
+    with _PREWARM_LOCK:
+        _prune_global_sidecars_locked()
+        _PREWARM_LOCK.notify_all()
 
 
 class RealtimeSession:
@@ -1011,6 +1830,7 @@ class RealtimeSession:
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         aec_verifier: Callable[[RealtimeConfig], None] | None = None,
         volume_guard: Callable[[RealtimeConfig], None] | None = None,
+        anchor_reconciler: Callable[[RealtimeConfig], bool] | None = None,
         sidecar_factory: Callable[[], WebRtcSidecarClient] | None = None,
         direct_player_factory: Callable[[int, str], _PlayerLike] | None = None,
     ) -> None:
@@ -1026,14 +1846,39 @@ class RealtimeSession:
         self._volume_guard = volume_guard or (
             aec_verifier if aec_verifier is not None else _verify_aec_sink_volume
         )
+        self._anchor_reconciler = anchor_reconciler or (
+            (lambda _config: False)
+            if aec_verifier is not None
+            else _repair_aec_sink_volume
+        )
         self._uses_global_sidecar = sidecar_factory is None
         self._sidecar_factory = sidecar_factory or _take_prewarmed_sidecar
+        self._direct_observes_rendered_playback = direct_player_factory is None
+        self._playback_attenuator = _PlaybackAttenuator(
+            min(
+                self._config.playback_volume_percent,
+                self._config.aec_sink_volume_ceiling_percent,
+            )
+        )
+        self._playback_volume_percent = min(
+            self._config.playback_volume_percent,
+            self._config.aec_sink_volume_ceiling_percent,
+        )
+        self._render_echo_guard = (
+            _RenderEchoGuard()
+            if self._config.full_duplex
+            and self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
+            else None
+        )
         self._direct_player_factory = direct_player_factory or (
             lambda maximum_bytes, sink: _PcmPlayer(
                 maximum_bytes,
                 sink=sink,
                 volume_percent=self._config.playback_volume_percent,
                 exact_sink_volume=True,
+                pcm_transform=self._playback_attenuator.scale,
+                write_observer=self._observe_direct_playback_write,
+                write_allowed=lambda: not self._direct_output_fenced.is_set(),
                 popen=self._popen,
             )
         )
@@ -1046,18 +1891,29 @@ class RealtimeSession:
         self._state_lock = threading.Lock()
         self._ready = threading.Event()
         self._terminal = threading.Event()
+        self._ready_at: float | None = None
         self._wake_network = threading.Event()
         self._stop_requested = threading.Event()
         self._interrupt_requested = threading.Event()
         self._interrupt_preserve_session = True
+        self._direct_output_fenced = threading.Event()
+        self._local_anchor_transition = threading.Event()
         self._output_active = threading.Event()
         self._local_output_epoch: int | None = None
+        self._direct_peer_epoch = 1
+        self._local_retired_barge_in_epoch: int | None = None
         self._local_barge_in_requested_epoch: int | None = None
         self._local_barge_in_requested_watermark: int | None = None
         self._local_barge_in_frames = 0
+        self._local_barge_in_ambiguous_frames = 0
         self._local_barge_in_rearm_required = False
         self._local_barge_in_quiet_frames = 0
         self._local_barge_in_settle_until = 0.0
+        self._local_anchor_settle_required = False
+        self._local_anchor_model_trained = False
+        self._local_anchor_requalification_pending = False
+        self._local_anchor_requalification_evidence_frames = 0
+        self._local_anchor_requalification_failed = threading.Event()
         self._local_barge_in_lock = threading.Lock()
         self._suppressed_output_epoch: int | None = None
         self._direct_preroll: deque[_AudioPacket] = deque()
@@ -1067,6 +1923,7 @@ class RealtimeSession:
         self._thread: threading.Thread | None = None
         self._ever_ready = False
         self._direct_diagnostics: _DirectSessionDiagnostics | None = None
+        self._direct_render_observation_tail = b""
 
     @property
     def state(self) -> SessionState:
@@ -1078,6 +1935,12 @@ class RealtimeSession:
     def ready(self) -> bool:
         """Return whether protocol v2 negotiation completed."""
         return self._ready.is_set()
+
+    @property
+    def ready_at(self) -> float | None:
+        """Return the monotonic instant when startup became usable."""
+        with self._state_lock:
+            return self._ready_at
 
     @property
     def output_active(self) -> bool:
@@ -1135,6 +1998,8 @@ class RealtimeSession:
         # before opening the bridge socket.
         captured_at = self._clock()
         with self._state_lock:
+            if self._direct_output_fenced.is_set():
+                return SubmitResult.CLOSED
             if self._state not in {
                 SessionState.CONNECTING,
                 SessionState.READY,
@@ -1157,17 +2022,22 @@ class RealtimeSession:
                     self._state = SessionState.STOPPING
                     self._wake_network.set()
                     return SubmitResult.FULL
-                if (
-                    self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
-                    and self._detect_local_barge_in(
+                local_interrupt = False
+                if self._config.media_transport == DEVICE_WEBRTC_TRANSPORT:
+                    disposition = self._detect_local_barge_in(
                         value,
+                        captured_at=captured_at,
                         capture_watermark=None,
                     )
-                ):
+                    local_interrupt = disposition.local_interrupt
+                if self._local_anchor_requalification_failed.is_set():
+                    self._fail_direct_anchor_reconciliation_state_locked()
+                elif local_interrupt:
                     # The causal speech frame was not admitted, so a fresh
                     # peer could not replay the complete trigger. Kill output
                     # through normal direct-session teardown instead of
                     # fabricating a capture watermark.
+                    self._direct_output_fenced.set()
                     self._interrupt_preserve_session = False
                     self._interrupt_requested.set()
                     self._state = SessionState.STOPPING
@@ -1180,31 +2050,369 @@ class RealtimeSession:
             # stop transition. The transition owns the same state lock and can
             # therefore clear every packet and pending detector result admitted
             # before it, while later submissions observe STOPPING.
-            self._detect_local_barge_in(
+            disposition = self._detect_local_barge_in(
                 value,
+                captured_at=captured_at,
                 capture_watermark=capture_watermark,
             )
+            if disposition.suppress_peer_epoch is not None:
+                annotated = replace(
+                    packet,
+                    suppress_peer_epoch=disposition.suppress_peer_epoch,
+                )
+                if not self._audio.replace_tail(packet, annotated):
+                    self._fail_direct_anchor_reconciliation_state_locked()
+                    return SubmitResult.CLOSED
+            if self._local_anchor_requalification_failed.is_set():
+                self._fail_direct_anchor_reconciliation_state_locked()
         self._wake_network.set()
         return SubmitResult.ACCEPTED
 
-    def _detect_local_barge_in(
+    def request_playback_volume(self, volume_percent: int) -> int:
+        """Apply dynamic direct-media volume without mutating the leased AEC sink."""
+        with self._state_lock:
+            if self._state not in {
+                SessionState.NEW,
+                SessionState.CONNECTING,
+                SessionState.READY,
+                SessionState.INTERRUPTING,
+            }:
+                raise RuntimeError("realtime session no longer accepts volume changes")
+            applied = self._playback_attenuator.request(
+                volume_percent,
+                ramp=self._state is not SessionState.NEW,
+            )
+            self._playback_volume_percent = applied
+        self._wake_network.set()
+        return applied
+
+    def reconcile_playback_volume(self, volume_percent: int) -> int:
+        """Repair out-of-band sink drift and retain the requested audible level."""
+        if type(volume_percent) is not int:
+            raise ValueError("playback volume must be an integer")
+        deadline = time.monotonic() + _PHYSICAL_ANCHOR_REPAIR_TIMEOUT_SECONDS
+        transition_settle_until = self._arm_local_anchor_repair_transition(deadline)
+        output_lock_acquired = False
+        try:
+            if not self._direct_output_lock.acquire(
+                timeout=self._remaining_anchor_repair_budget_or_fence(deadline)
+            ):
+                self._fence_direct_anchor_reconciliation_nowait()
+                raise WebSocketError("playback anchor repair lock timed out")
+            output_lock_acquired = True
+
+            if not self._state_lock.acquire(
+                timeout=self._remaining_anchor_repair_budget_or_fence(deadline)
+            ):
+                self._fence_direct_anchor_reconciliation_nowait()
+                raise WebSocketError("playback anchor state lock timed out")
+            try:
+                if self._state not in {
+                    SessionState.CONNECTING,
+                    SessionState.READY,
+                    SessionState.INTERRUPTING,
+                }:
+                    raise RuntimeError(
+                        "realtime session no longer accepts volume reconciliation"
+                    )
+            finally:
+                self._state_lock.release()
+
+            try:
+                repaired = self._reconcile_playback_anchor(
+                    transaction_timeout_seconds=(
+                        self._remaining_anchor_repair_budget_or_fence(deadline)
+                    )
+                )
+            except Exception:
+                # No direct PCM may cross the output boundary after an anchor
+                # check fails. Capture remains byte-for-byte unchanged until the
+                # normal bounded session teardown observes this terminal fence.
+                self._fence_direct_anchor_reconciliation_nowait()
+                raise
+
+            if not self._state_lock.acquire(
+                timeout=self._remaining_anchor_repair_budget_or_fence(deadline)
+            ):
+                self._fence_direct_anchor_reconciliation_nowait()
+                raise WebSocketError("playback anchor state lock timed out")
+            try:
+                if self._state not in {
+                    SessionState.CONNECTING,
+                    SessionState.READY,
+                    SessionState.INTERRUPTING,
+                }:
+                    raise RuntimeError(
+                        "realtime session stopped during volume reconciliation"
+                    )
+                applied = self._playback_attenuator.request(
+                    volume_percent,
+                    ramp=True,
+                )
+                self._playback_volume_percent = applied
+            finally:
+                self._state_lock.release()
+            if repaired and not self._reset_local_echo_after_anchor_repair(
+                settle_until=transition_settle_until,
+                lock_deadline=deadline,
+            ):
+                self._fence_direct_anchor_reconciliation_nowait()
+                self._raise_anchor_repair_boundary_timeout()
+            self._remaining_anchor_repair_budget_or_fence(deadline)
+            self._wake_network.set()
+            return applied
+        finally:
+            if output_lock_acquired:
+                self._direct_output_lock.release()
+            self._finish_local_anchor_repair_transition()
+
+    @staticmethod
+    def _raise_anchor_repair_boundary_timeout() -> NoReturn:
+        """Raise the fixed post-repair boundary failure."""
+        raise WebSocketError("playback anchor repair boundary timed out")
+
+    def _reconcile_playback_anchor(
+        self,
+        *,
+        transaction_timeout_seconds: float = _MEDIA_ANCHOR_REPAIR_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Run one exact fixed-sink check through the injected bounded guard."""
+        repaired = (
+            _repair_aec_sink_volume(
+                self._config,
+                transaction_timeout_seconds=transaction_timeout_seconds,
+            )
+            if self._anchor_reconciler is _repair_aec_sink_volume
+            else self._anchor_reconciler(self._config)
+        )
+        if not isinstance(repaired, bool):
+            raise WebSocketError("playback anchor reconciler returned invalid state")
+        return repaired
+
+    def _reconcile_media_started_anchor(self) -> None:
+        """Check one media boundary under its caller-owned output lock."""
+        deadline = time.monotonic() + _MEDIA_ANCHOR_REPAIR_TIMEOUT_SECONDS
+        transition_settle_until = self._arm_local_anchor_repair_transition(deadline)
+        try:
+            repaired = self._reconcile_playback_anchor(
+                transaction_timeout_seconds=self._remaining_anchor_repair_budget(
+                    deadline
+                )
+            )
+            if repaired and not self._reset_local_echo_after_anchor_repair(
+                settle_until=transition_settle_until,
+                lock_deadline=deadline,
+            ):
+                self._fence_direct_anchor_reconciliation_nowait()
+                self._raise_anchor_repair_boundary_timeout()
+            self._remaining_anchor_repair_budget(deadline)
+        except Exception:
+            self._fence_direct_anchor_reconciliation_nowait()
+            raise
+        finally:
+            # No-drift probes never alter the wall-clock settle deadline. An
+            # actual repair already published its one entry-anchored 128 ms
+            # boundary before this atomic transition marker is released.
+            self._finish_local_anchor_repair_transition()
+
+    @staticmethod
+    def _remaining_anchor_repair_budget(deadline: float) -> float:
+        """Return one positive whole-transaction budget or fail closed."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WebSocketError("playback anchor repair timed out")
+        return remaining
+
+    def _remaining_anchor_repair_budget_or_fence(self, deadline: float) -> float:
+        """Return remaining time, atomically fencing output on expiration."""
+        try:
+            return self._remaining_anchor_repair_budget(deadline)
+        except WebSocketError:
+            self._fence_direct_anchor_reconciliation_nowait()
+            raise
+
+    def _arm_local_anchor_repair_transition(self, deadline: float) -> float:
+        """Atomically suppress stale local evidence before any blocking wait."""
+        self._local_anchor_transition.set()
+        if self._render_echo_guard is not None and not (
+            self._render_echo_guard.freeze_model_updates(
+                max(0.0, deadline - time.monotonic())
+            )
+        ):
+            self._fence_direct_anchor_reconciliation_nowait()
+            raise WebSocketError("playback anchor model fence timed out")
+        return self._clock() + _LOCAL_BARGE_IN_ANCHOR_REPAIR_SETTLE_SECONDS
+
+    def _finish_local_anchor_repair_transition(self) -> None:
+        """Release the capture/model transition marker without taking its lock."""
+        self._local_anchor_transition.clear()
+        if self._render_echo_guard is not None:
+            self._render_echo_guard.thaw_model_updates()
+
+    def _fence_direct_anchor_reconciliation_nowait(self) -> None:
+        """Close the PCM boundary without waiting on capture-owned locks."""
+        self._direct_output_fenced.set()
+        self._interrupt_preserve_session = False
+        self._interrupt_requested.set()
+        if self._state_lock.acquire(blocking=False):
+            try:
+                self._state = SessionState.STOPPING
+                self._audio.clear()
+            finally:
+                self._state_lock.release()
+        self._wake_network.set()
+
+    def _fail_direct_anchor_reconciliation_locked(self) -> None:
+        """Fence output after a failed repair while leaving capture PCM untouched."""
+        with self._state_lock:
+            self._fail_direct_anchor_reconciliation_state_locked()
+
+    def _fail_direct_anchor_reconciliation_state_locked(self) -> None:
+        """Fence output while the caller already owns the lifecycle lock."""
+        self._direct_output_fenced.set()
+        self._interrupt_preserve_session = False
+        self._interrupt_requested.set()
+        self._state = SessionState.STOPPING
+        self._audio.clear()
+        self._reset_local_barge_in_detection()
+        self._wake_network.set()
+
+    def _detect_local_barge_in(  # noqa: C901 - one atomic capture decision
         self,
         value: bytes,
         *,
+        captured_at: float,
         capture_watermark: int | None,
-    ) -> bool:
-        """Detect bounded AEC-filtered speech and record its capture boundary."""
+    ) -> _CaptureDisposition:
+        """Classify raw capture once for local rollover and current-peer egress."""
         if not self._config.full_duplex:
-            return False
+            return _CaptureDisposition()
         with self._local_barge_in_lock:
-            if self._clock() < self._local_barge_in_settle_until:
+            transitioning = self._local_anchor_transition.is_set()
+            settling = captured_at < self._local_barge_in_settle_until
+            peak, rms = _pcm_peak_and_rms(value)
+            has_signal = (
+                peak >= _LOCAL_BARGE_IN_SIGNAL_PEAK
+                and rms >= _LOCAL_BARGE_IN_SIGNAL_RMS
+            )
+            provider_threshold = max(
+                1,
+                round(
+                    _INPUT_ACTIVITY_SIGNAL_PEAK
+                    / (10 ** (self._config.direct_capture_gain_db / 20))
+                ),
+            )
+            provider_candidate = peak >= provider_threshold
+            output_epoch = self._local_output_epoch
+            peer_epoch = self._direct_peer_epoch
+            requalifying = self._local_anchor_requalification_pending
+            decision: _EchoDecision | None = None
+            if (
+                provider_candidate
+                and output_epoch is not None
+                and self._render_echo_guard is not None
+            ):
+                decision = self._render_echo_guard.classify(
+                    value,
+                    captured_at=captured_at,
+                    output_epoch=output_epoch,
+                    calibrating=settling or requalifying,
+                    update_model=not transitioning,
+                )
+                diagnostics = self._direct_diagnostics
+                if diagnostics is not None and decision is not None:
+                    diagnostics.observe_echo_decision(decision)
+                if requalifying and decision is not None:
+                    repair_started, repair_qualified = (
+                        self._render_echo_guard.repair_status(output_epoch)
+                    )
+                    if repair_started and repair_qualified:
+                        self._local_anchor_requalification_pending = False
+                        self._local_anchor_requalification_evidence_frames = 0
+                        requalifying = False
+                    elif repair_started and decision.kind in {
+                        _EchoDecisionKind.ECHO,
+                        _EchoDecisionKind.AMBIGUOUS,
+                    }:
+                        self._local_anchor_requalification_evidence_frames += 1
+                        if (
+                            self._local_anchor_requalification_evidence_frames
+                            >= _LOCAL_BARGE_IN_ANCHOR_REPAIR_MAX_EVIDENCE_FRAMES
+                        ):
+                            self._direct_output_fenced.set()
+                            self._local_anchor_requalification_failed.set()
+
+            transitioning = transitioning or self._local_anchor_transition.is_set()
+            suppress_peer_epoch: int | None = None
+            if provider_candidate and output_epoch is not None:
+                if decision is None:
+                    suppress = transitioning or settling
+                elif (
+                    decision.reference_matched
+                    and decision.correlation_permille
+                    <= _RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE
+                ):
+                    # A decorrelated signal is clear near-end evidence even
+                    # while the model is calibrating and labels it ambiguous.
+                    suppress = False
+                elif decision.kind in {
+                    _EchoDecisionKind.ECHO,
+                    _EchoDecisionKind.AMBIGUOUS,
+                }:
+                    suppress = True
+                elif not decision.reference_matched:
+                    suppress = transitioning or settling
+                else:
+                    # Residual-heavy double-talk may still correlate with the
+                    # rendered voice. Keep it raw for local rollover/preroll,
+                    # but expose it only to the fresh peer after that rollover.
+                    suppress = (
+                        decision.correlation_permille
+                        > _RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE
+                    )
+                if suppress:
+                    suppress_peer_epoch = peer_epoch
+
+            def disposition(*, local_interrupt: bool = False) -> _CaptureDisposition:
+                return _CaptureDisposition(
+                    local_interrupt=local_interrupt,
+                    suppress_peer_epoch=suppress_peer_epoch,
+                )
+
+            effective_signal = has_signal and not (
+                decision is not None and decision.kind is _EchoDecisionKind.ECHO
+            )
+            if transitioning or settling:
                 self._local_barge_in_requested_epoch = None
                 self._local_barge_in_requested_watermark = None
                 self._local_barge_in_frames = 0
-                return False
-            has_signal = _pcm_has_local_barge_in_signal(value)
+                self._local_barge_in_ambiguous_frames = 0
+                return disposition()
+            if self._local_anchor_requalification_failed.is_set():
+                self._local_barge_in_requested_epoch = None
+                self._local_barge_in_requested_watermark = None
+                self._local_barge_in_frames = 0
+                self._local_barge_in_ambiguous_frames = 0
+                return disposition()
+            if (
+                requalifying
+                and decision is not None
+                and decision.kind
+                in {
+                    _EchoDecisionKind.ECHO,
+                    _EchoDecisionKind.AMBIGUOUS,
+                }
+            ):
+                # Correlated evidence belongs to the untrusted repair model.
+                # Suppress it until three independent frames qualify the new
+                # delay, or the bounded eight-frame fail-closed limit fires.
+                self._local_barge_in_requested_epoch = None
+                self._local_barge_in_requested_watermark = None
+                self._local_barge_in_frames = 0
+                self._local_barge_in_ambiguous_frames = 0
+                return disposition()
             if self._local_barge_in_rearm_required:
-                if has_signal:
+                if effective_signal:
                     self._local_barge_in_quiet_frames = 0
                 else:
                     self._local_barge_in_quiet_frames += 1
@@ -1217,58 +2425,229 @@ class RealtimeSession:
                 # One continuous utterance may retire only one peer epoch.
                 # Rearm solely after bounded quiet capture, even if the
                 # replacement starts speaking before that utterance ends.
-                return False
-            output_epoch = self._local_output_epoch
+                return disposition()
             if output_epoch is None:
+                if (
+                    self._local_retired_barge_in_epoch is not None
+                    and self._local_barge_in_requested_epoch
+                    == self._local_retired_barge_in_epoch
+                    and self._local_barge_in_requested_watermark is not None
+                ):
+                    # A provider quiet boundary may retire output after capture
+                    # has already qualified its exact generation. Preserve the
+                    # causal watermark until the network loop rolls the peer.
+                    return disposition()
+                self._local_barge_in_requested_epoch = None
                 self._local_barge_in_requested_watermark = None
                 self._local_barge_in_frames = 0
-                return False
+                self._local_barge_in_ambiguous_frames = 0
+                return disposition()
             if self._local_barge_in_requested_epoch is not None:
-                return False
-            if has_signal:
-                self._local_barge_in_frames += 1
-            else:
+                return disposition()
+            if not has_signal or (
+                decision is not None and decision.kind is _EchoDecisionKind.ECHO
+            ):
                 self._local_barge_in_frames = 0
-            if self._local_barge_in_frames < _LOCAL_BARGE_IN_FRAMES:
-                return False
+                self._local_barge_in_ambiguous_frames = 0
+                return disposition()
+            # Every consecutive non-echo signal frame contributes to the
+            # bounded fail-open path. NEAR_END additionally retains its faster
+            # two-consecutive-frame path; AMBIGUOUS resets only that fast path,
+            # not the shared evidence window.
+            self._local_barge_in_ambiguous_frames += 1
+            if decision is not None and decision.kind is _EchoDecisionKind.AMBIGUOUS:
+                self._local_barge_in_frames = 0
+            else:
+                self._local_barge_in_frames += 1
+            if (
+                self._local_barge_in_frames < _LOCAL_BARGE_IN_FRAMES
+                and self._local_barge_in_ambiguous_frames
+                < _LOCAL_BARGE_IN_AMBIGUOUS_FRAMES
+            ):
+                return disposition()
             self._local_barge_in_frames = 0
+            self._local_barge_in_ambiguous_frames = 0
             if capture_watermark is None:
-                return True
+                return disposition(local_interrupt=True)
             self._local_barge_in_requested_epoch = output_epoch
             self._local_barge_in_requested_watermark = capture_watermark
-            return False
+            return disposition()
 
     def _set_local_output_epoch(
         self,
         output_epoch: int | None,
         *,
         settle_barge_in: bool = False,
+        preserve_echo_model: bool = False,
+        preserve_pending_barge_in: bool = False,
     ) -> None:
         """Publish one network-thread-owned playback generation to capture."""
         with self._local_barge_in_lock:
             if settle_barge_in:
+                settle_seconds = (
+                    _LOCAL_BARGE_IN_ANCHOR_REPAIR_SETTLE_SECONDS
+                    if preserve_echo_model
+                    else _LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS
+                )
                 self._local_barge_in_settle_until = max(
                     self._local_barge_in_settle_until,
-                    self._clock() + _LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS,
+                    self._clock() + settle_seconds,
                 )
+            if self._render_echo_guard is not None:
+                if output_epoch is None:
+                    self._render_echo_guard.deactivate()
+                else:
+                    self._direct_render_observation_tail = b""
+                    self._render_echo_guard.begin_epoch(
+                        output_epoch,
+                        reset=settle_barge_in and not preserve_echo_model,
+                    )
+                    if self._local_anchor_requalification_pending:
+                        repair_started, _ = self._render_echo_guard.repair_status(
+                            output_epoch
+                        )
+                        if not repair_started:
+                            self._render_echo_guard.repair_boundary(output_epoch)
+            pending_retired_epoch: int | None = None
+            if (
+                preserve_pending_barge_in
+                and self._local_barge_in_requested_watermark is not None
+            ):
+                if (
+                    self._local_retired_barge_in_epoch is not None
+                    and self._local_barge_in_requested_epoch
+                    == self._local_retired_barge_in_epoch
+                ):
+                    # A quiet boundary and the following media start can share
+                    # one bounded sidecar drain. Carry the already-qualified
+                    # predecessor request across that whole ordered batch.
+                    pending_retired_epoch = self._local_retired_barge_in_epoch
+                elif (
+                    output_epoch is None
+                    and self._local_barge_in_requested_epoch == self._local_output_epoch
+                ):
+                    pending_retired_epoch = self._local_output_epoch
             self._local_output_epoch = output_epoch
-            self._local_barge_in_requested_epoch = None
-            self._local_barge_in_requested_watermark = None
+            self._local_retired_barge_in_epoch = pending_retired_epoch
+            if pending_retired_epoch is None:
+                self._local_barge_in_requested_epoch = None
+                self._local_barge_in_requested_watermark = None
             self._local_barge_in_frames = 0
+            self._local_barge_in_ambiguous_frames = 0
+            self._local_anchor_requalification_evidence_frames = 0
             if output_epoch is None:
                 self._output_active.clear()
             else:
                 self._output_active.set()
+
+    def _set_direct_peer_epoch(self, peer_epoch: int) -> None:
+        """Publish the peer identity used by capture-side suppression tags."""
+        if peer_epoch < 1:
+            raise ValueError("direct peer epoch must be positive")
+        with self._local_barge_in_lock:
+            self._direct_peer_epoch = peer_epoch
 
     def _reset_local_barge_in_detection(self) -> None:
         """Discard detector state without changing network-owned playback."""
         with self._local_barge_in_lock:
             self._local_barge_in_requested_epoch = None
             self._local_barge_in_requested_watermark = None
+            self._local_retired_barge_in_epoch = None
             self._local_barge_in_frames = 0
+            self._local_barge_in_ambiguous_frames = 0
             self._local_barge_in_rearm_required = False
             self._local_barge_in_quiet_frames = 0
             self._local_barge_in_settle_until = 0.0
+            self._local_anchor_settle_required = False
+            self._local_anchor_model_trained = False
+            self._local_anchor_requalification_pending = False
+            self._local_anchor_requalification_evidence_frames = 0
+            self._local_anchor_requalification_failed.clear()
+            self._finish_local_anchor_repair_transition()
+            self._reset_direct_render_reference()
+
+    def _reset_local_echo_after_anchor_repair(
+        self,
+        *,
+        settle_until: float | None = None,
+        lock_deadline: float | None = None,
+    ) -> bool:
+        """Fence unsafe render history while preserving a trained echo path."""
+        if lock_deadline is None:
+            self._local_barge_in_lock.acquire()
+        else:
+            try:
+                remaining = self._remaining_anchor_repair_budget(lock_deadline)
+            except WebSocketError:
+                return False
+            if not self._local_barge_in_lock.acquire(timeout=remaining):
+                return False
+        try:
+            self._local_barge_in_requested_epoch = None
+            self._local_barge_in_requested_watermark = None
+            self._local_barge_in_frames = 0
+            self._local_barge_in_ambiguous_frames = 0
+            self._local_barge_in_quiet_frames = 0
+            output_epoch = self._local_output_epoch
+            self._direct_render_observation_tail = b""
+            had_seed = True
+            if self._render_echo_guard is not None:
+                had_seed = self._render_echo_guard.repair_boundary(output_epoch)
+                self._local_anchor_requalification_pending = True
+                self._local_anchor_requalification_evidence_frames = 0
+                self._local_anchor_requalification_failed.clear()
+            if output_epoch is None:
+                self._local_anchor_settle_required = True
+                self._local_anchor_model_trained = had_seed
+                return True
+            self._local_anchor_settle_required = False
+            self._local_anchor_model_trained = had_seed
+            self._local_barge_in_settle_until = max(
+                self._local_barge_in_settle_until,
+                (
+                    self._clock() + _LOCAL_BARGE_IN_ANCHOR_REPAIR_SETTLE_SECONDS
+                    if settle_until is None
+                    else settle_until
+                ),
+            )
+            return True
+        finally:
+            self._local_barge_in_lock.release()
+
+    def _take_local_anchor_settle_required(self) -> tuple[bool, bool]:
+        """Consume an idle anchor repair at the next audible epoch boundary."""
+        with self._local_barge_in_lock:
+            required = self._local_anchor_settle_required
+            calibrated = self._local_anchor_model_trained
+            self._local_anchor_settle_required = False
+            self._local_anchor_model_trained = False
+            return required, calibrated
+
+    def _anchor_requalification_pending(self) -> bool:
+        """Return whether a repaired path still needs independent evidence."""
+        with self._local_barge_in_lock:
+            return self._local_anchor_requalification_pending
+
+    def _retired_barge_in_pending(self) -> bool:
+        """Return whether a qualified predecessor still owns a raw rollover."""
+        with self._local_barge_in_lock:
+            return (
+                self._local_retired_barge_in_epoch is not None
+                and self._local_barge_in_requested_epoch
+                == self._local_retired_barge_in_epoch
+                and self._local_barge_in_requested_watermark is not None
+            )
+
+    def _reset_direct_render_reference(self) -> None:
+        """Discard partial diagnostics and render features at a hard boundary."""
+        self._direct_render_observation_tail = b""
+        if self._render_echo_guard is not None:
+            self._render_echo_guard.reset()
+
+    def _abort_player(self, player: _PlayerLike) -> None:
+        """Abort playback together with every render-derived classifier tail."""
+        self._reset_direct_render_reference()
+        player.abort()
 
     def _remember_direct_preroll(self, packet: _AudioPacket) -> None:
         """Retain recent capture already sent during the active response.
@@ -1339,17 +2718,23 @@ class RealtimeSession:
                 # qualifying partial count until the next microphone frame.
                 return output_epoch, None
             requested_watermark = self._local_barge_in_requested_watermark
+            retired_request = requested_epoch == self._local_retired_barge_in_epoch
             self._local_barge_in_requested_epoch = None
             self._local_barge_in_requested_watermark = None
+            self._local_retired_barge_in_epoch = None
             self._local_barge_in_frames = 0
-            matches_current_output = requested_epoch == output_epoch or (
-                output_epoch is None
-                and requested_epoch == last_output_epoch
-                and player.active
+            self._local_barge_in_ambiguous_frames = 0
+            matches_current_output = (
+                requested_epoch == output_epoch
+                or retired_request
+                or (
+                    output_epoch is None
+                    and requested_epoch == last_output_epoch
+                    and player.active
+                )
             )
-            if (
-                not matches_current_output
-                or requested_epoch != self._local_output_epoch
+            if not matches_current_output or (
+                requested_epoch != self._local_output_epoch and not retired_request
             ):
                 return output_epoch, None
             # Arm only after the network thread commits a current-generation
@@ -1361,7 +2746,7 @@ class RealtimeSession:
             # player reap. Only this network-thread path mutates playback state.
             self._local_output_epoch = None
             self._output_active.clear()
-        player.abort()
+        self._abort_player(player)
         assert requested_epoch is not None
         assert requested_watermark is not None
         self._suppressed_output_epoch = requested_epoch
@@ -1377,6 +2762,8 @@ class RealtimeSession:
         """
         if self._terminal.is_set():
             return
+        if self._config.media_transport == DEVICE_WEBRTC_TRANSPORT:
+            self._direct_output_fenced.set()
         with (
             self._audio_send_lock,
             self._direct_output_lock,
@@ -1408,6 +2795,7 @@ class RealtimeSession:
         """Request bounded normal session shutdown."""
         if self._terminal.is_set():
             return
+        self._direct_output_fenced.set()
         with (
             self._audio_send_lock,
             self._direct_output_lock,
@@ -1502,9 +2890,10 @@ class RealtimeSession:
                 last_semantic_activity + self._config.handshake_timeout_seconds,
             )
             self._wait_for_started(connection, handshake_deadline)
-            self._ever_ready = True
-            self._ready.set()
             with self._state_lock:
+                self._ever_ready = True
+                self._ready_at = time.monotonic()
+                self._ready.set()
                 if self._state is SessionState.CONNECTING:
                     self._state = SessionState.READY
 
@@ -1532,7 +2921,7 @@ class RealtimeSession:
 
                 if self._interrupt_requested.is_set():
                     self._set_local_output_epoch(None)
-                    player.abort()
+                    self._abort_player(player)
                     self._audio.clear()
                     if output_epoch is not None:
                         self._suppressed_output_epoch = output_epoch
@@ -1545,7 +2934,7 @@ class RealtimeSession:
                         return
                 elif self._stop_requested.is_set():
                     self._set_local_output_epoch(None)
-                    player.abort()
+                    self._abort_player(player)
                     self._audio.clear()
                     connection.send_json({"type": "stop"})
                     return
@@ -1654,7 +3043,7 @@ class RealtimeSession:
                 self._set_local_output_epoch(None)
                 self._audio.clear()
                 with suppress(Exception):
-                    player.abort()
+                    self._abort_player(player)
                 if connection is not None:
                     with suppress(Exception):
                         connection.send_close()
@@ -1733,12 +3122,24 @@ class RealtimeSession:
                 handshake_deadline,
             )
             sidecar.set_answer(answer_sdp)
+            startup_capture_sample_end = self._freeze_direct_startup_capture(0)
             diagnostics.phase = "peer_handshake"
 
             pacer = _AudioPacer()
             sample_index = 0
+            capture_committed = self._maybe_commit_direct_capture(
+                sidecar,
+                sample_index=sample_index,
+                startup_sample_end=startup_capture_sample_end,
+                committed=False,
+            )
             ready_states: set[str] = set()
-            required_states = {"answer.applied", "connected", "data.ready"}
+            required_states = {
+                "answer.applied",
+                "capture.ready",
+                "connected",
+                "data.ready",
+            }
             while not required_states.issubset(ready_states):
                 self._raise_if_direct_startup_cancelled(handshake_deadline)
                 now = self._clock()
@@ -1747,9 +3148,21 @@ class RealtimeSession:
                 sample_index, _ = self._send_direct_audio(
                     sidecar,
                     pacer,
+                    peer_epoch=1,
                     sample_index=sample_index,
                     now=now,
                     capture_ages_ms=capture_ages_ms,
+                    capture_max_age_seconds=(
+                        _DIRECT_CAPTURE_MAX_AGE_SECONDS
+                        if capture_committed
+                        else _DIRECT_STARTUP_CAPTURE_MAX_AGE_SECONDS
+                    ),
+                )
+                capture_committed = self._maybe_commit_direct_capture(
+                    sidecar,
+                    sample_index=sample_index,
+                    startup_sample_end=startup_capture_sample_end,
+                    committed=capture_committed,
                 )
                 controls, _ = self._drain_direct_sidecar(
                     sidecar,
@@ -1775,6 +3188,7 @@ class RealtimeSession:
                 sample_index, _ = self._send_direct_audio(
                     sidecar,
                     pacer,
+                    peer_epoch=1,
                     sample_index=sample_index,
                     now=now,
                     capture_ages_ms=capture_ages_ms,
@@ -1803,11 +3217,12 @@ class RealtimeSession:
                     break
                 self._wait_direct_tick(pacer, now, handshake_deadline)
 
-            self._ever_ready = True
             diagnostics.handshake_ready = True
             diagnostics.phase = "runtime"
-            self._ready.set()
             with self._state_lock:
+                self._ever_ready = True
+                self._ready_at = time.monotonic()
+                self._ready.set()
                 if self._state is SessionState.CONNECTING:
                     self._state = SessionState.READY
             _emit_direct_syslog_status(
@@ -1828,7 +3243,6 @@ class RealtimeSession:
 
             while True:
                 now = self._clock()
-                self._service_direct_player(player)
                 self._raise_if_direct_rollover_failed()
                 _check_deadlines(
                     now,
@@ -1841,7 +3255,7 @@ class RealtimeSession:
                 )
 
                 if self._interrupt_requested.is_set():
-                    player.abort()
+                    self._abort_player(player)
                     self._set_local_output_epoch(None)
                     if state.active_generation is not None:
                         state.retired_generation = max(
@@ -1853,7 +3267,7 @@ class RealtimeSession:
                     connection.send_json({"type": "stop"})
                     return
                 if self._stop_requested.is_set():
-                    player.abort()
+                    self._abort_player(player)
                     self._set_local_output_epoch(None)
                     self._audio.clear()
                     sidecar.stop()
@@ -1865,16 +3279,21 @@ class RealtimeSession:
                     output_epoch=previous_generation,
                     last_output_epoch=state.newest_generation,
                 )
-                if previous_generation is not None and active_generation is None:
+                if requested_watermark is not None and active_generation is None:
+                    interrupted_generation = (
+                        previous_generation
+                        if previous_generation is not None
+                        else state.newest_generation
+                    )
                     state.retired_generation = max(
                         state.retired_generation,
-                        previous_generation,
+                        interrupted_generation,
                     )
                     state.active_generation = None
-                    assert requested_watermark is not None
                     self._begin_direct_rollover_capture(requested_watermark)
                     last_semantic_activity = now
                     peer_epoch += 1
+                    self._set_direct_peer_epoch(peer_epoch)
                     replacement = standby
                     standby = None
                     diagnostics.phase = "rollover"
@@ -1914,9 +3333,14 @@ class RealtimeSession:
                     pending_ping = None
                     pong_deadline = None
                     continue
+                # A capture callback or the preceding lifecycle drain may have
+                # qualified an interruption. Service queued output only after
+                # that decision is atomically consumed at the top of the loop.
+                self._service_direct_player(player)
                 sample_index, _ = self._send_direct_audio(
                     sidecar,
                     pacer,
+                    peer_epoch=peer_epoch,
                     sample_index=sample_index,
                     now=now,
                     capture_ages_ms=capture_ages_ms,
@@ -2033,7 +3457,7 @@ class RealtimeSession:
                 self._audio.clear()
                 if player is not None:
                     with suppress(Exception):
-                        player.abort()
+                        self._abort_player(player)
                     close_player = getattr(player, "close", None)
                     if callable(close_player):
                         with suppress(Exception):
@@ -2115,6 +3539,14 @@ class RealtimeSession:
                     duration_ms,
                     outcome,
                 )
+                if self._uses_global_sidecar:
+                    try:
+                        prewarm_device_webrtc()
+                    except Exception:  # noqa: BLE001 - terminal must still publish
+                        _LOGGER.warning(
+                            "ThirdReality WebRTC replenishment failed",
+                            exc_info=False,
+                        )
                 with self._state_lock:
                     self._state = (
                         SessionState.FAILED if failed else SessionState.STOPPED
@@ -2122,8 +3554,6 @@ class RealtimeSession:
                 self._terminal.set()
                 with _SESSIONS_LOCK:
                     _SESSIONS.discard(self)
-                if self._uses_global_sidecar:
-                    prewarm_device_webrtc()
 
     def _wait_for_direct_offer(
         self,
@@ -2390,7 +3820,21 @@ class RealtimeSession:
             # Capture watermarks remain process-global solely for dedupe, while
             # original capture timestamps remain unchanged as freshness proof.
             playback_state = _DirectPlaybackState()
-            required_states = {"answer.applied", "connected", "data.ready"}
+            startup_capture_sample_end = self._freeze_direct_startup_capture(
+                sample_index
+            )
+            capture_committed = self._maybe_commit_direct_capture(
+                replacement,
+                sample_index=sample_index,
+                startup_sample_end=startup_capture_sample_end,
+                committed=False,
+            )
+            required_states = {
+                "answer.applied",
+                "capture.ready",
+                "connected",
+                "data.ready",
+            }
             ready_states: set[str] = set()
             while not required_states.issubset(ready_states):
                 self._raise_if_direct_startup_cancelled(deadline)
@@ -2398,9 +3842,21 @@ class RealtimeSession:
                 sample_index, _ = self._send_direct_audio(
                     replacement,
                     pacer,
+                    peer_epoch=epoch,
                     sample_index=sample_index,
                     now=now,
                     capture_ages_ms=capture_ages_ms,
+                    capture_max_age_seconds=(
+                        _DIRECT_CAPTURE_MAX_AGE_SECONDS
+                        if capture_committed
+                        else _DIRECT_STARTUP_CAPTURE_MAX_AGE_SECONDS
+                    ),
+                )
+                capture_committed = self._maybe_commit_direct_capture(
+                    replacement,
+                    sample_index=sample_index,
+                    startup_sample_end=startup_capture_sample_end,
+                    committed=capture_committed,
                 )
                 controls = self._drain_direct_handshake_sidecar(
                     replacement,
@@ -2481,9 +3937,11 @@ class RealtimeSession:
             sample_index, _ = self._send_direct_audio(
                 sidecar,
                 pacer,
+                peer_epoch=epoch,
                 sample_index=sample_index,
                 now=now,
                 capture_ages_ms=capture_ages_ms,
+                capture_max_age_seconds=_DIRECT_STARTUP_CAPTURE_MAX_AGE_SECONDS,
             )
             if self._drain_direct_handshake_sidecar(sidecar, pending_output):
                 raise SidecarError("sidecar failed while awaiting rollover answer")
@@ -2520,6 +3978,7 @@ class RealtimeSession:
             sample_index, _ = self._send_direct_audio(
                 sidecar,
                 pacer,
+                peer_epoch=epoch,
                 sample_index=sample_index,
                 now=now,
                 capture_ages_ms=capture_ages_ms,
@@ -2549,6 +4008,41 @@ class RealtimeSession:
             raise WebSocketClosed("direct WebRTC startup was cancelled")
         if self._clock() >= deadline:
             raise TimeoutError("direct WebRTC startup timed out")
+
+    def _freeze_direct_startup_capture(self, sample_index: int) -> int:
+        """Freeze one finite queued prefix in the fresh peer's sample timeline."""
+        if sample_index < 0:
+            raise ValueError("direct capture sample index cannot be negative")
+        with self._state_lock:
+            if self._state not in {
+                SessionState.CONNECTING,
+                SessionState.INTERRUPTING,
+            }:
+                raise SidecarError("direct startup capture froze outside negotiation")
+            # ``submit_audio`` holds this same lifecycle lock while appending,
+            # so the queue byte snapshot is a linearized, finite prefix. Later
+            # recorder callbacks necessarily append on the post-commit side.
+            with self._audio._lock:  # noqa: SLF001 - one internal queue barrier.
+                queued_bytes = self._audio._bytes  # noqa: SLF001
+        if queued_bytes % 2:
+            raise SidecarError("direct startup capture is not aligned PCM16")
+        return sample_index + queued_bytes // 2
+
+    @staticmethod
+    def _maybe_commit_direct_capture(
+        sidecar: WebRtcSidecarClient,
+        *,
+        sample_index: int,
+        startup_sample_end: int,
+        committed: bool,
+    ) -> bool:
+        """Send the ordered commit immediately after the frozen prefix."""
+        if committed or sample_index < startup_sample_end:
+            return committed
+        if sample_index != startup_sample_end:
+            raise SidecarError("direct startup capture crossed its commit boundary")
+        sidecar.commit_capture()
+        return True
 
     def _raise_if_direct_rollover_failed(self) -> None:
         """Make loss-intolerant rollover queue pressure terminal."""
@@ -2591,9 +4085,11 @@ class RealtimeSession:
         sidecar: WebRtcSidecarClient,
         pacer: _AudioPacer,
         *,
+        peer_epoch: int,
         sample_index: int,
         now: float,
         capture_ages_ms: deque[float],
+        capture_max_age_seconds: float = _DIRECT_CAPTURE_MAX_AGE_SECONDS,
     ) -> tuple[int, bool]:
         """Send at most one timestamped frame, preserving bounded startup catch-up."""
         if not pacer.due(now):
@@ -2617,10 +4113,15 @@ class RealtimeSession:
             if packet is None:
                 return sample_index, False
             age_seconds = max(0.0, now - packet.captured_at)
-            if age_seconds > _DIRECT_CAPTURE_MAX_AGE_SECONDS:
+            if age_seconds > capture_max_age_seconds:
                 raise SidecarError("direct capture packet exceeded its age bound")
+            provider_pcm = (
+                bytes(len(packet.data))
+                if packet.suppress_peer_epoch == peer_epoch
+                else packet.data
+            )
             sidecar.send_audio(
-                packet.data,
+                provider_pcm,
                 sample_index=sample_index,
                 capture_monotonic_ns=max(
                     0,
@@ -2632,10 +4133,13 @@ class RealtimeSession:
                 packet.capture_watermark,
             )
             self._remember_direct_preroll(packet)
-        has_signal = _pcm_has_signal(packet.data)
+        provider_suppressed = provider_pcm is not packet.data
+        has_signal = _pcm_has_signal(provider_pcm)
         diagnostics = self._direct_diagnostics
         if diagnostics is not None:
-            diagnostics.observe_capture(packet.data, has_signal=has_signal)
+            diagnostics.observe_capture(provider_pcm, has_signal=has_signal)
+            if provider_suppressed:
+                diagnostics.observe_provider_suppression()
         capture_ages_ms.append(age_seconds * 1_000)
         sample_index += len(packet.data) // 2
         pacer.sent(
@@ -2654,7 +4158,8 @@ class RealtimeSession:
         if diagnostics is None:
             return
         if isinstance(message, PlaybackAudio):
-            diagnostics.observe_playback(message.pcm)
+            if not self._direct_observes_rendered_playback:
+                diagnostics.observe_playback(message.pcm)
             return
         if message.type == "capture.metrics":
             diagnostics.observe_capture_metrics(message.values)
@@ -2675,11 +4180,28 @@ class RealtimeSession:
                 # same bounded drain batch.
                 diagnostics.observe_failure_code("provider_error")
 
+    def _observe_direct_playback_write(self, value: bytes) -> None:
+        """Account only for transformed PCM actually accepted by paplay."""
+        combined = self._direct_render_observation_tail + value
+        aligned_bytes = len(combined) - (len(combined) % 2)
+        self._direct_render_observation_tail = combined[aligned_bytes:]
+        diagnostics = self._direct_diagnostics
+        if aligned_bytes:
+            rendered = combined[:aligned_bytes]
+            if diagnostics is not None:
+                diagnostics.observe_playback(rendered)
+            if self._render_echo_guard is not None:
+                self._render_echo_guard.observe_render(
+                    rendered,
+                    written_at=self._clock(),
+                )
+
     def _direct_output_allowed(self) -> bool:
         """Return whether direct media may cross the explicit output boundary."""
         with self._state_lock:
             return (
-                not self._stop_requested.is_set()
+                not self._direct_output_fenced.is_set()
+                and not self._stop_requested.is_set()
                 and not self._interrupt_requested.is_set()
                 and self._state
                 in {
@@ -2825,6 +4347,11 @@ class RealtimeSession:
             raise SidecarError("playback arrived before its media boundary")
         if state.active_generation != message.generation:
             raise SidecarError("playback arrived outside its active media epoch")
+        if self._retired_barge_in_pending():
+            # A new provider response can share the same ordered drain as the
+            # predecessor's quiet boundary. The qualified user utterance owns
+            # the next network transition, so never queue this peer's tail.
+            return False
         player.enqueue(message.pcm)
         return True
 
@@ -2851,6 +4378,18 @@ class RealtimeSession:
                 raise SidecarError("media generation did not advance")
             if state.active_generation is not None:
                 raise SidecarError("media generation overlapped its predecessor")
+            if self._retired_barge_in_pending():
+                # Capture already qualified a predecessor interruption. Admit
+                # just enough lifecycle state to retire this peer coherently;
+                # do not clear preroll, repair the anchor, or start new output
+                # before the network loop consumes the causal watermark.
+                state.newest_generation = generation
+                state.active_generation = generation
+                return True
+            # This handler runs under _direct_output_lock. Restore and verify the
+            # exact fixed anchor before either a fresh or resumed paplay child
+            # can accept bytes; a failed repair propagates to terminal cleanup.
+            self._reconcile_media_started_anchor()
             player_was_active = player.active
             if player_was_active:
                 resume = getattr(player, "resume", None)
@@ -2860,9 +4399,27 @@ class RealtimeSession:
             else:
                 player.begin(generation)
             self._clear_direct_preroll()
+            (
+                anchor_settle_required,
+                _anchor_model_trained,
+            ) = self._take_local_anchor_settle_required()
+            # A repair generation is untrusted even when it retained no FIR
+            # seed. Preserve that generation across this epoch boundary so it
+            # can perform a full-range post-repair qualification instead of
+            # being mistaken for an ordinary freshly reset playback settle.
+            repair_requalification_pending = self._anchor_requalification_pending()
+            preserve_echo_model = (
+                anchor_settle_required or repair_requalification_pending
+            )
             self._set_local_output_epoch(
                 generation,
-                settle_barge_in=not player_was_active,
+                settle_barge_in=(
+                    not player_was_active
+                    or anchor_settle_required
+                    or repair_requalification_pending
+                ),
+                preserve_echo_model=preserve_echo_model,
+                preserve_pending_barge_in=True,
             )
             state.newest_generation = generation
             state.active_generation = generation
@@ -2871,7 +4428,10 @@ class RealtimeSession:
 
         if event_type == "media.quiet":
             if generation == state.active_generation:
-                self._set_local_output_epoch(None)
+                self._set_local_output_epoch(
+                    None,
+                    preserve_pending_barge_in=True,
+                )
                 state.retired_generation = max(state.retired_generation, generation)
                 state.active_generation = None
                 return True
@@ -2971,7 +4531,7 @@ class RealtimeSession:
                     output_epoch is not None or player.active
                 ):
                     self._set_local_output_epoch(None)
-                    player.abort()
+                    self._abort_player(player)
                     suppressed_epoch = output_epoch or last_output_epoch
                     if suppressed_epoch > 0:
                         self._suppressed_output_epoch = suppressed_epoch
@@ -2981,7 +4541,7 @@ class RealtimeSession:
             return None, output_epoch, last_output_epoch, False
         if message_type == "stopped":
             self._set_local_output_epoch(None)
-            player.abort()
+            self._abort_player(player)
             reason = value.get("reason")
             if reason == "interrupt":
                 fresh_session_required = value.get("fresh_session_required")
@@ -3074,6 +4634,20 @@ def _pcm_peak_and_rms(value: bytes) -> tuple[int, int]:
         peak = max(peak, magnitude)
         energy += sample * sample
     return peak, isqrt(energy // sample_count)
+
+
+def _scale_pcm16(value: bytes, gain: float) -> bytes:
+    """Apply one non-amplifying gain to aligned little-endian PCM16."""
+    if not 0.0 <= gain <= 1.0:
+        raise ValueError("PCM gain is outside its attenuation bound")
+    if len(value) % 2:
+        raise ValueError("PCM must contain complete samples")
+    if gain == 1.0 or not value:
+        return value
+    scaled = bytearray(len(value))
+    for index, (sample,) in enumerate(struct.iter_unpack("<h", value)):
+        struct.pack_into("<h", scaled, index * 2, round(sample * gain))
+    return bytes(scaled)
 
 
 def _pcm_has_local_barge_in_signal(value: bytes) -> bool:

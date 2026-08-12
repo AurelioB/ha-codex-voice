@@ -10,26 +10,29 @@ described in
 [`webrtc-runtime.md`](webrtc-runtime.md). The overlay does not replace
 firmware, add a separately supervised daemon, or change Home Assistant.
 
-The two wake phrases deliberately have different authority:
+The current controlled deployment enables one wake route:
 
 | Wake phrase | Route | Capability |
 |---|---|---|
-| Okay Nabu | Official Home Assistant Assist satellite flow | Local/remote STT, Conversation, TTS, and Home Assistant controls |
-| Okay Computer | Explicit native [realtime wire v3](../../protocol/realtime-wire-v3.md) signaling to the Codex Voice bridge | Tool-free direct device WebRTC media/data channel; fresh-peer barge-in when the AEC safety contract is enabled |
+| Okay Nabu | `realtime_only` native [realtime wire v3](../../protocol/realtime-wire-v3.md) signaling to the Codex Voice bridge | Direct device WebRTC media/data channel, the sole terminal `end_conversation` tool, and fresh-peer barge-in when the AEC safety contract is enabled |
 
-Okay Nabu can preempt an active direct session and immediately reclaim the
-microphone for the normal Home Assistant path. While a direct full-duplex
-session owns the microphone, the legacy terminal stop-word detector is
-suspended: spoken interruptions belong to realtime barge-in, and playback echo
-must not tear down the conversation. Its exact prior membership is restored on
-release. Starting the normal Home Assistant path, mute/disconnect, idle expiry,
-or otherwise releasing the vendor owner flushes local playback and tears down
-the remote session. A later wake after teardown creates a fresh WebSocket,
-peer, and realtime thread.
+Home Assistant Assist/Hermes and Home Assistant entity tools are deferred for
+this trial. The optional split configuration can later return Okay Nabu to the
+official Assist route and use a separately installed Okay Computer detector for
+direct voice, but that is not the active deployment. While direct startup is
+connecting and while its confirmation cue plays, the legacy terminal stop-word
+detector remains active as the local cancel path. It is suspended only when
+capture enters the live provider phase, where spoken interruptions belong to
+realtime barge-in and playback echo must not tear down the conversation. Its
+exact prior membership is restored on release. Mute, disconnect, idle expiry,
+explicit stop, or otherwise releasing the vendor owner flushes local playback,
+tears down the remote session, and queues the idle LED. A later accepted wake
+creates a fresh WebSocket, peer, and realtime thread.
+
 In v3, bounded local AEC-filtered speech detection clears queued playback and
 immediately SIGKILLs the active `paplay` child in the parent, retires the old
-PeerConnection epoch, and sends no later capture to that peer. The outer vendor owner,
-session/player objects, bridge WebSocket, and ready latch remain attached. Two
+PeerConnection epoch, and sends no later capture to that peer. The outer vendor
+owner, session/player objects, bridge WebSocket, and ready latch remain attached. Two
 reusable isolated sidecar processes alternate roles: the standby creates a fresh
 PeerConnection for the next consecutive epoch, then the retired epoch's process
 is recycled as the next standby. Exactly those two prewarmed process slots are
@@ -38,15 +41,15 @@ cold-launching a replacement or allocating a third process.
 Exactly 4 KiB (two 64 ms frames, 128 ms) of recent AEC pre-roll and queued/live
 speech is sent once and in order to the replacement.
 Queue/age/timeout, sidecar, or epoch failure ends the outer session closed. A
-manual stop, normal wake, mute, disconnect, or non-speech interruption still
+manual stop, mute, disconnect, or non-speech interruption still
 tears it down.
 
 V3 direct mode has no captured-audio handoff to Home Assistant. If the AEC
 preflight, pinned runtime, sidecar, SDP exchange, WebRTC transport, data channel,
 queue, playback, or bridge lifeline fails, the overlay clears its bounded
-direct audio and returns to idle. The user must invoke Okay Nabu separately.
-This prevents a private Okay Computer utterance from silently becoming an
-Assist request with different authority.
+direct audio and returns to idle. In the current `realtime_only` deployment it
+never starts Assist/Hermes as a fallback. This prevents a private direct
+utterance from silently becoming an Assist request with different authority.
 
 ## Realtime behavior and bounds
 
@@ -61,11 +64,16 @@ Assist request with different authority.
   mono PCM16 to the bridge and receives bridge-gated 24 kHz mono PCM16. See
   [the v2 contract](../../protocol/realtime-wire-v2.md).
 
-Both routes hardcode `conversation_mode: "native"` and remain tool-free. The
-bridge ignores any Home Assistant broker snapshot, creates one native App
-Server realtime voice thread, and never inserts a completed-transcript wait,
-executor thread, or `thread/realtime/appendSpeech` render. Okay Nabu remains a
-separate vendor/Home Assistant path rather than an error fallback for v3.
+Both transports hardcode `conversation_mode: "native"`. The bridge ignores any
+Home Assistant broker snapshot and never inserts a completed-transcript wait,
+executor thread, or `thread/realtime/appendSpeech` render. Native v3 creates one
+App Server realtime voice thread per peer epoch with exactly one dynamic tool,
+`end_conversation`; it accepts only an empty-object call to that tool and
+rejects every other provider tool request. An explicit spoken request to stop,
+end, close, leave, or a clear goodbye invokes that terminal tool. The result
+ends the socket and normal device cleanup returns the LED and microphone owner
+to idle. No Home Assistant entity tool is declared or reachable. Native v2 is
+the retained rollback behavior.
 
 The v3 child accepts timestamped 16 kHz mono PCM16 from the vendor capture
 callback. It continuously reframes those variable callback boundaries into
@@ -82,15 +90,14 @@ DTLS negotiation material.
 The parent uses a bounded direct player pinned to the configured AEC
 sink; media never traverses the bridge WebSocket.
 
-The default input queue is 64 KiB: 2.048 seconds at 16 kHz mono PCM16. Once a
-cold handshake completes, queued input is sent at no more than 2× capture rate
-while more than one captured frame remains, then returns to realtime pacing.
-This bounded catch-up preserves accepted audio and removes a permanent startup
-offset; it does **not** remove the cold App Server/WebRTC handshake or
-provider-generation latency. V3 retains no Home Assistant compatibility copy:
-startup or capacity failure clears its direct queue and returns idle without
-replaying a captured prefix. The retained v2 `bridge_pcm` route alone keeps a
-separate default 64 KiB pre-ready buffer for historical bounded Assist replay.
+The configured input queue remains bounded at 64 KiB, or 2.048 seconds of
+16 kHz mono PCM16, but direct v3 does not use it as a cold-start capture buffer.
+An accepted v3 wake discards the triggering/wake-tail PCM, and every recorder
+frame produced before the ready cue reaches EOF is dropped. Capture opens with
+an empty initial queue. After the cue, the queue bounds live scheduling pressure
+and rollover capture; paced catch-up may drain such an accepted live backlog at
+no more than 2× capture rate. The retained v2 `bridge_pcm` route alone keeps a
+default 64 KiB pre-ready buffer and historical bounded Assist replay.
 
 Do not hand a complete 64 ms recorder callback directly to aiortc's Opus
 encoder. In pinned aiortc 1.15 that callback produces three or four payloads,
@@ -100,19 +107,42 @@ input before the 20 ms reframer was added. The production regression requires
 one payload per frame and consecutive 960-sample RTP timestamps.
 
 Wake activation occurs after the pinned recorder callback has already handled
-the triggering frame. While the satellite is idle, connected, and unmuted, the
-overlay therefore retains only the newest six 2,048-byte recorder frames in
-RAM: 384 ms, or 12 KiB. An Okay Computer wake atomically takes that direct-only
-pre-roll and seeds the selected transport's bounded input. An Okay Nabu wake
-discards it, so the official Assist path still receives only post-wake audio.
-Stop, mute, disconnect, teardown, and every v3 failure clear the buffer without
-forwarding, persisting, or logging it.
+the triggering frame. The overlay may retain the newest six 2,048-byte idle
+frames in its generic compatibility ring, but a direct v3 wake atomically
+discards all six: no part of that 384 ms / 12 KiB history seeds the initial
+peer. It also drops every pre-ready callback, so speaking during negotiation or
+the cue is intentionally not accepted. The 32 KiB startup-headroom calculation
+and any initial pre-roll transfer apply only to the retained v2 path. Stop,
+mute, disconnect, teardown, and every v3 failure clear remaining capture
+without forwarding, persisting, logging, or handing it to Home Assistant.
 
-Pre-roll never consumes the client's reserved 32 KiB (1.024 s) of live
-post-wake capacity. It is trimmed from the oldest samples or omitted when a
-smaller legal input queue needs that headroom; v2 also applies the same rule to
-its fallback buffer. The default 64 KiB bounds retain all 12 KiB. This allowance
-is part of the existing queue bounds, not additional unbounded storage.
+This initial startup rule is separate from interruption rollover. Once a v3
+session is live, the local AEC detector deliberately freezes exactly 4 KiB /
+128 ms of recent live capture around a committed interruption and delivers it
+once to the replacement peer as described below. That rollover pre-roll is not
+wake pre-roll and never exists before the first cue-gated live phase.
+
+An accepted direct wake immediately queues the non-blocking thinking/pulsing
+LED and claims the vendor owner. At most three session attempts share one
+absolute 12-second owner deadline; each session retains its own configured
+5-second signaling-handshake bound inside the remaining owner budget. Process
+prewarm only proves that each isolated `Popen` child is still alive. It does
+not create or validate an SDP offer; the selected child must do that during the
+owned attempt, and construction, preflight, offer, bridge, or transport failure
+can consume an attempt.
+
+`RealtimeSession.ready` is set only after the SDP answer is applied, the peer
+is connected, the `oai-events` data channel is ready, the device has sent
+`transport_ready`, and the bridge has returned the exact accepted `started`
+message. Readiness then starts exactly one pinned, root-owned cue:
+`/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`, SHA-256
+`6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, PCM16
+mono at 22,050 Hz and about 0.400 seconds. Capture stays closed and the local
+stop detector stays active until cue EOF. EOF switches the LED to listening,
+suspends the local stop detector, and opens live capture. The cue has a
+2-second completion timeout. Cue failure/timeout, a terminal session, the
+absolute deadline, or attempt exhaustion fails closed and returns idle without
+starting Home Assistant.
 
 The default device output queue is 48 KiB, about 1.024 seconds at 24 kHz mono
 PCM16. V3 also bounds every child IPC packet and fails rather than dropping a
@@ -127,23 +157,85 @@ to WebRTC; the client never probes or falls back to another engine. Before it
 creates the device peer or connects to the bridge, the client
 requires those exact PulseAudio defaults and a loaded `module-echo-cancel` with
 the expected raw hardware masters, endpoint names, configured method, and
-master format. It also requires an uncorked native capture stream owned by the
-current voice-process PID—including the already-open vendor recorder—to use
-that AEC source, and requires every live AEC sink channel to be at or below
+master format. `capture_backend` is either `pulseaudio_aec` (the compatibility
+default) or `native_aec3`. The PulseAudio backend also requires an uncorked
+capture stream owned by the current voice-process PID to use that AEC source.
+The normal native selector is `capture_backend: "native_aec3"` in the enabled,
+root-owned mode-0600 `/data/conf/codex-realtime.json` with
+`media_transport: "device_webrtc"`. `CODEX_AEC3_CAPTURE=1` is only an explicit
+service-environment override; it is not required when that secure configuration
+selects the backend. The early overlay hook loads and patches the native ABI
+before vendor microphone selection, then sets `CODEX_AEC3_ACTIVE=1` internally
+as proof for the later session preflight. Operators must not set that proof
+variable themselves. A wake additionally proves that the recorder delivers
+frames. Both backends require every live AEC sink channel to be at or below
 `aec_sink_volume_ceiling_percent`; v3 `paplay` playback is pinned to the same
-sink. A failed
-or mismatched check ends startup before any microphone audio leaves the device.
-Once per direct session, after that preflight and before the SDP offer or bridge
-connection, a fixed-argv `pactl` controller sets the dedicated AEC sink itself
-to the exact raw `playback_volume_percent` value and verifies it. The signaling
-handshake deadline begins only after this local AEC and player preparation has
-finished; the maximum-session deadline still covers the complete startup. The
-direct `paplay` child targets that sink with `--volume=65536` (100% relative) and never
+sink. A failed or mismatched check ends startup before any microphone audio
+leaves the device.
+At direct-session startup, after that preflight and before the SDP offer or
+bridge connection, a fixed-argv `pactl` controller sets the dedicated AEC sink
+itself to the exact raw `playback_volume_percent` value and verifies it. Every
+new direct response checks that exact raw anchor again before admitting audio;
+an out-of-band mismatch is repaired and verified or output fails closed. The
+per-attempt five-second handshake deadline begins only after this local AEC and
+player preparation, while the absolute 12-second owner deadline covers local
+work and all retries. The maximum-session clock remains a separate hard
+lifetime cap. The direct `paplay` child targets that sink with
+`--volume=65536` (100% relative) and never
 enumerates or mutates a sink-input. Configuration rejects a playback value
 above the 1–60% `aec_sink_volume_ceiling_percent`. The retained v2 path instead
-converts the same playback value into its `paplay` stream volume. The live v3
-response, playback begin/resume, and interruption paths run no `pactl`; an
-operator must not mutate the qualified sink while the direct session is live.
+converts the same playback value into its `paplay` stream volume. Matching Home
+Assistant volume, mute, and unmute commands are intercepted before either
+vendor media player or its system-volume callback can change PulseAudio. The
+pinned physical-button path is guarded separately: its existing settings loop
+runs every 50 ms instead of 500 ms, and a changed logical volume is reconciled
+before the two-frame (128 ms) local-interruption boundary. Reconciliation
+restores and verifies the exact AEC anchor, moves the requested level into the
+software attenuator, and updates the vendor/Home Assistant state without an
+MPV volume setter. Direct `pactl` mutations remain unsupported operator action;
+the per-response exact check is the fail-closed backstop. The requested audible level is
+capped at `playback_volume_percent` and applied as non-amplifying software
+attenuation immediately before each bounded 20 ms write. The attenuation uses
+PulseAudio's cubic volume curve, so a requested level retains the vendor
+slider's perceived loudness below the fixed anchor. A 40 ms gain ramp prevents
+clicks, while the dedicated sink and `paplay --volume=65536` remain at their
+qualified fixed operating point. This keeps the echo canceller's render
+reference equal to the PCM that reaches the sink.
+
+The parent also retains a bounded 4 kHz representation of only the transformed
+PCM actually accepted by `paplay`. During the existing 512 ms first-playback
+AEC convergence window, high-correlation capture frames calibrate a narrow
+render-delay and residual-echo model. After that window, only capture matching
+that previously learned model is rejected as local self-echo; missing, stale,
+quiet, uncalibrated, or genuinely independent speech fails open. Ambiguous
+evidence requires four consecutive 64 ms callbacks, while clear near-end
+speech keeps the two-callback interruption path. Raw microphone bytes remain
+unchanged in the bounded queue, local detector, and rollover pre-roll.
+Render-correlated, ambiguous, and high-correlation residual-heavy frames are
+sent as equal-length silence only to the provider peer whose response produced
+that render. After a genuine local interruption, those same tagged frames are
+raw on the fresh peer. Sample indices, capture timestamps, cadence, and packet
+lengths do not change. Software-only volume changes add no detector pause or
+blanket microphone blackout and duplicate requests do not extend a ramp.
+Repair of a real physical sink excursion keeps
+trained FIR coefficients only as an untrusted seed, discards the prior delay,
+render timing, and pending local evidence, then searches the complete 20–320 ms
+range. Three consecutive render-backed signal frames with stable delay,
+correlation, and bounded third-frame residual requalify the path. The first
+128 ms suppresses stale local-transition evidence; decorrelated near-end audio
+can still pass the current-peer filter, and clear near-end speech is locally
+interruptible after that boundary. Eight unsuccessful correlated/ambiguous
+evidence frames fence output, while quiet capture, muted software playback, and
+`media.quiet` retain the pending repair without consuming that bound. The guard
+changes only current-peer wire PCM; the existing outbound-gain stage and any
+fresh peer receive raw PCM. Only bounded content-free decision and suppression
+counts, correlation, and delay are logged. Direct volume persistence shares
+`/tmp/sound_config.lock` with the physical button script and atomically replaces
+`sound.json`. Every persisted change arms one next-tick exact anchor check that
+clears without another write, preventing either ordering of a concurrent
+physical key transaction from concealing sink drift or creating a poll loop.
+The bounded level is reflected and persisted through the normal Home Assistant
+entity, and each new direct session starts at that saved level.
 The preflight and exact preparation compare raw PulseAudio units rather than
 trusting rounded displayed percentages.
 
@@ -233,7 +325,7 @@ The initial peer is implicit epoch 1. Rollover uses exact consecutive
 Deploy the bridge first because an old bridge cannot advertise or accept the
 extension. Queue/age/timeout, sidecar, or invalid-epoch failure closes the
 outer session. Protocol and epoch numbers require exact integers; floats and
-booleans are rejected. Manual stop, normal wake, mute, disconnect, and
+booleans are rejected. Manual stop, mute, disconnect, and
 non-speech interruption also end it; `stop` remains normal termination in
 every rollover phase. No path hands direct audio to Home Assistant or logs it.
 
@@ -295,6 +387,19 @@ rejection and early, middle, and late double-talk barge-in pass at the new value
 on that physical device. Speex is available
 only on a different firmware build that actually compiles that engine.
 
+The production-qualified fallback remains this static Adrian topology plus the
+bounded render-aware guard described above. Selecting native AEC3 enters its
+canary-first path; it does not inherit Adrian's acoustic qualification. The
+native hardware-loopback AEC3 slice under
+[`aec3_capture`](aec3_capture) is disabled by default. The overlay has an early,
+fail-closed startup hook, but installing its files alone does not select it;
+the normal selector is `capture_backend: "native_aec3"` in the secure enabled
+realtime configuration. `CODEX_AEC3_CAPTURE=1` remains an explicit override for
+controlled use, not required service setup. Keep Adrian available as the
+playback-DMA keepalive during initial qualification, and do not call the native
+path production-qualified until playback-only, near-end, double-talk, and
+long-run gates pass on the physical unit.
+
 ## Wake-latency patch
 
 The Python-based ThirdReality `1.01.07`/upstream `v1.1.7` client starts the wake
@@ -307,20 +412,18 @@ include the combined device and Home Assistant path; they do not isolate the
 LED call by itself.
 
 [`latency_sitecustomize/sitecustomize.py`](latency_sitecustomize/sitecustomize.py)
-uses an LED-only acknowledgement and does not play wake audio; this cue-free
-path remains independent of whether the optional full-duplex AEC topology is
-enabled. On the pinned single microphone thread, it pre-arms forwarding, queues
-the pipeline start request, and ducks music without playing the local wake cue.
-For Okay Computer only, its bounded RAM pre-roll recovers recorder
-frames handled before that direct owner exists; Okay Nabu explicitly discards
-the same history. The
-ThirdReality LED command is queued on one daemon worker, so the DBus subprocess
-can no longer block microphone capture. Commands are serialized and bounded by
-the vendor's two-second timeout. If the bounded queue fills, stale pending
-animations are coalesced into the newest state; timed-out children are reaped.
-Both the vendor base class and the pinned ThirdReality subclass are patched
-directly. This prevents a later base-method rebinding during device startup from
-restoring the cue gate while retaining the guarded LED behavior.
+retains the older LED-only, cue-free latency path for the optional turn-based
+Assist route. Direct v3 deliberately uses a different deterministic boundary:
+the accepted Okay Nabu wake immediately queues the thinking/pulsing LED, drops
+all wake and connecting PCM, and waits for exact session readiness before
+playing the pinned roughly 0.400-second cue once. Only its EOF queues the
+listening LED and opens capture. The ThirdReality LED command is queued on one
+daemon worker, so the DBus subprocess cannot block microphone capture.
+Commands are serialized and bounded by the vendor's two-second timeout. If the
+bounded queue fills, stale pending animations are coalesced into the newest
+state; timed-out children are reaped. Both the vendor base class and the pinned
+ThirdReality subclass are patched directly so later base-method rebinding does
+not bypass either guarded lifecycle.
 
 The override is applied atomically only when SHA-256 hashes of all four
 installed vendor code objects match the tested build: the base wake and cue-EOF
@@ -358,6 +461,16 @@ webrtc_sidecar/
   peer.py
   protocol.py
   runtime.py
+aec3_capture/
+  CMakeLists.txt
+  README.md
+  THIRD_PARTY_NOTICES.md
+  __init__.py
+  build_aarch64.py
+  recorder.py
+  cmake/
+  include/
+  src/
 deploy/
   README.md
   prepare_mic_gain_boot.py
@@ -393,12 +506,13 @@ channel sends no provider interrupt control and supplies no bridge or provider
 acknowledgement. Manual stop/mute/disconnect ends the outer session.
 
 The device never receives tool schemas, tool calls, results, or a Home
-Assistant credential. Okay Computer is always native and tool-free; use Okay
-Nabu for Home Assistant control. **Provide Home Assistant tools to realtime
-voice** applies only to older strict-v2 clients that omit `conversation_mode`.
-The integration may maintain that compatibility broker, but its presence does
-not affect a reference-client session and adds nothing to device configuration
-or v3 signaling.
+Assistant credential. The native App Server thread alone receives the exact
+empty-input `end_conversation` declaration; the bridge executes it as terminal
+session control and rejects every other tool. No Home Assistant tool is
+available. **Provide Home Assistant tools to realtime voice** applies only to
+older strict-v2 clients that omit `conversation_mode`. The integration may
+maintain that compatibility broker, but its presence does not affect the
+reference v3 session and adds nothing to device configuration or signaling.
 
 Treat `PYTHONPATH` as root-process code execution. Copy only the reviewed file
 and package from a pinned repository commit or release asset, verify SHA-256
@@ -449,11 +563,15 @@ smoke/sidecar processes can read but not modify them. Previous release
 directories remain available for explicit runtime rollback.
 
 At voice-process startup the overlay prewarms exactly two reusable isolated
-sidecar processes with `/usr/bin/python3 -I -S`. One is active while the other
-is the offer-warm standby; after rollover they exchange roles using fresh
-PeerConnections, and the retired epoch's process is recycled. An absent or
-invalid standby terminates the outer session; the client does not cold-launch a
-replacement or third process. Every executable, source, runtime, and dependency
+sidecar processes with `/usr/bin/python3 -I -S`. This idle prewarm is only an
+alive `Popen` pool: it polls for process exit but does not request, drain, or
+validate an SDP offer. The selected process creates and validates its first
+offer only after an accepted wake owns startup. Once an epoch is active, the
+other process may be offer-prepared as the bounded rollover standby; after
+rollover the retired process is recycled and explicitly requalified. An absent
+or invalid required standby terminates the outer session; the client does not
+cold-launch a replacement or third process at that rollover boundary. Every
+executable, source, runtime, and dependency
 path must resolve to a root-owned file or directory with no group/other write
 access. Source/runtime directories are mode 0755 and files mode 0644 so each
 child can traverse and read them without modifying them. The launcher assigns
@@ -472,7 +590,9 @@ replacement or third process.
 Create `/data/conf/codex-realtime.json` as a root-owned regular file with mode
 0600. Start from [`codex-realtime.example.json`](codex-realtime.example.json),
 replace the documentation address and placeholder token, then explicitly set
-`enabled` to `true`. A minimal active configuration is:
+`enabled` to `true`. The repository template intentionally shows the optional
+split phrase; the current controlled trial changes the wake keys as shown in
+this minimal active configuration:
 
 ```json
 {
@@ -480,12 +600,14 @@ replace the documentation address and placeholder token, then explicitly set
   "url": "ws://192.0.2.10:8787/v1/realtime",
   "connect_address": "192.0.2.10",
   "token": "REPLACE_WITH_DISTINCT_REALTIME_DEVICE_TOKEN",
-  "wake_phrase": "okay computer",
-  "realtime_only": false,
+  "wake_phrase": "okay nabu",
+  "realtime_only": true,
   "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
+  "handshake_timeout_seconds": 5,
   "media_transport": "device_webrtc",
+  "capture_backend": "native_aec3",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
@@ -496,7 +618,7 @@ replace the documentation address and placeholder token, then explicitly set
 }
 ```
 
-This example is disabled in the repository because enabling v3 also asserts
+The public template is disabled in the repository because enabling v3 also asserts
 that the pinned runtime and physically qualified AEC topology are installed.
 On the observed stock v1.1.7 PulseAudio build, `adrian` is the available engine;
 the AEC names and 25% sink ceiling must exactly match the reviewed static block
@@ -510,10 +632,14 @@ The public example deliberately stays at the conservative 25% default. The
 reference v3 installation was separately qualified and canaried at 60%; that
 result is not transferable to another speaker or room.
 
-Playback volume is explicit configuration, not hardcoded behavior. Qualified
-deployments may set both values up to the enforced 60% maximum and must keep
-the vendor media-player preference aligned; every increase requires a new
-physical echo/double-talk canary.
+The configured playback value is the qualified physical anchor, not a hardcoded
+audible level. While direct realtime owns audio, Home Assistant may select any
+level from silence through that anchor without moving the AEC sink; higher
+requests are reported and persisted at the anchor. Qualified deployments may
+set both configuration values up to the enforced 60% maximum, and every anchor
+increase requires a new physical echo/double-talk canary. Render correlation
+does not make an unqualified higher anchor safe: downstream clipping is
+nonlinear and can no longer resemble the reference.
 
 Use `wss` with normal certificate validation whenever the path is not a
 source-restricted trusted LAN. `connect_address` must be the numeric address to
@@ -534,16 +660,12 @@ hard clock starts before local AEC/player preflight and covers all startup,
 runtime, and rollover work. Deployments may lower the values within their
 enforced 5–120-second and 15–900-second ranges, respectively.
 
-`wake_probability_cutoff` is optional and accepts 0.5–0.99. The pinned Okay
-Computer model ships at 0.97; the reference speaker uses 0.85 so accented
-English reaches the dedicated detector reliably. When several active models
-become ready in the same recorder block and share “Okay,” the guarded overlay
-presents the configured realtime detector first while preserving the relative
-order of every other model. It cannot override a Nabu activation from an
-earlier block; physical acceptance must verify that spoken Okay Computer does
-not produce an Assist detector marker. The cutoff override applies only to the
-exact normalized `wake_phrase`; Okay Nabu keeps its vendor threshold and
-continues to select Home Assistant Assist.
+`wake_probability_cutoff` is optional and accepts 0.5–0.99. It applies only to
+the exact normalized configured realtime phrase. The current trial uses the
+installed Okay Nabu detector and `realtime_only: true`; every accepted match
+selects direct v3 and no Assist detector is active. In a later split deployment,
+the guarded ordering can prioritize a distinct Okay Computer realtime detector
+when several active models become ready in the same recorder block.
 
 For a reversible realtime-only trial, set `wake_phrase` to `okay nabu`, set
 `realtime_only` to `true`, and leave only `okay_nabu` active in
@@ -582,11 +704,14 @@ PulseAudio value into the managed block after sink creation. The stock vendor
 voice process subsequently applies its Home Assistant media-player preference,
 which must be set to the same value and verified after restart. Once its static
 and physical canaries pass, select the v3 transport and add the complete AEC
-settings together:
+settings together. Normally select native hardware-loopback capture in the
+root-owned mode-0600 realtime configuration itself; no voice-service
+environment edit is required:
 
 ```json
 {
   "media_transport": "device_webrtc",
+  "capture_backend": "native_aec3",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
@@ -596,6 +721,12 @@ settings together:
   "direct_capture_gain_db": 0
 }
 ```
+
+`CODEX_AEC3_CAPTURE=1` remains an explicit environment override of the early
+selection hook for controlled diagnostics. It does not replace the validated
+`capture_backend` session contract. `CODEX_AEC3_ACTIVE=1` is
+internal proof written only after the early recorder patch succeeds; do not set
+it in the service environment.
 
 To run this device at 60%, install the static block with
 `--aec-sink-volume-percent 60`, set the sink ceiling to `60`, keep the retained
@@ -648,7 +779,8 @@ overlay installed and change the root-only configuration to:
 }
 ```
 
-Remove `pulse_aec_source`, `pulse_aec_sink`, and `pulse_aec_method` when
+Remove `capture_backend` (or restore it to `pulseaudio_aec`) and remove
+`pulse_aec_source`, `pulse_aec_sink`, and `pulse_aec_method` when
 disabling full duplex; otherwise strict configuration validation rejects the
 mix. Restart the long-lived voice process and verify that its start/started
 frames negotiate [wire v2](../../protocol/realtime-wire-v2.md), binary 16 kHz
@@ -657,12 +789,13 @@ runtime can remain in place because `bridge_pcm` never launches it.
 
 V2 preserves its historical pre-ready bounded Assist fallback. That is a
 deliberate rollback behavior and a privacy/authority difference from v3: a v2
-startup failure may replay its retained Okay Computer prefix into the official
-Home Assistant path, while v3 always clears captured direct audio and returns
-idle. Complete removal of the overlay is documented in
+startup failure in an optional non-`realtime_only` split deployment may replay
+its retained direct-wake prefix into the official Home Assistant path, while v3
+always clears captured direct audio and returns idle. Current `realtime_only`
+mode disables that v2 fallback too. Complete removal of the overlay is documented in
 [Acceptance and rollback](#acceptance-and-rollback).
 
-In the default split mode, enable both installed detector
+In an optional split mode, enable both installed detector
 identifiers—`okay_nabu` and `okay_computer`—in the device's existing sound
 configuration without replacing its other settings. Keep Okay Nabu as the
 normal Home Assistant wake phrase and make `wake_phrase` match Okay Computer.
@@ -681,9 +814,10 @@ shell job.
 Verify the *long-lived* process PID after at least one monitor interval, its
 `PYTHONPATH`/`PYTHONDONTWRITEBYTECODE` environment, source and config
 ownership/mode/hash, absence of `__pycache__` in the import directory, and TCP
-ADB connection. A physical wake must also show no
-`wake_word_triggered_old.wav` playback. Merely importing `sitecustomize` in a
-separate probe process is not acceptance.
+ADB connection. A current direct physical wake must show no cue before exact
+session readiness and then exactly one playback of the pinned
+`wake_word_triggered_old.wav`; capture must remain closed until its EOF. Merely
+importing `sitecustomize` in a separate probe process is not acceptance.
 
 Python imports `sitecustomize` during process startup. The script first
 validates the wake/LED compatibility group atomically before installing the
@@ -692,15 +826,18 @@ the audio/stop handlers, configuration mutation, both constructors, and the
 separately executed microphone-loop bytecode before enabling direct ownership
 and detector ordering. An initial-group mismatch leaves vendor wake behavior
 untouched; a direct-group mismatch retains only the separately guarded latency
-path and normal Home Assistant routing. Both cases emit a content-free warning.
+path and the Assist implementation for explicit rollback. The current
+`realtime_only` matching wake still fails closed. Both cases emit a content-free
+warning.
 
 ## Acceptance and rollback
 
-The repository tests cover immediate request/duck/stream ordering, the first
-post-wake microphone frame, VAD/run-end/disconnect/mute flag races during setup,
-startup guards and exceptions, bounded direct-only pre-roll, normal-wake
-discard, 32 KiB live headroom, active-session wake suppression, v3 fail-closed
-startup,
+The repository tests cover immediate owner/thinking-LED ordering, discard of
+the wake frame and every v3 pre-ready microphone frame, the exact ready-to-cue
+and cue-EOF-to-capture boundaries, cue failure/timeout, stop during connecting
+and confirmation, three-attempt/12-second startup ownership, terminal cleanup,
+VAD/run-end/disconnect/mute races, startup guards and exceptions,
+active-session wake suppression, and v3 fail-closed startup,
 retained v2 pre-ready fallback/replay, strict v2 and v3 framing, device-owned
 SDP negotiation, absence of bridge PCM in v3, bounded sidecar IPC and media
 queues, receiver-owned `media.started`/`media.quiet` boundaries,
@@ -761,21 +898,36 @@ following full matrix remains required for each deployment.
 
 On the physical device, verify these independently:
 
-1. Okay Nabu still completes Home Assistant commands, timers, announcements,
-   reconnects, and repeated wakes.
-2. Okay Computer starts direct voice, speaks a response, returns to listening,
+1. In the current `realtime_only` trial, Okay Nabu starts direct voice and
+   cannot enter Home Assistant Assist/Hermes. Separately validate the deferred
+   Assist route before restoring a split configuration.
+2. Okay Nabu speaks a direct response, returns to listening,
    accepts a spoken interruption and a follow-up without another wake, and does
    not let its own output activate the legacy terminal stop-word detector.
-3. Okay Computer cannot control Home Assistant even when a compatibility
+3. Okay Nabu cannot control Home Assistant even when a compatibility
    realtime authority is registered. Its start and `started` frames both carry
-   `conversation_mode: "native"`. Okay Nabu can invoke only the reviewed
-   entities exposed through its official Assist pipeline.
-4. A normal wake can preempt direct mode and then control Home Assistant.
-5. A forced v3 pre-ready and post-ready failure clears captured Okay Computer
-   audio, returns idle, and does not start or replay into Home Assistant. A
-   subsequent explicit Okay Nabu wake must still work normally.
-6. Repeated direct and standard turns leave one stable voice process, no stale
-   direct or v2 `paplay` child, no LED/duck state behind, and bounded memory.
+   `conversation_mode: "native"`. The App Server thread must expose exactly
+   `end_conversation`, reject every other tool, and expose no Home Assistant
+   entity schema. A clear spoken goodbye must invoke the terminal tool and
+   return the device LED to idle.
+4. On each accepted wake, verify that thinking/pulsing is queued immediately;
+   the trigger, wake tail, connecting frames, and cue-time frames never reach
+   the initial peer. Up to three attempts must share one absolute 12-second
+   owner deadline and each attempt's handshake must remain bounded at five
+   seconds. Alive-only process prewarm must not be reported as an offer-ready
+   peer.
+5. Require SDP applied, peer connected, `oai-events` ready,
+   `transport_ready`, and the exact bridge `started` before readiness. Then
+   verify exactly one root-owned pinned cue (SHA-256
+   `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`) and no
+   capture until EOF; only EOF may switch the LED to listening. The local stop
+   detector must remain active through connecting/cue and be suspended only in
+   the live phase. Cue timeout at two seconds, forced pre-ready/post-ready
+   failure, owner-deadline expiry, and attempt exhaustion must return idle with
+   no Home Assistant fallback.
+6. Repeated direct turns—and standard turns only during deliberate rollback or
+   split-route validation—leave one stable voice process, no stale direct or v2
+   `paplay` child, no LED/duck state behind, and bounded memory.
 7. At the configured and previously qualified sink/playback value, speak over
    early, middle, and late response audio from near and far positions. Playback
    must stop at speech detection, the command must be recognized once, and
@@ -784,8 +936,13 @@ On the physical device, verify these independently:
    and verify the exact raw `playback_volume_percent` on that dedicated sink
    before the SDP offer. A forced preflight or preparation mismatch must fail
    before negotiation or outbound capture. Trace child execution to confirm
-   that `response.created`, playback begin/resume, and interruption never run
-   `pactl`; do not mutate the sink while the session is live. Direct `paplay`
+   that ordinary interruption never runs `pactl`; playback begin/resume performs
+   one exact raw check and only a mismatch performs bounded repair. Exercise
+   Home Assistant volume plus the physical up/down buttons during early, middle,
+   and late response audio. The sink must return to the exact anchor before two
+   recorder callbacks, the entity must report the bounded requested level, and
+   playback must neither self-interrupt nor block a genuine interruption after
+   the short transition boundary. Direct `paplay`
    must target only that sink, use raw stream volume 65536, accept non-blocking
    20 ms writes with the reviewed 60 ms/20 ms settings, and never enumerate or
    mutate a sink-input.
@@ -795,7 +952,7 @@ On the physical device, verify these independently:
    during normal playback. Interruption must drop queued PCM and SIGKILL
    `paplay` immediately, retire the old PeerConnection epoch, and prevent every
    later capture frame from reaching it. Hold speech continuously through
-   replacement output and prove it cannot retire a second peer. Prove one
+   replacement output and prove it cannot retire a second peer. Prove that
    seven detector-quiet 64 ms callbacks are insufficient, signal resets that
    partial quiet count, eight consecutive quiet callbacks rearm, and only a later
    two-frame speech edge triggers the next rollover. Verify consecutive epoch signaling,
@@ -826,8 +983,10 @@ On the physical device, verify these independently:
    must repeat it as part of this matrix.
 9. A deliberately missing AEC module or mismatched default source/sink must fail
    direct startup before sending microphone audio to the bridge or provider,
-   must not hand captured audio to Home Assistant, and must leave a later Okay
-   Nabu wake usable.
+   must not hand captured audio to Home Assistant, and must leave a later direct
+   Okay Nabu wake usable. With native AEC3 selected, deliberately break its
+   library/device contract and verify voice startup fails closed without a raw
+   microphone fallback; then restore the exact artifact and repeat the wake.
 10. TCP ADB remains reachable on port 5555 before deployment, after the service
    restart, and after any reboot. The overlay and its procedures must never
    stop `adbd`, blank its TCP-port setting, or remove that recovery path.
@@ -841,7 +1000,8 @@ completed its handshake in 1.308 s, and device-local answer playback began at
 controlled run validates only that historical v2 clipping regression; it is
 not a latency distribution, benchmark, or v3 validation.
 
-Reject the overlay if it clips initial phonemes, plays or forwards cue audio,
+Reject the overlay if it accepts speech before cue EOF, plays the ready cue
+before readiness or more than once, forwards cue audio as microphone input,
 leaks microphone audio after session teardown, echoes its own response, fails to
 return to idle, leaves stale player/LED/duck state, destabilizes wake detection,
 or breaks the standard Home Assistant path.

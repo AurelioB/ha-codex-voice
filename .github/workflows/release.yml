@@ -23,6 +23,9 @@ jobs:
           mkdir -p release/thirdreality-realtime/latency_sitecustomize
           mkdir -p release/thirdreality-realtime/realtime_client
           mkdir -p release/thirdreality-realtime/webrtc_sidecar
+          mkdir -p release/thirdreality-realtime/aec3_capture/cmake
+          mkdir -p release/thirdreality-realtime/aec3_capture/include
+          mkdir -p release/thirdreality-realtime/aec3_capture/src
           mkdir -p release/thirdreality-realtime/deploy/init
           mkdir -p release/thirdreality-realtime/deploy/pulse
           install -m 0644 \
@@ -32,6 +35,21 @@ jobs:
             release/thirdreality-realtime/realtime_client/
           install -m 0644 device/thirdreality/webrtc_sidecar/*.py \
             release/thirdreality-realtime/webrtc_sidecar/
+          install -m 0644 \
+            device/thirdreality/aec3_capture/CMakeLists.txt \
+            device/thirdreality/aec3_capture/README.md \
+            device/thirdreality/aec3_capture/THIRD_PARTY_NOTICES.md \
+            device/thirdreality/aec3_capture/__init__.py \
+            device/thirdreality/aec3_capture/recorder.py \
+            release/thirdreality-realtime/aec3_capture/
+          install -m 0755 device/thirdreality/aec3_capture/build_aarch64.py \
+            release/thirdreality-realtime/aec3_capture/build_aarch64.py
+          install -m 0644 device/thirdreality/aec3_capture/cmake/*.cmake \
+            release/thirdreality-realtime/aec3_capture/cmake/
+          install -m 0644 device/thirdreality/aec3_capture/include/*.h \
+            release/thirdreality-realtime/aec3_capture/include/
+          install -m 0644 device/thirdreality/aec3_capture/src/* \
+            release/thirdreality-realtime/aec3_capture/src/
           install -m 0644 \
             device/thirdreality/webrtc-runtime.in \
             device/thirdreality/webrtc-runtime.lock.txt \

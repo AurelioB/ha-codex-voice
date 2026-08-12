@@ -21,7 +21,9 @@ from device.thirdreality.realtime_client.config import (
     DEVICE_WEBRTC_TRANSPORT,
     MAX_DIRECT_CAPTURE_GAIN_DB,
     MAX_REALTIME_VOLUME_PERCENT,
+    NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
+    PULSEAUDIO_AEC_CAPTURE,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -61,6 +63,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.prompt is None
     assert config.full_duplex is False
     assert config.media_transport == BRIDGE_PCM_TRANSPORT
+    assert config.capture_backend == PULSEAUDIO_AEC_CAPTURE
     assert config.direct_capture_gain_db == DEFAULT_DIRECT_CAPTURE_GAIN_DB
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
@@ -213,6 +216,33 @@ def test_config_loads_normalized_device_webrtc_capture_gain(tmp_path: Path) -> N
     assert config is not None
     assert config.direct_capture_gain_db == 6.0
     assert isinstance(config.direct_capture_gain_db, float)
+
+
+def test_config_loads_native_aec3_only_for_device_webrtc(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "capture_backend": NATIVE_AEC3_CAPTURE,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.capture_backend == NATIVE_AEC3_CAPTURE
+
+    _write_config(
+        path,
+        {**_valid_config(), "capture_backend": NATIVE_AEC3_CAPTURE},
+    )
+    with pytest.raises(ConfigError, match="requires device_webrtc"):
+        load_config(path, expected_uid=os.getuid())
 
 
 @pytest.mark.parametrize(
@@ -508,12 +538,12 @@ def test_full_duplex_defaults_to_existing_webrtc_aec_contract(tmp_path: Path) ->
     assert config.pulse_aec_method == DEFAULT_PULSE_AEC_METHOD
 
 
-@pytest.mark.parametrize("mode", [0o604, 0o640, 0o666])
-def test_config_rejects_group_or_other_access(tmp_path: Path, mode: int) -> None:
+@pytest.mark.parametrize("mode", [0o400, 0o604, 0o640, 0o666, 0o700])
+def test_config_requires_exact_private_mode(tmp_path: Path, mode: int) -> None:
     path = tmp_path / "realtime.json"
     _write_config(path, _valid_config(), mode=mode)
 
-    with pytest.raises(ConfigError, match="group or other"):
+    with pytest.raises(ConfigError, match="mode 0600"):
         load_config(path, expected_uid=os.getuid())
 
 

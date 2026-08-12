@@ -27,8 +27,14 @@ NATIVE_CONVERSATION_MODE = "native"
 BRIDGE_PCM_TRANSPORT = "bridge_pcm"
 DEVICE_WEBRTC_TRANSPORT = "device_webrtc"
 SUPPORTED_MEDIA_TRANSPORTS = frozenset({BRIDGE_PCM_TRANSPORT, DEVICE_WEBRTC_TRANSPORT})
+PULSEAUDIO_AEC_CAPTURE = "pulseaudio_aec"
+NATIVE_AEC3_CAPTURE = "native_aec3"
+SUPPORTED_CAPTURE_BACKENDS = frozenset(
+    {PULSEAUDIO_AEC_CAPTURE, NATIVE_AEC3_CAPTURE}
+)
 DEFAULT_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_SESSION_SECONDS = 900.0
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
 MAX_REALTIME_VOLUME_PERCENT = 60
@@ -64,6 +70,7 @@ _ALLOWED_KEYS = frozenset(
         "max_message_bytes",
         "full_duplex",
         "media_transport",
+        "capture_backend",
         "pulse_aec_source",
         "pulse_aec_sink",
         "pulse_aec_method",
@@ -100,6 +107,7 @@ class RealtimeConfig:
     max_message_bytes: int
     full_duplex: bool
     media_transport: str = BRIDGE_PCM_TRANSPORT
+    capture_backend: str = field(default=PULSEAUDIO_AEC_CAPTURE, kw_only=True)
     realtime_only: bool = field(default=False, kw_only=True)
     wake_probability_cutoff: float | None = field(default=None, kw_only=True)
     voice: str | None = None
@@ -140,6 +148,18 @@ class RealtimeConfig:
             raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
         if self.media_transport == DEVICE_WEBRTC_TRANSPORT and not self.full_duplex:
             raise ConfigError("device_webrtc media transport requires full_duplex")
+        if (
+            not isinstance(self.capture_backend, str)
+            or self.capture_backend not in SUPPORTED_CAPTURE_BACKENDS
+        ):
+            raise ConfigError(
+                "capture_backend must be 'pulseaudio_aec' or 'native_aec3'"
+            )
+        if (
+            self.capture_backend == NATIVE_AEC3_CAPTURE
+            and self.media_transport != DEVICE_WEBRTC_TRANSPORT
+        ):
+            raise ConfigError("native_aec3 capture requires device_webrtc")
         capture_gain = self.direct_capture_gain_db
         if (
             isinstance(capture_gain, bool)
@@ -408,6 +428,7 @@ def load_config(
         raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
     if media_transport == DEVICE_WEBRTC_TRANSPORT and not full_duplex:
         raise ConfigError("device_webrtc media transport requires full_duplex")
+    capture_backend = _capture_backend(decoded, media_transport=media_transport)
     direct_capture_gain_db = _bounded_float(
         decoded,
         "direct_capture_gain_db",
@@ -491,7 +512,7 @@ def load_config(
         handshake_timeout_seconds=_bounded_float(
             decoded,
             "handshake_timeout_seconds",
-            default=20.0,
+            default=DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
             minimum=1.0,
             maximum=30.0,
         ),
@@ -543,6 +564,7 @@ def load_config(
         max_message_bytes=max_message_bytes,
         full_duplex=full_duplex,
         media_transport=media_transport,
+        capture_backend=capture_backend,
         direct_capture_gain_db=direct_capture_gain_db,
         realtime_only=realtime_only,
         wake_probability_cutoff=wake_probability_cutoff,
@@ -574,10 +596,8 @@ def _read_secure_file(path: Path, *, expected_uid: int) -> bytes:
             raise ConfigError("realtime config must be a regular file")
         if metadata.st_uid != expected_uid:
             raise ConfigError("realtime config must be owned by root")
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise ConfigError(
-                "realtime config must not be accessible by group or other"
-            )
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise ConfigError("realtime config must have mode 0600")
         if metadata.st_size > _MAX_CONFIG_BYTES:
             raise ConfigError("realtime config is too large")
         chunks: list[bytes] = []
@@ -668,6 +688,23 @@ def _optional_pulse_aec_method(value: dict[str, Any]) -> str | None:
     candidate = value.get("pulse_aec_method")
     if not isinstance(candidate, str) or candidate not in SUPPORTED_PULSE_AEC_METHODS:
         raise ConfigError(_PULSE_AEC_METHOD_ERROR)
+    return candidate
+
+
+def _capture_backend(value: dict[str, Any], *, media_transport: str) -> str:
+    candidate = value.get("capture_backend", PULSEAUDIO_AEC_CAPTURE)
+    if (
+        not isinstance(candidate, str)
+        or candidate not in SUPPORTED_CAPTURE_BACKENDS
+    ):
+        raise ConfigError(
+            "capture_backend must be 'pulseaudio_aec' or 'native_aec3'"
+        )
+    if (
+        candidate == NATIVE_AEC3_CAPTURE
+        and media_transport != DEVICE_WEBRTC_TRANSPORT
+    ):
+        raise ConfigError("native_aec3 capture requires device_webrtc")
     return candidate
 
 

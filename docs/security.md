@@ -20,10 +20,14 @@ sides of a narrow bridge API.
   executes the calls, and sends only their results back to the bridge.
 - The current ThirdReality v3 client explicitly requests
   `conversation_mode: "native"`. The bridge ignores any Home Assistant broker
-  snapshot for that session and creates one active tool-free native App Server
-  realtime thread per peer epoch. It relays validated SDP and lifecycle sideband but never
-  carries v3 PCM or raw provider data. Okay Computer therefore has no Home Assistant control
-  authority; Okay Nabu retains the official Assist/tool route.
+  snapshot for that session and creates one native App Server realtime thread
+  per peer epoch with exactly one dynamic tool, `end_conversation`. The tool has
+  an empty-object input schema and only terminates this voice session; the bridge
+  rejects every other provider tool request with `do_not_retry` and ends the
+  epoch. It relays validated SDP and lifecycle sideband but never carries v3 PCM
+  or raw provider data. In the current controlled deployment, Okay Nabu selects
+  this direct route with `realtime_only: true`; Home Assistant Assist/Hermes and
+  entity tools are deferred, so it has no Home Assistant control authority.
 - The bridge echoes an accepted explicit mode in `started`; the reference
   client requires `conversation_mode: "native"` and fails closed if the echo is
   absent or different. Native audio never crosses the legacy completed-
@@ -110,18 +114,41 @@ sides of a narrow bridge API.
   teardown the active turn is tombstoned and interrupted before its event
   consumer closes, and provider/thread cleanup remains tracked and shielded
   from request-handler cancellation.
-- “Okay Computer” selects explicit native v3 and gains no Home Assistant
-  authority. “Okay Nabu” selects the official Assist path while the microphone
-  is idle. Once a direct session owns it, later detector hits are ignored;
-  interruption and follow-up are driven only by bounded live-audio/VAD logic.
-- The device retains at most six idle microphone frames for the direct wake:
-  384 ms, or 12 KiB of PCM16, in process memory only. Okay Computer atomically
-  consumes it; Okay Nabu, stop, mute, disconnect, and teardown discard it. It
-  is never written to configuration, disk, diagnostics, or logs, remains inside
-  existing queue bounds, and is trimmed or omitted to preserve 32 KiB of live
-  post-wake capacity. Any v3 startup/runtime failure clears its captured direct
-  audio and returns idle rather than handing it to Home Assistant. The v2
-  rollback alone preserves bounded pre-ready Assist replay.
+- Okay Nabu selects explicit native v3 in the current `realtime_only` trial and
+  gains no Home Assistant authority. Once a direct session owns the device,
+  later detector hits are ignored; interruption and follow-up are driven only
+  by bounded live-audio/VAD logic. A later split deployment may restore Assist
+  and a distinct direct phrase, but that authority split is not active now.
+- The device may retain at most six idle microphone frames in its generic
+  compatibility ring: 384 ms, or 12 KiB of PCM16 in memory only. An accepted v3
+  wake discards all of it and drops every recorder callback during connecting
+  and ready-cue playback. The initial peer therefore receives zero wake or
+  pre-ready PCM and does not wait on the 64 KiB live input queue. That queue
+  opens empty after cue EOF and then bounds accepted live/rollover pressure.
+  Stop, mute, disconnect, teardown, deadline, exhaustion, cue failure, and every
+  v3 terminal clear remaining capture without forwarding, persisting, logging,
+  or handing it to Home Assistant. The v2 rollback alone preserves bounded
+  initial pre-roll/headroom and pre-ready Assist replay.
+- An accepted direct wake queues the thinking/pulsing LED immediately and gives
+  at most three fresh session attempts one shared absolute 12-second owner
+  deadline. Each session has its own five-second signaling-handshake bound
+  inside the remaining owner time. Idle process prewarm proves only that the
+  two isolated `Popen` children are alive; it does not request or validate an
+  SDP offer. Construction, AEC/player preflight, offer creation, bridge setup,
+  peer readiness, terminal state, deadline, or attempt exhaustion all fail
+  closed without widening authority to Home Assistant.
+- `RealtimeSession.ready` is set only after the answer is applied, the peer and
+  `oai-events` channel are ready, the device sends `transport_ready`, and the
+  bridge returns the exact accepted `started`. Only then may the root process
+  play once the pinned root-owned PCM16 mono 22,050 Hz cue
+  `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`, SHA-256
+  `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
+  0.400 seconds. Capture remains closed and the local stop detector remains
+  active through cue EOF; EOF switches to the listening LED, suspends that
+  detector, and opens live provider capture. Missing EOF or cue failure has a
+  two-second bound and is terminal. During LIVE, an explicit spoken stop or
+  goodbye invokes `end_conversation`; its result closes the session and normal
+  cleanup restores the prior detector membership and idle LED.
 - The ThirdReality controller is standard-library code imported into the
   existing root voice process. Direct media runs in a separate
   `/usr/bin/python3 -I -S` child with a complete hash-locked Python
@@ -140,7 +167,8 @@ sides of a narrow bridge API.
   validated before the latency patch, and the broader audio/configuration/
   constructor/microphone-loop group is validated before direct ownership and
   detector ordering. A second-stage mismatch disables direct mode while
-  retaining only the separately guarded normal Assist path. Its JSON
+  retaining the separately guarded Assist implementation for explicit rollback;
+  the current `realtime_only` matching wake still fails closed. Its JSON
   configuration must be a root-owned, non-symlink regular file with mode 0600;
   source directories/files must not be writable by group or other.
 - V3 `device_webrtc` requires full duplex and fails closed without a reviewed static
@@ -152,28 +180,42 @@ sides of a narrow bridge API.
   v1.1.7 must explicitly select Adrian because its module rejects the uncompiled
   WebRTC and Speex engines. The client checks the exact method before opening
   the bridge socket, enforces a configured 1–60% sink ceiling with a safe 25%
-  default, then once per direct session uses fixed-argv `pactl` to set and
-  verify the dedicated sink at the exact configured raw playback value. Both
-  checks finish before the SDP offer or bridge connection, and only then does
-  the signaling handshake deadline begin; the maximum-session deadline still
-  spans local preparation. V3 runs `paplay`
+  default, then at direct startup uses fixed-argv `pactl` to set and verify the
+  dedicated sink at the exact configured raw playback value. Both checks finish
+  before the SDP offer or bridge connection. Each attempt's five-second
+  signaling deadline begins only after this local preparation, while the shared
+  12-second wake-owner deadline spans preparation and every retry. V3 runs `paplay`
   only on that allowlisted sink with raw stream volume 65536 (100% relative),
   non-blocking stdin, and fixed format and latency arguments. It never
-  enumerates or mutates a sink-input; the live response/interruption path
-  performs no blocking volume subprocess work, and the v2 rollback retains its
-  configured stream-volume behavior. The guard compares raw PulseAudio units
+  enumerates or mutates a sink-input. Each response verifies the exact anchor;
+  a mismatch is repaired or output fails closed. Home Assistant volume requests
+  are applied as bounded software attenuation, and the guarded 50 ms physical-
+  button loop restores a displaced anchor. Ordinary interruption performs no
+  blocking volume subprocess work, and the v2 rollback retains its configured
+  stream-volume behavior. The guard compares raw PulseAudio units
   to the exact linear ceiling rather than trusting rounded display percentages.
   The installer writes the matching raw setpoint in the static startup block
   immediately after sink creation. The stock voice process later applies its
   persistent Home Assistant media-player preference, which must match;
-  deferred PulseAudio restore state alone is not trusted across reboot. Other
-  software must not mutate the qualified sink during a live direct session. A
-  successfully loaded Adrian topology still requires a
+  deferred PulseAudio restore state alone is not trusted across reboot.
+  Uncoordinated sink mutation is unsupported and is repaired or fences output.
+  A successfully loaded Adrian topology still requires a
   physical double-talk canary on each installation at its configured sink and
   stream values. The reference device's bounded 25% pass exercised the prior
   v2 path. Its separate v3 canary ran at that installation's qualified 60%
   setting. Neither result is transferable evidence for another device, and the
   public example remains at the conservative 25% default.
+- Native hardware-loopback AEC3 remains disabled by default. Its normal
+  selector is `capture_backend: "native_aec3"` in the enabled root-owned
+  mode-0600 `/data/conf/codex-realtime.json` with `device_webrtc`. The overlay
+  reads that no-follow, bounded configuration before vendor microphone
+  selection; `CODEX_AEC3_CAPTURE=1` is only an explicit environment override,
+  not a required companion flag. It publishes `CODEX_AEC3_ACTIVE=1` internally
+  only after installing the recorder, and session preflight treats that marker
+  as proof that the configured backend is active. Operators must not set it.
+  An invalid native library, ABI, device, or capture path fails startup closed.
+  Merely installing the library does not select it, never authorizes raw-
+  microphone fallback, and does not satisfy physical qualification.
 - Provider response/output lifecycle never labels or gates the normal direct
   RTP lane; local media boundaries come only from first decoded audio and an
   actual roughly 120 ms receiver quiet gap. Trusted AEC-filtered v3 barge-in
@@ -195,8 +237,9 @@ sides of a narrow bridge API.
   epoch-tagged controls. Deploy the compatible bridge before the new device
   because the initial acknowledgement cannot advertise this extension. Invalid
   epoch, queue/age/timeout, sidecar, or transport failure ends the outer session
-  closed. Stop, normal wake, mute, and disconnect also end it. Captured direct
-  audio is neither handed to Home Assistant nor persisted/logged.
+  closed. Stop, mute, and disconnect also end it; later detector hits remain
+  ignored while the owner is live. Captured direct audio is neither handed to
+  Home Assistant nor persisted/logged.
 - Capture age is checked again at actual RTP consumption; anything older than
   2.25 seconds is terminal. Standby health is re-polled before use, and an absent
   or invalid slot terminates the outer session. Pre-ack replacement lifecycle and PCM

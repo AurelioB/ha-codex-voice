@@ -40,36 +40,68 @@ temporal values such as `date`, `time`, and `datetime`. Values outside that
 policy are rejected locally with a data-safe protocol error before a WebSocket
 message is sent.
 
-The pinned v1.1.7 device overlay adds a second, explicitly separate route:
+The pinned v1.1.7 device overlay supports two explicitly separate routes. The
+current controlled trial deliberately binds the installed `Okay Nabu` detector
+to the direct route and sets `realtime_only: true`:
 
 ```text
-"Okay Nabu" -> stock satellite protocol -> Home Assistant Assist/tools
-"Okay Computer" -> stdlib controller + isolated device aiortc sidecar
-                 -> realtime wire v3 SDP/sideband -> bridge/App Server/OAuth
-                 -> direct RTP audio + oai-events between device and provider
-                 -> local device playback
+"Okay Nabu" -> stdlib controller + isolated device aiortc sidecar
+             -> realtime wire v3 SDP/sideband -> bridge/App Server/OAuth
+             -> direct RTP audio + oai-events between device and provider
+             -> local device playback
 
-No Home Assistant broker snapshot, transcript executor, or appendSpeech render
-handoff participates in the Okay Computer session.
+Home Assistant Assist/Hermes and entity tools are deferred for this trial. No
+Home Assistant broker snapshot, transcript executor, or appendSpeech render
+handoff participates in the direct session.
 ```
+
+The detector split remains available for a later deployment: `Okay Nabu` can
+return to the stock Home Assistant Assist route while a separately installed
+`Okay Computer` detector selects direct realtime. It is not the active trial
+configuration.
 
 The direct device is the aarch64 Buildroot Linux speaker, not Android, and
 remains an untrusted audio/control endpoint. It never
 receives a Home Assistant credential, advertises tools, sends tool results, or
-receives provider tool calls or transcript content. The current reference
-client always requests native mode. The bridge ignores any registered realtime
-authority for that session, so Okay Computer is tool-free; Okay Nabu owns Home
-Assistant Assist and entity control. Qualified device AEC makes Okay Computer
-the full-duplex/barge-in route. A normal Okay Nabu wake can preempt direct
-mode and regain the microphone on the same vendor capture thread.
+receives transcript content. The current reference client always requests
+native mode. The bridge ignores any registered realtime authority for that
+session and injects exactly one dynamic provider tool, `end_conversation`,
+which can only end the voice session. No Home Assistant entity tool or broker
+authority is available. Qualified device AEC makes the direct route the
+full-duplex/barge-in route.
 
 For v3 the bridge owns the managed Codex login, one active App Server realtime
-thread per peer epoch, SDP relay, lifecycle sideband, unexpected-tool rejection,
-and cleanup only. It
+thread per peer epoch, the `end_conversation` declaration and handler, SDP
+relay, lifecycle sideband, unexpected-tool rejection, and cleanup only. It
 does not construct the peer or relay PCM/provider data. The device's isolated,
 hash-locked `aiortc` runtime owns the audio transceiver and ordered
 `oai-events` channel. Protocol v2 `bridge_pcm` remains an explicit rollback and
 legacy compatibility path.
+
+The direct wake boundary is deterministic. An accepted Okay Nabu detection
+immediately claims the vendor owner and queues the non-blocking
+thinking/pulsing LED. Initial v3 startup discards the trigger/wake history and
+every recorder callback produced before local confirmation completes; it does
+not seed or wait on a microphone backlog. At most three fresh session attempts
+share one absolute 12-second owner deadline, while each attempt keeps its own
+5-second signaling-handshake bound inside the remaining budget. Deadline,
+attempt exhaustion, terminal state, or setup failure releases the owner and
+returns the LED to idle without entering Home Assistant.
+
+`RealtimeSession.ready` is narrower than process or offer readiness. It means
+the SDP answer was applied, the peer connected, the `oai-events` data channel
+opened, the device sent `transport_ready`, and the bridge returned the exact
+accepted `started`. Only then does the device play once the root-owned pinned
+PCM16 mono 22,050 Hz cue
+`/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav` (SHA-256
+`6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
+0.400 seconds). Capture remains closed until cue EOF. The vendor stop-word
+detector remains active through connecting and cue playback; EOF suspends it,
+opens live capture, and switches the LED to listening. The cue must finish
+within two seconds. Cue failure/timeout and any terminal race fail closed. In
+the live phase a clear spoken stop/goodbye is handled by the sole
+`end_conversation` tool; its terminal result tears down the socket and normal
+cleanup restores the detector and idle LED. No Home Assistant tool is present.
 
 For legacy auto/managed compatibility, authority is selected from Conversation
 config subentries, not from a device message. Zero or multiple opted-in
@@ -308,14 +340,17 @@ session would occupy the single subscription speech lane without a documented
 quota-neutral idle lifetime. Experimental Codex adapter optimization is
 therefore limited to capture overlap and progressive TTS delivery. The
 recommended Wyoming providers do not use those remote adapters. The direct
-device prewarms exactly two reusable local isolated `aiortc` processes. One is
-active and one is the offer-warm standby; they alternate fresh PeerConnections,
-and recycle the retired epoch's process as standby. An absent or invalid standby
-ends the outer session without a cold replacement or third process. This local
-prewarm does not create a Codex thread, open a bridge socket, negotiate remote
-WebRTC, or consume the speech lane until the explicit wake. See
-[performance and ThirdReality tuning](performance.md) for the live measurements
-and acceptance criteria.
+device prewarms exactly two reusable local isolated `aiortc` processes. Idle
+process prewarm means only that each `Popen` is alive; it does not request,
+drain, or validate an SDP offer. The selected child creates its first offer only
+inside an accepted wake attempt. After the first peer is live, the other process
+can be offer-prepared as the rollover standby; the two then alternate fresh
+PeerConnections and recycle the retired process. An absent or invalid required
+standby ends the outer session without a cold replacement or third process.
+This local process pool does not create a Codex thread, open a bridge socket,
+negotiate remote WebRTC, or consume the speech lane before the explicit wake.
+See [performance and ThirdReality tuning](performance.md) for the live
+measurements and acceptance criteria.
 
 ## Realtime client mode
 
@@ -344,10 +379,17 @@ before any patch is installed; missing, disabled, insecure, invalid, or unknown
 inputs leave direct mode inactive or fail the selected wake closed.
 
 ```text
-vendor microphone callback (16 kHz PCM16)
+accepted Okay Nabu wake
+  -> queue thinking/pulsing LED
+  -> discard wake and all pre-ready PCM
+  -> <=3 attempts within one absolute 12 s owner deadline
+  -> exact v3 transport readiness
+  -> one pinned ~0.400 s cue (2 s EOF timeout; capture still closed)
+  -> cue EOF -> listening LED + live capture
+
+live vendor microphone callback (16 kHz PCM16)
   -> statically qualified PulseAudio AEC source
-  -> direct-only idle pre-roll (up to 6 × 64 ms / 12 KiB in RAM)
-  -> bounded device input queue (64 KiB / 2.048 s; up to 2x catch-up)
+  -> bounded live device input queue (64 KiB / 2.048 s)
   -> bounded timestamped sidecar IPC
   -> device aiortc RTP track ==============================> provider
 
@@ -358,18 +400,24 @@ provider audio RTP =======================================> device aiortc peer
   -> exact raw sink value; paplay raw relative volume 65536
   -> AEC sink at configured 1–60% ceiling (25% default)
 
-device v3 WebSocket -> SDP offer/answer + ready/ping/stop -> bridge/App Server
-                      (no PCM or raw provider data)
+device v3 WebSocket -> SDP offer/answer + transport_ready/started/ping/stop
+                      -> bridge/App Server (no PCM or raw provider data)
 ```
 
 The recorder callback runs before local wake-model activation. The overlay
-retains the newest six idle frames and transfers them only to Okay Computer.
-Okay Nabu discards that history before official Assist starts. Stop, mute,
-disconnect, teardown, and every v3 failure clear it without forwarding,
-persisting, or logging it. Pre-roll remains inside configured queue bounds and
-is trimmed or omitted to reserve at least 32 KiB (1.024 s) of live post-wake
-capacity. V3 never replays captured direct audio into Home Assistant; the user
-must invoke Okay Nabu separately.
+may retain the newest six idle frames in the compatibility ring, but the current
+Okay Nabu v3 wake discards all 384 ms / 12 KiB instead of transferring it. It
+also drops every connecting and cue-time callback. The 64 KiB input queue
+therefore starts empty when cue EOF opens capture; it bounds accepted live and
+rollover pressure, not cold negotiation. Initial 32 KiB headroom and wake
+pre-roll transfer remain v2-only compatibility behavior. Stop, mute,
+disconnect, teardown, and every v3 failure clear capture without forwarding,
+persisting, logging, or replaying it into Home Assistant.
+
+Initial startup must not be confused with live rollover. After capture has
+opened, a committed trusted-AEC interruption deliberately retains 4 KiB /
+128 ms of recent live capture and merges it with the rollover queue for the
+replacement peer. That bounded live pre-roll never seeds epoch 1.
 
 The v3 start requires `conversation_mode: "native"`, a device SDP offer with
 audio and application media lines, and no device tools or PCM fields. App
@@ -378,7 +426,10 @@ for answer-applied, connected peer, and open `oai-events` before sending
 `transport_ready`; only then does the bridge send a content-free `started` with
 `audio_over_bridge: false` and `sideband_control: true`. The bridge ignores any
 Home Assistant broker snapshot, so there is no transcript boundary, executor,
-or `appendSpeech` render handoff.
+or `appendSpeech` render handoff. The native thread declares only
+`end_conversation` with an empty input schema. The bridge returns a successful
+terminal result for that exact call and a `do_not_retry` rejection for any
+other tool request, then ends the epoch so device cleanup cannot remain live.
 
 The initial peer is implicit epoch 1 and its exact v3
 `start`/`answer`/`transport_ready`/`started` shapes do not change. Trusted AEC
@@ -397,15 +448,31 @@ automatic fallback. Stock v1.1.7 rejects WebRTC and Speex but loads Adrian, so
 its active configuration explicitly selects Adrian. Startup verifies the
 topology and ceiling before constructing the peer. Once per direct session,
 before the SDP offer or bridge connection, a fixed-argv `pactl` controller sets
-and verifies the dedicated sink to the exact raw playback setting. The signaling
-handshake deadline starts only after that local AEC and player preparation
-finishes; the maximum-session deadline still spans the complete startup. Direct
+and verifies the dedicated sink to the exact raw playback setting. The
+per-attempt five-second signaling deadline starts only after that local AEC and
+player preparation finishes, while the absolute 12-second wake-owner deadline
+also bounds preparation and all retries. The maximum-session deadline remains a
+separate hard lifetime cap. Direct
 `paplay` uses that sink with raw stream volume 65536 (100% relative),
 non-blocking 20 ms writes, and 60 ms/20 ms latency/process arguments; it never
-enumerates or mutates a sink-input. No blocking volume subprocess runs from
-`response.created`, playback begin/resume, or the interruption path. The
-guarded installer and later vendor media-player preference must agree on the
-sink volume, and nothing may mutate it while a direct session is live.
+enumerates or mutates a sink-input. Each response rechecks the exact anchor and
+repairs a mismatch before admitting audio or fails output closed. Matching Home
+Assistant volume requests use bounded software attenuation instead of moving
+the sink, and the guarded 50 ms physical-button loop restores a displaced
+anchor. Ordinary interruption runs no volume subprocess. Uncoordinated live
+sink mutation remains unsupported and is repaired or fences output.
+
+The native hardware-loopback AEC3 capture slice is disabled by default. Its
+normal selector is `capture_backend: "native_aec3"` in the enabled root-owned
+mode-0600 `/data/conf/codex-realtime.json` for `device_webrtc`. The early
+overlay hook reads that secure configuration before vendor microphone import;
+`CODEX_AEC3_CAPTURE=1` is only an explicit environment override. After a
+successful native patch the overlay publishes `CODEX_AEC3_ACTIVE=1` as internal
+proof consumed by session preflight, not as an operator selector. Library, ABI,
+device, or capture errors fail startup closed, and merely installing the files
+does not select them. Adrian remains available as the playback-DMA keepalive
+during the initial physical acceptance program; native AEC3 remains canary-first
+and unqualified until the physical gates pass.
 
 Provider response/output lifecycle observes control state but never labels,
 gates, splits, or retires the normal RTP lane. First decoded audio emits
@@ -465,9 +532,10 @@ the historical wire-v2 `bridge_pcm` rollback is separate.
 
 Fresh-peer rollover is a safe subscription-backed approximation, not exact
 ChatGPT same-session interruption. Queue/age/timeout, sidecar, or epoch failure
-ends the outer session closed. Manual stop, mute, disconnect, and normal-wake
-preemption still end it. No failure forwards direct audio to Home Assistant or
-logs it. At that installation's qualified 60% setting, a reference-device
+ends the outer session closed. Manual stop, mute, and disconnect still end it;
+later detector hits remain ignored while the owner is live. No failure forwards
+direct audio to Home Assistant or logs it. At that installation's qualified 60%
+setting, a reference-device
 physical double-interruption canary passed twice with the exact artifact. Four
 cuts were 208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its
 same two worker PIDs without a cold replacement and retained context twice.

@@ -133,6 +133,20 @@ THREAD_DISPOSAL_DELETE_TIMEOUT_SECONDS = 4.0
 REALTIME_CONTROL_TIMEOUT_SECONDS = 5.0
 REALTIME_WEBSOCKET_SEND_TIMEOUT_SECONDS = 2.0
 DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS = 0.10
+DIRECT_END_CONVERSATION_TOOL_NAME = "end_conversation"
+DIRECT_END_CONVERSATION_TOOL = {
+    "type": "function",
+    "name": DIRECT_END_CONVERSATION_TOOL_NAME,
+    "description": (
+        "End this voice conversation immediately. Use only when the user explicitly "
+        "asks to stop, end, close, or leave the conversation, or clearly says goodbye."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
 REALTIME_OUTPUT_PREROLL_MILLISECONDS = 200
 REALTIME_OUTPUT_PREROLL_MAX_BYTES = (
@@ -4194,7 +4208,10 @@ async def _serve_direct_webrtc_session(
     base_instructions = (
         "Act as a natural realtime voice conversation partner. Respond directly "
         "in conversational spoken language. Keep answers concise unless the user "
-        "asks for detail. Never inspect local files or invoke tools."
+        "asks for detail. Never inspect local files. Your only tool is "
+        "end_conversation. Invoke it only when the user explicitly asks to end, "
+        "stop, close, or leave this conversation, or clearly says goodbye. Do not "
+        "invoke it merely because a response or topic is complete."
     )
     voice = first.get("voice")
     normalized_voice = voice.lower() if isinstance(voice, str) and voice else None
@@ -4266,7 +4283,7 @@ async def _serve_direct_webrtc_session(
                 if candidate_thread_id is None:
                     candidate_thread_id = await state.start_thread(
                         thread_payload,
-                        tools=[],
+                        tools=[DIRECT_END_CONVERSATION_TOOL],
                         base_instructions=base_instructions,
                     )
                     created_thread = True
@@ -4572,7 +4589,13 @@ async def _wait_for_direct_transport_ready(
                     raise ProtocolError(
                         "realtime provider closed during device handshake"
                     )
-                await _reject_direct_provider_tool_call(session, event)
+                action = await _handle_direct_provider_tool_call(session, event)
+                if action == "end":
+                    await _send_realtime_json(
+                        websocket,
+                        {"type": "stopped", "reason": "end_conversation"},
+                    )
+                    raise _RealtimeClientDisconnected
             if client_task in done:
                 message = client_task.result()
                 if not isinstance(message, Mapping):
@@ -4644,12 +4667,17 @@ async def _run_direct_realtime_socket(
                     {"type": "stopped", "reason": "remote_closed"},
                 )
                 return
-            if await _reject_direct_provider_tool_call(session, event):
-                # Native direct voice starts without tools.  Once transport is
-                # live, a provider tool request cannot make forward progress:
-                # continuing would leave the device listening indefinitely
-                # after the rejected call.  End this epoch so the device can
-                # release its LED/microphone owner and accept a fresh wake.
+            tool_action = await _handle_direct_provider_tool_call(session, event)
+            if tool_action == "end":
+                await _send_realtime_json(
+                    websocket,
+                    {"type": "stopped", "reason": "end_conversation"},
+                )
+                return
+            if tool_action == "rejected":
+                # Any tool other than the one local terminal capability cannot
+                # make forward progress. End this epoch so the device releases
+                # its LED/microphone owner instead of waiting indefinitely.
                 await _send_realtime_json(
                     websocket,
                     {"type": "stopped", "reason": "provider_tool_rejected"},
@@ -4679,13 +4707,13 @@ async def _run_direct_realtime_socket(
         await asyncio.gather(client_task, provider_task, return_exceptions=True)
 
 
-async def _reject_direct_provider_tool_call(
+async def _handle_direct_provider_tool_call(
     session: SignalingRealtimeSession,
     event: Mapping[str, Any],
-) -> bool:
-    """Reject one impossible direct-voice tool request in every lifecycle phase."""
+) -> str | None:
+    """Execute the sole terminal tool and reject every other provider request."""
     if event.get("method") != "item/tool/call":
-        return False
+        return None
     request_id = event.get("id")
     if not isinstance(request_id, (int, str)):
         raise ProtocolError("direct voice received an invalid tool request")
@@ -4693,20 +4721,38 @@ async def _reject_direct_provider_tool_call(
     values = params if isinstance(params, Mapping) else {}
     raw_call_id = values.get("callId", request_id)
     call_id = str(raw_call_id)
+    tool_name = values.get("tool")
+    arguments = values.get("arguments")
+    if (
+        tool_name == DIRECT_END_CONVERSATION_TOOL_NAME
+        and isinstance(arguments, Mapping)
+        and not arguments
+    ):
+        await _respond_to_tool_result(
+            session.rpc,
+            {
+                "call_id": call_id,
+                "success": True,
+                "result": {"status": "conversation_ended"},
+            },
+            {call_id: request_id},
+            timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
+        )
+        return "end"
     await _respond_to_tool_result(
         session.rpc,
         {
             "call_id": call_id,
             "success": False,
             "result": {
-                "error": "direct_voice_has_no_tools",
+                "error": "direct_voice_tool_not_allowed",
                 "do_not_retry": True,
             },
         },
         {call_id: request_id},
         timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
     )
-    return True
+    return "rejected"
 
 
 async def _serve_realtime_session(

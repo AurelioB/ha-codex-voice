@@ -18,16 +18,20 @@ and releases use semantic versioning.
 - Add strict ThirdReality wire protocol v3: the device supplies an SDP offer,
   confirms ICE/DTLS/SCTP and `oai-events` readiness, and keeps RTP audio plus
   provider data directly on its own WebRTC peer. The bridge now owns only the
-  managed Codex login, App Server signaling/lifecycle sideband, tool rejection,
-  and bounded cleanup for that route.
+  managed Codex login, App Server signaling/lifecycle sideband, the sole
+  empty-input `end_conversation` terminal tool, rejection of every other tool,
+  and bounded cleanup for that route. No Home Assistant tool is declared.
 - Add an isolated ThirdReality `aiortc` sidecar for the Python 3.11/aarch64
   Buildroot Linux target, bounded transcript-free sequenced-packet IPC, direct
   continuous-RTP media boundaries based on first audio/receiver quiet, exact
   once-per-session pre-negotiation AEC sink-volume preparation, fixed-argv
   non-blocking `paplay`, and fresh-peer interruption rollover. Exactly two
-  prewarmed processes alternate active/standby roles and construct fresh
-  PeerConnections in place. An absent or invalid standby terminates the outer
-  session instead of cold-launching a replacement or allocating a third process.
+  reusable processes alternate active/standby roles and construct fresh
+  PeerConnections in place. Idle process prewarm proves only that each `Popen`
+  remains alive; it does not request or validate an offer. Offer validation
+  occurs only after an accepted wake or while preparing the owned rollover
+  standby. An absent or invalid required standby terminates the outer session
+  instead of cold-launching a replacement or allocating a third process.
 - Add epoch-tagged v3 rollover signaling. Trusted two-frame AEC barge-in keeps
   the outer vendor owner, device session, logical player, bridge WebSocket, and
   ready latch while replacing the device/provider WebRTC peer. A bounded
@@ -44,12 +48,69 @@ and releases use semantic versioning.
   import/SDP smoke test as UID/GID 65534 on root installs, unprivileged sidecar
   launch with a minimal environment, and explicit runtime rollback
   documentation.
+- Add a disabled-by-default native hardware-loopback AEC3 capture slice and
+  standalone canary for physical qualification. The overlay includes a
+  config-selected, fail-closed startup hook; merely installing the native
+  runtime does not select it.
+- Add an explicit `capture_backend` contract. `native_aec3` requires device
+  WebRTC and is normally selected by `capture_backend: "native_aec3"` in the
+  enabled root-owned mode-0600 realtime configuration. The service environment
+  `CODEX_AEC3_CAPTURE=1` is an explicit override, not a second requirement.
+  After successfully installing the recorder, the overlay publishes
+  `CODEX_AEC3_ACTIVE=1` as internal preflight proof. The backend retains the
+  verified Pulse playback topology and removes only the obsolete requirement
+  that the voice process own a Pulse microphone stream.
 - Document the complete [v3 wire contract](protocol/realtime-wire-v3.md),
   including signaling order, privacy boundaries, failure semantics, and the
   retained [v2 rollback contract](protocol/realtime-wire-v2.md).
 
 ### Changed
 
+- Route the current controlled Okay Nabu deployment to direct v3 with
+  `realtime_only: true`; defer Home Assistant Assist/Hermes and entity tools.
+  An accepted wake immediately queues the thinking/pulsing LED, discards all
+  wake and pre-ready PCM, and permits at most three fresh attempts inside one
+  absolute 12-second owner deadline, with a five-second signaling handshake per
+  attempt. `RealtimeSession.ready` now means answer applied, peer connected,
+  `oai-events` ready, `transport_ready` sent, and the exact bridge `started`
+  accepted. Only then play once the pinned root-owned PCM16 mono 22,050 Hz cue
+  `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`
+  (SHA-256 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`,
+  about 0.400 seconds). Keep capture closed and the local stop detector active until
+  cue EOF; then switch the LED to listening, suspend that detector, and open
+  live capture. Cue failure/two-second timeout, terminal state, deadline, or
+  attempt exhaustion returns idle without Home Assistant fallback. A clear
+  live stop/goodbye invokes `end_conversation` and terminal cleanup returns the
+  LED to idle.
+- Keep the qualified direct-WebRTC AEC sink and `paplay` stream gain fixed
+  while a realtime session owns audio. Home Assistant volume, mute, and unmute
+  commands are intercepted before the vendor players, capped at the configured
+  playback anchor, persisted, and applied with PulseAudio-compatible cubic
+  attenuation plus a click-free 40 ms ramp at the next 20 ms PCM staging
+  boundary. Guard the pinned firmware's physical-button bridge too: shorten its
+  settings monitor from 500 ms to 50 ms, restore and verify any changed AEC
+  sink before the two-frame local-interruption boundary, and require the exact
+  anchor again before every response. A bounded render-aware double-talk guard
+  learns only during the existing AEC convergence window and rejects
+  high-confidence self-echo while uncertain speech fails open. A trained model
+  survives ordinary response gaps. A repaired volume excursion retains only
+  its FIR coefficients as an untrusted seed, invalidates the old delay, and
+  searches the full 20–320 ms range until three fresh correlated frames
+  requalify it. The first 128 ms suppresses stale transition evidence; clear
+  near-end speech is interruptible after that boundary, and eight unsuccessful
+  evidence frames fence output. Quiet or muted playback carries the pending
+  repair without consuming its evidence bound. Raw microphone PCM remains
+  byte-identical in the queue, local detector, and rollover pre-roll. Capture
+  correlated or uncertain against the active render is replaced by
+  equal-length silence only on the current provider peer; a fresh interruption
+  peer receives the untouched PCM. This prevents provider VAD from cancelling
+  on the speaker's own dynamic-volume transient while preserving cadence,
+  timestamps, genuine interruption, and follow-up speech. Sound-state writes
+  also share the hardware key's lock and use an atomic same-directory replace,
+  then arm exactly one next-tick anchor verification, so either ordering of a
+  concurrent key press and slider write cannot hide an AEC-sink repair. The
+  verification-only tick does not persist again. Diagnostics cover only
+  aggregate rendered/echo/suppression decisions.
 - Prioritize the configured ThirdReality realtime detector for same-block
   shared-prefix collisions without changing stored model order, add an
   optional bounded detector cutoff for accented speech, and record only
@@ -63,16 +124,24 @@ and releases use semantic versioning.
   Mexican Spanish prompt. Protocol v2 remains selectable explicitly with
   `media_transport: "bridge_pcm"`. The public 25% example is intentionally
   conservative; the reference v3 installation was separately qualified at 60%.
-- Make direct v3 startup and runtime failures clear bounded Okay Computer audio
-  and return idle instead of replaying captured audio into Home Assistant.
-  Okay Nabu remains the separate official Assist/home-control route.
+- Make direct v3 epoch 1 start with zero captured audio: discard the wake-tail
+  history and every connecting/cue frame instead of forwarding the former
+  384 ms pre-roll or waiting on the 64 KiB input queue. That queue now bounds
+  only accepted post-cue live and rollover pressure. Keep the distinct 4 KiB /
+  128 ms live rollover pre-roll unchanged. Startup/runtime failures return idle
+  instead of replaying captured audio into Home Assistant.
+- Commit each initial and rollover capture prefix through an ordered sidecar
+  barrier. The peer acknowledges `capture.ready` only after consuming the exact
+  committed sample boundary, so first RTP pull timing can no longer reclassify
+  delayed startup frames under the shorter live-age limit.
 - Make v3 response/output lifecycle control-only: it never labels or gates the
   normal RTP lane, so RTP-before-start prefixes and stopped-before-tail audio
   remain in one decoded lane. Local/explicit interruption immediately SIGKILLs
   `paplay` in the parent and drops queued media. Trusted AEC barge-in retires
   the old PeerConnection, queues bounded capture, and negotiates the next
   consecutive peer epoch over the existing authenticated WebSocket. The
-  stopped process is then recycled as the next offer-warm standby. The bridge
+  stopped process is then recycled and explicitly requalified as the next
+  rollover standby. The bridge
   reuses the Codex thread only after a confirmed old
   `thread/realtime/closed` barrier; otherwise it isolates the replacement on a
   new thread. Rollover reports whether startup context was retained without
@@ -110,30 +179,31 @@ and releases use semantic versioning.
 
 ### Fixed
 
-- Suspend the ThirdReality vendor's legacy terminal stop-word detector while a
-  direct full-duplex owner is live. Provider playback echo and ordinary reply
-  tails can no longer end an otherwise healthy realtime conversation; spoken
-  interruptions remain on the realtime barge-in path, and teardown restores
-  the detector's exact prior membership.
+- Keep the ThirdReality vendor's legacy terminal stop-word detector active as
+  the local cancel path while direct startup connects and while the ready cue
+  plays. Suspend it only when cue EOF opens LIVE capture, so provider playback
+  echo and ordinary reply tails cannot end a healthy realtime conversation;
+  teardown restores the detector's exact prior membership.
 - Answer Codex App Server's client-owned `currentTime/read` callback with whole
   Unix seconds, so realtime voice can complete clock questions instead of
-  stopping after its acknowledgement. Unexpected runtime tool requests now
-  end a tool-free direct session after their fail-closed response rather than
-  leaving its device owner live indefinitely.
+  stopping after its acknowledgement. Native direct threads now declare only
+  `end_conversation`; unexpected runtime tool requests receive a fail-closed
+  `do_not_retry` result and end the session rather than leaving its device owner
+  live indefinitely.
 - Release terminal ThirdReality realtime owners before routing the next wake,
   and stop ambient capture or signal-free decoded RTP from renewing semantic
   idle time. Live owners remain protected from duplicate wake detections while
   stalled sessions can return the microphone and LED to idle.
 - Restore and verify the configured direct-playback sink volume before the
   complete AEC topology preflight. Home Assistant TTS could leave the shared
-  dedicated AEC sink at 70%, causing every later 60%-ceiling Okay Computer
+  dedicated AEC sink at 70%, causing every later 60%-ceiling direct
   session to fail closed before WebRTC negotiation even though direct playback
   would otherwise have reset it to 60% immediately afterward.
-- Prevent a normal-wake detector false positive on the first post-wake command
-  from preempting a newly started Okay Computer session and silently routing
-  the utterance through single-turn Assist instead. All later wake detections
-  are suppressed while realtime owns the microphone; live VAD remains the
-  interruption and follow-up mechanism.
+- Prevent a later detector false positive on the first post-cue command from
+  preempting the newly started direct session. All later wake detections are
+  suppressed while realtime owns the microphone; live VAD remains the
+  interruption and follow-up mechanism, with no Assist route in the current
+  `realtime_only` deployment.
 - Protect the first audible playback of each fresh device peer from its
   physical AEC convergence transient. For one 512 ms onset window, capture
   frames are replaced with timestamp-preserving silence while the parent also
@@ -164,13 +234,13 @@ and releases use semantic versioning.
   control but did not affect samples until ALSA capture reopened. Installation
   is exact-file, dry-run-first, firmware-guarded, and symmetrically removable;
   invalid gain data uses the vendor's 30% fail-safe.
-- Prevent direct ThirdReality WebRTC startup from retaining a redundant Home
-  Assistant fallback copy of pre-ready microphone audio. With the default
-  64 KiB fallback bound and 12 KiB pre-roll, that unused copy previously filled
-  after 1.664 seconds and could fail closed before a roughly two-second cold
-  handshake completed. V3 remains bounded by its real 64 KiB input queue and
-  never replays into Assist; the `bridge_pcm` rollback keeps its existing
-  bounded fallback/replay behavior.
+- Prevent direct ThirdReality WebRTC startup from accepting any wake or
+  pre-ready microphone audio. The former 12 KiB wake pre-roll and redundant
+  Home Assistant fallback copy are discarded, and capture remains closed
+  through exact readiness and cue EOF. V3 therefore never depends on the
+  64 KiB live queue to survive a cold handshake and never replays into Assist;
+  the `bridge_pcm` rollback keeps its historical bounded fallback/replay
+  behavior.
 
 ## [0.6.0] - 2026-08-10
 

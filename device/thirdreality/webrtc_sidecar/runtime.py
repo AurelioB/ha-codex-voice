@@ -39,6 +39,10 @@ class PeerLike(Protocol):
         """Queue one timestamped capture packet."""
         ...
 
+    def commit_capture(self) -> None:
+        """Freeze the ordered startup capture prefix."""
+        ...
+
     def interrupt_response(self) -> None:
         """Fence local playback while provider server VAD interrupts output."""
         ...
@@ -77,6 +81,8 @@ class SidecarRuntime:
         self._shutdown = False
         self._offer_created = False
         self._answer_applied = False
+        self._capture_committed = False
+        self._capture_ready = False
         self._stopped = False
         if peer_factory is None:
             from .peer import DeviceWebRtcPeer  # noqa: PLC0415
@@ -111,7 +117,10 @@ class SidecarRuntime:
                 {receive_task, fatal_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if fatal_task in done and self._fatal_code is not None:
+            # A peer callback can synchronously latch a fatal while the receive
+            # task also completes. The first fatal always beats any readiness or
+            # generic receive-loop classification from the same ordered action.
+            if self._fatal_code is not None:
                 self._send_error(self._fatal_code)
                 code = 1
             elif receive_task in done:
@@ -172,6 +181,8 @@ class SidecarRuntime:
                     raise RuntimeErrorCode("offer_failed") from exc
                 self._offer_created = False
                 self._answer_applied = False
+                self._capture_committed = False
+                self._capture_ready = False
                 self._stopped = False
             if self._offer_created:
                 raise RuntimeErrorCode("offer_state_invalid")
@@ -196,6 +207,21 @@ class SidecarRuntime:
                 raise RuntimeErrorCode("answer_failed") from exc
             self._answer_applied = True
             self._send(encode_control("answer.applied"))
+            return
+        if message.type == "capture.commit":
+            if (
+                not self._answer_applied
+                or self._capture_committed
+                or self._stopped
+            ):
+                raise RuntimeErrorCode("capture_commit_state_invalid")
+            # Set the latch first: a zero-packet epoch can acknowledge
+            # synchronously from inside commit_capture().
+            self._capture_committed = True
+            try:
+                self._peer.commit_capture()
+            except Exception as exc:
+                raise RuntimeErrorCode("capture_commit_failed") from exc
             return
         if message.type == "response.interrupt":
             if not self._answer_applied or self._stopped:
@@ -242,6 +268,18 @@ class SidecarRuntime:
             return
 
     def _emit_state(self, state: str) -> None:
+        if state == "capture.ready":
+            if (
+                not self._capture_committed
+                or self._capture_ready
+                or self._fatal_code is not None
+            ):
+                if self._fatal_code is None:
+                    self._fail("state_invalid")
+                return
+            self._capture_ready = True
+            self._send(encode_control(state))
+            return
         if state not in {"connected", "data.ready"}:
             self._fail("state_invalid")
             return

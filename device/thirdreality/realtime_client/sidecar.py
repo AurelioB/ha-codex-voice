@@ -235,6 +235,10 @@ class WebRtcSidecarClient:
             )
         )
 
+    def commit_capture(self) -> None:
+        """Commit the finite ordered startup-capture prefix."""
+        self._send(encode_control("capture.commit"))
+
     def interrupt_response(self) -> None:
         """Fence local playback while provider server VAD handles interruption."""
         self._send(encode_control("response.interrupt"))

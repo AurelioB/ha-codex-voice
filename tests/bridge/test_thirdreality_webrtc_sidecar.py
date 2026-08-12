@@ -28,6 +28,7 @@ from device.thirdreality.webrtc_sidecar.peer import (
     MAX_CAPTURE_AGE_MILLISECONDS,
     MAX_CAPTURE_QUEUE_FRAMES,
     MAX_CAPTURE_QUEUE_MILLISECONDS,
+    MAX_STARTUP_CAPTURE_AGE_MILLISECONDS,
     CaptureAudioTrack,
     DeviceWebRtcPeer,
     PeerBackpressure,
@@ -125,6 +126,16 @@ def test_ipc_exposes_interrupt_but_not_unsupported_provider_cancel() -> None:
         encode_control("response.cancel", response_id="resp_1")
 
 
+@pytest.mark.parametrize("message_type", ["capture.commit", "capture.ready"])
+def test_ipc_round_trips_fieldless_capture_barrier(message_type: str) -> None:
+    assert decode_packet(encode_control(message_type)) == ControlMessage(
+        type=message_type,
+        values={},
+    )
+    with pytest.raises(ProtocolError, match="unexpected field"):
+        encode_control(message_type, sample_end=320)
+
+
 @pytest.mark.parametrize("gain_db", [0.0, 6.25, 12.0])
 def test_ipc_round_trips_strict_capture_gain(gain_db: float) -> None:
     assert decode_packet(
@@ -220,6 +231,12 @@ def test_provider_lifecycle_sanitizer_rejects_content_disguised_as_identifier() 
 @pytest.mark.parametrize(
     "event_type",
     [
+        "capture.direction.inactive",
+        "capture.direction.recvonly",
+        "capture.direction.sendonly",
+        "capture.direction.sendrecv",
+        "capture.direction.unknown",
+        "capture.outbound_active",
         "capture.rtp_started",
         "playback.rtp_started",
         "media.started",
@@ -427,6 +444,7 @@ class FakePeer:
         self.interruptions = 0
         self.stop_count = 0
         self.capture_gains: list[float] = []
+        self.capture_commits = 0
 
     def set_capture_gain_db(self, value: float) -> None:
         self.capture_gains.append(value)
@@ -441,6 +459,10 @@ class FakePeer:
 
     def feed_capture(self, value: CaptureAudio) -> None:
         self.captures.append(value)
+
+    def commit_capture(self) -> None:
+        self.capture_commits += 1
+        self.emit_state("capture.ready")
 
     def interrupt_response(self) -> None:
         self.interruptions += 1
@@ -488,6 +510,15 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
             ControlMessage(type="data.ready", values={}),
             ControlMessage(type="answer.applied", values={}),
         ]
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("capture.commit"),
+        )
+        assert await _recv_packet(parent) == ControlMessage(
+            type="capture.ready",
+            values={},
+        )
+        assert peers[0].capture_commits == 1
 
         capture = CaptureAudio(
             sample_index=320,
@@ -549,6 +580,25 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
         assert len(peers) == 2
         assert peers[0].stop_count == 1
         assert peers[1].capture_gains == [0.0]
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("set_answer", sdp="v=0\r\na=fresh-answer\r\n"),
+        )
+        fresh_answer_events = [await _recv_packet(parent) for _ in range(3)]
+        assert fresh_answer_events == [
+            ControlMessage(type="connected", values={}),
+            ControlMessage(type="data.ready", values={}),
+            ControlMessage(type="answer.applied", values={}),
+        ]
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("capture.commit"),
+        )
+        assert await _recv_packet(parent) == ControlMessage(
+            type="capture.ready",
+            values={},
+        )
+        assert peers[1].capture_commits == 1
         await asyncio.get_running_loop().sock_sendall(
             parent,
             encode_control("shutdown"),
@@ -980,10 +1030,12 @@ def test_capture_track_duration_bound_covers_one_prewarmed_rollover() -> None:
         track.stop()
 
 
-def test_capture_track_rejects_stale_audio_instead_of_replaying_it_late() -> None:
+def test_capture_track_rejects_audio_older_than_startup_bound() -> None:
     track = CaptureAudioTrack()
     try:
-        stale_at = time.monotonic_ns() - (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
+        stale_at = (
+            time.monotonic_ns() - (MAX_STARTUP_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
+        )
         with pytest.raises(PeerBackpressure, match="age bound"):
             track.feed(
                 CaptureAudio(
@@ -997,7 +1049,7 @@ def test_capture_track_rejects_stale_audio_instead_of_replaying_it_late() -> Non
 
 
 @pytest.mark.asyncio
-async def test_capture_track_revalidates_age_when_rtp_sender_consumes_queue(
+async def test_capture_track_accepts_negotiation_backlog_beyond_runtime_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_at = 10_000_000_000
@@ -1012,16 +1064,145 @@ async def test_capture_track_revalidates_age_when_rtp_sender_consumes_queue(
         )
     )
 
+    try:
+        now[0] += (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
+        frame = await track.recv()
+
+        assert frame.samples == 960
+        assert track.consumed_samples == 320
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_capture_track_first_recv_does_not_overtake_later_precommit_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10_000_000_000]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    track = CaptureAudioTrack()
+    try:
+        track.feed(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=7_500_000_000,
+                pcm=b"\x01\x00" * 320,
+            )
+        )
+        await track.recv()
+
+        now[0] = 11_000_000_000
+        track.feed(
+            CaptureAudio(
+                sample_index=320,
+                capture_monotonic_ns=8_000_000_000,
+                pcm=b"\x02\x00" * 320,
+            )
+        )
+        assert track.commit_startup_capture() == 640
+        frame = await track.recv()
+
+        assert frame.samples == 960
+        assert track.consumed_sample_end == 640
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_capture_track_commit_cutoff_selects_exact_runtime_age_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [20_000_000_000]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    track = CaptureAudioTrack()
+    try:
+        track.feed(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=17_000_000_000,
+                pcm=b"\x01\x00" * 320,
+            )
+        )
+        assert track.commit_startup_capture() == 320
+        # A packet ending exactly at the exclusive cursor is pre-commit; the
+        # next packet beginning there is post-commit and gets the runtime bound.
+        assert track._capture_age_limit_ns(319) == (
+            MAX_STARTUP_CAPTURE_AGE_MILLISECONDS * 1_000_000
+        )
+        assert track._capture_age_limit_ns(320) == (
+            MAX_CAPTURE_AGE_MILLISECONDS * 1_000_000
+        )
+        track.feed(
+            CaptureAudio(
+                sample_index=320,
+                capture_monotonic_ns=(
+                    now[0] - MAX_CAPTURE_AGE_MILLISECONDS * 1_000_000
+                ),
+                pcm=b"\x02\x00" * 320,
+            )
+        )
+        post_cutoff_at = now[0] - 1_000_000_000
+        track.feed(
+            CaptureAudio(
+                sample_index=640,
+                capture_monotonic_ns=post_cutoff_at,
+                pcm=b"\x03\x00" * 320,
+            )
+        )
+
+        await track.recv()
+        await track.recv()
+        await track.recv()
+        now[0] = post_cutoff_at + (
+            MAX_CAPTURE_AGE_MILLISECONDS + 1
+        ) * 1_000_000
+        with pytest.raises(PeerBackpressure, match="age bound"):
+            track.feed(
+                CaptureAudio(
+                    sample_index=960,
+                    capture_monotonic_ns=post_cutoff_at,
+                    pcm=b"\x04\x00" * 320,
+                )
+            )
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_capture_track_revalidates_runtime_age_after_startup_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at = 15_000_000_000
+    now = [captured_at]
+    monkeypatch.setattr(peer_module.time, "monotonic_ns", lambda: now[0])
+    track = CaptureAudioTrack()
+    track.feed(
+        CaptureAudio(
+            sample_index=0,
+            capture_monotonic_ns=captured_at,
+            pcm=b"\x01\x00" * 320,
+        )
+    )
+    await track.recv()
+    track.commit_startup_capture()
+    track.feed(
+        CaptureAudio(
+            sample_index=320,
+            capture_monotonic_ns=captured_at,
+            pcm=b"\x01\x00" * 320,
+        )
+    )
+
     now[0] += (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
     with pytest.raises(PeerBackpressure, match="before RTP consumption"):
         await track.recv()
 
-    assert track.consumed_samples == 0
+    assert track.consumed_samples == 320
     assert track._queued_samples == 0
     with pytest.raises(PeerError, match="stopped"):
         track.feed(
             CaptureAudio(
-                sample_index=320,
+                sample_index=640,
                 capture_monotonic_ns=now[0],
                 pcm=b"\x01\x00" * 320,
             )
@@ -1044,13 +1225,22 @@ async def test_capture_track_accepts_exact_age_bound_at_rtp_consumption(
                 pcm=b"\x01\x00" * 320,
             )
         )
+        await track.recv()
+        track.commit_startup_capture()
+        track.feed(
+            CaptureAudio(
+                sample_index=320,
+                capture_monotonic_ns=captured_at,
+                pcm=b"\x01\x00" * 320,
+            )
+        )
         now[0] += MAX_CAPTURE_AGE_MILLISECONDS * 1_000_000
 
         frame = await track.recv()
 
         assert frame.samples == 960
         assert frame.sample_rate == 48_000
-        assert track.consumed_samples == 320
+        assert track.consumed_samples == 640
     finally:
         track.stop()
 
@@ -1066,6 +1256,16 @@ async def test_delayed_capture_consumption_emits_terminal_peer_error(
     peer.input_track.feed(
         CaptureAudio(
             sample_index=0,
+            capture_monotonic_ns=captured_at,
+            pcm=b"\x01\x00" * 320,
+        )
+    )
+    await peer.input_track.recv()
+    peer.commit_capture()
+    emitted.clear()
+    peer.input_track.feed(
+        CaptureAudio(
+            sample_index=320,
             capture_monotonic_ns=captured_at,
             pcm=b"\x01\x00" * 320,
         )
@@ -1108,6 +1308,10 @@ class FakePeerConnection:
         self.connectionState = "new"
         self.localDescription = SimpleNamespace(sdp="v=0\r\na=device\r\n")
         self.receivers: list[Any] = []
+        self.negotiated_direction = "sendrecv"
+        self.capture_transceiver = SimpleNamespace(currentDirection=None)
+        self.stats_reports: list[dict[str, Any]] = []
+        self.stats_error: Exception | None = None
 
     def on(self, event: str) -> Any:
         def decorate(handler: Any) -> Any:
@@ -1116,8 +1320,9 @@ class FakePeerConnection:
 
         return decorate
 
-    def addTransceiver(self, track: Any, *, direction: str) -> None:
+    def addTransceiver(self, track: Any, *, direction: str) -> object:
         self.transceiver = (track, direction)
+        return self.capture_transceiver
 
     def createDataChannel(self, label: str, *, ordered: bool) -> FakeChannel:
         assert label == "oai-events"
@@ -1136,6 +1341,14 @@ class FakePeerConnection:
 
     async def setRemoteDescription(self, answer: object) -> None:
         self.answer = answer
+        self.capture_transceiver.currentDirection = self.negotiated_direction
+
+    async def getStats(self) -> dict[str, Any]:
+        if self.stats_error is not None:
+            raise self.stats_error
+        if self.stats_reports:
+            return self.stats_reports.pop(0)
+        return {}
 
     async def close(self) -> None:
         self.connectionState = "closed"
@@ -1198,19 +1411,128 @@ async def test_peer_reports_first_capture_rtp_consumption_once(
                 pcm=b"\x01\x00" * 640,
             )
         )
+        peer.commit_capture()
 
         assert emitted == []
         await peer.input_track.recv()
-        await peer.input_track.recv()
-
         assert emitted == [
             (
                 "lifecycle",
                 {"event_type": "capture.rtp_started", "generation": 0},
             )
         ]
+        await peer.input_track.recv()
+
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 0},
+            ),
+            ("state", "capture.ready"),
+        ]
     finally:
         await peer.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_zero_packet_and_already_consumed_commits_are_immediately_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_peer, empty_emitted = _fake_device_peer(monkeypatch)
+    consumed_peer, consumed_emitted = _fake_device_peer(monkeypatch)
+    try:
+        empty_peer.commit_capture()
+        assert empty_emitted == [("state", "capture.ready")]
+
+        consumed_peer.feed_capture(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=time.monotonic_ns(),
+                pcm=b"\x01\x00" * 320,
+            )
+        )
+        await consumed_peer.input_track.recv()
+        consumed_peer.commit_capture()
+        assert consumed_emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.rtp_started", "generation": 0},
+            ),
+            ("state", "capture.ready"),
+        ]
+    finally:
+        await empty_peer.stop()
+        await consumed_peer.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_fatal_capture_lifecycle_suppresses_capture_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_lifecycle(_values: dict[str, str | int]) -> None:
+        raise BlockingIOError
+
+    peer, emitted = _fake_device_peer(
+        monkeypatch,
+        emit_lifecycle=fail_lifecycle,
+    )
+    try:
+        peer.feed_capture(
+            CaptureAudio(
+                sample_index=0,
+                capture_monotonic_ns=time.monotonic_ns(),
+                pcm=b"\x01\x00" * 320,
+            )
+        )
+        peer.commit_capture()
+        await peer.input_track.recv()
+
+        assert emitted == [("fatal", "lifecycle_output_failed")]
+        assert peer._failed
+        assert not peer._capture_ready_emitted
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.asyncio
+async def test_runtime_latched_fatal_beats_synchronous_capture_ready() -> None:
+    class FatalCommitPeer(FakePeer):
+        def commit_capture(self) -> None:
+            self.emit_fatal("capture_audio_stale")
+            self.emit_state("capture.ready")
+            raise PeerError("commit failed after fatal")
+
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parent.setblocking(False)
+    runtime = SidecarRuntime(child, peer_factory=FatalCommitPeer)
+    run_task = asyncio.create_task(runtime.run())
+    try:
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("create_offer"),
+        )
+        assert isinstance(await _recv_packet(parent), ControlMessage)
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("set_answer", sdp="v=0\r\n"),
+        )
+        for _ in range(3):
+            assert isinstance(await _recv_packet(parent), ControlMessage)
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("capture.commit"),
+        )
+
+        assert await _recv_packet(parent) == ControlMessage(
+            type="error",
+            values={"code": "capture_audio_stale"},
+        )
+        assert await asyncio.wait_for(run_task, timeout=1) == 1
+    finally:
+        parent.close()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1253,6 +1575,21 @@ async def test_runtime_reports_delayed_capture_consumption_as_terminal_error(
             ),
         )
         await _wait_for(lambda: peers[0].input_track.latest_sample_end == 320)
+        await peers[0].input_track.recv()
+        peers[0].input_track.commit_startup_capture()
+        assert await _recv_packet(parent) == ControlMessage(
+            type="lifecycle",
+            values={"event_type": "capture.rtp_started", "generation": 0},
+        )
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_capture_audio(
+                b"\x01\x00" * 320,
+                sample_index=320,
+                capture_monotonic_ns=captured_at,
+            ),
+        )
+        await _wait_for(lambda: peers[0].input_track.latest_sample_end == 640)
         now[0] += (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
 
         with pytest.raises(PeerBackpressure, match="before RTP consumption"):
@@ -1280,6 +1617,121 @@ def test_peer_creates_audio_sendrecv_and_ordered_oai_events(
         assert peer.pc.channel is peer.data_channel
     finally:
         peer.input_track.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_reports_negotiated_send_direction_and_outbound_counter_movement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "OUTBOUND_CAPTURE_PROOF_POLL_SECONDS", 0.001)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    peer.pc.negotiated_direction = "sendonly"
+    peer.pc.stats_reports = [
+        {
+            "outbound-audio": SimpleNamespace(
+                type="outbound-rtp",
+                kind="audio",
+                packetsSent=0,
+                bytesSent=0,
+                ssrc=4_294_967_295,
+                transportId="private-transport-id",
+                trackId="private-track-id",
+            )
+        },
+        {
+            "outbound-audio": SimpleNamespace(
+                type="outbound-rtp",
+                kind="audio",
+                packetsSent=1,
+                bytesSent=72,
+                ssrc=4_294_967_295,
+                transportId="private-transport-id",
+                trackId="private-track-id",
+            )
+        },
+    ]
+    try:
+        await peer.set_answer("v=0\r\na=private-answer\r\n")
+        proof_task = peer._outbound_capture_proof_task
+        assert proof_task is not None
+        await asyncio.wait_for(proof_task, timeout=1)
+
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.direction.sendonly", "generation": 0},
+            ),
+            (
+                "lifecycle",
+                {"event_type": "capture.outbound_active", "generation": 0},
+            ),
+        ]
+        serialized = json.dumps(emitted)
+        assert "private-answer" not in serialized
+        assert "private-transport-id" not in serialized
+        assert "private-track-id" not in serialized
+        assert "4294967295" not in serialized
+        assert "packetsSent" not in serialized
+        assert "bytesSent" not in serialized
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_outbound_proof_requires_both_counters_and_is_nonfatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_module, "OUTBOUND_CAPTURE_PROOF_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(peer_module, "OUTBOUND_CAPTURE_PROOF_POLL_SECONDS", 0.001)
+    peer, emitted = _fake_device_peer(monkeypatch)
+    peer.pc.stats_reports = [
+        {
+            "outbound-audio": SimpleNamespace(
+                type="outbound-rtp",
+                kind="audio",
+                packetsSent=4,
+                bytesSent=0,
+            )
+        }
+    ]
+    try:
+        await peer.set_answer("v=0\r\n")
+        proof_task = peer._outbound_capture_proof_task
+        assert proof_task is not None
+        await asyncio.wait_for(proof_task, timeout=1)
+
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.direction.sendrecv", "generation": 0},
+            )
+        ]
+        assert peer._failed is False
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_unavailable_outbound_stats_do_not_fail_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer, emitted = _fake_device_peer(monkeypatch)
+    peer.pc.stats_error = RuntimeError("stats unavailable")
+    try:
+        await peer.set_answer("v=0\r\n")
+        proof_task = peer._outbound_capture_proof_task
+        assert proof_task is not None
+        await asyncio.wait_for(proof_task, timeout=1)
+
+        assert emitted == [
+            (
+                "lifecycle",
+                {"event_type": "capture.direction.sendrecv", "generation": 0},
+            )
+        ]
+        assert peer._failed is False
+    finally:
+        await peer.stop()
 
 
 class PassthroughResampler:

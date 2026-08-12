@@ -29,11 +29,25 @@ _RTP_STARTED_LIFECYCLE_TYPES = frozenset(
     {"capture.rtp_started", "playback.rtp_started"}
 )
 _INTERNAL_LIFECYCLE_TYPES = (
-    frozenset({"media.started", "media.quiet", "interrupt.fenced", "capture.metrics"})
+    frozenset(
+        {
+            "media.started",
+            "media.quiet",
+            "interrupt.fenced",
+            "capture.metrics",
+            "capture.direction.inactive",
+            "capture.direction.recvonly",
+            "capture.direction.sendonly",
+            "capture.direction.sendrecv",
+            "capture.direction.unknown",
+            "capture.outbound_active",
+        }
+    )
     | _RTP_STARTED_LIFECYCLE_TYPES
 )
 _PARENT_CONTROL_TYPES = frozenset(
     {
+        "capture.commit",
         "create_offer",
         "set_answer",
         "response.interrupt",
@@ -46,6 +60,7 @@ _CHILD_CONTROL_TYPES = frozenset(
         "offer",
         "answer.applied",
         "connected",
+        "capture.ready",
         "data.ready",
         "lifecycle",
         "capture.metrics",
@@ -295,6 +310,7 @@ def _validate_control(
     if message_type not in _CONTROL_TYPES:
         raise ProtocolError("sidecar control type is not allowed")
     allowed: dict[str, frozenset[str]] = {
+        "capture.commit": frozenset(),
         "create_offer": frozenset({"direct_capture_gain_db"}),
         "set_answer": frozenset({"sdp"}),
         "response.interrupt": frozenset(),
@@ -303,6 +319,7 @@ def _validate_control(
         "offer": frozenset({"sdp"}),
         "answer.applied": frozenset(),
         "connected": frozenset(),
+        "capture.ready": frozenset(),
         "data.ready": frozenset(),
         "lifecycle": frozenset(
             {

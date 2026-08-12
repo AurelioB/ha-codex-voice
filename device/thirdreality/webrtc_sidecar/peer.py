@@ -38,10 +38,12 @@ MAX_CAPTURE_QUEUE_FRAMES = 32
 # and still rejects stale packets before admission and at RTP consumption.
 MAX_CAPTURE_QUEUE_MILLISECONDS = 2_048
 MAX_CAPTURE_AGE_MILLISECONDS = 2_250
+MAX_STARTUP_CAPTURE_AGE_MILLISECONDS = 5_000
 _MAX_CAPTURE_QUEUE_SAMPLES = (
     CAPTURE_SAMPLE_RATE * MAX_CAPTURE_QUEUE_MILLISECONDS // 1_000
 )
 _MAX_CAPTURE_AGE_NANOSECONDS = MAX_CAPTURE_AGE_MILLISECONDS * 1_000_000
+_MAX_STARTUP_CAPTURE_AGE_NANOSECONDS = MAX_STARTUP_CAPTURE_AGE_MILLISECONDS * 1_000_000
 _MAX_CAPTURE_FUTURE_SKEW_NANOSECONDS = 100 * 1_000_000
 MEDIA_QUIET_SECONDS = 0.120
 MEDIA_FENCE_QUIET_SECONDS = 0.500
@@ -55,6 +57,10 @@ MEDIA_FENCE_RECEIVER_MAX_TICK_SLIP_SECONDS = 0.010
 # decoded RTP still advances the independent interruption fence below.
 PLAYBACK_SIGNAL_PEAK = 64
 PLAYBACK_SIGNAL_RMS = 8
+OUTBOUND_CAPTURE_PROOF_TIMEOUT_SECONDS = 5.0
+OUTBOUND_CAPTURE_PROOF_POLL_SECONDS = 0.100
+OUTBOUND_CAPTURE_STATS_TIMEOUT_SECONDS = 0.250
+_CAPTURE_DIRECTIONS = frozenset({"sendrecv", "sendonly", "recvonly", "inactive"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +211,8 @@ class CaptureAudioTrack(MediaStreamTrack):
         self._queued_samples = 0
         self._consumed_samples = 0
         self._consumed_sample_end: int | None = None
+        self._startup_capture_boundary_initialized = False
+        self._startup_capture_sample_end: int | None = None
         self._capture_gain_db = 0.0
         self._metrics_frames = 0
         self._metrics_max_peak = 0
@@ -252,15 +260,26 @@ class CaptureAudioTrack(MediaStreamTrack):
             raise PeerError("capture gain cannot change after capture starts")
         self._capture_gain_db = float(value)
 
+    def commit_startup_capture(self) -> int | None:
+        """Freeze the ordered startup prefix and return its exclusive sample end."""
+        if self._stopped:
+            raise PeerError("capture track is stopped")
+        if self._startup_capture_boundary_initialized:
+            raise PeerError("startup capture is already committed")
+        self._startup_capture_boundary_initialized = True
+        self._startup_capture_sample_end = self._last_sample_end
+        return self._startup_capture_sample_end
+
     def feed(self, value: CaptureAudio) -> None:
         """Queue one validated capture packet without blocking."""
         if self._stopped:
             raise PeerError("capture track is stopped")
         samples = len(value.pcm) // PCM_SAMPLE_WIDTH
+        sample_end = value.sample_index + samples
         now_ns = time.monotonic_ns()
         if value.capture_monotonic_ns > now_ns + _MAX_CAPTURE_FUTURE_SKEW_NANOSECONDS:
             raise PeerError("capture timestamp is in the future")
-        if now_ns - value.capture_monotonic_ns > _MAX_CAPTURE_AGE_NANOSECONDS:
+        if now_ns - value.capture_monotonic_ns > self._capture_age_limit_ns(sample_end):
             raise PeerBackpressure("capture packet exceeded its age bound")
         if (
             self._last_sample_end is not None
@@ -295,7 +314,10 @@ class CaptureAudioTrack(MediaStreamTrack):
             source_sample_index = self._source_frame_sample_index
             assert capture_monotonic_ns is not None
             assert source_sample_index is not None
-            self._raise_if_capture_stale(capture_monotonic_ns)
+            self._raise_if_capture_stale(
+                capture_monotonic_ns,
+                sample_index=source_sample_index,
+            )
 
             # aiortc 1.15's Opus encoder emits one 20 ms payload for one exact
             # 960-sample / 48 kHz input frame. Larger inputs produce several
@@ -407,7 +429,10 @@ class CaptureAudioTrack(MediaStreamTrack):
 
             value = self._capture_packet
             assert value is not None
-            self._raise_if_capture_stale(value.capture_monotonic_ns)
+            self._raise_if_capture_stale(
+                value.capture_monotonic_ns,
+                sample_index=(value.sample_index + self._capture_packet_sample_offset),
+            )
             source_samples = len(self._source_frame_pcm) // PCM_SAMPLE_WIDTH
             packet_samples = len(value.pcm) // PCM_SAMPLE_WIDTH
             take_samples = min(
@@ -439,9 +464,25 @@ class CaptureAudioTrack(MediaStreamTrack):
                 self._capture_packet = None
                 self._capture_packet_sample_offset = 0
 
-    def _raise_if_capture_stale(self, capture_monotonic_ns: int) -> None:
+    def _capture_age_limit_ns(self, sample_position: int) -> int:
+        """Return the bound for a packet end or a source-sample position."""
+        if not self._startup_capture_boundary_initialized:
+            return _MAX_STARTUP_CAPTURE_AGE_NANOSECONDS
+        boundary = self._startup_capture_sample_end
+        if boundary is not None and sample_position < boundary:
+            return _MAX_STARTUP_CAPTURE_AGE_NANOSECONDS
+        return _MAX_CAPTURE_AGE_NANOSECONDS
+
+    def _raise_if_capture_stale(
+        self,
+        capture_monotonic_ns: int,
+        *,
+        sample_index: int,
+    ) -> None:
         """Fail closed when source PCM is stale at actual sender consumption."""
-        if time.monotonic_ns() - capture_monotonic_ns <= (_MAX_CAPTURE_AGE_NANOSECONDS):
+        if time.monotonic_ns() - capture_monotonic_ns <= self._capture_age_limit_ns(
+            sample_index
+        ):
             return
         # Offer-created peers can accumulate capture before the remote SDP
         # activates RTP. Admission freshness is therefore insufficient:
@@ -776,7 +817,11 @@ class DeviceWebRtcPeer:
         self._remote_audio_track_seen = False
         self._capture_rtp_started_emitted = False
         self._playback_rtp_started_emitted = False
+        self._capture_commit_received = False
+        self._capture_commit_sample_end: int | None = None
+        self._capture_ready_emitted = False
         self._capture_echo_settle_started = False
+        self._outbound_capture_proof_task: asyncio.Task[None] | None = None
         self._playback_sample_index = 0
         self._consumer_tasks: set[asyncio.Task[None]] = set()
         self._ice_gathering_complete = asyncio.Event()
@@ -786,7 +831,10 @@ class DeviceWebRtcPeer:
             on_fatal=self._safe_fatal,
         )
         self.pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
-        self.pc.addTransceiver(self.input_track, direction="sendrecv")
+        self._capture_transceiver = self.pc.addTransceiver(
+            self.input_track,
+            direction="sendrecv",
+        )
         self.data_channel = self.pc.createDataChannel("oai-events", ordered=True)
         self._register_handlers()
 
@@ -871,6 +919,63 @@ class DeviceWebRtcPeer:
         await self.pc.setRemoteDescription(
             RTCSessionDescription(sdp=sdp, type="answer")
         )
+        self._emit_capture_direction_proof()
+        self._outbound_capture_proof_task = asyncio.create_task(
+            self._prove_outbound_capture(),
+            name="codex-device-webrtc-outbound-proof",
+        )
+
+    def _emit_capture_direction_proof(self) -> None:
+        """Report only the fixed negotiated direction of the capture media."""
+        direction = getattr(self._capture_transceiver, "currentDirection", None)
+        if direction not in _CAPTURE_DIRECTIONS:
+            direction = "unknown"
+        self._safe_capture_diagnostic(f"capture.direction.{direction}")
+
+    async def _prove_outbound_capture(self) -> None:
+        """Bound polling until aggregate outbound audio RTP counters move."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + OUTBOUND_CAPTURE_PROOF_TIMEOUT_SECONDS
+        while not self._closed and not self._failed:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            try:
+                stats = await asyncio.wait_for(
+                    self.pc.getStats(),
+                    timeout=min(
+                        remaining,
+                        OUTBOUND_CAPTURE_STATS_TIMEOUT_SECONDS,
+                    ),
+                )
+            except TimeoutError:
+                return
+            except Exception:  # noqa: BLE001 - diagnostics never own media.
+                return
+            if self._outbound_audio_counters_moved(stats):
+                self._safe_capture_diagnostic("capture.outbound_active")
+                return
+            await asyncio.sleep(min(OUTBOUND_CAPTURE_PROOF_POLL_SECONDS, remaining))
+
+    @staticmethod
+    def _outbound_audio_counters_moved(stats: Any) -> bool:
+        """Inspect only aggregate counters, ignoring identifying stats fields."""
+        values = getattr(stats, "values", None)
+        if not callable(values):
+            return False
+        for value in values():
+            packets_sent = getattr(value, "packetsSent", None)
+            bytes_sent = getattr(value, "bytesSent", None)
+            if (
+                getattr(value, "type", None) == "outbound-rtp"
+                and getattr(value, "kind", None) == "audio"
+                and type(packets_sent) is int
+                and type(bytes_sent) is int
+                and packets_sent > 0
+                and bytes_sent > 0
+            ):
+                return True
+        return False
 
     def _install_remote_queue_tracker(self, track: Any) -> bool:
         """Install the pinned aiortc 1.15 decoded-output serialization shim."""
@@ -978,6 +1083,16 @@ class DeviceWebRtcPeer:
         """Submit one timestamped microphone packet."""
         self.input_track.feed(value)
 
+    def commit_capture(self) -> None:
+        """Freeze the ordered startup capture prefix for this peer epoch."""
+        if self._closed or self._failed:
+            raise PeerError("WebRTC peer is not available")
+        if self._capture_commit_received:
+            raise PeerError("startup capture is already committed")
+        self._capture_commit_received = True
+        self._capture_commit_sample_end = self.input_track.commit_startup_capture()
+        self._maybe_emit_capture_ready()
+
     def interrupt_response(self) -> None:
         """Fence local media while Frameless Bidi server VAD interrupts output."""
         if self._closed:
@@ -1000,6 +1115,10 @@ class DeviceWebRtcPeer:
         if completion_task is not None:
             completion_task.cancel()
             self._fence_completion_task = None
+        outbound_proof_task = self._outbound_capture_proof_task
+        if outbound_proof_task is not None:
+            outbound_proof_task.cancel()
+            self._outbound_capture_proof_task = None
         if self._closed:
             return
         self._closed = True
@@ -1010,6 +1129,8 @@ class DeviceWebRtcPeer:
         tasks = list(self._consumer_tasks)
         if completion_task is not None:
             tasks.append(completion_task)
+        if outbound_proof_task is not None:
+            tasks.append(outbound_proof_task)
         await asyncio.gather(*tasks, return_exceptions=True)
         self._consumer_tasks.clear()
 
@@ -1238,6 +1359,25 @@ class DeviceWebRtcPeer:
                 }
             )
         self._maybe_complete_fence()
+        # Readiness is the final success action for this sender advancement.
+        # Any synchronous lifecycle/fence failure above gets first ownership.
+        self._maybe_emit_capture_ready()
+
+    def _maybe_emit_capture_ready(self) -> None:
+        """Acknowledge once the sender has consumed the committed startup prefix."""
+        if (
+            not self._capture_commit_received
+            or self._capture_ready_emitted
+            or self._closed
+            or self._failed
+        ):
+            return
+        cutoff = self._capture_commit_sample_end
+        consumed_end = self.input_track.consumed_sample_end
+        if cutoff is not None and (consumed_end is None or consumed_end < cutoff):
+            return
+        self._capture_ready_emitted = True
+        self._safe_state("capture.ready")
 
     def _note_playback_rtp_received(self) -> None:
         """Report the first frame returned by this peer's RTP receiver."""
@@ -1574,6 +1714,20 @@ class DeviceWebRtcPeer:
             return
         try:
             self._emit_capture_metrics(values)
+        except Exception:  # noqa: BLE001 - diagnostics never own live media.
+            return
+
+    def _safe_capture_diagnostic(self, event_type: str) -> None:
+        """Emit one fixed content-free proof without owning live media."""
+        if self._closed or self._failed:
+            return
+        try:
+            self._emit_lifecycle(
+                {
+                    "event_type": event_type,
+                    "generation": self._generation,
+                }
+            )
         except Exception:  # noqa: BLE001 - diagnostics never own live media.
             return
 
