@@ -192,6 +192,13 @@ _DIRECT_END_CONVERSATION_TRANSCRIPTS = frozenset(
     }
 )
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
+REALTIME_NATIVE_ROLLOVER_PREROLL_MILLISECONDS = 320
+REALTIME_NATIVE_ROLLOVER_PREROLL_MAX_BYTES = (
+    REALTIME_SAMPLE_RATE * 2 * REALTIME_NATIVE_ROLLOVER_PREROLL_MILLISECONDS // 1_000
+)
+REALTIME_NATIVE_ROLLOVER_INPUT_MAX_BYTES = (
+    REALTIME_SAMPLE_RATE * 2 * REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS // 1_000
+)
 REALTIME_OUTPUT_PREROLL_MILLISECONDS = 200
 REALTIME_OUTPUT_PREROLL_MAX_BYTES = (
     REALTIME_SAMPLE_RATE * 2 * REALTIME_OUTPUT_PREROLL_MILLISECONDS // 1_000
@@ -223,6 +230,88 @@ REALTIME_FRONTEND_PROMPT = (
     "follow-up offer. Never mention the client, backend, delegation, tools, or "
     "internal architecture."
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeV2Barge:
+    """One exact device interruption boundary for a provider generation."""
+
+    generation: int
+
+
+@dataclass(slots=True)
+class _NativeV2InputContinuity:
+    """Preserve bounded causal microphone PCM across provider replacement."""
+
+    resampler: Pcm16Mono24KhzResampler
+    generation: int = 1
+    output_epoch: int = 0
+    recent: deque[bytes] = field(default_factory=deque)
+    recent_bytes: int = 0
+    rollover: list[bytes] | None = None
+    rollover_bytes: int = 0
+
+    def feed_live(self, value: bytes, session: RealtimeSession) -> None:
+        converted = self.resampler.feed(value)
+        if not converted:
+            return
+        self._remember(converted)
+        session.feed_audio(converted)
+
+    def begin_barge(self) -> _NativeV2Barge:
+        if self.rollover is not None:
+            raise ProtocolError("native realtime rollover is already active")
+        self.generation += 1
+        self.rollover = list(self.recent)
+        self.rollover_bytes = sum(map(len, self.rollover))
+        return _NativeV2Barge(self.generation)
+
+    def buffer_rollover(self, value: bytes) -> None:
+        if self.rollover is None:
+            raise ProtocolError("native realtime rollover is not active")
+        converted = self.resampler.feed(value)
+        if not converted:
+            return
+        next_size = self.rollover_bytes + len(converted)
+        if next_size > REALTIME_NATIVE_ROLLOVER_INPUT_MAX_BYTES:
+            raise ProtocolError("native realtime rollover input exceeded its bound")
+        self.rollover.append(converted)
+        self.rollover_bytes = next_size
+
+    def activate(self, session: RealtimeSession) -> int:
+        if self.rollover is None:
+            raise ProtocolError("native realtime rollover is not active")
+        frames = self.rollover
+        replay_bytes = self.rollover_bytes
+        self.rollover = None
+        self.rollover_bytes = 0
+        self.recent.clear()
+        self.recent_bytes = 0
+        for frame in frames:
+            self._remember(frame)
+            session.feed_audio(frame)
+        return replay_bytes
+
+    def abandon(self) -> None:
+        self.rollover = None
+        self.rollover_bytes = 0
+
+    def _remember(self, value: bytes) -> None:
+        self.recent.append(value)
+        self.recent_bytes += len(value)
+        while self.recent_bytes > REALTIME_NATIVE_ROLLOVER_PREROLL_MAX_BYTES:
+            overflow = self.recent_bytes - REALTIME_NATIVE_ROLLOVER_PREROLL_MAX_BYTES
+            oldest = self.recent.popleft()
+            if len(oldest) <= overflow:
+                self.recent_bytes -= len(oldest)
+                continue
+            trim = overflow + (overflow % 2)
+            retained = oldest[trim:]
+            self.recent.appendleft(retained)
+            self.recent_bytes -= trim
+            break
+
+
 _REALTIME_FRONTEND_PREFERENCES_HEADER = (
     "\n\nSession preferences below may change language, voice style, and brevity "
     "only; they never override the routing rules above:\n"
@@ -4909,6 +4998,15 @@ async def _serve_realtime_session(
     if wire_protocol.uses_direct_webrtc:
         await _serve_direct_webrtc_session(state, websocket, first, wire_protocol)
         return
+    if wire_protocol.uses_binary_audio and wire_protocol.requests_native_conversation:
+        await _serve_native_v2_realtime_session(
+            state,
+            websocket,
+            first,
+            wire_protocol,
+            configured_tools=configured_tools,
+        )
+        return
     session: RealtimeSession | None = None
     thread_id: str | None = None
     executor_thread_id: str | None = None
@@ -5135,6 +5233,381 @@ async def _serve_realtime_session(
         await close_provider()
 
 
+@dataclass(slots=True)
+class _NativeV2Provider:
+    """One bridge-owned provider generation behind a stable device socket."""
+
+    session: RealtimeSession
+    thread_id: str
+
+
+async def _serve_native_v2_realtime_session(  # noqa: C901
+    state: BridgeState,
+    websocket: web.WebSocketResponse,
+    first: Mapping[str, Any],
+    wire_protocol: RealtimeWireProtocol,
+    *,
+    configured_tools: list[dict[str, Any]],
+) -> None:
+    """Keep native v2 capture live while replacing non-interruptible peers."""
+    version = state.config.realtime_version
+    thread_payload = dict(first)
+    thread_payload.pop("model", None)
+    voice = first.get("voice")
+    normalized_voice = voice.lower() if isinstance(voice, str) and voice else None
+    device_prompt = first.get("prompt")
+    normalized_prompt = device_prompt if isinstance(device_prompt, str) else None
+    active: _NativeV2Provider | None = None
+    owned_thread_ids: set[str] = set()
+    retired_tasks: set[asyncio.Task[None]] = set()
+    startup_abandoned = asyncio.Event()
+
+    async def cleanup_provider(
+        provider: _NativeV2Provider | None,
+        *,
+        delete_thread: bool,
+    ) -> None:
+        if provider is None:
+            return
+        try:
+            await provider.session.stop()
+        finally:
+            if delete_thread:
+                owned_thread_ids.discard(provider.thread_id)
+                await _dispose_thread(state.rpc, provider.thread_id)
+
+    async def start_candidate(
+        reuse_thread_id: str | None,
+        *,
+        include_startup_context: bool,
+        abandoned: asyncio.Event | None = None,
+        ownership: set[str] | None = None,
+    ) -> _NativeV2Provider:
+        owned = owned_thread_ids if ownership is None else ownership
+        candidate_thread_id = reuse_thread_id
+        candidate_session: RealtimeSession | None = None
+        created_thread = False
+
+        def require_attached_device() -> None:
+            if abandoned is not None and abandoned.is_set():
+                raise _RealtimeClientDisconnected
+
+        try:
+            if candidate_thread_id is None:
+                candidate_thread_id = await state.start_thread(
+                    thread_payload,
+                    tools=configured_tools,
+                    base_instructions=DIRECT_REALTIME_BASE_INSTRUCTIONS,
+                )
+                created_thread = True
+                owned.add(candidate_thread_id)
+            require_attached_device()
+            candidate_session = RealtimeSession(
+                state.rpc,
+                candidate_thread_id,
+                peer=state.peer_factory(),
+                version=version,
+                timeout=state.config.request_timeout,
+            )
+            candidate_session.set_input_buffer_limit(
+                REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS
+            )
+            await candidate_session.start(
+                prompt=normalized_prompt,
+                model=None,
+                voice=normalized_voice,
+                include_startup_context=include_startup_context,
+                client_managed_handoffs=False,
+            )
+            require_attached_device()
+            return _NativeV2Provider(candidate_session, candidate_thread_id)
+        except BaseException:
+            if candidate_session is not None:
+                await candidate_session.stop()
+            if created_thread and candidate_thread_id is not None:
+                owned.discard(candidate_thread_id)
+                await _dispose_thread(state.rpc, candidate_thread_id)
+            raise
+
+    async def retire_ambiguous(
+        provider: _NativeV2Provider,
+        strict_stop: asyncio.Task[None],
+    ) -> None:
+        try:
+            await strict_stop
+        except Exception as err:  # noqa: BLE001 - isolated cleanup is best effort.
+            LOGGER.warning("Native v2 retired provider stop failed: %s", err)
+        finally:
+            await _dispose_thread(state.rpc, provider.thread_id)
+
+    def transfer_ambiguous_retirement(
+        provider: _NativeV2Provider,
+        strict_stop: asyncio.Task[None],
+        ownership: set[str],
+    ) -> None:
+        ownership.discard(provider.thread_id)
+        task = asyncio.create_task(
+            retire_ambiguous(provider, strict_stop),
+            name=f"codex-native-v2-retire-{provider.thread_id}",
+        )
+        retired_tasks.add(task)
+        task.add_done_callback(retired_tasks.discard)
+        state.track_realtime_provider_cleanup(task)
+
+    async def replace_provider(
+        previous: _NativeV2Provider,
+        *,
+        abandoned: asyncio.Event,
+        ownership: set[str],
+    ) -> tuple[_NativeV2Provider, str]:
+        strict_stop = asyncio.create_task(
+            previous.session.stop_strict(),
+            name=f"codex-native-v2-strict-stop-{previous.thread_id}",
+        )
+        retirement_transferred = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(strict_stop),
+                    timeout=DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS,
+                )
+            except TimeoutError:
+                transfer_ambiguous_retirement(previous, strict_stop, ownership)
+                retirement_transferred = True
+                reuse_thread_id = None
+                include_startup_context = False
+            except Exception:  # noqa: BLE001 - any unproven stop needs isolation.
+                transfer_ambiguous_retirement(previous, strict_stop, ownership)
+                retirement_transferred = True
+                reuse_thread_id = None
+                include_startup_context = False
+            else:
+                reuse_thread_id = previous.thread_id
+                include_startup_context = True
+            return (
+                await start_candidate(
+                    reuse_thread_id,
+                    include_startup_context=include_startup_context,
+                    abandoned=abandoned,
+                    ownership=ownership,
+                ),
+                "reused" if reuse_thread_id is not None else "isolated",
+            )
+        except asyncio.CancelledError:
+            if not retirement_transferred and (
+                not strict_stop.done()
+                or strict_stop.cancelled()
+                or strict_stop.exception() is not None
+            ):
+                transfer_ambiguous_retirement(previous, strict_stop, ownership)
+            raise
+
+    async def cleanup_abandoned_replacement(
+        replacement_task: asyncio.Task[tuple[_NativeV2Provider, str]],
+        ownership: set[str],
+    ) -> None:
+        provider: _NativeV2Provider | None = None
+        try:
+            result = await replacement_task
+            provider = result[0]
+        except BaseException as err:  # noqa: BLE001 - detached cleanup owns failure.
+            if not isinstance(
+                err, (asyncio.CancelledError, _RealtimeClientDisconnected)
+            ):
+                LOGGER.warning("Native v2 abandoned replacement failed: %s", err)
+        finally:
+            if provider is not None:
+                try:
+                    await provider.session.stop()
+                finally:
+                    ownership.discard(provider.thread_id)
+                    await _dispose_thread(state.rpc, provider.thread_id)
+            residual_thread_ids = tuple(ownership)
+            ownership.clear()
+            if residual_thread_ids:
+                await asyncio.gather(
+                    *(
+                        _dispose_thread(state.rpc, thread_id)
+                        for thread_id in residual_thread_ids
+                    ),
+                    return_exceptions=True,
+                )
+
+    def transfer_abandoned_replacement(
+        replacement_task: asyncio.Task[tuple[_NativeV2Provider, str]],
+        ownership: set[str],
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            cleanup_abandoned_replacement(replacement_task, ownership),
+            name="codex-native-v2-abandoned-replacement-cleanup",
+        )
+        state.track_realtime_provider_cleanup(cleanup_task)
+
+    continuity = _NativeV2InputContinuity(
+        Pcm16Mono24KhzResampler(wire_protocol.input_sample_rate)
+    )
+
+    try:
+        LOGGER.info(
+            "Realtime conversation route selected: route=native selection=explicit"
+        )
+
+        async def start_initial() -> None:
+            nonlocal active
+            active = await start_candidate(
+                None,
+                include_startup_context=False,
+                abandoned=startup_abandoned,
+            )
+
+        await _start_realtime_provider_or_disconnect(
+            websocket,
+            start_initial(),
+            abandoned=startup_abandoned,
+            thread_pending=lambda: not owned_thread_ids,
+            track_detached=state.track_realtime_startup_cleanup,
+        )
+        assert active is not None
+        await _send_realtime_json(
+            websocket,
+            {
+                "type": "started",
+                "conversation_id": first.get("conversation_id") or active.thread_id,
+                "thread_id": active.thread_id,
+                "realtime_session_id": active.session.realtime_session_id,
+                "version": version,
+                "sample_rate": REALTIME_SAMPLE_RATE,
+                "channels": 1,
+                **wire_protocol.started_fields(),
+            },
+        )
+
+        while True:
+            barge = await _run_realtime_socket(
+                state,
+                websocket,
+                active.session,
+                wire_protocol,
+                broker_snapshot=None,
+                native_input=continuity,
+            )
+            if barge is None:
+                return
+            rollover_started_at = time.monotonic()
+            LOGGER.info("Native v2 barge generation=%d", barge.generation)
+            previous = active
+            active = None
+            replacement_abandoned = asyncio.Event()
+            replacement_ownership = {previous.thread_id}
+            owned_thread_ids.discard(previous.thread_id)
+            replacement_task = asyncio.create_task(
+                replace_provider(
+                    previous,
+                    abandoned=replacement_abandoned,
+                    ownership=replacement_ownership,
+                ),
+                name=f"codex-native-v2-replace-{barge.generation}",
+            )
+            try:
+                while not replacement_task.done():
+                    receive_task = asyncio.create_task(
+                        _receive_realtime_message(websocket, allow_binary=True),
+                        name="codex-native-v2-rollover-receiver",
+                    )
+                    try:
+                        done, _ = await asyncio.wait(
+                            {replacement_task, receive_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if receive_task in done:
+                            message = receive_task.result()
+                            if isinstance(message, bytes):
+                                continuity.buffer_rollover(message)
+                            else:
+                                message_type = message.get("type")
+                                if message_type == "ping":
+                                    await _send_realtime_json(
+                                        websocket, {"type": "pong"}
+                                    )
+                                elif message_type == "barge" and set(message) == {
+                                    "type"
+                                }:
+                                    # The current output generation is already retired.
+                                    pass
+                                elif message_type == "stop":
+                                    raise _RealtimeClientDisconnected
+                                else:
+                                    raise ProtocolError(
+                                        "only audio, ping, stop, or exact barge is "
+                                        "accepted during rollover"
+                                    )
+                        if replacement_task in done:
+                            break
+                    finally:
+                        if not receive_task.done():
+                            receive_task.cancel()
+                        await asyncio.gather(receive_task, return_exceptions=True)
+                active, close_outcome = await replacement_task
+                owned_thread_ids.update(replacement_ownership)
+                replacement_ownership.clear()
+            except BaseException:
+                if (
+                    replacement_task.done()
+                    and not replacement_task.cancelled()
+                    and replacement_task.exception() is None
+                ):
+                    # A terminal device frame may complete in the same loop
+                    # turn as replacement startup. Claim the provider before
+                    # unwinding so normal cleanup closes its peer as well as
+                    # deleting its thread.
+                    active = replacement_task.result()[0]
+                    owned_thread_ids.update(replacement_ownership)
+                    replacement_ownership.clear()
+                else:
+                    # Thread creation may complete after its local RPC waiter
+                    # has been cancelled. Keep the ownership-acquiring task
+                    # alive under process-level cleanup instead of delaying
+                    # the device's terminal socket path or orphaning its late
+                    # provider/thread.
+                    replacement_abandoned.set()
+                    replacement_task.cancel()
+                    transfer_abandoned_replacement(
+                        replacement_task,
+                        replacement_ownership,
+                    )
+                continuity.abandon()
+                raise
+            replay_bytes = continuity.activate(active.session)
+            LOGGER.info(
+                "Native v2 rollover generation=%d close_outcome=%s "
+                "replacement_ready_ms=%d replay_bytes=%d",
+                barge.generation,
+                close_outcome,
+                round((time.monotonic() - rollover_started_at) * 1_000),
+                replay_bytes,
+            )
+    finally:
+        continuity.abandon()
+        try:
+            await cleanup_provider(active, delete_thread=True)
+        finally:
+            residual_thread_ids = tuple(owned_thread_ids)
+            owned_thread_ids.clear()
+            if residual_thread_ids:
+                await asyncio.gather(
+                    *(
+                        _dispose_thread(state.rpc, thread_id)
+                        for thread_id in residual_thread_ids
+                    ),
+                    return_exceptions=True,
+                )
+            if retired_tasks:
+                await asyncio.gather(
+                    *(asyncio.shield(task) for task in tuple(retired_tasks)),
+                    return_exceptions=True,
+                )
+
+
 async def _settle_managed_realtime_startup(session: RealtimeSession) -> None:
     """Consume the ordered startup data burst before admitting managed turns."""
     deadline = time.monotonic() + REALTIME_MANAGED_STARTUP_TIMEOUT_SECONDS
@@ -5239,7 +5712,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     broker_snapshot: ToolBrokerSnapshot | None,
     executor_thread_id: str | None = None,
     managed_interrupt_continuation: bool = False,
-) -> None:
+    native_input: _NativeV2InputContinuity | None = None,
+) -> _NativeV2Barge | None:
     bridge_managed_realtime = executor_thread_id is not None
     executor_subscription = state.rpc.subscribe() if bridge_managed_realtime else None
     send_lock = asyncio.Lock()
@@ -5247,13 +5721,15 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     tool_requests: dict[str, int | str] = {}
     input_resampler = (
         Pcm16Mono24KhzResampler(wire_protocol.input_sample_rate)
-        if wire_protocol.uses_binary_audio
+        if wire_protocol.uses_binary_audio and native_input is None
         else None
     )
+    provider_generation = native_input.generation if native_input is not None else None
+    native_barge: _NativeV2Barge | None = None
     output_state_lock = asyncio.Lock()
     output_preroll: deque[tuple[int, float, bytes]] = deque()
     output_preroll_bytes = 0
-    output_epoch = 0
+    output_epoch = native_input.output_epoch if native_input is not None else 0
     output_speaking = False
     output_last_pcm_at: float | None = None
     output_armed = False
@@ -5323,21 +5799,33 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             and wire_protocol.requests_native_conversation
         )
 
+    def provider_generation_is_current() -> bool:
+        return native_input is None or native_input.generation == provider_generation
+
     async def send(value: Mapping[str, Any]) -> None:
-        await _send_realtime_json(websocket, value, send_lock=send_lock)
+        if native_input is None:
+            await _send_realtime_json(websocket, value, send_lock=send_lock)
+        else:
+            await _send_realtime_json(
+                websocket,
+                value,
+                send_lock=send_lock,
+                guard=provider_generation_is_current,
+            )
 
     async def send_audio(
         chunk: bytes, expected_backend_generation: int | None = None
     ) -> bool:
         if wire_protocol.uses_binary_audio:
-            guard = (
-                None
-                if expected_backend_generation is None
-                else lambda: (
+
+            def guard() -> bool:
+                if not provider_generation_is_current():
+                    return False
+                return expected_backend_generation is None or (
                     backend_output_generation == expected_backend_generation
                     and background_generation == expected_backend_generation
                 )
-            )
+
             return await _send_realtime_binary(
                 websocket, chunk, send_lock=send_lock, guard=guard
             )
@@ -5372,6 +5860,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             output_arm_task.cancel()
             output_arm_task = None
         output_epoch += 1
+        if native_input is not None:
+            native_input.output_epoch = output_epoch
         output_speaking = True
         await send(
             {
@@ -6653,7 +7143,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             return
         await complete_managed_user_turn(control)
 
-    async def receive() -> None:
+    async def receive() -> None:  # noqa: C901 - protocol control dispatcher
+        nonlocal native_barge
         nonlocal input_speech_active, pending_managed_speech_generation
         nonlocal user_transcript_handled
         while not stop.is_set():
@@ -6661,10 +7152,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 websocket, allow_binary=wire_protocol.uses_binary_audio
             )
             if isinstance(message, bytes):
-                assert input_resampler is not None
-                converted = input_resampler.feed(message)
-                if converted:
-                    session.feed_audio(converted)
+                if native_input is not None:
+                    native_input.feed_live(message, session)
+                else:
+                    assert input_resampler is not None
+                    converted = input_resampler.feed(message)
+                    if converted:
+                        session.feed_audio(converted)
                 continue
             message_type = message.get("type")
             if message_type == "audio":
@@ -6789,6 +7283,14 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         "remote_cancelled": False,
                     }
                 )
+                stop.set()
+                return
+            elif message_type == "barge":
+                if native_input is None or set(message) != {"type"}:
+                    raise ProtocolError(
+                        "barge requires an exact explicit native realtime control"
+                    )
+                native_barge = native_input.begin_barge()
                 stop.set()
                 return
             elif message_type == "stop":
@@ -7342,6 +7844,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             await asyncio.gather(executor_event_task, return_exceptions=True)
         if executor_subscription is not None:
             executor_subscription.close()
+    return native_barge
 
 
 async def _drain_transcription_audio(
@@ -8075,9 +8578,10 @@ async def _send_realtime_json(
     value: Mapping[str, Any],
     *,
     send_lock: asyncio.Lock | None = None,
-) -> None:
-    await _send_realtime_frame(
-        websocket, dict(value), send_lock=send_lock, binary=False
+    guard: Callable[[], bool] | None = None,
+) -> bool:
+    return await _send_realtime_frame(
+        websocket, dict(value), send_lock=send_lock, binary=False, guard=guard
     )
 
 

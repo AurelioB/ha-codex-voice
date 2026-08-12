@@ -14,8 +14,9 @@ deliberately grants the device only audio and bounded lifecycle-control
 authority.
 
 The current reference client explicitly requests
-`conversation_mode: "native"`. That selection is session-scoped and forces one
-native Codex App Server WebRTC voice thread. The bridge ignores any captured
+`conversation_mode: "native"`. That selection is session-scoped and forces a
+native Codex App Server WebRTC provider generation. The bridge keeps at most
+one generation active at a time behind the device WebSocket and ignores any captured
 Home Assistant broker snapshot for that session: it does not wait for a
 completed transcript, start an executor thread, or render text with
 `thread/realtime/appendSpeech`.
@@ -77,7 +78,7 @@ The first WebSocket frame is UTF-8 JSON:
 `input_channels` must be `1`. Samples are signed little-endian PCM16.
 `conversation_mode`, when present, must be exactly `native`; `managed`, `null`,
 and other values are rejected. A native request ignores Home Assistant broker
-availability and selects a single App Server realtime voice thread. Omitting
+availability and selects an initial App Server realtime voice thread. Omitting
 the field preserves legacy automatic route selection. V2 rejects unknown start
 fields, device `tools`, model or realtime-version overrides,
 startup-context/handoff overrides, and `initial_items`. The bridge selects
@@ -132,18 +133,22 @@ omits it from `started`.
 it interrupts playback. `remote_cancel: false` is intentionally explicit: a
 client may never infer remote cancellation from a local flush or VAD event.
 `same_session_interrupt_ack: true` means the bridge can separately acknowledge
-whether one interrupt may continue on this socket. On the native path, that
-requires a provider `response.cancelled` event whose identifier matches the
-active response. On the legacy managed two-thread path, a `/2` client can instead
-receive `continuation_safe: true` after the bridge invalidates its owned
-executor/output generation. The latter explicitly keeps
+whether the legacy `interrupt` exchange may continue on this socket. On its
+native compatibility path, that requires a provider `response.cancelled` event
+whose identifier matches the active response. On the legacy managed two-thread
+path, a `/2` client can instead receive `continuation_safe: true` after the
+bridge invalidates its owned executor/output generation. The latter explicitly keeps
 `remote_cancelled: false`. The bridge never claims that already-played audio
-was unheard or that an uncorrelated response was truncated.
+was unheard or that an uncorrelated response was truncated. The active explicit
+native client uses the non-acknowledged `barge` rollover below instead of this
+legacy cancellation exchange.
 `server_owned_media: true` proves that the bridge, not the speaker, owns the
 provider WebRTC peer. For an explicit native start,
 `native_end_conversation: true` proves that the sole bridge-owned terminal
-control is available. The reference client requires both capabilities and
-fails closed against an older bridge.
+control is available. The reference client requires every capability value
+shown above and fails closed against an older bridge;
+`same_session_interrupt_ack` remains a compatibility/version floor and does
+not make active `barge` acknowledgement-based.
 
 Invalid or ambiguous negotiation produces a JSON `error` and closes the
 socket before a Codex thread is created.
@@ -169,6 +174,50 @@ cap does not change those provider contracts. The decoded provider-audio queue
 holds at most 25 chunks (normally roughly 500 ms). Queue overflow and
 unexpected media EOF are terminal protocol errors; audio is not silently
 dropped to hide latency.
+
+### Native barge rollover
+
+An explicit native v2 client interrupts assistant playback with exactly this
+JSON object:
+
+```json
+{"type":"barge"}
+```
+
+No additional fields are permitted. `barge` is nonterminal and has no
+acknowledgement frame: the device flushes its local playback immediately,
+keeps the same WebSocket and microphone capture open, and continues sending
+binary PCM. It must not wait for a provider event before sending the speech
+that caused the interruption. This control is accepted only for an explicit
+`conversation_mode: "native"` binary-v2 session; it is not an alias for the
+legacy `interrupt` exchange described below.
+
+The bridge owns the provider replacement behind that stable device socket. On
+`barge`, it atomically advances the provider generation, fences every old
+generation JSON/control and binary-audio sender, and preserves up to 320 ms of
+already-resampled microphone pre-roll. PCM arriving while replacement is in
+progress is appended in capture order, within the existing 2,250 ms live-input
+bound. Once the replacement is ready, the bridge feeds the retained pre-roll
+followed by during-rollover PCM to its paced input track exactly once. Old
+provider audio and controls can never become output for the new generation.
+
+Before reusing a Codex thread, the bridge requires strict stop and a matching
+provider `thread/realtime/closed` confirmation within the 100 ms reuse grace. A
+confirmed close starts the replacement on the same thread with startup context
+retained. An RPC error, provider error, timeout, provider/App Server disconnect,
+or otherwise ambiguous stop isolates the replacement on a fresh thread without
+startup context while the old thread is retired under bounded cleanup ownership.
+Ambiguity is never treated as proof that same-thread reuse is safe.
+
+During rollover, `ping` still receives `pong`, `stop` remains terminal, and a
+duplicate exact `barge` is idempotent because the current output generation is
+already retired. Other controls are protocol errors. A device stop or
+disconnect also abandons retained PCM and closes/disposes any replacement that
+finishes late; it does not leave a provider or thread orphaned.
+
+`output_epoch` remains monotonic for the lifetime of the WebSocket, not the
+lifetime of one provider peer. Thus the first response after a rollover uses
+an epoch greater than every response sent before that barge.
 
 For full-duplex realtime-only operation, the reference ThirdReality client
 discards the wake tail and all pre-ready microphone audio. It plays exactly one
@@ -206,13 +255,15 @@ An explicit native session has no transcript/executor/render handoff in its
 media path:
 
 ```text
-paced microphone PCM -> one App Server WebRTC voice thread
+paced microphone PCM -> active App Server WebRTC provider generation
                      -> provider audio -> speaking epoch -> device playback
 ```
 
-Provider speech is the direct output of that same realtime thread. The bridge
-does not require a user transcript to complete, does not create a second Codex
-thread, and does not call `thread/realtime/appendSpeech`.
+Provider speech is the direct output of the active realtime generation. The
+bridge does not require a user transcript to complete, create a parallel
+executor thread, or call `thread/realtime/appendSpeech`. An ambiguous strict
+stop may create a fresh isolated native thread for the replacement generation,
+as specified above.
 
 The legacy auto-selected managed two-thread path adds a stricter bridge-owned
 authorization gate:
@@ -284,12 +335,13 @@ the expected endpoints does not replace physical echo-rejection and double-talk
 qualification.
 
 Only after those checks does the client keep microphone submission active
-during playback. A client may use bounded AEC-filtered local speech detection
-to flush the player and quarantine late PCM for the exact output epoch before
-remote VAD arrives. `input_audio_buffer.speech_started` independently reinforces
-that local boundary. Neither event proves cancellation; the correlated
-interrupt acknowledgement below decides whether the remote session is safe to
-resume.
+during playback. The active reference client uses bounded AEC-filtered local
+speech detection to flush the player and send exact `barge`; it never waits for
+provider VAD. The bridge's generation fence and strict replacement—not
+`input_audio_buffer.speech_started`, response cancellation, or a remote
+acknowledgement—decide when retained audio may enter the new provider peer.
+Clients using the legacy `interrupt` control remain subject to the correlated
+acknowledgement rules below.
 
 ## JSON control messages
 
@@ -306,8 +358,10 @@ The following client-to-bridge controls remain JSON:
   may enter its frontend rendering channel.
 - `ping`: request `{"type":"pong"}`.
 - `stop`: end the session normally.
-- `interrupt`: flush local output and request cancellation of the active
-  provider response.
+- `barge`: exact explicit-native, nonterminal provider rollover as defined
+  above. No fields other than `type` are accepted.
+- `interrupt`: legacy compatibility exchange that requests cancellation of the
+  active provider response.
 
 The v2 device remains audio/control only. A v2 start containing `tools` or an
 incoming device `tool_result` is rejected. Provider tool calls and Home
@@ -349,9 +403,10 @@ Home Assistant. App Server v3 may route native delegation before notifying the
 bridge, so this thread boundary—not frontend prompt compliance—is what prevents
 side effects.
 
-Every interrupt flushes the device's local playback and revokes the bridge's
-current output epoch. The acknowledgement then depends on the internal route
-and negotiated client behavior.
+Every legacy `interrupt` revokes the bridge's current output epoch. The
+acknowledgement then depends on the internal route and negotiated client
+behavior. Active `barge` instead follows the nonterminal generation-replacement
+contract above and returns no acknowledgement frame.
 
 For a legacy broker-managed session from the exact `/2` User-Agent, the bridge
 advances its executor/output generation and asks the tool-free frontend
@@ -397,8 +452,9 @@ The next wake uses a fresh WebSocket, frontend, and executor. This preserves
 backward compatibility: an older deployed client need not understand the new
 field or upgrade in lockstep with the bridge.
 
-On the native v2 path used by the current reference client, same-socket
-continuation remains tied to remote cancellation. If and only if the bridge
+For an explicit-native compatibility client that sends legacy `interrupt`
+rather than `barge`, same-socket continuation remains tied to remote
+cancellation. If and only if the bridge
 receives a provider `response.cancelled` event whose response identifier
 matches the response active when the request was sent, it returns:
 
@@ -411,7 +467,7 @@ matches the response active when the request was sent, it returns:
 }
 ```
 
-The client may then continue on the same WebSocket. A cancellation event for a
+That compatibility client may then continue on the same WebSocket. A cancellation event for a
 different response, a completion event, send failure, or the bounded
 confirmation timeout cannot produce this acknowledgement; the bridge instead
 returns the same `fresh_session_required: true` /
@@ -435,7 +491,7 @@ emit only an allowlisted, content-free signal:
 The allowlist is limited to session, speech-boundary, response-boundary, and
 turn-boundary event names, including the content-free name
 `response.cancelled`. The provider response identifier is consumed only inside
-the bridge to correlate an outstanding interrupt; it is not included in the
+the bridge to correlate an outstanding legacy `interrupt`; it is not included in the
 device control. Transcript fragments, deltas, tool payloads, delegation
 payloads, unknown future events, malformed JSON, and every other provider field
 are dropped at the trust boundary.

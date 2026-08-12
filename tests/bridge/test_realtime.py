@@ -1068,3 +1068,144 @@ async def test_cancelled_stop_caller_does_not_abandon_shared_cleanup() -> None:
     assert peer.close_cancelled is True
     assert rpc.stop_cancelled is True
     assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_confirmed_close_is_idempotent() -> None:
+    rpc = ControlledStopRpc(emit_closed_on_stop=True)
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+    rpc.subscription.events.put_nowait(
+        {
+            "method": "thread/realtime/progress",
+            "params": {"threadId": "thread-1", "sequence": "before-closed"},
+        }
+    )
+
+    await session.stop_strict()
+    await session.stop_strict()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert peer.closed is True
+    assert rpc.subscription.closed is True
+    assert rpc.subscription.events.empty()
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_waiter_cancellation_rejoins_authoritative_stop() -> None:
+    rpc = ControlledStopRpc(block_stop=True, emit_closed_on_stop=True)
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+    first = asyncio.create_task(session.stop_strict())
+    await asyncio.wait_for(rpc.stop_started.wait(), timeout=0.2)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert rpc.stop_cancelled is False
+
+    second = asyncio.create_task(session.stop_strict())
+    rpc.release_stop.set()
+    await second
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_cancelled is False
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_propagates_provider_error_without_retry() -> None:
+    rpc = ControlledStopRpc(stop_error=RuntimeError("unknown stop outcome"))
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    with pytest.raises(RuntimeError, match="unknown stop outcome"):
+        await session.stop_strict()
+    await session.stop()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_provider_error_event_is_ambiguous() -> None:
+    rpc = ControlledStopRpc()
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+    rpc.subscription.events.put_nowait(
+        {
+            "method": "thread/realtime/error",
+            "params": {"threadId": "thread-1", "message": "stop failed"},
+        }
+    )
+
+    with pytest.raises(ProtocolError, match="provider error during stop"):
+        await session.stop_strict()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_rpc_return_without_closed_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc()
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    with pytest.raises(TimeoutError, match="realtime stop outcome is ambiguous"):
+        await session.stop_strict()
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_hard_bounds_provider_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc(block_stop=True)
+    peer = ControlledClosePeer()
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    with pytest.raises(TimeoutError, match="realtime stop outcome is ambiguous"):
+        await asyncio.wait_for(session.stop_strict(), timeout=0.5)
+
+    assert rpc.stop_calls == 1
+    assert rpc.stop_cancelled is True
+    assert peer.close_calls == 1
+    assert rpc.subscription.closed is True
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_hard_bounds_peer_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_module, "_STOP_TIMEOUT_SECONDS", 0.02)
+    rpc = ControlledStopRpc(emit_closed_on_stop=True)
+    peer = ControlledClosePeer(block_close=True)
+    session = RealtimeSession(rpc, "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    with pytest.raises(TimeoutError, match="realtime stop outcome is ambiguous"):
+        await asyncio.wait_for(session.stop_strict(), timeout=0.5)
+
+    assert rpc.stop_calls == 1
+    assert peer.close_calls == 1
+    assert peer.close_cancelled is True
+    assert rpc.subscription.closed is True

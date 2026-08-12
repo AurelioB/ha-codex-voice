@@ -10,9 +10,17 @@ and releases use semantic versioning.
 - Add the server-offloaded ThirdReality realtime route. Strict wire v2 now
   keeps the speaker on wake, LED, native AEC3, local barge-in, and raw PCM while
   the local bridge owns Codex App Server, OAuth, the WebRTC peer, resampling,
-  provider lifecycle, and output epochs. The provider peer remains open across
-  follow-up speech and interruption; Home Assistant and Hermes remain outside
-  this first conversation-only path.
+  provider lifecycle, and output epochs. The stable device WebSocket remains
+  open across follow-up speech and interruption; Home Assistant and Hermes
+  remain outside this first conversation-only path.
+- Add exact native-v2 `barge` rollover for the non-interruptible Frameless
+  provider path. A qualified local cut keeps device capture and the WebSocket
+  live while the bridge fences the old generation, retains up to 320 ms of
+  causal PCM, buffers within the 2,250 ms total input bound, strictly stops the
+  old provider, and feeds the retained utterance exactly once to a replacement.
+  Confirmed close within 100 ms reuses the thread with startup context;
+  ambiguous close isolates the replacement. Output epochs remain monotonic
+  across generations, and the path does not depend on provider VAD or cancel.
 - Add a reproducible Docker Compose bridge deployment with pinned Codex CLI and
   Python dependencies, non-root execution, a read-only filesystem, an
   owner-only writable OAuth file mount, authenticated health checks, bounded
@@ -126,12 +134,12 @@ and releases use semantic versioning.
   near-end speech is interruptible after that boundary, and eight unsuccessful
   evidence frames fence output. Quiet or muted playback carries the pending
   repair without consuming its evidence bound. Raw microphone PCM remains
-  byte-identical in the queue, local detector, and rollover pre-roll. Capture
-  correlated or uncertain against the active render is replaced by
-  equal-length silence only on the current provider peer; a fresh interruption
-  peer receives the untouched PCM. This prevents provider VAD from cancelling
-  on the speaker's own dynamic-volume transient while preserving cadence,
-  timestamps, genuine interruption, and follow-up speech. Sound-state writes
+  byte-identical in the queue and local detector. Active native AEC3 never
+  rewrites accepted bridge PCM from render classification; the guard only
+  qualifies the local cut and fail-closed anchor boundary. The PulseAudio-AEC
+  compatibility backend retains current-provider equal-length silence for
+  affirmative echo or ambiguous evidence. This preserves cadence, timestamps,
+  genuine interruption, and follow-up speech. Sound-state writes
   also share the hardware key's lock and use an atomic same-directory replace,
   then arm exactly one next-tick anchor verification, so either ordering of a
   concurrent key press and slider write cannot hide an AEC-sink repair. The

@@ -9,10 +9,12 @@ transport is strict realtime wire v2 with `media_transport: "bridge_pcm"`,
 capture backend. The existing device-owned WebRTC and Home Assistant paths
 remain in the repository, but neither participates in this first deployment.
 
-This is a boundary change, not a turn-based imitation of realtime voice. One
-server-owned WebRTC peer remains open for the conversation. Microphone audio
-flows continuously, provider audio streams back immediately, and the user can
-interrupt without starting a replacement peer.
+This is a boundary change, not a turn-based imitation of realtime voice. The
+device WebSocket and microphone ownership remain open for the conversation,
+with exactly one server-owned provider generation active at a time. Microphone
+audio flows continuously, provider audio streams back immediately, and a
+qualified interruption replaces the non-interruptible provider peer behind
+that stable device connection.
 
 ```mermaid
 flowchart LR
@@ -29,7 +31,7 @@ flowchart LR
     subgraph host["Local Linux host / Docker Compose"]
         bridge["Codex Voice bridge"]
         appserver["Codex App Server"]
-        peer["One aiortc peer per conversation"]
+        peer["One active aiortc provider generation"]
         oauth["Mounted ChatGPT OAuth state"]
         bridge --> appserver
         appserver --> peer
@@ -71,9 +73,11 @@ The Compose service owns the stateful and memory-intensive work:
 
 - the authenticated strict-v2 `/v1/realtime` WebSocket;
 - Codex App Server and the existing file-backed ChatGPT login;
-- exactly one native realtime thread and one `aiortc` peer per conversation;
-- stateful 16-to-24 kHz microphone resampling and paced RTP input;
-- provider VAD, response lifecycle, cancellation, and output epochs;
+- exactly one active native realtime provider generation at a time;
+- socket-lifetime stateful 16-to-24 kHz microphone resampling, bounded causal
+  rollover buffering, and paced RTP input;
+- response lifecycle, provider-generation fencing/replacement, and monotonic
+  output epochs;
 - the sole `end_conversation` tool and an exact bilingual terminal-phrase
   fallback; and
 - bounded cleanup of the WebRTC peer and every thread owned by the session.
@@ -100,7 +104,7 @@ stateDiagram-v2
     Listening --> Speaking: speaking.started + first PCM
     Speaking --> Listening: speaking.stopped
     Speaking --> Interrupting: qualified near-end speech
-    Interrupting --> Listening: same peer continues
+    Interrupting --> Listening: replacement ready and retained PCM replayed
     Listening --> Ending: end tool / terminal phrase / manual stop
     Speaking --> Ending: end tool / terminal phrase / manual stop
     Ending --> Idle: bounded cleanup
@@ -141,16 +145,31 @@ output. The reference deployment must pass its physical canary at the 100%
 worst case and exercise representative attenuated levels.
 
 During provider speech the microphone never closes. Qualified near-end speech
-immediately kills and flushes local playback, fences all late PCM from that
-output epoch, and continues sending the interrupting samples on the same LAN
-socket. Nothing replays or renegotiates. Provider VAD then cancels the active
-response and consumes that same utterance. This specifically preserves the
-words that caused the interruption instead of waiting for a later sentence.
+immediately kills and flushes local playback and sends exactly
+`{"type":"barge"}` on the same LAN socket. `barge` is nonterminal: the device
+keeps its owner, LED, capture queue, pacing, and WebSocket alive and continues
+sending PCM. With active native AEC3, the render classifier qualifies the local
+cut but never zeroes or rewrites accepted outbound capture.
+
+The server atomically advances its provider generation and fences every old
+generation output sender. Its socket-lifetime resampler has retained up to 320
+ms of already-resampled causal PCM; subsequent PCM is buffered in capture order
+within the 2,250 ms total rollover bound. After the replacement is ready, the
+bridge feeds that retained sequence exactly once through the new normally paced
+input track. Output epochs keep increasing across replacements.
+
+The bridge strictly stops the retired provider. A matching
+`thread/realtime/closed` within the 100 ms reuse grace permits same-thread
+startup-context reuse. An RPC/provider error, timeout, provider/App Server
+disconnect, or otherwise ambiguous outcome transfers the retired thread to
+bounded cleanup and starts an isolated replacement without startup context. A
+delayed old stop therefore cannot terminate the active generation.
 
 The device must not use simple microphone energy as its only barge-in signal:
 the decision is made from AEC-filtered near-end speech with a short consecutive
-frame requirement. Provider `speech_started` remains an independent reinforcing
-cut. A local cut alone never claims remote cancellation.
+frame requirement. Tagged Frameless supplies neither a dependable
+active-response VAD boundary nor a supported response cancel/truncate control,
+so correctness does not depend on provider `speech_started` or cancellation.
 
 ## Ending a conversation
 
@@ -239,8 +258,9 @@ state. The acceptance log needs:
 - startup attempt count and terminal phase;
 - microphone, LAN-send, RTP-input, provider-output, and playback queue
   high-water marks;
-- speaking epoch, local barge-in cut, provider speech-start, cancellation, and
-  next user-turn timing;
+- speaking epoch, local barge-in cut, provider generation, confirmed-reuse or
+  isolated-close outcome, replacement-ready time, retained byte count, and next
+  user-turn timing;
 - session duration, end reason, thread cleanup outcome, device RSS, server RSS,
   and unexpected process restart/OOM counts; and
 - AEC health and level summaries sufficient to distinguish echo from near-end
@@ -288,24 +308,27 @@ ThirdReality unit, not merely in mocked tests:
   plus 1, 25, 60, 80, and 100% physical-button levels all produce the expected
   non-amplifying software level without moving the anchor;
 - 20 deliberate interruptions cut playback within 250 ms p95, retain the words
-  that caused the cut, and produce the replacement response without a fresh
-  WebRTC negotiation;
+  that caused the cut exactly once on the replacement provider, keep the same
+  device WebSocket, preserve monotonic output epochs, and require neither a
+  second sentence nor another wake;
 - “terminar” and “terminar llamada” each end 10 sessions within one second,
   with the LED and microphone returning to idle; and
 - disconnect, server restart, and startup-failure drills always converge to
   idle and a later wake succeeds without rebooting the speaker.
 
 Automated gates cover strict-v2 framing, state transitions, retry ownership,
-PCM gain/saturation, output-epoch fencing, same-peer barge-in, end-tool/fallback
-behavior, cleanup, Compose parsing, image build, non-root imports, and secure
-OAuth mounting. A green automated suite is necessary but does not replace the
-physical matrix.
+PCM gain/saturation, output-epoch fencing, exact `barge`, bounded exactly-once
+rollover replay, strict-close reuse/isolation, end-tool/fallback behavior,
+cleanup, Compose parsing, image build, non-root imports, and secure OAuth
+mounting. A green automated suite is necessary but does not replace the physical
+matrix.
 
 ## Milestones
 
 - **M1 — Server-offloaded native conversation:** Compose bridge, strict-v2
-  binary media, one server peer, deterministic startup, native AEC3, 100%
-  playback, same-peer interruption, and explicit end. Home Assistant is absent.
+  binary media, one active provider generation, deterministic startup, native
+  AEC3, 100% playback, stable-socket provider rollover, and explicit end. Home
+  Assistant is absent.
 - **M2 — Measured latency work:** optimize only the largest measured latency
   segment. Trial one connected server warm slot only if provider negotiation is
   proven dominant and the quota/lifecycle cost is acceptable.

@@ -13,7 +13,7 @@ The current controlled deployment enables one wake route:
 
 | Wake phrase | Route | Capability |
 |---|---|---|
-| Okay Nabu | `realtime_only` native [realtime wire v2](../../protocol/realtime-wire-v2.md) PCM to the Codex Voice bridge | Server-owned WebRTC, continuous full-duplex audio, same-peer barge-in, and the sole terminal `end_conversation` tool |
+| Okay Nabu | `realtime_only` native [realtime wire v2](../../protocol/realtime-wire-v2.md) PCM to the Codex Voice bridge | Server-owned WebRTC, continuous full-duplex audio, stable-socket provider rollover, and the sole terminal `end_conversation` tool |
 
 Home Assistant Assist/Hermes and Home Assistant entity tools are deferred for
 this trial. An optional split configuration can be restored later, but it is
@@ -33,9 +33,10 @@ sink/playback anchor. The stream itself stays at 100% relative volume and one
 non-amplifying software stage gives the physical buttons their full 0–100%
 range. During provider
 speech, two-frame qualified near-end detection cuts local `paplay` immediately
-without discarding or replaying the causal microphone frames. The same server
-peer receives those frames in normal order; provider VAD cancels the old
-response and continues the conversation.
+and sends one exact `{"type":"barge"}` boundary without stopping capture or
+closing the device WebSocket. The server retains up to 320 ms of causal
+microphone pre-roll, buffers subsequent PCM within its 2,250 ms input bound,
+and feeds it exactly once to a replacement provider generation.
 
 An accepted wake claims the vendor owner and pulses the LED. Up to three
 startup attempts share one absolute 12-second owner deadline. Capture stays
@@ -49,10 +50,13 @@ with no Assist/Hermes fallback or pre-ready replay.
 
 [`realtime_client`](realtime_client) sends binary 16 kHz mono PCM16 to the
 bridge and receives 24 kHz mono PCM16 inside monotonic speaking epochs. It
-keeps the microphone open during playback. The bridge owns one WebRTC peer for
-the whole conversation, so interruption requires neither a replacement peer
-nor a second wake. Provider `speech_started` independently flushes stale local
-output; a local cut by itself never claims remote cancellation.
+keeps the microphone open during playback. The device WebSocket, owner, LED,
+capture, and playback controller remain live through interruption; the bridge
+strictly stops and replaces the provider peer behind them. A matching
+`thread/realtime/closed` confirmation within the 100 ms reuse grace permits
+same-thread context reuse, while an ambiguous close is isolated on a fresh
+thread. No second wake is required, and the path does not depend on provider
+VAD or a cancel acknowledgement.
 
 Both the client and bridge fix `conversation_mode: "native"`. The bridge
 ignores Home Assistant authority and exposes exactly one empty-input tool,
@@ -246,13 +250,16 @@ that previously learned model is rejected as local self-echo; missing, stale,
 quiet, uncalibrated, or genuinely independent speech fails open. Ambiguous
 evidence requires four consecutive 64 ms callbacks, while clear near-end
 speech keeps the two-callback interruption path. Raw microphone bytes remain
-unchanged in the bounded queue, local detector, and rollover pre-roll.
-Render-correlated, ambiguous, and high-correlation residual-heavy frames are
-sent as equal-length silence only to the provider peer whose response produced
-that render. After a genuine local interruption, those same tagged frames are
-raw on the fresh peer. Sample indices, capture timestamps, cadence, and packet
-lengths do not change. Software-only volume changes add no detector pause or
-blanket microphone blackout and duplicate requests do not extend a ramp.
+unchanged in the bounded device queue and local detector. With active native
+AEC3, the parent never zeroes or otherwise rewrites accepted bridge PCM based
+on this render classification: every frame continues through the configured
+outbound gain, and the server retains its own already-resampled rollover
+pre-roll. The classifier only qualifies the local cut and fail-closed anchor
+guard. The PulseAudio-AEC compatibility backend retains the narrower prior
+behavior of sending affirmative echo/ambiguous evidence as equal-length silence
+to the current provider peer. Sample indices, capture timestamps, cadence, and
+packet lengths do not change. Software-only volume changes add no detector
+pause or blanket microphone blackout and duplicate requests do not extend a ramp.
 Repair of a real physical sink excursion keeps
 trained FIR coefficients only as an untrusted seed, discards the prior delay,
 render timing, and pending local evidence, then searches the complete 20–320 ms
@@ -263,9 +270,11 @@ can still pass the current-peer filter, and clear near-end speech is locally
 interruptible after that boundary. Eight unsuccessful correlated/ambiguous
 evidence frames fence output, while quiet capture, muted software playback, and
 `media.quiet` retain the pending repair without consuming that bound. The guard
-changes only current-peer wire PCM; the existing outbound-gain stage and any
-fresh peer receive raw PCM. Only bounded content-free decision and suppression
-counts, correlation, and delay are logged. Direct volume persistence shares
+changes no active-native-AEC3 wire PCM. With the PulseAudio-AEC compatibility
+backend, it may change only current-provider wire PCM; after a committed cut,
+subsequent capture again flows normally to the stable socket. The existing
+outbound-gain stage remains unchanged. Only bounded content-free decision and
+suppression counts, correlation, and delay are logged. Direct volume persistence shares
 `/tmp/sound_config.lock` with the physical button script and atomically replaces
 `sound.json`. Every persisted change arms one next-tick exact anchor check that
 clears without another write, preventing either ordering of a concurrent
@@ -281,7 +290,7 @@ bounded stage. Gain is applied after the 16 kHz AEC capture frame is assembled
 and before LAN transmission or WebRTC resampling, using saturating PCM16 arithmetic; it
 does not change the wake detector, Home Assistant Assist audio, or the local
 barge-in detector. Keep it at 0 unless privacy-safe peak/RMS telemetry and a
-physical speech canary demonstrate that provider VAD is missing low-level
+physical speech canary demonstrate that provider input is missing low-level
 speech. Start such a canary at 6 dB, test close/normal/far and loud speech plus
 playback echo and interruption, and increase no further than the 12 dB hard
 limit only when the 6 dB evidence still requires it. This is fixed gain, not
@@ -535,9 +544,10 @@ reuse the Home Assistant bridge token, a Home Assistant access token, or Codex
 `auth.json`. Both packaged transports hardcode `conversation_mode: "native"`.
 The active v2 client also emits `User-Agent:
 ha-codex-voice-thirdreality/2`. Native AEC3 barge-in cuts playback locally and
-keeps the causal PCM in order on the same socket and server peer; provider VAD
-owns remote cancellation. Manual stop/mute/disconnect ends the session.
-Historical v3 instead stopped the old peer and negotiated a fresh epoch.
+keeps the causal PCM in order on the same socket while the server replaces the
+provider generation. Manual stop/mute/disconnect remains terminal.
+Historical v3 performed that rollover in the device sidecar through wire-v3
+signaling instead of on the bridge media server.
 
 The device never receives tool schemas, tool calls, results, or a Home
 Assistant credential. The native App Server thread alone receives the exact
@@ -884,15 +894,17 @@ passes all of the following on the physical speaker:
    one cue only after strict-v2 `started`, and opens capture only at cue EOF.
 2. Forced connection, readiness, cue, and playback failures always restore the
    idle LED and release ownership. No captured audio enters Assist/Hermes.
-3. Normal, quiet, loud, close, 1.5 m, and room-edge speech reaches provider VAD
-   with the configured native AEC3 and +12 dB post-AEC gain without clipping.
+3. Normal, quiet, loud, close, 1.5 m, and room-edge speech reaches the active
+   provider with the configured native AEC3 and +12 dB post-AEC gain without
+   clipping.
 4. At the fixed 100% anchor and representative software levels through 100%, no-user
    playback does not self-interrupt. Early, middle, and late near-end speech
    cuts playback promptly and the exact causal words become the next request;
    no second sentence or wake is needed.
-5. Long multi-turn conversation stays on one server peer. Replies have no
-   systematic prefix/tail loss or crackle, and volume changes do not move the
-   fixed sink anchor or introduce a second attenuation stage.
+5. Long multi-turn conversation stays on one device WebSocket across every
+   provider replacement. Output epochs remain strictly increasing; replies
+   have no systematic prefix/tail loss or crackle, and volume changes do not
+   move the fixed sink anchor or introduce a second attenuation stage.
 6. Spanish `terminar`/`terminar llamada`, an unambiguous English end request,
    manual stop, mute, disconnect, idle expiry, and hard lifetime expiry all
    return the device to idle with no stale `paplay` child.

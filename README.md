@@ -28,7 +28,7 @@ ThirdReality: "Okay Nabu"
   -> strict realtime wire v2 (binary PCM16) over the trusted LAN
   -> local Docker/host bridge
      -> Codex App Server + existing ChatGPT OAuth
-     -> one server-owned aiortc/WebRTC peer for the whole conversation
+     -> one active server-owned aiortc/WebRTC provider generation
   -> streamed speech back to the speaker
 ```
 
@@ -40,12 +40,14 @@ Codex App Server, OAuth, WebRTC, provider lifecycle, and exactly one native
 tool: `end_conversation`.
 
 An accepted wake pulses the LED and claims the microphone, but does not admit
-speech. The bridge completes one provider session, returns strict-v2 `started`,
-and only then does the speaker play the acknowledgement cue. Cue EOF changes
-the LED to listening and opens capture. During playback the microphone remains
+speech. The bridge completes the initial provider session, returns strict-v2
+`started`, and only then does the speaker play the acknowledgement cue. Cue EOF
+changes the LED to listening and opens capture. During playback the microphone remains
 open; qualified AEC-filtered near-end speech cuts local playback immediately
-while the same provider peer receives the interrupting words. Startup failure
-returns to idle and never falls through to a single-turn Assist request.
+and sends exact `{"type":"barge"}` while the device socket and capture stay
+open. The bridge replaces the provider generation and feeds the retained
+utterance once to its paced input track. Startup failure returns to idle and
+never falls through to a single-turn Assist request.
 
 The standard Home Assistant Conversation/STT/TTS integration is retained in
 the repository, but Home Assistant Assist, Hermes, and entity tools are
@@ -74,9 +76,9 @@ historical.
 - Milestone 2 is now the active server-offloaded realtime route. “Okay Nabu”
   starts strict v2 `bridge_pcm`, `conversation_mode: "native"`, full duplex,
   and native AEC3. The device owns only the physical audio boundary; the
-  always-running local bridge owns the App Server thread and one long-lived
-  WebRTC peer for the conversation. No firmware flash or separately supervised
-  device daemon is required.
+  always-running local bridge owns the App Server and one active WebRTC provider
+  generation behind the stable device WebSocket. No firmware flash or
+  separately supervised device daemon is required.
 - The route-scoped device token cannot open the Home Assistant broker. Active
   native v2 ignores every broker snapshot, rejects device-declared tools, and
   exposes only the server-owned empty-input `end_conversation` tool. Home
@@ -99,7 +101,7 @@ historical.
   do not physically validate the current single-worker build; they also do not
   replace the per-installation acceptance matrix.
   These figures are historical evidence only and do not describe the active
-  same-peer v2 interruption path.
+  server-owned v2 rollover path.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.147.0 or newer.
 
@@ -363,8 +365,10 @@ installed apps, including automatically discovered MCP sidecars, outside voice
 sessions and prevents finished threads from lingering in App Server's idle
 cache. Only an authority-enabled legacy strict-v2 managed session owns both a
 speech frontend and executor thread; teardown deletes both independently. The
-active native-v2 session owns one realtime thread and deletes it when the
-conversation ends. Dormant v3 deletes every peer-epoch thread it creates.
+active native-v2 session owns one active provider generation. A confirmed stop
+can reuse its thread; an ambiguous stop transfers the retired thread to bounded
+cleanup and creates an isolated replacement. Every owned thread is deleted when
+the conversation ends. Dormant v3 deletes every peer-epoch thread it creates.
 
 No OAuth secret is copied into Home Assistant or this repository. The isolated
 home contains a link to the source credential so refreshes remain owned by the
@@ -386,13 +390,19 @@ requires `conversation_mode: "native"`, sends binary 16 kHz mono PCM16 to the
 bridge, and receives binary 24 kHz mono PCM16 inside monotonic speaking epochs.
 `full_duplex: true` keeps capture open throughout provider playback.
 
-The bridge constructs and paces one WebRTC peer for the whole conversation.
-The device performs an immediate local playback cut on qualified native-AEC3
-near-end speech but keeps the interrupting PCM in normal stream order. Provider
-VAD observes those same samples, cancels the current response, and continues
-on the same thread and peer. Provider `speech_started` is an independent output
-flush; a local cut alone never claims remote cancellation. There is no
-replacement-peer pause, transcript executor, or synthesized turn handoff.
+The bridge constructs and paces the active WebRTC provider generation. On
+qualified native-AEC3 near-end speech, the device immediately cuts playback,
+sends exact `barge`, and keeps its WebSocket and capture open. The bridge fences
+the old generation, retains up to 320 ms of causal already-resampled PCM,
+buffers live input within the 2,250 ms total bound, and feeds it once at normal
+pace to a replacement peer. Output epochs remain monotonic across replacements.
+
+The tagged App Server Frameless path exposes no dependable active-response VAD
+boundary or supported cancel/truncate control. Strict stop plus a matching
+`thread/realtime/closed` within the 100 ms reuse grace permits same-thread
+startup-context reuse; an ambiguous outcome uses a fresh isolated thread. The
+active path therefore does not depend on provider `speech_started` or remote
+cancellation. There is no transcript executor or synthesized turn handoff.
 
 Strict-v2 `started` is the session-readiness boundary. The speaker plays its
 pinned cue only after that message and opens capture only at cue EOF. The

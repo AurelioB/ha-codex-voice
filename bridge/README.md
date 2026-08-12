@@ -3,7 +3,9 @@
 This process exposes a small bearer-authenticated HTTP/WebSocket API and owns a
 local `codex app-server` child. In the active realtime architecture it is the
 media server for the ThirdReality speaker: strict-v2 PCM arrives over the LAN,
-and the bridge owns the one `aiortc`/WebRTC peer for the entire conversation.
+and the bridge keeps one provider generation active behind the stable device
+WebSocket. A qualified interruption replaces that generation without making
+the speaker reconnect.
 Home Assistant integration routes remain available but are deferred from the
 active Okay Nabu path. The child uses the machine's existing file-backed
 Codex/ChatGPT login through a private temporary Codex home; no OAuth token is
@@ -110,10 +112,11 @@ requires the primary Home Assistant bridge token.
   binary PCM16, or strict v3 device-owned WebRTC signaling. V3 relays a
   validated SDP offer/answer and then carries JSON lifeline controls only;
   audio and `oai-events` go directly between the device peer and provider.
-  V2 emits content-free lifecycle
-  controls, filters continuous WebRTC silence, gates output with monotonic
-  epochs, and supports negotiated same-session interruption. It does not expose
-  transcripts, provider payloads, tool calls, or tool results to the device.
+  V2 emits content-free lifecycle controls, filters continuous WebRTC silence,
+  gates output with socket-lifetime monotonic epochs, and supports exact native
+  `barge` rollover as well as the legacy negotiated interrupt exchange. It does
+  not expose transcripts, provider payloads, tool calls, or tool results to the
+  device.
   The active strict-v2 route requires `conversation_mode: "native"`; an
   accepted value is echoed in `started`. Native v2 declares only the
   empty-input `end_conversation` tool and ignores Home Assistant broker state.
@@ -132,11 +135,21 @@ schemas, arguments, results, prompts, or conversation content.
 
 Okay Nabu uses strict v2 `bridge_pcm`, explicit native mode, and full duplex.
 The speaker continuously sends 16 kHz mono PCM16; the bridge resamples and
-paces it into one provider WebRTC peer, then returns 24 kHz mono PCM16 inside
-monotonic speaking epochs. The same peer remains open across responses and
-interruptions. Provider VAD observes the very samples that caused a local
-playback cut, so the replacement utterance is neither replayed nor delayed for
-a fresh-peer negotiation.
+paces it into the active provider WebRTC peer, then returns 24 kHz mono PCM16
+inside monotonic speaking epochs. The device WebSocket remains open across
+responses and interruptions. A qualified local cut sends exact `{"type":"barge"}`;
+the bridge fences the old provider generation, retains up to 320 ms of causal
+microphone pre-roll, buffers live input within the 2,250 ms bound, and feeds it
+once at normal media pace to a replacement peer.
+
+The tagged App Server Frameless path exposes neither a dependable
+active-response VAD boundary nor a supported cancel/truncate control. The
+bridge therefore does not wait for `speech_started` or claim same-peer provider
+cancellation. It requires strict stop and a matching
+`thread/realtime/closed` notification within the 100 ms reuse grace before
+reusing the existing thread with startup context. An error, timeout, or
+otherwise ambiguous close starts the replacement on a fresh isolated thread so
+late output from the retired generation cannot cross the fence.
 
 The bridge sends `started` only after the App Server thread, SDP exchange,
 WebRTC transport, and provider session are ready. That is the device's
@@ -273,9 +286,10 @@ ceiling; runtime restore state alone is not treated as reboot evidence.
 
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises
-`same_session_interrupt_ack: true`. The v2 ThirdReality client path sends
-`User-Agent: ha-codex-voice-thirdreality/2`; that header retains compatibility
-with the managed interrupt policy but does not select it. On a legacy
+`same_session_interrupt_ack: true` for the legacy `interrupt` exchange. The v2
+ThirdReality client sends `User-Agent: ha-codex-voice-thirdreality/2`; that
+header retains compatibility with the managed interrupt policy but does not
+select it. On a legacy
 broker-managed interrupt, the bridge invalidates the executor/output generation
 and asks the frontend provider to cancel only when an identified assistant
 render is active; it never cancels an idle or pending frontend. Before Home
@@ -285,11 +299,14 @@ newest request when its transcript arrives.
 It then returns `fresh_session_required: false`, `remote_cancelled: false`, and
 `continuation_safe: true`; the local generation gate makes continuation safe
 without claiming remote cancellation. A legacy client gets the established
-fresh-session fallback and socket teardown. On the active v2 native path,
-microphone PCM continues in order on the same socket and peer. Provider VAD
-observes the interrupting samples and drives remote response cancellation;
-provider `speech_started` independently flushes late local output. A local cut
-alone never claims remote cancellation.
+fresh-session fallback and socket teardown.
+
+The active explicit-native client instead sends the exact nonterminal `barge`
+control after its local AEC-qualified cut. Capture and the device WebSocket stay
+live while the bridge replaces the non-interruptible provider generation and
+replays bounded causal pre-roll plus during-rollover PCM exactly once. The
+bridge never relies on provider VAD or a provider cancellation acknowledgement
+for this path.
 
 ### Dormant v3 rollover details
 

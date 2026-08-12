@@ -49,7 +49,7 @@ native realtime and sets `realtime_only: true`:
 "Okay Nabu" -> speaker wake/LED/cue/native AEC3/capture/playback
              -> strict wire v2 binary PCM over the trusted LAN
              -> Docker/host bridge + App Server/OAuth
-             -> one bridge-owned WebRTC peer for the conversation
+             -> one active bridge-owned WebRTC provider generation
 
 Home Assistant Assist/Hermes and entity tools are deferred for this trial. No
 Home Assistant broker snapshot, transcript executor, or appendSpeech render
@@ -64,12 +64,12 @@ render reference are sample-aligned there. +12 dB saturating gain is applied
 after AEC and only to outgoing bridge PCM.
 
 The always-running server owns the authenticated v2 socket, the managed Codex
-login, one App Server realtime thread, one paced WebRTC peer, provider VAD and
-response lifecycle, and cleanup. The active thread exposes exactly one dynamic
-empty-input tool, `end_conversation`; a narrow normalized Spanish/English
-terminal-phrase fallback handles explicit end requests that are acknowledged
-without a tool call. No Home Assistant entity tool or broker authority is
-available.
+login, the App Server realtime provider generation, its paced WebRTC peer,
+response lifecycle, interruption replacement, and cleanup. The active provider
+generation exposes exactly one dynamic empty-input tool, `end_conversation`;
+a narrow normalized Spanish/English terminal-phrase fallback handles explicit
+end requests that are acknowledged without a tool call. No Home Assistant
+entity tool or broker authority is available.
 
 The direct wake boundary is deterministic. An accepted Okay Nabu detection
 immediately claims the vendor owner and queues the non-blocking
@@ -83,8 +83,8 @@ returns the LED to idle without entering Home Assistant.
 
 `RealtimeSession.ready` is narrower than socket connection. It means the
 server has applied the SDP answer, connected the provider peer/data channel,
-and returned exact strict-v2 `started`. Only then does the device play once the root-owned pinned
-PCM16 mono 22,050 Hz cue
+and returned exact strict-v2 `started`. Only then does the device play once the
+root-owned pinned PCM16 mono 22,050 Hz cue
 `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav` (SHA-256
 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
 0.400 seconds). The vendor stop-word detector remains suspended throughout the
@@ -97,11 +97,16 @@ down the socket and normal cleanup restores the detector and idle LED. No Home
 Assistant tool is present.
 
 During provider playback the microphone stays open. Qualified AEC-filtered
-near-end speech immediately kills and flushes local playback, while its exact
-PCM remains in normal order on the same socket and provider peer. Provider VAD
-then cancels the response and consumes that utterance. There is no fresh-peer
-rollover or replacement delay. Provider `speech_started` independently fences
-late output; a local cut alone never claims remote cancellation.
+near-end speech immediately kills and flushes local playback and sends one
+exact `barge` boundary on the same device socket. The bridge fences the old
+provider generation, retains 320 ms of recent already-resampled microphone
+PCM, buffers live PCM within the 2,250 ms total rollover bound while it replaces
+the provider peer, and replays that causal audio once through the new paced
+input track. A confirmed provider close within the 100 ms reuse grace reuses
+the thread and its context; an ambiguous close starts an isolated thread
+instead of risking cross-generation output. The App Server Frameless path does
+not provide a usable active-response VAD/cancel boundary, so correctness does
+not depend on provider `speech_started`.
 
 The dedicated sink and `paplay` stream remain at the fixed 100% physical
 anchor. One non-amplifying software attenuator implements dynamic user volume:
@@ -381,9 +386,10 @@ The active device is full duplex. Its fixed 100% sink anchor and
 100%-relative playback stream are separated from one non-amplifying
 software-volume stage that implements the physical 0/1–100% range.
 Local AEC-qualified speech cuts output immediately while its samples continue
-to the same peer; provider VAD owns response cancellation. The server exposes
-only `end_conversation`, and realtime-only failure returns idle without an
-Assist/Hermes fallback.
+on the same device socket. The bridge replaces the non-interruptible provider
+generation and replays the retained utterance once at normal media pace. The
+server exposes only `end_conversation`, and realtime-only failure returns idle
+without an Assist/Hermes fallback.
 
 ### Dormant device-owned v3 experiment (historical)
 

@@ -325,6 +325,7 @@ class RealtimeSession:
         self._started = False
         self._closed = False
         self._stop_waiter: asyncio.Future[None] | None = None
+        self._strict_stop_task: asyncio.Task[None] | None = None
 
     async def start(
         self,
@@ -537,6 +538,12 @@ class RealtimeSession:
                 events.append(event)
 
     async def stop(self) -> None:
+        if self._strict_stop_task is not None:
+            try:
+                await asyncio.shield(self._strict_stop_task)
+            except Exception as err:  # noqa: BLE001 - cleanup remains best effort.
+                LOGGER.warning("Realtime strict cleanup failed: %s", err)
+            return
         if self._stop_waiter is not None:
             await asyncio.shield(self._stop_waiter)
             return
@@ -547,6 +554,77 @@ class RealtimeSession:
         finally:
             if not self._stop_waiter.done():
                 self._stop_waiter.set_result(None)
+
+    async def stop_strict(self) -> None:
+        """Stop only after App Server confirms this thread's realtime closure.
+
+        The single underlying task is shielded so a short rollover grace-period
+        waiter may leave it running under transferred cleanup ownership without
+        issuing a second stop request.
+        """
+        if self._stop_waiter is not None:
+            raise ProtocolError("realtime cleanup already started without confirmation")
+        if self._strict_stop_task is None:
+            self._closed = True
+            self._strict_stop_task = asyncio.create_task(
+                self._stop_strict_once(),
+                name=f"codex-realtime-strict-stop-{self.thread_id}",
+            )
+        await asyncio.shield(self._strict_stop_task)
+
+    async def _stop_strict_once(self) -> None:
+        cleanup_timeout = max(0.0, min(self.timeout, _STOP_TIMEOUT_SECONDS))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cleanup_timeout
+        remote_stop_task: asyncio.Task[None] | None = None
+        peer_close_task: asyncio.Task[None] | None = None
+
+        async def stop_remote_confirmed() -> None:
+            await self.rpc.call(
+                "thread/realtime/stop",
+                {"threadId": self.thread_id},
+                timeout=max(0.0, deadline - loop.time()),
+            )
+            while True:
+                event = await self.subscription.get(
+                    timeout=max(0.0, deadline - loop.time())
+                )
+                self._raise_if_app_server_exited(event)
+                if not self._belongs_to_thread(event):
+                    continue
+                method = event.get("method")
+                if method == "thread/realtime/error":
+                    raise ProtocolError("realtime provider error during stop")
+                if method == "thread/realtime/closed":
+                    return
+
+        try:
+            remote_stop_task = asyncio.create_task(
+                stop_remote_confirmed(),
+                name=f"codex-realtime-strict-rpc-stop-{self.thread_id}",
+            )
+            peer_close_task = asyncio.create_task(
+                self.peer.close(),
+                name=f"codex-realtime-strict-peer-close-{self.thread_id}",
+            )
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.gather(remote_stop_task, peer_close_task)
+            except TimeoutError:
+                raise TimeoutError("realtime stop outcome is ambiguous") from None
+        finally:
+            for task in (remote_stop_task, peer_close_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(
+                    task
+                    for task in (remote_stop_task, peer_close_task)
+                    if task is not None
+                ),
+                return_exceptions=True,
+            )
+            self.subscription.close()
 
     async def _stop_once(self) -> None:
         cleanup_timeout = max(0.0, min(self.timeout, _STOP_TIMEOUT_SECONDS))

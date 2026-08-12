@@ -7936,6 +7936,121 @@ def test_network_thread_runs_v2_audio_turn_and_drains_before_stop(
     assert player.events[-1] == ("abort", None)
 
 
+def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module,
+        "_LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS",
+        0.0,
+    )
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    _install_fake_loop_io(monkeypatch, player)
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=12.0,
+        ),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+        aec_verifier=lambda _config: None,
+        direct_player_factory=lambda _maximum, _sink: player,
+    )
+    start = {
+        "type": "start",
+        "protocol_version": 2,
+        "conversation_mode": "native",
+        "audio_transport": "binary",
+        "input_sample_rate": 16_000,
+        "input_channels": 1,
+    }
+
+    session.start()
+    assert connection.wait_for_json(start)
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "control",
+                    "event_type": "speaking.started",
+                    "output_epoch": 1,
+                }
+            ),
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    _force_render_matched_near_end(session)
+    speech = struct.pack("<1024h", *([1_024, -1_024] * 512))
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert connection.wait_for_json({"type": "barge"})
+    assert _wait_for(lambda: not session.output_active)
+    assert connection.json_sent.count({"type": "barge"}) == 1
+    assert connection.json_sent.count({"type": "interrupt"}) == 0
+    assert session.state is SessionState.READY
+    assert not session.terminal
+    assert not connection.closed
+    assert session._local_barge_in_rearm_required
+    assert player.events == [("prepare", None), ("begin", 1), ("abort", None)]
+
+    # The bridge replaces its provider behind the stable socket. Capture sent
+    # during that negotiation must keep its normal gain and microphone pacing;
+    # the device neither clears nor gates it at the barge boundary.
+    assert connection.wait_for_binary_count(2)
+    negotiation_capture = struct.pack("<1024h", *([512, -512] * 512))
+    baseline = len(connection.binary_sent)
+    assert session.submit_audio(negotiation_capture) is SubmitResult.ACCEPTED
+    assert connection.wait_for_binary_count(baseline + 1)
+    assert connection.binary_sent[-1][0] == session_module._apply_capture_gain_pcm16(
+        negotiation_capture,
+        12.0,
+    )
+
+    # Continuous evidence from the same utterance cannot emit another barge.
+    baseline = len(connection.binary_sent)
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert connection.wait_for_binary_count(baseline + 2)
+    assert connection.json_sent.count({"type": "barge"}) == 1
+
+    quiet = bytes(2_048)
+    for _ in range(session_module._LOCAL_BARGE_IN_REARM_QUIET_FRAMES):
+        baseline = len(connection.binary_sent)
+        assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+        assert connection.wait_for_binary_count(baseline + 1)
+    assert not session._local_barge_in_rearm_required
+
+    # A later provider speaking epoch establishes a new eligible interruption
+    # generation; exactly one barge may then be emitted for its fresh speech.
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "control",
+                    "event_type": "speaking.started",
+                    "output_epoch": 2,
+                }
+            ),
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert _wait_for(lambda: connection.json_sent.count({"type": "barge"}) == 2)
+    assert connection.json_sent.count({"type": "interrupt"}) == 0
+    assert session.state is SessionState.READY
+    assert not session.terminal
+
+    session.stop()
+    assert session.join(1.0)
+    assert connection.json_sent.count({"type": "stop"}) == 1
+
+
 def test_network_thread_sends_optional_voice_and_prompt_only_when_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

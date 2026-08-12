@@ -3049,11 +3049,19 @@ class RealtimeSession:
                     connection.send_json({"type": "stop"})
                     return
                 else:
-                    output_epoch, _ = self._flush_local_barge_in(
+                    output_epoch, barge_watermark = self._flush_local_barge_in(
                         player,
                         output_epoch=output_epoch,
                         last_output_epoch=last_output_epoch,
                     )
+                    if barge_watermark is not None:
+                        # This is a nonterminal provider-generation boundary.
+                        # Keep the stable v2 socket, capture queue, pacer, and
+                        # device session alive while the bridge replaces its
+                        # non-interruptible upstream peer. The watermark stays
+                        # local; the wire boundary is intentionally exact.
+                        connection.send_json({"type": "barge"})
+                        last_semantic_activity = now
 
                 player.service()
                 if output_epoch is None and not player.active:

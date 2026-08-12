@@ -20,9 +20,9 @@ sides of a narrow bridge API.
   executes the calls, and sends only their results back to the bridge.
 - The current ThirdReality strict-v2 client explicitly requests
   `conversation_mode: "native"`. The bridge ignores any Home Assistant broker
-  snapshot for that session and creates one native App Server realtime thread
-  and one server-owned WebRTC peer per conversation, with exactly one dynamic
-  tool, `end_conversation`. The tool has
+  snapshot for that session and keeps exactly one active native App Server
+  realtime provider generation behind a stable device WebSocket. Every
+  generation has exactly one dynamic tool, `end_conversation`. The tool has
   an empty-object input schema and only terminates this voice session; the bridge
   rejects every other provider tool request with `do_not_retry` and ends the
   session. The bridge accepts bounded binary v2 PCM but never exposes raw
@@ -76,8 +76,10 @@ sides of a narrow bridge API.
 - Threads are deliberately non-ephemeral inside that isolated home so App
   Server can delete them immediately with `thread/delete`. Experimental Codex
   STT, TTS, and realtime threads are deleted when their session ends. An active
-  native-v2 conversation owns one realtime thread and one peer until bounded
-  cleanup. A legacy managed session owns two
+  native-v2 conversation owns one active realtime provider generation; a
+  confirmed close may reuse its thread, while an ambiguous close transfers the
+  retired thread to bounded cleanup and creates an isolated replacement. Every
+  thread owned by the device session is ultimately deleted. A legacy managed session owns two
   threads, and cleanup independently deletes
   both its tool-free frontend and its executor. Reusable Conversation threads
   are deleted when retired, evicted, or the bridge shuts down.
@@ -114,8 +116,9 @@ sides of a narrow bridge API.
 - Okay Nabu selects explicit native v2 in the current `realtime_only` trial and
   gains no Home Assistant authority. Once a direct session owns the device,
   later detector hits are ignored; interruption and follow-up are driven only
-  by bounded live-audio/VAD logic. A later split deployment may restore Assist
-  and a distinct direct phrase, but that authority split is not active now.
+  by bounded live audio and local AEC-qualified barge-in. A later split
+  deployment may restore Assist and a distinct direct phrase, but that authority
+  split is not active now.
 - The device may retain at most six idle microphone frames in its generic
   compatibility ring: 384 ms, or 12 KiB of PCM16 in memory only. An accepted
   active-v2 wake discards all of it and drops every recorder callback during connecting
@@ -164,8 +167,11 @@ sides of a narrow bridge API.
   hardware output. +12 dB capture gain is saturating, occurs only after AEC,
   and affects only microphone PCM sent to the bridge, never playback PCM.
   AEC-filtered near-end speech cuts local playback while its original causal
-  PCM continues on the same socket and server peer. Provider VAD owns remote
-  cancellation; the device never asserts that a local cut cancelled it.
+  PCM continues on the same socket. The device sends one exact nonterminal
+  `barge`; the bridge fences the retired generation, keeps up to 320 ms of
+  already-resampled pre-roll, and buffers live PCM within the 2,250 ms total
+  rollover bound. It replays that audio once through a replacement provider
+  peer. Provider VAD/cancellation is not an authority or correctness boundary.
 - Dormant v3 direct media ran in a separate
   `/usr/bin/python3 -I -S` child with a complete hash-locked Python
   3.11/aarch64 runtime, root-owned immutable source/runtime paths, and bounded
@@ -291,8 +297,12 @@ sides of a narrow bridge API.
   documentation supports realtime WebRTC v1 and v3, not v2; that statement
   concerns the provider surface, not the project's active v2 LAN protocol. A
   live v1 subscription canary did not complete startup. On active native v2,
-  microphone PCM stays ordered on the same peer, provider VAD handles remote
-  cancellation, and provider `speech_started` independently flushes output. On the
+  the device socket stays open while the bridge strictly replaces the
+  non-interruptible provider generation. Confirmed
+  `thread/realtime/closed` within the 100 ms reuse grace permits same-thread
+  startup-context reuse; a timeout, error, or otherwise ambiguous close
+  isolates the replacement on a fresh thread. No provider VAD or cancel
+  acknowledgement is assumed. On the
   legacy broker-managed path, a new utterance invalidates the bridge generation
   and best-effort cancellation cannot reopen the local output gate. Before Home
   Assistant tool dispatch, the bridge tombstones and interrupts the executor;
@@ -376,6 +386,11 @@ Realtime event-shape tracing records only deduplicated source/event types,
 allowlisted item types, and coarse role/target labels. It omits transcript text,
 agent deltas, prompts, tool names, arguments, results, raw provider payloads,
 SDP, audio, and provider identifiers.
+
+Native-v2 rollover logs contain only the monotonic generation number,
+confirmed-reuse versus isolated-close outcome, replacement readiness time, and
+retained PCM byte count. They contain no PCM, transcript, prompt, thread or
+provider identifier, or tool content.
 
 The ThirdReality overlay emits one device-syslog wake selection using only
 fixed detector-class and reason enums. It never includes the spoken phrase,
