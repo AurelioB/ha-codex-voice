@@ -245,9 +245,7 @@ def _audit_abi(readelf: Path, dist: Path) -> dict[str, list[str]]:
         "GLIBCXX": (3, 4, 28),
         "CXXABI": (1, 3, 12),
     }
-    artifacts = sorted((dist / "bin").glob("*")) + sorted(
-        (dist / "lib").glob("*.so*")
-    )
+    artifacts = sorted((dist / "bin").glob("*")) + sorted((dist / "lib").glob("*.so*"))
     for artifact in artifacts:
         header = _run([str(readelf), "--file-header", str(artifact)])
         if "Machine:" not in header or "AArch64" not in header:
@@ -268,10 +266,10 @@ def _audit_abi(readelf: Path, dist: Path) -> dict[str, list[str]]:
 def _copy_licenses(module_dir: Path, output: Path, dist: Path) -> None:
     build = output / "build"
     sources = {
-        "webrtc-audio-processing-BSD-3-Clause.txt":
-            build / f"webrtc-audio-processing-{_APM_VERSION}/COPYING",
-        "libabseil-cpp-Apache-2.0.txt":
-            build / f"libabseil-cpp-{_ABSEIL_VERSION}/LICENSE",
+        "webrtc-audio-processing-BSD-3-Clause.txt": build
+        / f"webrtc-audio-processing-{_APM_VERSION}/COPYING",
+        "libabseil-cpp-Apache-2.0.txt": build
+        / f"libabseil-cpp-{_ABSEIL_VERSION}/LICENSE",
     }
     for destination, source in sources.items():
         _require_file(source, f"license for {destination}")

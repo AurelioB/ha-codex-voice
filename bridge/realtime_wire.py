@@ -232,6 +232,8 @@ class RealtimeWireProtocol:
                 "local_flush": True,
                 "remote_cancel": False,
                 "same_session_interrupt_ack": True,
+                "server_owned_media": True,
+                "native_end_conversation": self.requests_native_conversation,
             },
         }
         if self.conversation_mode is not None:

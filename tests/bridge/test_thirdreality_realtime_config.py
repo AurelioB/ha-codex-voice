@@ -218,14 +218,21 @@ def test_config_loads_normalized_device_webrtc_capture_gain(tmp_path: Path) -> N
     assert isinstance(config.direct_capture_gain_db, float)
 
 
-def test_config_loads_native_aec3_only_for_device_webrtc(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "media_transport",
+    [DEVICE_WEBRTC_TRANSPORT, BRIDGE_PCM_TRANSPORT],
+)
+def test_config_loads_native_aec3_for_full_duplex_transports(
+    tmp_path: Path,
+    media_transport: str,
+) -> None:
     path = tmp_path / "realtime.json"
     _write_config(
         path,
         {
             **_valid_config(),
             "full_duplex": True,
-            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "media_transport": media_transport,
             "capture_backend": NATIVE_AEC3_CAPTURE,
             "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
             "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
@@ -241,7 +248,7 @@ def test_config_loads_native_aec3_only_for_device_webrtc(tmp_path: Path) -> None
         path,
         {**_valid_config(), "capture_backend": NATIVE_AEC3_CAPTURE},
     )
-    with pytest.raises(ConfigError, match="requires device_webrtc"):
+    with pytest.raises(ConfigError, match="requires full_duplex"):
         load_config(path, expected_uid=os.getuid())
 
 
@@ -306,11 +313,35 @@ def test_config_rejects_invalid_device_webrtc_capture_gain(
         load_config(path, expected_uid=os.getuid())
 
 
-def test_config_rejects_nonzero_capture_gain_for_bridge_pcm(tmp_path: Path) -> None:
+def test_config_loads_bridge_pcm_native_aec3_capture_gain(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": BRIDGE_PCM_TRANSPORT,
+            "capture_backend": NATIVE_AEC3_CAPTURE,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": 6,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.capture_backend == NATIVE_AEC3_CAPTURE
+    assert config.direct_capture_gain_db == 6.0
+
+
+def test_config_rejects_nonzero_capture_gain_for_pulse_bridge_pcm(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "realtime.json"
     _write_config(path, {**_valid_config(), "direct_capture_gain_db": 6})
 
-    with pytest.raises(ConfigError, match="requires device_webrtc"):
+    with pytest.raises(ConfigError, match="requires device_webrtc or native_aec3"):
         load_config(path, expected_uid=os.getuid())
 
 

@@ -5,6 +5,12 @@ These assets are an opt-in preparation step for the pinned ThirdReality
 scripts never restart PulseAudio or the voice service, never change the running
 speaker volume, and never change or disable TCP ADB on port 5555.
 
+The active route is strict-v2 `bridge_pcm` with full duplex, native AEC3,
++12 dB bounded post-AEC capture gain, and a physically qualified 60%
+sink/playback anchor. `paplay` uses 100% relative stream volume and dynamic
+volume uses one software attenuation stage. The dormant `device_webrtc`
+sidecar is not required for this deployment.
+
 ## Latch configured microphone gain before capture opens
 
 The pinned firmware has a boot-order defect. `S50pulseaudio` opens the PDM
@@ -155,13 +161,13 @@ recorder that was opened before wake) to reference the AEC source index, and
 requires every reported AEC sink channel to be no louder than
 `aec_sink_volume_ceiling_percent`. It fails closed if any route or channel is
 wrong. Playback is additionally pinned to the AEC sink. Once per direct
-session, after the preflight and before requesting the SDP offer or opening the
-bridge socket, a fixed-argv `pactl` controller sets and verifies the dedicated
-sink itself to the exact raw `playback_volume_percent`. Direct v3 `paplay`
+session, after the preflight and before opening the bridge socket, a fixed-argv
+`pactl` controller sets and verifies the dedicated sink itself to the exact raw
+`playback_volume_percent`. Active v2 `paplay`
 targets that sink with raw stream volume 65536 (100% relative),
 `--latency-msec=60`, and `--process-time-msec=20`; the client never enumerates
-or mutates a sink-input. The retained v2 `paplay` path instead derives its
-stream volume from the configured playback percentage. The response,
+or mutates a sink-input. One non-amplifying software attenuator implements
+dynamic user volume, eliminating the old double-attenuation path. The response,
 playback-begin/resume, and interruption paths intentionally perform no live
 volume subprocess work. The preflight and preparation compare PulseAudio's raw
 channel units with the exact linear value (`65536 × percent // 100`), not the
@@ -172,9 +178,10 @@ direct session or raise a live sink or stream during the canary.
 Loading Adrian and observing its 16 kHz mono endpoints verifies topology, not
 acoustic echo cancellation. For the first physical double-talk canary, read
 `aec_sink_volume_ceiling_percent` from the reviewed root-only realtime config
-and set the AEC sink to it. V3 and the v2 rollback both read
+and set the AEC sink to it. Active v2 reads
 `playback_volume_percent`; configuration rejects that value above the sink
-ceiling. Both settings default to 25 and have an absolute 1–60 range. Never
+ceiling. The active reference explicitly sets both to 60; the schema range is
+1–60. Never
 increase the active value above a previously qualified level without repeating
 AEC qualification at the new value. Lower it for a quiet room or near-field test. Record the
 pre-test volume separately and restore it only after echo-rejection,
@@ -183,10 +190,10 @@ The helper intentionally does not change the running sink. Its static startup
 setpoint takes effect on the next controlled PulseAudio/service start; use the
 following runtime command only for the immediate canary.
 
-For the default canary value, the explicit device-side volume command is:
+For the active reference canary value, the explicit device-side volume command is:
 
 ```sh
-pactl set-sink-volume codex_echo_cancel_sink 25%
+pactl set-sink-volume codex_echo_cancel_sink 60%
 ```
 
 Use the exact configured ceiling. A 60% deployment must explicitly configure
@@ -199,23 +206,25 @@ writer and reboot-persistence authority. They must agree. PulseAudio's deferred
 restore database is not sufficient evidence.
 
 Only after the static topology and acoustic canary pass should the root-only
-realtime configuration enable:
+realtime configuration enable the server-offloaded route:
 
 ```json
 {
-  "media_transport": "device_webrtc",
+  "media_transport": "bridge_pcm",
+  "capture_backend": "native_aec3",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 25,
-  "playback_volume_percent": 25
+  "aec_sink_volume_ceiling_percent": 60,
+  "playback_volume_percent": 60,
+  "direct_capture_gain_db": 12
 }
 ```
 
 These checks qualify only the AEC topology and acoustics. The earlier 25%
-reference measurements exercised v2 bridge PCM; they are not themselves proof
-of the device-owned WebRTC v3 path. The current v3 build must keep exactly one
+reference measurements exercised an older v2 bridge-PCM configuration; they do
+not qualify active native-AEC3 v2 at 60%. The dormant v3 build kept one
 isolated sidecar OS process; its active and offer-warm standby peers are logical
 slots within that worker, and the first standby is gated until readiness, cue
 completion, and capture-open. A historical two-worker v3 build separately
@@ -223,13 +232,14 @@ passed a reference-device hardware double-interruption canary twice at that
 installation's qualified 60% setting with the exact artifact: four local cuts
 were 208–211 ms and four rollovers were 1.29–1.57 s. Each run recycled its same
 two worker PIDs without a cold replacement and retained context twice. Those
-measurements do not physically validate the current single-worker build. The 25%-default example above
-remains conservative, and 60% qualification is not transferable. Each
+measurements do not physically validate the dormant single-worker build. The
+60% qualification is not transferable. Each
 installation still requires the complete acceptance matrix.
 
-Transport-only rollback sets `media_transport` to `bridge_pcm` and
-`full_duplex` to `false`, then removes the AEC route keys. Full AEC rollback
-uses a dry run followed by the explicit removal:
+The dormant device-owned WebRTC experiment can be re-enabled only by selecting
+`media_transport: "device_webrtc"` and reinstalling/validating its pinned
+runtime. That is not an automatic fallback. Complete AEC removal first disables
+realtime, then uses a dry run followed by the explicit removal:
 
 ```sh
 python3 prepare_pulseaudio_aec.py remove

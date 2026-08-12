@@ -768,6 +768,8 @@ def _started(*, remote_cancel: bool = False) -> dict[str, object]:
             "local_flush": True,
             "remote_cancel": remote_cancel,
             "same_session_interrupt_ack": True,
+            "server_owned_media": True,
+            "native_end_conversation": True,
         },
     }
 
@@ -5549,6 +5551,63 @@ def test_direct_paplay_sets_exact_sink_volume_and_resumes_without_tail_flush(
     assert process.killed
 
 
+def test_bridge_native_full_duplex_uses_exact_sink_software_volume_player(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    constructions: list[tuple[int, dict[str, object]]] = []
+
+    def build_player(maximum_bytes: int, **kwargs: object) -> _LoopPlayer:
+        constructions.append((maximum_bytes, kwargs))
+        return player
+
+    monkeypatch.setattr(session_module, "_PcmPlayer", build_player)
+    monkeypatch.setattr(
+        session_module,
+        "_socket_readable",
+        lambda transport, timeout: transport.wait_readable(timeout),
+    )
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            playback_volume_percent=60,
+            aec_sink_volume_ceiling_percent=60,
+        ),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+        aec_verifier=lambda _config: None,
+    )
+    assert session.request_playback_volume(30) == 30
+
+    session.start()
+    assert connection.wait_for_json(
+        {
+            "type": "start",
+            "protocol_version": 2,
+            "conversation_mode": "native",
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
+    )
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+    session.stop()
+    assert session.join(1.0)
+
+    assert len(constructions) == 1
+    assert player.events[0] == ("prepare", None)
+    maximum_bytes, kwargs = constructions[0]
+    assert maximum_bytes == session._config.output_queue_bytes
+    assert kwargs["sink"] == DEFAULT_PULSE_AEC_SINK
+    assert kwargs["volume_percent"] == 60
+    assert kwargs["exact_sink_volume"] is True
+    assert kwargs["popen"] is session._popen
+    transform = kwargs["pcm_transform"]
+    assert callable(transform)
+    assert transform(struct.pack("<2h", 4_000, -4_000)) == struct.pack("<2h", 500, -500)
+
+
 def test_full_duplex_preflight_requires_exact_active_pulseaudio_aec_routes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6377,8 +6436,24 @@ def test_full_duplex_speech_start_immediately_flushes_local_output_only() -> Non
     assert session._suppressed_output_epoch is None
 
 
-def test_local_barge_in_flushes_after_two_speech_frames_without_stopping() -> None:
-    session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
+@pytest.mark.parametrize(
+    ("capture_backend", "capture_gain_db"),
+    [
+        (PULSEAUDIO_AEC_CAPTURE, 0.0),
+        (NATIVE_AEC3_CAPTURE, 12.0),
+    ],
+)
+def test_local_barge_in_flushes_after_two_speech_frames_without_stopping(
+    capture_backend: str,
+    capture_gain_db: float,
+) -> None:
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=capture_backend,
+            direct_capture_gain_db=capture_gain_db,
+        ),
+        aec_verifier=lambda _config: None,
+    )
     with session._state_lock:
         session._state = SessionState.READY
     player = _RecordingPlayer()
@@ -6416,6 +6491,7 @@ def test_local_barge_in_flushes_after_two_speech_frames_without_stopping() -> No
     assert session._suppressed_output_epoch == 1
     assert session.state is SessionState.READY
     assert session.terminal is False
+    assert not session._interrupt_requested.is_set()
     assert player.events == [("begin", 1), ("abort", None)]
 
 
@@ -6919,6 +6995,20 @@ def test_started_requires_local_only_cancel_semantics() -> None:
     with pytest.raises(WebSocketError, match="same-session interrupt"):
         _validate_started(without_same_session_ack)
 
+    without_server_media = _started()
+    capabilities = without_server_media["capabilities"]
+    assert isinstance(capabilities, dict)
+    capabilities.pop("server_owned_media")
+    with pytest.raises(WebSocketError, match="does not own"):
+        _validate_started(without_server_media)
+
+    without_end_control = _started()
+    capabilities = without_end_control["capabilities"]
+    assert isinstance(capabilities, dict)
+    capabilities.pop("native_end_conversation")
+    with pytest.raises(WebSocketError, match="end-conversation"):
+        _validate_started(without_end_control)
+
 
 def test_interrupt_is_idempotent_closes_admission_and_forces_fresh_object() -> None:
     session = RealtimeSession(_config())
@@ -7075,6 +7165,30 @@ def test_explicit_boundary_cannot_overtake_a_dequeued_audio_send(
     assert sent_count() == 1
     assert session._audio.bytes == 0
     assert session.state is SessionState.STOPPING
+
+
+def test_bridge_native_capture_gain_is_applied_once_with_pcm16_saturation() -> None:
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=6.0,
+        ),
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    source = struct.pack("<6h", 1_000, -1_000, 20_000, -20_000, 32_767, -32_768)
+    connection = _FakeRealtimeConnection()
+
+    assert session.submit_audio(source) is SubmitResult.ACCEPTED
+    packet, remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+
+    assert packet is not None
+    assert packet.data == source
+    assert remaining == 0
+    assert [value for value, _sent_at in connection.binary_sent] == [
+        struct.pack("<6h", 1_995, -1_995, 32_767, -32_768, 32_767, -32_768)
+    ]
 
 
 def test_blocking_bridge_send_does_not_block_microphone_admission() -> None:

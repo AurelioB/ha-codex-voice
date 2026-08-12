@@ -11,10 +11,12 @@ CLI version, Home Assistant pipeline choices, utterance length, and
 media-player buffering all affect a turn.
 
 > [!IMPORTANT]
-> The current Okay Nabu `realtime_only` implementation uses wire v3 and a device-owned
-> `aiortc` peer on the aarch64 Buildroot Linux speaker. The bridge carries
-> OAuth/App Server signaling and sideband only; RTP and `oai-events` bypass it.
-> V3 clears captured direct audio on failure. A historical two-worker build's
+> The current Okay Nabu `realtime_only` implementation uses strict wire v2 with
+> full-duplex `bridge_pcm` and native AEC3. The aarch64 Buildroot Linux speaker
+> owns only wake/LED/cue/AEC/capture/playback/local cut; the local server owns
+> OAuth, App Server, and one `aiortc` peer for the whole conversation. Startup
+> and runtime fail closed without Assist/Hermes fallback. A historical
+> device-owned-v3 two-worker build's
 > reference-device hardware double-interruption canary passed twice with exact gzip artifact SHA-256
 > `5209f6bda3625b50c7413772414a74e12765c6fba2fa23155f79c24d1936e615`
 > at that installation's qualified 60% setting. Cuts were 210/211 ms and
@@ -25,9 +27,9 @@ media-player buffering all affect a turn.
 > cuts and 1,432/1,276 ms rollovers with the same two PIDs and retained context
 > twice. These results do not physically validate the current single-worker
 > build and are not the full per-installation acceptance matrix.
-> Measurements below that mention bridge PCM,
-> bridge audio queues, v2 interrupt acknowledgements, or Assist replay are
-> retained historical v2/adapter results and do not validate v3.
+> Those v3 results do not validate the active v2 route. Measurements that
+> mention pre-ready Assist replay, turn-taking v2, or double stream attenuation
+> describe older configurations unless explicitly labeled active.
 
 ## What is optimized
 
@@ -53,7 +55,7 @@ Several enabled optimizations shorten different parts of that path:
 The retained experimental Codex TTS entity progressively returns an
 EOF-terminated PCM16 WAV stream and uses an explicit empty ICE-server list.
 Those optimizations remain relevant to diagnostic Codex TTS and direct
-realtime speech, but they are no longer on the recommended Okay Nabu TTS path.
+realtime speech, but they are no longer on the retained Assist TTS path.
 
 Automatic experimental Codex STT-to-TTS session reuse is not enabled. Live
 validation found that the realtime v3 session can start genuine assistant
@@ -67,39 +69,50 @@ turn the standard Assist pipeline into a full-duplex or barge-in session.
 
 The current controlled ThirdReality deployment selects this path with Okay
 Nabu and `realtime_only: true`; Home Assistant Assist/Hermes and entity control
-are deferred. A later split deployment may restore Okay Nabu to Assist and use
-a distinct Okay Computer model for direct speech, but those are not the current
-latency boundaries. The client always requests `conversation_mode: "native"`;
-the bridge echoes it, ignores any Home Assistant broker snapshot, and creates
-one active App Server realtime thread per peer epoch with exactly one dynamic
-tool, `end_conversation`. That empty-input tool only terminates the voice
-session; every other tool request is rejected and no Home Assistant tool is
-present. The
-device creates the WebRTC offer, audio transceiver, and `oai-events` data
-channel; the bridge relays SDP but never carries v3 PCM. There is no finite
-transcript gate, isolated executor, or `thread/realtime/appendSpeech` render
-handoff.
+are deferred. The client requests `conversation_mode: "native"`; the bridge
+echoes it, ignores Home Assistant broker state, and creates one App Server
+thread and one server-owned WebRTC peer for the entire conversation. Exactly
+one empty-input tool, `end_conversation`, can terminate it. There is no finite
+transcript gate, executor, `appendSpeech` render, device `aiortc` import, or
+fresh-peer rollover.
 
 Native mode does not make cold startup free. Each new direct wake still has to
-acquire the bridge's single speech lane, create a Codex thread, negotiate
-App Server/WebRTC, play the ready cue, accept post-cue speech, wait for provider
+acquire the bridge's single speech lane, create a Codex thread and server peer,
+negotiate App Server/WebRTC, play the ready cue, accept post-cue speech, wait for provider
 endpointing/response generation, and begin physical playback. It does not
-capture or catch up microphone audio during cold startup. Report wake to exact
+capture or catch up microphone audio during cold startup. Compose keeps the
+bridge, App Server process, OAuth state, media stack, and listener warm, but
+does not yet hold a connected provider standby. Report wake to exact
 `started`, `started` to cue EOF/capture-open, capture-open to speech endpoint,
-endpoint to first PCM, and first PCM to audible playback separately. The experimental App Server surface provides no
+endpoint to first PCM, and first PCM to audible playback separately. The
+experimental App Server surface provides no
 latency or availability SLA, and an already-open ChatGPT voice session is not
 an equivalent cold-start comparison.
 
-Current App Server documentation supports realtime start/stop with WebRTC v1
-and v3, not v2. This route remains on tagged Frameless v3; a live v1
-subscription canary did not complete startup and is not a latency fallback.
+Project wire v2 is only the LAN framing; the bridge still uses the supported
+App Server WebRTC surface for its provider peer. Older strict-v2 clients that
+omit `conversation_mode` retain automatic native/managed compatibility, but
+the reference ThirdReality client never selects it.
 
-The explicit `bridge_pcm` rollback and older strict-v2 clients that omit
-`conversation_mode` retain the prior
-automatic native/managed behavior. App Server v3 plus a captured Home Assistant
-authority can still create the two-thread transcript/executor/render sequence
-for those compatibility clients, but the reference ThirdReality client never
-selects it.
+The active latency and safety bounds are:
+
+| Boundary | Active bound | Purpose |
+|---|---:|---|
+| Wake-owner startup | At most 3 attempts / one absolute 12 s deadline | Bounds connection, server peer readiness, cue, retry, and terminal races |
+| Ready cue | About 0.400 s / 2 s EOF timeout | Starts only after exact `started`; capture opens only at EOF |
+| Pre-ready microphone | 0 bytes admitted | Discards wake-tail, connecting, and cue-time PCM |
+| Live input queue | 64 KiB / 2.048 s | Bounds post-cue scheduling pressure, never cold-start replay |
+| Server input-track age | 2,250 ms | Fails instead of presenting stale microphone audio |
+| Device playback queue | 48 KiB / about 1.024 s | Bounds 24 kHz mono PCM16 output |
+| Capture gain | +12 dB maximum, saturating | Raises post-AEC provider input without changing local wake/AEC samples |
+| Playback | Fixed 60% sink anchor, 100%-relative stream | One later non-amplifying software stage controls audible volume |
+| Session lifetime | 120 s semantic idle / 900 s hard maximum | Normal provider delay does not end the session; explicit end/terminal state does |
+| Barge-in | Two qualifying AEC-filtered callbacks | Cuts local playback while causal PCM continues on the same peer |
+
+### Historical device-owned v3 bounds and measurements
+
+The table and discussion below preserve the former v3 experiment and older
+compatibility routes. They are not the active acceptance contract.
 
 The shipped bounds are intentionally small and fail closed:
 
@@ -112,9 +125,9 @@ The shipped bounds are intentionally small and fail closed:
 | Device live microphone queue | 64 KiB / 2.048 s | Bounds accepted post-cue live audio and rollover pressure; it is not a cold-start queue |
 | Device Opus/RTP input frame | 320 source samples / 20 ms, expanded to 960 samples at 48 kHz | Produces exactly one pinned-aiortc Opus payload and one 960-sample RTP timestamp per track read, continuously across 64 ms recorder callback boundaries |
 | Device realtime lifetime | 120 s semantic idle / 900 s hard maximum | Idle begins after readiness and is refreshed by semantic microphone, playback, or lifecycle activity; the hard clock begins before local preflight and covers startup, runtime, and rollover. Configurable ranges remain 5–120 s and 15–900 s |
-| V2 retained pre-ready Assist copy | 64 KiB / 2.048 s | `bridge_pcm` rollback only; v3 neither allocates this compatibility copy nor replays into Assist |
+| Older v2 pre-ready Assist copy | 64 KiB / 2.048 s | Historical split configuration only; active native/realtime-only v2 discards it |
 | V2 reserved startup headroom | 32 KiB / 1.024 s | Compatibility-only pre-roll rule; it does not apply to initial v3 startup |
-| Bridge v2 WebRTC input track | 2,250 ms | V2 rollback only; v3 media bypasses the bridge |
+| Bridge v2 WebRTC input track | 2,250 ms | Active v2 still uses this bound; dormant v3 media bypassed the bridge |
 | Bridge provider-audio queue | 25 decoded chunks / roughly 500 ms | V1/v2/adapters only; v3 provider audio stays on the device peer |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds v2 child input and the v3 direct player's configured buffer allowance |
 | V3 decoded-receiver quiet boundary | About 120 ms without PCM meeting both peak 64 and RMS 8 | Splits only normal media generations; exact silence and sub-audible Opus residue are not played or semantic, while every decoded RTP frame still participates in the independent interruption fence |
@@ -126,7 +139,7 @@ The shipped bounds are intentionally small and fail closed:
 | Legacy managed: App Server tool fallback | 45 s | Remains responsible until the result write completes |
 | Legacy managed: post-tool provider continuation | 20 s | Requires output or a terminal response after result delivery |
 | V3 direct `paplay` | Dedicated AEC sink set/verified to exact raw `playback_volume_percent`; stream forced to raw 65536; 60 ms latency, 20 ms process time and writes | One fixed-argv child, non-blocking stdin, immediate SIGKILL on abort, no sink-input manipulation |
-| V2 full-duplex `paplay` stream | Configured 1–60% (25% default), never above the sink ceiling | Retained rollback-only fixed linear playback setting |
+| Older v2 `paplay` stream | Configured 1–60% (25% default) | Historical second linear attenuation, removed from the active route |
 
 An accepted wake queues the thinking/pulsing LED immediately. Here, exact
 readiness means SDP applied, peer connected, `oai-events` data ready,
@@ -167,7 +180,7 @@ speech endpoint to completed transcript, transcript to executor completion
 `session.context.appended`, acknowledgement to identified assistant turn, and
 that turn to the first authorized PCM.
 
-The retained v2 route is turn-taking by default on v1.1.7. With
+Historically, v2 was turn-taking by default on v1.1.7. With
 `full_duplex: false`,
 the microphone gate stays closed from `speaking.started` until the
 corresponding PCM has drained from both the local queue and playback child.
@@ -363,12 +376,14 @@ waits in a one-item queue. This preserves the Home Assistant side-effect
 boundary at the cost of serializing a barged-in request behind an already
 dispatched call.
 
+### Active v2 semantics and acceptance
+
 The v2 ThirdReality path advertises
 `User-Agent: ha-codex-voice-thirdreality/2`; this retains compatibility with the
 managed `continuation_safe` acknowledgement but does not select that route.
-V2 native same-session resume is allowed only after the bridge receives a provider
-`response.cancelled` event correlated to the exact active response; timeout,
-mismatch, ambiguity, or completion closes the session.
+Active v2 native microphone PCM remains ordered on the same peer. Provider VAD
+drives response cancellation and `speech_started` independently fences late
+output; the device does not wait for a fresh-peer handoff.
 
 Adrian loading with the reviewed raw masters and creating 16 kHz mono endpoints
 is a static-topology result, not an acoustic result. On the reference device's
@@ -376,40 +391,20 @@ historical v2 path at 25%, a 5.531-second playback canary caused no false interr
 frames (maximum peak 2 and integer RMS 0), and staged double-talk flushed
 playback in 141 ms versus 2.650 seconds when waiting for the provider-only
 boundary. The same v2 socket continued and produced the next response. These
-measurements do not validate v3. Physical acceptance for each v3 installation
-must cover the current Okay Nabu `realtime_only` route, active-session wake
-suppression, zero initial wake/pre-ready capture, immediate thinking LED,
-three attempts inside one 12-second owner deadline, exact readiness, one pinned
-cue and its two-second timeout, cue-EOF capture opening, stop-word cancellation
-during connecting/cue and suspension only when live, terminal-tool cleanup,
-first-audio latency, queue failures, repeated
-turns, memory stability, player cleanup, and recovery after bridge and Wi-Fi
-loss. Full-duplex acceptance must additionally cover early/middle/late
-double-talk at the configured sink/playback values, self-echo rejection, exact
-once-per-session pre-preflight raw sink-volume restoration and verification,
-absence of live
-response/interruption `pactl` work, playback sink pinning, fixed `paplay`
-arguments and immediate abort, RTP-before-start and stopped-before-tail
-preservation, absence of public Realtime cancel/clear controls, trusted-AEC-only
-fresh-peer rollover, immediate old-peer retirement, no later capture to the old
-peer, consecutive epochs, bounded 4 KiB / 128 ms recent pre-roll and live queue
-replay, 2.25-second capture-age rejection, configured handshake timeout that
-starts after local AEC/player preparation within the absolute owner deadline,
-exactly-once ordered replacement
-writes, outer-session retention, bridge close-barrier thread reuse within the
-100 ms grace, tracked isolated-thread cleanup after ambiguity, exactly one
-reusable sidecar process with active/standby peer slots, ordered promotion, and
-terminal failure for an absent or invalid standby without another worker,
-post-interruption suppression of a continuing-speech retrigger, seven quiet
-callbacks being insufficient, signal resetting the partial quiet count, eight
-consecutive detector-quiet 64 ms callbacks rearming a later speech edge,
-manual stop/mute/disconnect teardown, the sole `end_conversation` declaration
-with rejection of all other tools, no Home Assistant tool authority, and no
-captured-audio Assist handoff or logging. The 4 KiB rollover pre-roll must be
-reported separately from the zero-byte initial startup boundary.
-It must also verify TCP ADB port 5555
-before and after every device restart or reboot; the overlay never changes the
-ADB service.
+measurements do not validate active native-AEC3 v2.
+
+Physical acceptance must cover reliable 1.5 m wake and speech; immediate
+thinking LED; at most three attempts in the shared 12-second deadline; exact
+server readiness; one pinned cue and its two-second timeout; zero admitted
+pre-ready PCM; cue-EOF capture opening; long same-peer conversation; first
+audio; queue failure; repeated sessions; and recovery after bridge or Wi-Fi
+loss. At the fixed 60% anchor and all software-volume levels, test no-user
+self-echo plus early/middle/late near-end speech. The playback cut must be
+prompt and the causal words must become the next request without replay, a new
+peer, a second sentence, or another wake. Also verify +12 dB saturation,
+normal-distance recognition, single-stage volume, absence of persistent
+crackle, sole-tool Spanish/English termination, bounded memory/player cleanup,
+no Home Assistant authority or fallback, and unchanged TCP ADB port 5555.
 
 ### Physical quick-command regression canary
 
@@ -808,13 +803,11 @@ has a new remote context. Direct calls do the same.
 
 ## Why remote prewarming is not enabled
 
-The bridge does not keep an always-on remote speech session waiting for a
-future wake word. Home Assistant exposes no custom STT-provider callback before
-wake detection; the earliest reliable component hook is the STT stream itself,
-which already overlaps setup with capture. The ThirdReality direct client can
-start its remote session only at its own wake callback, so the Codex/App
-Server/WebRTC conversation remains cold and explicitly owned even though one
-local sidecar process is already warm.
+The Compose deployment keeps the bridge listener, Codex App Server process,
+OAuth state, and server media stack warm, but it does not keep an assigned
+provider speech session waiting for a future wake. The ThirdReality client
+starts its explicitly owned session at the wake callback, so remote thread and
+WebRTC negotiation remain measurable startup costs.
 
 Always-on remote prewarming would also:
 
@@ -830,15 +823,12 @@ provides usage and rate-limit observability, but no idle realtime-session cost
 or lifetime guarantee. Any future *remote* prewarm experiment must therefore be
 explicit, one-shot, short-lived, owner/profile-bound, and measured against a
 no-prewarm control. It must not silently replenish itself. The implemented
-local-only design keeps exactly one reusable isolated process. Before wake,
-"warm" means only an alive `Popen`; no SDP offer has been requested or
-validated. That worker creates its first offer inside the bounded startup
-attempt. Only after the active peer is ready and the confirmation cue has
-completed and opened capture may it prepare one fresh offer-warm standby. An
-ordered promotion swaps that standby into the active slot, and the worker then
-prepares the next one. An absent or invalid required standby ends the outer
-session without launching another worker. The alive-only worker
-consumes no remote speech lane before wake.
+design instead keeps ordinary server processes warm and creates one peer per
+accepted conversation. Caching only a local offer would not remove remote
+admission and negotiation. If measurements justify a future connected warm
+slot, it must be a single opt-in server slot with bounded expiry and no device
+audio before assignment. The dormant device-side worker/standby design is
+retained as historical evidence only.
 
 ## ThirdReality safe performance settings
 
@@ -851,11 +841,11 @@ fixed phrase set before accepting it.
 Firmware `1.01.07` normally waits for the entire wake confirmation file before
 it begins forwarding microphone audio. The measured stock cue was 0.946979 s;
 the current pinned direct cue is the older 0.399592-second asset (about
-0.400 seconds). Direct v3 uses that shorter file as a positive readiness
+0.400 seconds). Active native v2 uses that shorter file as a positive readiness
 boundary, not as startup overlap. The accepted Okay Nabu wake immediately
-queues the thinking/pulsing LED while capture stays closed. After SDP is
-applied, the peer/data channel are ready, `transport_ready` has been sent, and
-the exact `started` has arrived, the device plays exactly once the root-owned
+queues the thinking/pulsing LED while capture stays closed. After the
+server-owned peer/data channel are ready and exact strict-v2 `started` has
+arrived, the device plays exactly once the root-owned
 PCM16 mono 22,050 Hz file
 `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`, SHA-256
 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`.
@@ -867,19 +857,19 @@ the entire direct ownership window, so the wake tail cannot cancel signaling
 and playback echo cannot end the live session. The sole spoken terminal control
 is `end_conversation`. Missing EOF or cue failure is terminal after at most two
 seconds; no Assist/Hermes fallback starts. This is not a cue-free path and it
-has no 384 ms initial pre-roll or 64 KiB cold-start microphone backlog. The
-distinct 4 KiB / 128 ms rollover pre-roll exists only after a live trusted-AEC
-interruption.
+has no 384 ms initial pre-roll or 64 KiB cold-start microphone backlog. There
+is no fresh-peer rollover pre-roll; causal interruption PCM stays in normal
+order on the same server peer.
 
-The prior acoustic path remains Adrian plus the render-aware guard. The
-reference device's historical v2 Adrian canaries passed at 25%, and its
-separate v3 rollover canary passed at that installation's qualified 60%
-setting. Neither result transfers: every installation and increase above its
-previously qualified values needs its own physical double-talk and
-echo-rejection canaries. Native AEC3 is normally selected by
+The active acoustic path uses native AEC3 with Adrian maintaining the reviewed
+PulseAudio playback topology. The reference device's older v2 Adrian canaries
+passed at 25%, and its historical v3 rollover canary passed at that
+installation's qualified 60% setting. Neither result alone validates this
+route: every installation and increase above its previously qualified values
+needs its own physical double-talk and echo-rejection canaries. Native AEC3 is selected by
 `capture_backend: "native_aec3"` in the secure realtime configuration; the
-environment flag is only an explicit diagnostic override. The public example
-remains at the conservative 25% default.
+environment flag is only an explicit diagnostic override. The active reference
+configuration uses +12 dB post-AEC gain and a 60% sink/playback anchor.
 
 ### Finished speaking detection
 

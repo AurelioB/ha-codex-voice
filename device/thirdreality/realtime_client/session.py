@@ -2870,7 +2870,12 @@ class RealtimeSession:
                 packet, remaining_packets = self._audio.pop()
                 if packet is None:
                     return None, 0
-            connection.send_binary(packet.data)
+            connection.send_binary(
+                _apply_capture_gain_pcm16(
+                    packet.data,
+                    self._config.direct_capture_gain_db,
+                )
+            )
             self._sent_capture_watermark = packet.capture_watermark
             return packet, remaining_packets
 
@@ -2878,20 +2883,26 @@ class RealtimeSession:
         self,
     ) -> None:
         connection: WebSocketConnection | None = None
-        player = _PcmPlayer(
-            self._config.output_queue_bytes,
-            sink=(self._config.pulse_aec_sink if self._config.full_duplex else None),
-            volume_percent=(
-                self._config.playback_volume_percent
-                if self._config.full_duplex
-                else None
-            ),
-            popen=self._popen,
-        )
+        if self._config.full_duplex:
+            sink = self._config.pulse_aec_sink
+            assert sink is not None
+            player = self._direct_player_factory(
+                self._config.output_queue_bytes,
+                sink,
+            )
+        else:
+            player = _PcmPlayer(
+                self._config.output_queue_bytes,
+                popen=self._popen,
+            )
         failed = False
         try:
             started_at = self._clock()
             if self._config.full_duplex:
+                # Resolve the fixed sink anchor before the bridge/provider is
+                # declared ready. This keeps blocking pactl work out of the
+                # first response and prevents clipping its first audio frame.
+                player.prepare()
                 self._aec_verifier(self._config)
             connection = self._connection_factory(
                 url=self._config.url,
@@ -4505,7 +4516,7 @@ class RealtimeSession:
     def _handle_message(  # noqa: C901 - one bounded protocol decoder
         self,
         message: Message,
-        player: _PcmPlayer,
+        player: _PlayerLike,
         *,
         output_epoch: int | None,
         last_output_epoch: int,
@@ -4684,6 +4695,24 @@ def _scale_pcm16(value: bytes, gain: float) -> bytes:
     return bytes(scaled)
 
 
+def _apply_capture_gain_pcm16(value: bytes, gain_db: float) -> bytes:
+    """Apply the configured bridge capture gain once with PCM16 saturation."""
+    if len(value) % 2:
+        raise ValueError("capture PCM must contain complete samples")
+    if not value or gain_db == 0.0:
+        return value
+    gain = 10 ** (gain_db / 20)
+    amplified = bytearray(len(value))
+    for index, (sample,) in enumerate(struct.iter_unpack("<h", value)):
+        scaled = int(sample * gain)
+        if scaled > 32_767:
+            scaled = 32_767
+        elif scaled < -32_768:
+            scaled = -32_768
+        struct.pack_into("<h", amplified, index * 2, scaled)
+    return bytes(amplified)
+
+
 def _levels_have_local_barge_in_signal(
     peak: int,
     rms: int,
@@ -4743,6 +4772,10 @@ def _validate_started(value: dict[str, Any]) -> None:
         raise WebSocketError("bridge returned incompatible cancel semantics")
     if capabilities.get("same_session_interrupt_ack") is not True:
         raise WebSocketError("bridge omitted same-session interrupt acknowledgement")
+    if capabilities.get("server_owned_media") is not True:
+        raise WebSocketError("bridge does not own the realtime media peer")
+    if capabilities.get("native_end_conversation") is not True:
+        raise WebSocketError("bridge omitted native end-conversation support")
 
 
 def _direct_answer_sdp(value: dict[str, Any]) -> str:

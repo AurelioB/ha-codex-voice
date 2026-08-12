@@ -34,10 +34,10 @@ device client
                                                            OAuth and SDP only
 ```
 
-V3 is always native, tool-free realtime voice. It never attaches the Home
-Assistant tool broker, creates a transcript/executor/TTS handoff, or exposes a
-Home Assistant credential to the speaker. Use the separate Okay Nabu Assist
-route for Home Assistant controls.
+V3 is always native realtime voice with one bridge-owned control tool,
+`end_conversation`. It never attaches the Home Assistant tool broker, creates a
+transcript/executor/TTS handoff, or exposes a Home Assistant credential to the
+speaker. Use the separate Assist route for Home Assistant controls.
 
 This App Server realtime surface is experimental and version-coupled. It is
 not the documented OpenAI Realtime API. The v3 code and deterministic runtime
@@ -360,10 +360,17 @@ The command is an argument vector with `shell=False`; the sink name has already
 passed the configuration allowlist.
 
 The bridge separately watches App Server thread lifecycle events so it can
-sanitize remote failure, reject any unexpected provider tool call with
+sanitize remote failure, execute the exact empty-input `end_conversation`
+control tool, reject any other provider tool call with
 `direct_voice_has_no_tools`/`do_not_retry`, and clean up the owned realtime
-session and thread. That control plane does not put the bridge in the media
-path.
+session and thread. The tool description and base instructions explicitly cover
+English and Spanish terminal requests and require an immediate tool call rather
+than a spoken promise. As a deterministic fallback, a completed user transcript
+that normalizes to an exact allowlisted terminal phrase (for example,
+`Terminar`, `Terminar llamada`, `goodbye`, or `hang up`) produces the same
+content-free `stopped` control. The comparison is exact, not a substring match;
+the bridge does not log or forward the transcript. That control plane does not
+put the bridge in the media path.
 
 ## Barge-in and interruption
 
@@ -409,11 +416,12 @@ not the generic public Realtime API client-event dialect. The pinned
 enum](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs#L50-L85)
 contains audio/context/session messages but no `response.cancel` or
 `output_audio_buffer.clear`. The device therefore sends neither event and must
-not borrow an equivalent public-Realtime client control. Public Realtime v2
+not borrow an equivalent public-Realtime client control. Public Realtime API
 WebRTC and its client-event/`session.update` dialect are unsupported on this
 ChatGPT-subscription direct route; live attempts to configure VAD with
-`session.update` were rejected. This does not deprecate this project's separate
-historical wire-v2 `bridge_pcm` rollback.
+`session.update` were rejected. This dormant v3 experiment is separate from
+this project's active strict-v2 `bridge_pcm` route, where the local server owns
+the provider peer.
 
 The direct Frameless data channel provides no provider interruption
 acknowledgement. Live evidence observed only `session.started`; it produced no
@@ -478,8 +486,8 @@ playback, queue/age bound, rollover deadline, epoch, or protocol check fails,
 the device stops the direct owner, clears bounded audio, and returns to idle.
 Captured Okay Computer audio is not replayed or handed to Home Assistant.
 
-This is deliberately different from the retained v2 `bridge_pcm` path, whose
-pre-ready compatibility behavior can replay its bounded prefix into the
-official Assist path. To roll back transport without removing the overlay, set
-`media_transport` to `bridge_pcm` and follow the complete
-[v2 wire contract](realtime-wire-v2.md) and device rollback procedure.
+The active full-duplex v2 `bridge_pcm` path also fails closed and uses the same
+capture-closed deterministic ready-cue boundary; it does not replay pre-ready
+audio into Assist. To leave this dormant experiment without removing the
+overlay, set `media_transport` to `bridge_pcm` and follow the complete
+[v2 wire contract](realtime-wire-v2.md) and device deployment procedure.

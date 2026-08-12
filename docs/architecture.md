@@ -40,47 +40,40 @@ temporal values such as `date`, `time`, and `datetime`. Values outside that
 policy are rejected locally with a data-safe protocol error before a WebSocket
 message is sent.
 
-The pinned v1.1.7 device overlay supports two explicitly separate routes. The
-current controlled trial deliberately binds the installed `Okay Nabu` detector
-to the direct route and sets `realtime_only: true`:
+## Active server-offloaded realtime route
+
+The current controlled deployment binds the installed `Okay Nabu` detector to
+native realtime and sets `realtime_only: true`:
 
 ```text
-"Okay Nabu" -> stdlib controller + isolated device aiortc sidecar
-             -> realtime wire v3 SDP/sideband -> bridge/App Server/OAuth
-             -> direct RTP audio + oai-events between device and provider
-             -> local device playback
+"Okay Nabu" -> speaker wake/LED/cue/native AEC3/capture/playback
+             -> strict wire v2 binary PCM over the trusted LAN
+             -> Docker/host bridge + App Server/OAuth
+             -> one bridge-owned WebRTC peer for the conversation
 
 Home Assistant Assist/Hermes and entity tools are deferred for this trial. No
 Home Assistant broker snapshot, transcript executor, or appendSpeech render
 handoff participates in the direct session.
 ```
 
-The detector split remains available for a later deployment: `Okay Nabu` can
-return to the stock Home Assistant Assist route while a separately installed
-`Okay Computer` detector selects direct realtime. It is not the active trial
-configuration.
+The device is the aarch64 Buildroot Linux speaker, not Android, and remains an
+untrusted audio endpoint. It never receives a Home Assistant credential or
+Codex OAuth state, imports `aiortc`, creates SDP, advertises tools, or receives
+transcript content. Native AEC3 stays local because the microphone and physical
+render reference are sample-aligned there. +12 dB saturating gain is applied
+after AEC and only to outgoing bridge PCM.
 
-The direct device is the aarch64 Buildroot Linux speaker, not Android, and
-remains an untrusted audio/control endpoint. It never
-receives a Home Assistant credential, advertises tools, sends tool results, or
-receives transcript content. The current reference client always requests
-native mode. The bridge ignores any registered realtime authority for that
-session and injects exactly one dynamic provider tool, `end_conversation`,
-which can only end the voice session. No Home Assistant entity tool or broker
-authority is available. Qualified device AEC makes the direct route the
-full-duplex/barge-in route.
-
-For v3 the bridge owns the managed Codex login, one active App Server realtime
-thread per peer epoch, the `end_conversation` declaration and handler, SDP
-relay, lifecycle sideband, unexpected-tool rejection, and cleanup only. It
-does not construct the peer or relay PCM/provider data. The device's isolated,
-hash-locked `aiortc` runtime owns the audio transceiver and ordered
-`oai-events` channel. Protocol v2 `bridge_pcm` remains an explicit rollback and
-legacy compatibility path.
+The always-running server owns the authenticated v2 socket, the managed Codex
+login, one App Server realtime thread, one paced WebRTC peer, provider VAD and
+response lifecycle, and cleanup. The active thread exposes exactly one dynamic
+empty-input tool, `end_conversation`; a narrow normalized Spanish/English
+terminal-phrase fallback handles explicit end requests that are acknowledged
+without a tool call. No Home Assistant entity tool or broker authority is
+available.
 
 The direct wake boundary is deterministic. An accepted Okay Nabu detection
 immediately claims the vendor owner and queues the non-blocking
-thinking/pulsing LED. Initial v3 startup discards the trigger/wake history and
+thinking/pulsing LED. Initial v2 startup discards the trigger/wake history and
 every recorder callback produced before local confirmation completes; it does
 not seed or wait on a microphone backlog. At most three fresh session attempts
 share one absolute 12-second owner deadline, while each attempt keeps its own
@@ -88,10 +81,9 @@ share one absolute 12-second owner deadline, while each attempt keeps its own
 attempt exhaustion, terminal state, or setup failure releases the owner and
 returns the LED to idle without entering Home Assistant.
 
-`RealtimeSession.ready` is narrower than process or offer readiness. It means
-the SDP answer was applied, the peer connected, the `oai-events` data channel
-opened, the device sent `transport_ready`, and the bridge returned the exact
-accepted `started`. Only then does the device play once the root-owned pinned
+`RealtimeSession.ready` is narrower than socket connection. It means the
+server has applied the SDP answer, connected the provider peer/data channel,
+and returned exact strict-v2 `started`. Only then does the device play once the root-owned pinned
 PCM16 mono 22,050 Hz cue
 `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav` (SHA-256
 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
@@ -103,6 +95,17 @@ within two seconds. Cue failure/timeout and any terminal race fail closed. The
 sole spoken terminal control is `end_conversation`; its terminal result tears
 down the socket and normal cleanup restores the detector and idle LED. No Home
 Assistant tool is present.
+
+During provider playback the microphone stays open. Qualified AEC-filtered
+near-end speech immediately kills and flushes local playback, while its exact
+PCM remains in normal order on the same socket and provider peer. Provider VAD
+then cancels the response and consumes that utterance. There is no fresh-peer
+rollover or replacement delay. Provider `speech_started` independently fences
+late output; a local cut alone never claims remote cancellation.
+
+The dedicated sink remains at the qualified 60% anchor and `paplay` uses 100%
+relative stream volume. One non-amplifying software attenuator implements
+dynamic user volume, avoiding the earlier v2 double attenuation.
 
 For legacy auto/managed compatibility, authority is selected from Conversation
 config subentries, not from a device message. Zero or multiple opted-in
@@ -118,9 +121,9 @@ the device.
 
 ## Legacy auto/managed realtime compatibility
 
-The current ThirdReality v3 client does not enter this route. It sends
+The current ThirdReality native-v2 client does not enter this route. It sends
 `conversation_mode: "native"`, requires the bridge to echo that selection, and
-therefore gets exactly one native App Server WebRTC voice thread. A native
+therefore gets exactly one server-owned App Server/WebRTC voice thread. A native
 session does not wait for a transcript, create an executor, or call
 `thread/realtime/appendSpeech`.
 
@@ -357,10 +360,32 @@ measurements and acceptance criteria.
 ## Realtime client mode
 
 The bridge's `/v1/realtime` WebSocket is a project-owned LAN protocol, not the
-App Server transport. Legacy v1 keeps JSON/base64 compatibility; v2 keeps its
-binary bridge-PCM contract; v3 carries strict SDP and JSON sideband only. For
-v3 the bridge owns the managed login and App Server signaling lifecycle but
-never constructs the media peer.
+App Server transport. Legacy v1 keeps JSON/base64 compatibility; active strict
+v2 carries binary bridge PCM; dormant v3 carries SDP and JSON sideband only.
+
+```text
+accepted Okay Nabu wake
+  -> thinking/pulsing LED; capture closed; wake tail discarded
+  -> <=3 strict-v2 attempts inside one absolute 12 s owner deadline
+  -> server App Server thread + aiortc peer ready -> exact started
+  -> pinned ~0.400 s cue (2 s EOF timeout)
+  -> cue EOF -> listening LED + live native-AEC3 capture
+
+16 kHz mono PCM16 -> authenticated v2 socket -> server resampler/RTP -> provider
+provider audio -> server decode -> v2 speaking epoch + 24 kHz PCM16 -> paplay
+```
+
+The active device is full duplex. Its fixed 60% sink anchor and
+100%-relative playback stream are separated from one software-volume stage.
+Local AEC-qualified speech cuts output immediately while its samples continue
+to the same peer; provider VAD owns response cancellation. The server exposes
+only `end_conversation`, and realtime-only failure returns idle without an
+Assist/Hermes fallback.
+
+### Dormant device-owned v3 experiment (historical)
+
+The following design and physical measurements are retained for rollback and
+research. They do not describe the active Okay Nabu media path.
 
 Current App Server documentation exposes realtime start/stop with WebRTC for
 v1 and v3; v2 WebRTC is unsupported. The direct device path remains on tagged
@@ -407,8 +432,8 @@ device v3 WebSocket -> SDP offer/answer + transport_ready/started/ping/stop
 ```
 
 The recorder callback runs before local wake-model activation. The overlay
-may retain the newest six idle frames in the compatibility ring, but the current
-Okay Nabu v3 wake discards all 384 ms / 12 KiB instead of transferring it. It
+may retain the newest six idle frames in the compatibility ring, but the
+historical Okay Nabu v3 wake discarded all 384 ms / 12 KiB instead of transferring it. It
 also drops every connecting and cue-time callback. The 64 KiB input queue
 therefore starts empty when cue EOF opens capture; it bounds accepted live and
 rollover pressure, not cold negotiation. Initial 32 KiB headroom and wake
@@ -531,8 +556,8 @@ acknowledgement. It also rejects public Realtime `session.update` VAD
 configuration. A synthetic same-peer canary was rejected after old RTP
 continued beyond the five-second media-fence deadline; the former
 `response.interrupt`/`interrupt.fenced` experiment is not the production path.
-Public Realtime v2 WebRTC is unsupported on this subscription-backed route;
-the historical wire-v2 `bridge_pcm` rollback is separate.
+Public Realtime v2 WebRTC was unsupported on that subscription-backed route;
+the project's active wire-v2 `bridge_pcm` LAN transport is separate.
 
 Fresh-peer rollover is a safe subscription-backed approximation, not exact
 ChatGPT same-session interruption. Queue/age/timeout, sidecar, or epoch failure
@@ -548,26 +573,29 @@ not replace the full per-installation acceptance matrix. The normative
 contract is [wire v3](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 The reference device's earlier 25% echo-residual/double-talk results exercised
-the v2 bridge-PCM route. The public example also remains at 25%; the separate
-v3 reference qualification at 60% does not qualify another speaker or room.
+an older v2 bridge-PCM configuration. The active reference configuration is
+60%, but neither that nor the historical v3 qualification transfers to another
+speaker or room.
 The v3 protocol, sidecar, runtime installer, queue, cancellation, and cleanup
 paths have automated local coverage plus the hardware canary above, but the
 full physical v3 acceptance matrix remains installation-specific.
 
-The explicit `media_transport: "bridge_pcm"` rollback retains v2 binary input,
-bridge-owned WebRTC media, bridge-side speaking epochs, a 2,250 ms live input
-cap, and bounded pre-ready Assist replay. Older v2 clients may also omit
-`conversation_mode` to enter the legacy auto/managed two-thread compatibility
-policy. V2 interruption acknowledgements, native correlated cancellation, and
-managed `continuation_safe` generation invalidation remain unchanged and never
-apply to a v3 socket.
+### Active strict-v2 contract summary
+
+The active `media_transport: "bridge_pcm"` route uses v2 binary input,
+bridge-owned WebRTC media, bridge-side speaking epochs, and a 2,250 ms live
+input cap. Native/realtime-only startup discards pre-ready PCM and exposes only
+`end_conversation`; it does not enter Assist or the managed compatibility
+route. Older v2 clients may omit `conversation_mode` and retain the legacy
+two-thread policy. Those compatibility semantics never apply to explicit
+native mode or a v3 socket.
 
 The device stores a distinct route-scoped bearer in a root-owned mode-0600
 file. The bridge accepts it only on `/v1/realtime` after v2 or v3 negotiation;
 the primary bridge token, ChatGPT credential, and Home Assistant token do not
 go to the speaker. The bearer cannot open the tool-authority route. See the
-[v3 wire protocol](../protocol/realtime-wire-v3.md), [v2 rollback
-protocol](../protocol/realtime-wire-v2.md), [deterministic runtime
+[dormant v3 wire protocol](../protocol/realtime-wire-v3.md), [active v2
+protocol](../protocol/realtime-wire-v2.md), [historical sidecar runtime
 guide](../device/thirdreality/webrtc-runtime.md), and [device deployment
 contract](../device/thirdreality/README.md).
 

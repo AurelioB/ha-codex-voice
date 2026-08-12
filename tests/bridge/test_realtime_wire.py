@@ -69,6 +69,8 @@ def test_binary_realtime_wire_negotiates_explicit_pcm_shape() -> None:
             "local_flush": True,
             "remote_cancel": False,
             "same_session_interrupt_ack": True,
+            "server_owned_media": True,
+            "native_end_conversation": False,
         },
     }
 
@@ -88,6 +90,8 @@ def test_binary_realtime_wire_retains_and_echoes_native_conversation_mode() -> N
     assert protocol.conversation_mode == "native"
     assert protocol.requests_native_conversation is True
     assert protocol.started_fields()["conversation_mode"] == "native"
+    assert protocol.started_fields()["capabilities"]["server_owned_media"] is True
+    assert protocol.started_fields()["capabilities"]["native_end_conversation"] is True
 
 
 def test_direct_webrtc_wire_retains_device_offer_and_advertises_direct_media() -> None:

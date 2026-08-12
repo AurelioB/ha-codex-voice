@@ -1,0 +1,51 @@
+name: ha-codex-voice
+
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        CODEX_CLI_VERSION: "${CODEX_CLI_VERSION:-0.147.0}"
+    image: "ha-codex-voice-bridge:${HA_CODEX_IMAGE_TAG:-0.147.0}"
+    init: true
+    user: "${HA_CODEX_UID:-1000}:${HA_CODEX_GID:-1000}"
+    read_only: true
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - "${HA_CODEX_ENV_FILE:-./.codex-voice/bridge.env}"
+    environment:
+      CODEX_APP_SERVER_COMMAND: ""
+      HOME: /tmp
+      HA_CODEX_AUTH_FILE: /run/codex-auth/auth.json
+      HA_CODEX_BINARY: /usr/local/bin/codex
+      HA_CODEX_BRIDGE_CWD: ""
+      HA_CODEX_BRIDGE_HOST: "${HA_CODEX_BRIDGE_HOST:-0.0.0.0}"
+      HA_CODEX_BRIDGE_PORT: "${HA_CODEX_BRIDGE_PORT:-8787}"
+      HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS: "${HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS:-0.5}"
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      - type: bind
+        source: "${HA_CODEX_AUTH_FILE_HOST:?Set HA_CODEX_AUTH_FILE_HOST to the absolute auth.json path}"
+        target: /run/codex-auth/auth.json
+        read_only: false
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python3", "/app/deploy/docker/healthcheck.py"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

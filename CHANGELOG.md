@@ -7,10 +7,29 @@ and releases use semantic versioning.
 
 ### Added
 
-- Add explicit `direct_capture_gain_db` tuning for device-WebRTC microphone
-  RTP, defaulting to 0 dB and bounded to 0–12 dB. Gain uses saturating PCM16,
-  leaves wake/Assist/local-barge audio unchanged, and reports only bounded
-  post-gain peak/RMS and clipping counts for acoustic qualification.
+- Add the server-offloaded ThirdReality realtime route. Strict wire v2 now
+  keeps the speaker on wake, LED, native AEC3, local barge-in, and raw PCM while
+  the local bridge owns Codex App Server, OAuth, the WebRTC peer, resampling,
+  provider lifecycle, and output epochs. The provider peer remains open across
+  follow-up speech and interruption; Home Assistant and Hermes remain outside
+  this first conversation-only path.
+- Add a reproducible Docker Compose bridge deployment with pinned Codex CLI and
+  Python dependencies, non-root execution, a read-only filesystem, an
+  owner-only writable OAuth file mount, authenticated health checks, bounded
+  logs, and host networking for the server-owned WebRTC peer.
+- Add the sole native `end_conversation` tool to server-owned PCM sessions and
+  a strict normalized Spanish/English transcript fallback for exact phrases
+  such as “terminar” and “terminar llamada”. The model is instructed to invoke
+  the tool immediately without first promising verbally to end the session.
+- Quarantine native assistant output while the user transcript can still be
+  an exact terminal phrase. Ordinary speech releases immediately; an exact
+  Spanish or English end request now closes silently even when provider audio
+  arrives before the completed transcript, and user `turn.done` can no longer
+  truncate an active assistant response.
+- Add explicit `direct_capture_gain_db` tuning for realtime microphone egress,
+  defaulting to 0 dB and bounded to 0–12 dB. Gain uses saturating PCM16, leaves
+  wake/Assist/local-barge audio unchanged, and is applied exactly once before
+  bridge PCM or device-WebRTC provider egress.
 - Add a reversible ThirdReality `realtime_only` wake policy. It permits Okay
   Nabu to replace the normal Assist wake, ignores every non-matching detector,
   disables buffered v2 Assist fallback, and fails closed if guarded realtime
@@ -21,17 +40,15 @@ and releases use semantic versioning.
   managed Codex login, App Server signaling/lifecycle sideband, the sole
   empty-input `end_conversation` terminal tool, rejection of every other tool,
   and bounded cleanup for that route. No Home Assistant tool is declared.
-- Add an isolated ThirdReality `aiortc` sidecar for the Python 3.11/aarch64
+- Add an experimental isolated ThirdReality `aiortc` sidecar for the Python
+  3.11/aarch64
   Buildroot Linux target, bounded transcript-free sequenced-packet IPC, direct
   continuous-RTP media boundaries based on first audio/receiver quiet, exact
   once-per-session pre-negotiation AEC sink-volume preparation, fixed-argv
-  non-blocking `paplay`, and fresh-peer interruption rollover. Exactly two
-  reusable processes alternate active/standby roles and construct fresh
-  PeerConnections in place. Idle process prewarm proves only that each `Popen`
-  remains alive; it does not request or validate an offer. Offer validation
-  occurs only after an accepted wake or while preparing the owned rollover
-  standby. An absent or invalid required standby terminates the outer session
-  instead of cold-launching a replacement or allocating a third process.
+  non-blocking `paplay`, and fresh-peer interruption rollover. The dormant v3
+  route is now hard-capped at one reusable process containing active and
+  offer-warm logical peers; its earlier two-process measurements remain
+  historical evidence rather than validation of the active server-PCM route.
 - Add epoch-tagged v3 rollover signaling. Trusted two-frame AEC barge-in keeps
   the outer vendor owner, device session, logical player, bridge WebSocket, and
   ready latch while replacing the device/provider WebRTC peer. A bounded
@@ -52,28 +69,32 @@ and releases use semantic versioning.
   standalone canary for physical qualification. The overlay includes a
   config-selected, fail-closed startup hook; merely installing the native
   runtime does not select it.
-- Add an explicit `capture_backend` contract. `native_aec3` requires device
-  WebRTC and is normally selected by `capture_backend: "native_aec3"` in the
-  enabled root-owned mode-0600 realtime configuration. The service environment
+- Add an explicit `capture_backend` contract. `native_aec3` requires full
+  duplex and is selected by `capture_backend: "native_aec3"` in the enabled
+  root-owned mode-0600 realtime configuration. The service environment
   `CODEX_AEC3_CAPTURE=1` is an explicit override, not a second requirement.
   After successfully installing the recorder, the overlay publishes
   `CODEX_AEC3_ACTIVE=1` as internal preflight proof. The backend retains the
   verified Pulse playback topology and removes only the obsolete requirement
   that the voice process own a Pulse microphone stream.
-- Document the complete [v3 wire contract](protocol/realtime-wire-v3.md),
-  including signaling order, privacy boundaries, failure semantics, and the
-  retained [v2 rollback contract](protocol/realtime-wire-v2.md).
+- Document both the active [v2 wire contract](protocol/realtime-wire-v2.md)
+  and dormant [v3 wire contract](protocol/realtime-wire-v3.md), including
+  signaling order, privacy boundaries, and failure semantics.
 
 ### Changed
 
-- Route the current controlled Okay Nabu deployment to direct v3 with
-  `realtime_only: true`; defer Home Assistant Assist/Hermes and entity tools.
+- Route the current controlled Okay Nabu deployment to full-duplex
+  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 12`, a fixed 60%
+  playback anchor, and `realtime_only: true`; defer Home Assistant
+  Assist/Hermes and entity tools. The device-owned v3 implementation remains
+  available in source as a dormant rollback experiment.
   An accepted wake immediately queues the thinking/pulsing LED, discards all
   wake and pre-ready PCM, and permits at most three fresh attempts inside one
   absolute 12-second owner deadline, with a ten-second signaling handshake per
-  attempt. `RealtimeSession.ready` now means answer applied, peer connected,
-  `oai-events` ready, `transport_ready` sent, and the exact bridge `started`
-  accepted. Only then play once the pinned root-owned PCM16 mono 22,050 Hz cue
+  attempt. `RealtimeSession.ready` now means the bridge has created the native
+  thread, connected its server-owned WebRTC peer, and returned the exact v2
+  `started` contract. Only then play once the pinned root-owned PCM16 mono
+  22,050 Hz cue
   `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`
   (SHA-256 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`,
   about 0.400 seconds). Suspend the local stop detector for the entire direct
@@ -82,7 +103,7 @@ and releases use semantic versioning.
   state, deadline, or attempt exhaustion returns idle without Home Assistant
   fallback. The sole spoken terminal control is `end_conversation`; terminal
   cleanup returns the LED to idle.
-- Keep the qualified direct-WebRTC AEC sink and `paplay` stream gain fixed
+- Keep the qualified realtime AEC sink and `paplay` stream gain fixed
   while a realtime session owns audio. Home Assistant volume, mute, and unmute
   commands are intercepted before the vendor players, capped at the configured
   playback anchor, persisted, and applied with PulseAudio-compatible cubic
@@ -119,11 +140,9 @@ and releases use semantic versioning.
   semantic idle time and from 300 to 900 seconds of total lifetime. The idle
   limit remains activity-based; the hard limit still covers local preflight,
   negotiation, runtime, and rollover.
-- Configure the disabled ThirdReality example for `device_webrtc`, the
-  separately qualified Adrian AEC topology, 25% sink/playback ceilings, and a
-  Mexican Spanish prompt. Protocol v2 remains selectable explicitly with
-  `media_transport: "bridge_pcm"`. The public 25% example is intentionally
-  conservative; the reference v3 installation was separately qualified at 60%.
+- Configure the disabled ThirdReality example for the active `bridge_pcm`
+  route, native AEC3, a 12 dB post-AEC capture gain, 60% sink/playback
+  ceilings, `realtime_only`, Okay Nabu, and a Mexican Spanish prompt.
 - Make direct v3 epoch 1 start with zero captured audio: discard the wake-tail
   history and every connecting/cue frame instead of forwarding the former
   384 ms pre-roll or waiting on the 64 KiB input queue. That queue now bounds
@@ -164,7 +183,8 @@ and releases use semantic versioning.
   order. Treat `stop` as normal through every rollover phase, reject float/bool
   integer controls, and transfer only terminal killed-child `waitpid`
   ownership to a bounded daemon reaper.
-- Distinguish prior v2/AEC physical canaries from the new v3 path. The final v3
+- Preserve prior v2/AEC and v3 physical canaries as historical evidence. The
+  final v3
   package, gzip SHA-256
   `5209f6bda3625b50c7413772414a74e12765c6fba2fa23155f79c24d1936e615`,
   passed two consecutive realistic-memory double-interruption runs on the
@@ -234,13 +254,12 @@ and releases use semantic versioning.
   control but did not affect samples until ALSA capture reopened. Installation
   is exact-file, dry-run-first, firmware-guarded, and symmetrically removable;
   invalid gain data uses the vendor's 30% fail-safe.
-- Prevent direct ThirdReality WebRTC startup from accepting any wake or
+- Prevent deterministic ThirdReality realtime startup from accepting any wake or
   pre-ready microphone audio. The former 12 KiB wake pre-roll and redundant
   Home Assistant fallback copy are discarded, and capture remains closed
   through exact readiness and cue EOF. V3 therefore never depends on the
-  64 KiB live queue to survive a cold handshake and never replays into Assist;
-  the `bridge_pcm` rollback keeps its historical bounded fallback/replay
-  behavior.
+  64 KiB live queue to survive a cold handshake and never replays into Assist.
+  Full-duplex `bridge_pcm` now uses the same cue-gated capture boundary.
 
 ## [0.6.0] - 2026-08-10
 

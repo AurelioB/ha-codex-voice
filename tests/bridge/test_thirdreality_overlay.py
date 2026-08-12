@@ -844,6 +844,31 @@ def test_secure_config_installs_native_aec3_and_publishes_active_proof(
     assert os.environ["CODEX_AEC3_ACTIVE"] == "1"
 
 
+def test_bridge_pcm_native_aec3_installs_without_sidecar_prewarm(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = object()
+    aec3_capture = ModuleType("aec3_capture")
+    aec3_capture.install_from_environment = (  # type: ignore[attr-defined]
+        lambda *, environ: patch
+    )
+    monkeypatch.setitem(sys.modules, "aec3_capture", aec3_capture)
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        capture_backend=NATIVE_AEC3_CAPTURE,
+        full_duplex=True,
+        prewarm_result=False,
+    )
+
+    _protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+
+    assert module._AEC3_CAPTURE_PATCH is patch
+    assert module._REALTIME_CONFIG.capture_backend == NATIVE_AEC3_CAPTURE
+    assert support.prewarm_calls == []  # type: ignore[attr-defined]
+    assert os.environ["CODEX_AEC3_ACTIVE"] == "1"
+
+
 def test_environment_override_promotes_valid_device_config_to_native_aec3(
     load_overlay: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -879,13 +904,13 @@ def test_invalid_aec3_environment_fails_closed_without_config(
     assert "CODEX_AEC3_ACTIVE" not in os.environ
 
 
-def test_enabled_aec3_override_requires_secure_device_config(
+def test_enabled_aec3_override_requires_secure_realtime_config(
     load_overlay: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CODEX_AEC3_CAPTURE", "1")
 
-    with pytest.raises(SystemExit, match="requires a valid enabled device_webrtc"):
+    with pytest.raises(SystemExit, match="requires a valid enabled realtime"):
         load_overlay(_REALTIME_HASHES)
 
     assert "CODEX_AEC3_ACTIVE" not in os.environ
@@ -990,7 +1015,7 @@ def test_native_aec3_config_selection_ignores_unselected_config(
     ("config", "mode", "owner_uid"),
     [
         (_native_aec3_config(unknown=True), 0o600, 0),
-        (_native_aec3_config(media_transport="bridge_pcm"), 0o600, 0),
+        (_native_aec3_config(full_duplex=False), 0o600, 0),
         (_native_aec3_config(), 0o640, 0),
         (_native_aec3_config(), 0o600, 1_000),
     ],
@@ -1202,15 +1227,24 @@ def _fake_realtime_support(
     return support
 
 
-def test_direct_webrtc_prewarms_only_after_guarded_overlay_activation(
+@pytest.mark.parametrize(
+    ("media_transport", "expected_calls"),
+    [("device_webrtc", [None]), ("bridge_pcm", [])],
+)
+def test_only_direct_webrtc_prewarms_after_guarded_overlay_activation(
     load_overlay: Any,
+    media_transport: str,
+    expected_calls: list[None],
 ) -> None:
-    support = _fake_realtime_support(media_transport="device_webrtc")
+    support = _fake_realtime_support(
+        media_transport=media_transport,
+        full_duplex=True,
+    )
 
     _protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
 
     assert module._REALTIME_PATCH_ACTIVE
-    assert support.prewarm_calls == [None]  # type: ignore[attr-defined]
+    assert support.prewarm_calls == expected_calls  # type: ignore[attr-defined]
 
 
 def test_guarded_direct_overlay_uses_50ms_system_volume_poll(
@@ -2487,6 +2521,87 @@ def test_realtime_only_bridge_failure_does_not_fall_back_to_assist(
     assert not instance._is_streaming_audio
 
 
+def test_full_duplex_bridge_uses_deterministic_ready_boundary(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threads_before = frozenset(threading.enumerate())
+    aec3_capture = ModuleType("aec3_capture")
+    aec3_capture.install_from_environment = (  # type: ignore[attr-defined]
+        lambda *, environ: object()
+    )
+    monkeypatch.setitem(sys.modules, "aec3_capture", aec3_capture)
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        capture_backend=NATIVE_AEC3_CAPTURE,
+        full_duplex=True,
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    led_states: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        module,
+        "_nonblocking_led_fire",
+        lambda state, to_idle=False: led_states.append((state, to_idle)),
+    )
+    instance = protocol()
+    instance.state.active_wake_words.add("stop")
+    instance.handle_audio(_pcm_frame(1))
+
+    _wake(instance, "okay nabu")
+
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    owner = instance._codex_realtime_owner
+    assert owner is not None
+    assert owner.startup_deadline is not None
+    assert session.audio == []
+    assert session.volume_requests == [60]
+    assert support.prewarm_calls == []  # type: ignore[attr-defined]
+    assert "stop" not in instance.state.active_wake_words
+    assert led_states == [("thinking", False)]
+
+    instance.handle_audio(_pcm_frame(2))
+    assert session.audio == []
+
+    _mark_direct_ready(instance, session)
+    instance.handle_audio(_pcm_frame(3))
+    assert session.audio == []
+    assert instance.events == ["duck", "cue"]
+
+    callback = instance.state.tts_player.callbacks.pop()
+    callback()
+    instance.handle_audio(_pcm_frame(4))
+
+    assert owner.capture_open
+    assert session.live_capture_opened == 1
+    assert session.audio == [_pcm_frame(4)]
+    assert led_states == [("thinking", False), ("listening", False)]
+
+    list(instance.handle_message(_volume_command(0.4)))
+    entity = instance.state.media_player_entity
+    assert session.volume_requests == [60, 40]
+    assert entity.music_player.volume_calls == []
+    assert entity.announce_player.volume_calls == []
+
+    session.terminal = True
+    instance.handle_audio(_pcm_frame(5))
+    assert instance._codex_realtime_owner is None
+    assert "stop" in instance.state.active_wake_words
+    for _ in range(100):
+        if not any(
+            thread not in threads_before
+            and thread.name == "thirdreality-realtime-startup"
+            for thread in threading.enumerate()
+        ):
+            break
+        time.sleep(0.002)
+    assert not any(
+        thread not in threads_before and thread.name == "thirdreality-realtime-startup"
+        for thread in threading.enumerate()
+    )
+
+
 def test_realtime_only_guard_mismatch_fails_closed_instead_of_using_assist(
     load_overlay: Any,
 ) -> None:
@@ -2534,10 +2649,15 @@ def test_direct_webrtc_constructor_failure_does_not_start_ha_fallback(
     assert led_states == [("thinking", False), ("idle", True)]
 
 
-def test_direct_webrtc_retries_pre_ready_failures_before_releasing_mic(
+@pytest.mark.parametrize("media_transport", ["device_webrtc", "bridge_pcm"])
+def test_deterministic_transport_retries_pre_ready_failures_before_releasing_mic(
     load_overlay: Any,
+    media_transport: str,
 ) -> None:
-    support = _fake_realtime_support(media_transport="device_webrtc")
+    support = _fake_realtime_support(
+        media_transport=media_transport,
+        full_duplex=True,
+    )
     protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
     instance = protocol()
     preroll = _pcm_frame(7)
@@ -2584,10 +2704,15 @@ def test_direct_webrtc_retries_pre_ready_failures_before_releasing_mic(
     assert not instance._is_streaming_audio
 
 
-def test_direct_webrtc_startup_deadline_is_shared_by_all_attempts(
+@pytest.mark.parametrize("media_transport", ["device_webrtc", "bridge_pcm"])
+def test_deterministic_startup_deadline_is_shared_by_all_attempts(
     load_overlay: Any,
+    media_transport: str,
 ) -> None:
-    support = _fake_realtime_support(media_transport="device_webrtc")
+    support = _fake_realtime_support(
+        media_transport=media_transport,
+        full_duplex=True,
+    )
     protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
     instance = protocol()
     _wake(instance, "okay computer")

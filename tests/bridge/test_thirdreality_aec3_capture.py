@@ -87,9 +87,9 @@ def _settings(**overrides: Any) -> recorder.CaptureSettings:
 
 def test_capture_is_disabled_by_default() -> None:
     assert recorder.CaptureSettings.from_environment({}) is None
-    assert recorder.CaptureSettings.from_environment(
-        {"CODEX_AEC3_CAPTURE": "off"}
-    ) is None
+    assert (
+        recorder.CaptureSettings.from_environment({"CODEX_AEC3_CAPTURE": "off"}) is None
+    )
 
 
 def test_enabled_environment_uses_exact_hardware_defaults() -> None:

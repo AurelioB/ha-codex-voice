@@ -3,8 +3,8 @@
   "url": "ws://192.0.2.10:8787/v1/realtime",
   "connect_address": "192.0.2.10",
   "token": "REPLACE_WITH_DISTINCT_REALTIME_DEVICE_TOKEN",
-  "wake_phrase": "okay computer",
-  "realtime_only": false,
+  "wake_phrase": "okay nabu",
+  "realtime_only": true,
   "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
@@ -12,13 +12,13 @@
   "idle_timeout_seconds": 120,
   "max_session_seconds": 900,
   "max_message_bytes": 65536,
-  "media_transport": "device_webrtc",
+  "media_transport": "bridge_pcm",
   "capture_backend": "native_aec3",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 25,
-  "playback_volume_percent": 25,
-  "direct_capture_gain_db": 0
+  "aec_sink_volume_ceiling_percent": 60,
+  "playback_volume_percent": 60,
+  "direct_capture_gain_db": 12
 }

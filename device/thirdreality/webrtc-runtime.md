@@ -1,10 +1,17 @@
 # ThirdReality WebRTC dependency runtime
 
+> [!NOTE]
+> This runtime belongs to the dormant wire-v3 device-owned WebRTC experiment.
+> The active strict-v2 `bridge_pcm` deployment runs `aiortc` on the local
+> Docker/host bridge and never launches this device sidecar. Keep these
+> deterministic build/install instructions only for explicit rollback or
+> research; they are not an active deployment prerequisite.
+
 The target is the ThirdReality `1.01.07`/upstream `v1.1.7` aarch64 Buildroot
 Linux image with Python 3.11 and glibc 2.28 or newer. It is not an Android
 runtime.
 
-The direct-media client runs `aiortc` in exactly one reusable isolated Python
+The dormant direct-media client ran `aiortc` in exactly one reusable isolated Python
 worker so the vendor voice process never imports its native libraries. The
 worker holds the active PeerConnection and at most one fresh, offer-warm
 standby PeerConnection. It prepares the initial standby only after the active
@@ -44,7 +51,7 @@ verify every wheel hash. Standard proxy and CA variables may be forwarded to
 
 The exact aiortc and PyAV pins are compatibility and media-correctness
 boundaries for offer creation, SDP handling, RTP capture timestamps, decoding,
-and resampling. Production interruption does not reuse a peer or reset private
+and resampling. The historical v3 interruption path did not reuse a peer or reset private
 receiver queues, jitter buffers, or resampler state: every rollover constructs
 a fresh `RTCPeerConnection` as the logical standby inside the same prewarmed
 worker, then promotes it only after fencing and stopping the old peer. Any dependency

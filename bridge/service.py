@@ -14,6 +14,7 @@ import secrets
 import sys
 import tempfile
 import time
+import unicodedata
 from collections import OrderedDict, deque
 from collections.abc import (
     AsyncIterator,
@@ -139,7 +140,10 @@ DIRECT_END_CONVERSATION_TOOL = {
     "name": DIRECT_END_CONVERSATION_TOOL_NAME,
     "description": (
         "End this voice conversation immediately. Use only when the user explicitly "
-        "asks to stop, end, close, or leave the conversation, or clearly says goodbye."
+        "asks to stop, end, close, or leave the conversation, or clearly says goodbye. "
+        "Spanish examples include: terminar, terminar llamada, terminar la llamada, "
+        "finalizar, colgar, and adios. Call this function with {} immediately; do not "
+        "first say that you are going to end the conversation."
     ),
     "inputSchema": {
         "type": "object",
@@ -147,6 +151,46 @@ DIRECT_END_CONVERSATION_TOOL = {
         "additionalProperties": False,
     },
 }
+DIRECT_REALTIME_BASE_INSTRUCTIONS = (
+    "Act as a natural realtime voice conversation partner. Respond directly in "
+    "conversational spoken language. Keep answers concise unless the user asks for "
+    "detail. Never inspect local files. Your only tool is end_conversation. Invoke "
+    "it only when the user explicitly asks to end, stop, close, or leave this "
+    "conversation, or clearly says goodbye. Spanish requests such as 'terminar', "
+    "'terminar llamada', 'terminar la llamada', 'finalizar', 'colgar', and 'adios' "
+    "mean to invoke end_conversation with {} immediately. Never say that you will "
+    "end the conversation; call the tool without further speech. Do not invoke it "
+    "merely because a response or topic is complete."
+)
+_DIRECT_END_CONVERSATION_TRANSCRIPTS = frozenset(
+    {
+        "adios",
+        "bye",
+        "cuelga",
+        "cuelga la llamada",
+        "end",
+        "end call",
+        "end conversation",
+        "end the call",
+        "end the conversation",
+        "finaliza",
+        "finaliza la llamada",
+        "finaliza llamada",
+        "finalizar",
+        "finalizar la llamada",
+        "finalizar llamada",
+        "goodbye",
+        "hang up",
+        "stop",
+        "stop the conversation",
+        "termina",
+        "termina la llamada",
+        "termina llamada",
+        "terminar",
+        "terminar la llamada",
+        "terminar llamada",
+    }
+)
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
 REALTIME_OUTPUT_PREROLL_MILLISECONDS = 200
 REALTIME_OUTPUT_PREROLL_MAX_BYTES = (
@@ -156,6 +200,11 @@ REALTIME_OUTPUT_TAIL_SECONDS = 0.12
 REALTIME_OUTPUT_TAIL_HARD_CAP_SECONDS = 1.0
 REALTIME_OUTPUT_ARM_TIMEOUT_SECONDS = 5.0
 REALTIME_OUTPUT_PREROLL_TTL_SECONDS = 0.5
+REALTIME_NATIVE_TERMINAL_GATE_MILLISECONDS = 1_000
+REALTIME_NATIVE_TERMINAL_GATE_MAX_BYTES = (
+    REALTIME_SAMPLE_RATE * 2 * REALTIME_NATIVE_TERMINAL_GATE_MILLISECONDS // 1_000
+)
+REALTIME_NATIVE_TERMINAL_GATE_TTL_SECONDS = 1.25
 REALTIME_OUTPUT_SIGNAL_PEAK = 256
 REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS = 0.5
 REALTIME_MAX_PENDING_TOOL_CALLS = 16
@@ -4130,7 +4179,12 @@ async def _realtime_admitted(
             else None
         )
         configured_tools = normalize_dynamic_tools(
-            list(broker_snapshot.tools)
+            [DIRECT_END_CONVERSATION_TOOL]
+            if (
+                wire_protocol.uses_binary_audio
+                and wire_protocol.requests_native_conversation
+            )
+            else list(broker_snapshot.tools)
             if broker_snapshot is not None
             else first.get("tools")
         )
@@ -4205,14 +4259,7 @@ async def _serve_direct_webrtc_session(
     thread_payload = dict(first)
     thread_payload.pop("model", None)
     thread_payload.pop("transport", None)
-    base_instructions = (
-        "Act as a natural realtime voice conversation partner. Respond directly "
-        "in conversational spoken language. Keep answers concise unless the user "
-        "asks for detail. Never inspect local files. Your only tool is "
-        "end_conversation. Invoke it only when the user explicitly asks to end, "
-        "stop, close, or leave this conversation, or clearly says goodbye. Do not "
-        "invoke it merely because a response or topic is complete."
-    )
+    base_instructions = DIRECT_REALTIME_BASE_INSTRUCTIONS
     voice = first.get("voice")
     normalized_voice = voice.lower() if isinstance(voice, str) and voice else None
     prompt = first.get("prompt")
@@ -4589,8 +4636,16 @@ async def _wait_for_direct_transport_ready(
                     raise ProtocolError(
                         "realtime provider closed during device handshake"
                     )
+                if _direct_provider_transcript_requests_end(event):
+                    LOGGER.info("Direct realtime terminal intent: source=transcript")
+                    await _send_realtime_json(
+                        websocket,
+                        {"type": "stopped", "reason": "end_conversation"},
+                    )
+                    raise _RealtimeClientDisconnected
                 action = await _handle_direct_provider_tool_call(session, event)
                 if action == "end":
+                    LOGGER.info("Direct realtime terminal intent: source=tool")
                     await _send_realtime_json(
                         websocket,
                         {"type": "stopped", "reason": "end_conversation"},
@@ -4667,8 +4722,16 @@ async def _run_direct_realtime_socket(
                     {"type": "stopped", "reason": "remote_closed"},
                 )
                 return
+            if _direct_provider_transcript_requests_end(event):
+                LOGGER.info("Direct realtime terminal intent: source=transcript")
+                await _send_realtime_json(
+                    websocket,
+                    {"type": "stopped", "reason": "end_conversation"},
+                )
+                return
             tool_action = await _handle_direct_provider_tool_call(session, event)
             if tool_action == "end":
+                LOGGER.info("Direct realtime terminal intent: source=tool")
                 await _send_realtime_json(
                     websocket,
                     {"type": "stopped", "reason": "end_conversation"},
@@ -4707,8 +4770,47 @@ async def _run_direct_realtime_socket(
         await asyncio.gather(client_task, provider_task, return_exceptions=True)
 
 
+def _normalize_direct_terminal_transcript(value: object) -> str:
+    """Normalize one short terminal phrase without retaining conversation text."""
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    without_marks = "".join(
+        character for character in decomposed if not unicodedata.combining(character)
+    )
+    return " ".join(
+        "".join(
+            character if character.isalnum() else " " for character in without_marks
+        ).split()
+    )
+
+
+def _direct_provider_transcript_requests_end(event: Mapping[str, Any]) -> bool:
+    """Recognize only an exact user terminal phrase from a completed transcript."""
+    if event.get("method") != "thread/realtime/transcript/done":
+        return False
+    params = event.get("params")
+    if not isinstance(params, Mapping):
+        return False
+    role = params.get("role")
+    if not isinstance(role, str) or role.casefold() not in {"input", "user"}:
+        return False
+    normalized = _normalize_direct_terminal_transcript(params.get("text"))
+    return normalized in _DIRECT_END_CONVERSATION_TRANSCRIPTS
+
+
+def _direct_terminal_transcript_is_possible_prefix(value: str) -> bool:
+    """Keep output quarantined only while a partial phrase may be terminal."""
+    normalized = _normalize_direct_terminal_transcript(value)
+    if not normalized:
+        return True
+    return any(
+        phrase.startswith(normalized) for phrase in _DIRECT_END_CONVERSATION_TRANSCRIPTS
+    )
+
+
 async def _handle_direct_provider_tool_call(
-    session: SignalingRealtimeSession,
+    session: RealtimeSession | SignalingRealtimeSession,
     event: Mapping[str, Any],
 ) -> str | None:
     """Execute the sole terminal tool and reject every other provider request."""
@@ -4853,10 +4955,7 @@ async def _serve_realtime_session(
                 ),
             )
             base_instructions = (
-                "Act as a natural realtime voice conversation partner. Respond "
-                "directly in conversational spoken language. Keep answers concise "
-                "unless the user asks for detail. Never inspect local files or "
-                "invoke tools."
+                DIRECT_REALTIME_BASE_INSTRUCTIONS
                 if wire_protocol.requests_native_conversation
                 else (
                     "Act only as a realtime Home Assistant voice agent. Never inspect "
@@ -5172,7 +5271,17 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     backend_render_retired: asyncio.Future[None] | None = None
     backend_render_quiet_until = 0.0
     backend_output_generation: int | None = None
+    native_terminal_turn_tracking = False
+    native_terminal_gate_pending = False
+    native_terminal_transcript = ""
+    native_terminal_fragment_chars = 0
     event_trace = _RealtimeEventTrace()
+
+    def uses_native_terminal_gate() -> bool:
+        return (
+            wire_protocol.uses_binary_audio
+            and wire_protocol.requests_native_conversation
+        )
 
     async def send(value: Mapping[str, Any]) -> None:
         await _send_realtime_json(websocket, value, send_lock=send_lock)
@@ -5216,6 +5325,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         nonlocal output_last_pcm_at, output_preroll_bytes, output_speaking
         if output_speaking or stop.is_set():
             return
+        if uses_native_terminal_gate() and native_terminal_gate_pending:
+            return
         output_armed = False
         if output_arm_task is not None:
             output_arm_task.cancel()
@@ -5246,10 +5357,93 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             output_preroll.clear()
             output_preroll_bytes = 0
 
+    async def release_native_terminal_gate() -> None:
+        """Release quarantined output after terminal intent is resolved."""
+        nonlocal native_terminal_gate_pending
+        if not native_terminal_gate_pending:
+            return
+        native_terminal_gate_pending = False
+        async with output_state_lock:
+            if output_armed and output_preroll and not output_speaking:
+                await begin_output_locked()
+
+    async def begin_native_terminal_turn(*, stop_current_output: bool = True) -> None:
+        """Quarantine native output until one terminal phrase is disproved."""
+        nonlocal native_terminal_turn_tracking
+        nonlocal native_terminal_gate_pending, native_terminal_transcript
+        nonlocal native_terminal_fragment_chars
+        if not uses_native_terminal_gate():
+            return
+        if native_terminal_turn_tracking:
+            return
+        native_terminal_turn_tracking = True
+        native_terminal_gate_pending = True
+        native_terminal_transcript = ""
+        native_terminal_fragment_chars = 0
+        if stop_current_output:
+            await end_output(after_tail=False)
+
+    async def observe_native_terminal_fragment(value: object) -> None:
+        """Release ordinary utterances as soon as exact end becomes impossible."""
+        nonlocal native_terminal_gate_pending, native_terminal_transcript
+        nonlocal native_terminal_fragment_chars
+        if not uses_native_terminal_gate() or not isinstance(value, str):
+            return
+        if not native_terminal_gate_pending:
+            await begin_native_terminal_turn()
+        remaining = 256 - native_terminal_fragment_chars
+        if remaining <= 0:
+            await release_native_terminal_gate()
+            return
+        fragment = value[:remaining]
+        native_terminal_transcript += fragment
+        native_terminal_fragment_chars += len(fragment)
+        if not _direct_terminal_transcript_is_possible_prefix(
+            native_terminal_transcript
+        ):
+            await release_native_terminal_gate()
+
+    async def resolve_native_terminal_turn(value: object) -> bool:
+        """Return true after terminating an exact bilingual end utterance."""
+        nonlocal native_terminal_turn_tracking
+        nonlocal native_terminal_gate_pending, native_terminal_transcript
+        nonlocal native_terminal_fragment_chars
+        nonlocal output_preroll_bytes
+        if not uses_native_terminal_gate():
+            return False
+        text = (
+            value
+            if isinstance(value, str) and value.strip()
+            else native_terminal_transcript
+        )
+        event = {
+            "method": "thread/realtime/transcript/done",
+            "params": {"role": "user", "text": text},
+        }
+        if _direct_provider_transcript_requests_end(event):
+            LOGGER.info("Direct realtime terminal intent: source=transcript")
+            async with output_state_lock:
+                output_preroll.clear()
+                output_preroll_bytes = 0
+            await end_output(after_tail=False)
+            await send({"type": "stopped", "reason": "end_conversation"})
+            stop.set()
+            return True
+        native_terminal_turn_tracking = False
+        native_terminal_transcript = ""
+        native_terminal_fragment_chars = 0
+        await release_native_terminal_gate()
+        return False
+
     def prune_output_preroll_locked() -> None:
         """Discard PCM not causally bound to the current output arm."""
         nonlocal output_preroll_bytes
-        cutoff = time.monotonic() - REALTIME_OUTPUT_PREROLL_TTL_SECONDS
+        ttl = (
+            REALTIME_NATIVE_TERMINAL_GATE_TTL_SECONDS
+            if uses_native_terminal_gate() and native_terminal_gate_pending
+            else REALTIME_OUTPUT_PREROLL_TTL_SECONDS
+        )
+        cutoff = time.monotonic() - ttl
         while output_preroll and (
             output_preroll[0][0] != output_arm_generation
             or output_preroll[0][1] < cutoff
@@ -5373,7 +5567,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         prune_output_preroll_locked()
         output_preroll.append((output_arm_generation, time.monotonic(), chunk))
         output_preroll_bytes += len(chunk)
-        while output_preroll_bytes > REALTIME_OUTPUT_PREROLL_MAX_BYTES:
+        maximum_bytes = (
+            REALTIME_NATIVE_TERMINAL_GATE_MAX_BYTES
+            if uses_native_terminal_gate() and native_terminal_gate_pending
+            else REALTIME_OUTPUT_PREROLL_MAX_BYTES
+        )
+        while output_preroll_bytes > maximum_bytes:
             output_preroll_bytes -= len(output_preroll.popleft()[2])
 
     async def request_remote_response_cancel() -> bool:
@@ -6549,7 +6748,17 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             params = raw_params if isinstance(raw_params, Mapping) else {}
             if method == "item/tool/call" and "id" in event:
                 if wire_protocol.uses_binary_audio:
-                    if bridge_managed_realtime:
+                    if wire_protocol.requests_native_conversation:
+                        action = await _handle_direct_provider_tool_call(session, event)
+                        if action == "end":
+                            LOGGER.info("Direct realtime terminal intent: source=tool")
+                            await end_output(after_tail=False)
+                            await send(
+                                {"type": "stopped", "reason": "end_conversation"}
+                            )
+                            stop.set()
+                            return
+                    elif bridge_managed_realtime:
                         await reject_unowned_tool_call(event)
                     else:
                         start_home_assistant_tool_call(event)
@@ -6570,6 +6779,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 if wire_protocol.uses_binary_audio:
                     role = str(params.get("role", "")).lower()
                     if (
+                        role in {"input", "user"}
+                        and wire_protocol.requests_native_conversation
+                    ):
+                        await observe_native_terminal_fragment(params.get("delta"))
+                        continue
+                    if (
                         role in {"assistant", "output"}
                         and not bridge_managed_realtime
                         and pending_tool_continuation_correlation is None
@@ -6587,6 +6802,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             elif method == "thread/realtime/transcript/done":
                 if wire_protocol.uses_binary_audio:
                     role = str(params.get("role", "")).lower()
+                    if (
+                        role in {"input", "user"}
+                        and wire_protocol.requests_native_conversation
+                    ):
+                        if await resolve_native_terminal_turn(params.get("text")):
+                            return
+                        continue
                     if role == "user" and bridge_managed_realtime:
                         continue
                     if role in {"assistant", "output"} and not bridge_managed_realtime:
@@ -6698,6 +6920,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     or background_generation != expected_backend_generation
                 ):
                     continue
+                if uses_native_terminal_gate() and native_terminal_gate_pending:
+                    quarantine_output(chunk)
+                    continue
                 if output_speaking:
                     output_last_pcm_at = time.monotonic()
                     sent = await send_audio(chunk, expected_backend_generation)
@@ -6747,7 +6972,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             control.event_type == "turn.done"
             and (
                 control.role in {"assistant", "output"}
-                or (not bridge_managed_realtime and output_speaking)
+                or (
+                    control.role is None
+                    and not bridge_managed_realtime
+                    and output_speaking
+                )
             )
         )
 
@@ -6770,6 +6999,25 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         if control.response_id == active_response_id:
             active_response_id = None
         await send(control.wire_value())
+
+    async def handle_native_terminal_control(
+        control: RealtimeDataControl,
+    ) -> str | None:
+        """Handle user turn boundaries for the native terminal output gate."""
+        if not wire_protocol.requests_native_conversation or control.role != "user":
+            return None
+        if control.event_type == "turn.created":
+            await begin_native_terminal_turn()
+            await send(control.wire_value())
+            return "handled"
+        if control.event_type != "turn.done":
+            return None
+        if control.transcript is not None and await resolve_native_terminal_turn(
+            control.transcript
+        ):
+            return "stop"
+        await send(control.wire_value())
+        return "handled"
 
     async def data_events() -> None:
         nonlocal active_response_id, backend_output_generation
@@ -6794,6 +7042,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             ):
                 await handle_managed_user_control(control)
                 continue
+            terminal_action = await handle_native_terminal_control(control)
+            if terminal_action == "stop":
+                return
+            if terminal_action == "handled":
+                continue
             if control.event_type == "input_audio_buffer.speech_started":
                 managed_barge_started = False
                 interrupted_owner: tuple[str | None, int | None] | None = None
@@ -6807,6 +7060,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     user_transcript_handled = False
                     request_backend_render_cancel_best_effort()
                     managed_barge_started = True
+                if wire_protocol.requests_native_conversation:
+                    await begin_native_terminal_turn(stop_current_output=False)
                 # Commit the generation tombstone above before either socket
                 # or output cleanup can yield to a late executor tool event.
                 await send(control.wire_value())

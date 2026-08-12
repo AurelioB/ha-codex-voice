@@ -77,26 +77,25 @@ except Exception as exc:  # noqa: BLE001 - optional support is an untrusted boun
     _EARLY_REALTIME_SUPPORT = None
     _EARLY_REALTIME_CONFIG = None
 
-_VALID_DEVICE_WEBRTC_CONFIG = bool(
-    _EARLY_REALTIME_CONFIG is not None
-    and _EARLY_REALTIME_CONFIG.media_transport
-    == _EARLY_REALTIME_SUPPORT.DEVICE_WEBRTC_TRANSPORT
-)
-if _AEC3_OVERRIDE and not _VALID_DEVICE_WEBRTC_CONFIG:
+_VALID_REALTIME_CONFIG = _EARLY_REALTIME_CONFIG is not None
+if _AEC3_OVERRIDE and not _VALID_REALTIME_CONFIG:
     _fatal_aec3_startup(
-        "CODEX_AEC3_CAPTURE requires a valid enabled device_webrtc configuration"
+        "CODEX_AEC3_CAPTURE requires a valid enabled realtime configuration"
     )
 if (
     _AEC3_OVERRIDE
     and _EARLY_REALTIME_CONFIG.capture_backend
     != _EARLY_REALTIME_SUPPORT.NATIVE_AEC3_CAPTURE
 ):
-    _EARLY_REALTIME_CONFIG = replace(
-        _EARLY_REALTIME_CONFIG,
-        capture_backend=_EARLY_REALTIME_SUPPORT.NATIVE_AEC3_CAPTURE,
-    )
+    try:
+        _EARLY_REALTIME_CONFIG = replace(
+            _EARLY_REALTIME_CONFIG,
+            capture_backend=_EARLY_REALTIME_SUPPORT.NATIVE_AEC3_CAPTURE,
+        )
+    except Exception as exc:  # noqa: BLE001 - native selection must fail closed
+        _fatal_aec3_startup("ThirdReality realtime configuration is invalid", exc)
 _NATIVE_AEC3_SELECTED = bool(
-    _VALID_DEVICE_WEBRTC_CONFIG
+    _VALID_REALTIME_CONFIG
     and _EARLY_REALTIME_CONFIG.capture_backend
     == _EARLY_REALTIME_SUPPORT.NATIVE_AEC3_CAPTURE
 )
@@ -472,6 +471,19 @@ def _uses_device_webrtc() -> bool:
     )
 
 
+def _uses_deterministic_realtime_media() -> bool:
+    """Return whether capture starts only after one confirmed live session."""
+    if _REALTIME_CONFIG is None or _REALTIME_SUPPORT is None:
+        return False
+    if not bool(getattr(_REALTIME_CONFIG, "full_duplex", False)):
+        return False
+    media_transport = getattr(_REALTIME_CONFIG, "media_transport", None)
+    return media_transport in {
+        getattr(_REALTIME_SUPPORT, "BRIDGE_PCM_TRANSPORT", "bridge_pcm"),
+        getattr(_REALTIME_SUPPORT, "DEVICE_WEBRTC_TRANSPORT", "device_webrtc"),
+    }
+
+
 def _realtime_only_mode() -> bool:
     """Return whether this appliance must never enter the Assist wake path."""
     return bool(getattr(_REALTIME_CONFIG, "realtime_only", False))
@@ -479,7 +491,7 @@ def _realtime_only_mode() -> bool:
 
 def _assist_fallback_allowed() -> bool:
     """Return whether buffered direct audio may fall back to Home Assistant."""
-    return not _uses_device_webrtc() and not _realtime_only_mode()
+    return not _uses_deterministic_realtime_media() and not _realtime_only_mode()
 
 
 def _configure_stop_word_membership(instance: Any) -> tuple[Any, bool]:
@@ -490,7 +502,7 @@ def _configure_stop_word_membership(instance: Any) -> tuple[Any, bool]:
     if stop_word_id is None or active is None:
         return None, False
     was_active = stop_word_id in active
-    if _uses_device_webrtc() and bool(getattr(_REALTIME_CONFIG, "full_duplex", False)):
+    if _uses_deterministic_realtime_media():
         # The direct conversation owns the microphone from wake acceptance
         # through terminal teardown. Keeping the vendor stop model armed here
         # can reinterpret the wake tail as a stop and cancel negotiation before
@@ -633,7 +645,7 @@ def _prepare_realtime_startup_audio(
     preroll_audio: list[bytes],
 ) -> tuple[list[bytes], int]:
     """Apply the transport-specific capture boundary and retry policy."""
-    if _uses_device_webrtc():
+    if _uses_deterministic_realtime_media():
         return [], _DIRECT_STARTUP_MAX_ATTEMPTS
     return _preroll_with_startup_headroom(preroll_audio), 1
 
@@ -665,7 +677,7 @@ def _activate_realtime_owner(
         if owner.stop_requested:
             _interrupt_realtime_owner(instance, owner)
             return
-        if _uses_device_webrtc() and not _start_direct_lifecycle_watcher(
+        if _uses_deterministic_realtime_media() and not _start_direct_lifecycle_watcher(
             instance,
             owner,
         ):
@@ -719,10 +731,10 @@ def _start_realtime_wakeup(
         preroll_audio, maximum_attempts = _prepare_realtime_startup_audio(preroll_audio)
         startup_deadline = (
             time.monotonic() + _DIRECT_STARTUP_DEADLINE_SECONDS
-            if _uses_device_webrtc()
+            if _uses_deterministic_realtime_media()
             else None
         )
-        if _uses_device_webrtc():
+        if _uses_deterministic_realtime_media():
             _nonblocking_led_fire("thinking")
         session, startup_attempt = _construct_realtime_session(
             maximum_attempts,
@@ -730,7 +742,7 @@ def _start_realtime_wakeup(
         )
         if session is None:
             if getattr(instance, _REALTIME_STOP_REQUESTED_ATTRIBUTE, False):
-                if _uses_device_webrtc():
+                if _uses_deterministic_realtime_media():
                     _nonblocking_led_fire("idle", to_idle=True)
                 return
             if _assist_fallback_allowed():
@@ -751,7 +763,7 @@ def _start_realtime_wakeup(
                 session.stop()
             except Exception:  # noqa: BLE001 - best-effort unowned cleanup
                 _LOGGER.warning("Failed to stop unowned ThirdReality session")
-            if _uses_device_webrtc():
+            if _uses_deterministic_realtime_media():
                 _nonblocking_led_fire("idle", to_idle=True)
             return
         try:
@@ -808,7 +820,7 @@ def _retry_direct_realtime_startup(
 ) -> bool:
     """Replace a failed pre-ready session without releasing device state."""
     if (
-        not _uses_device_webrtc()
+        not _uses_deterministic_realtime_media()
         or owner.stop_requested
         or owner.released
         or owner.ready_seen
@@ -1249,7 +1261,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             owner.stop_requested = True
             _interrupt_realtime_owner(instance, owner, source="mute")
             return
-        if _uses_device_webrtc() and not owner.capture_open:
+        if _uses_deterministic_realtime_media() and not owner.capture_open:
             # The lifecycle watcher exclusively owns CONNECTING/CONFIRMING.
             # This callback is therefore a pure drop boundary until cue EOF.
             return
@@ -1262,7 +1274,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             _detach_realtime_owner(instance, owner, unduck=owner.ducked)
             return
 
-        if not _uses_device_webrtc() and not owner.session.ready:
+        if not _uses_deterministic_realtime_media() and not owner.session.ready:
             if _assist_fallback_allowed():
                 maximum = _REALTIME_CONFIG.fallback_buffer_bytes
                 if owner.fallback_bytes + len(audio_chunk) > maximum:
@@ -1338,7 +1350,7 @@ def _live_direct_volume_owner(instance: Any) -> _RealtimeOwner | None:
     """Return only an owner whose output is safe to control in software."""
     if not bool(getattr(_REALTIME_CONFIG, "full_duplex", False)):
         return None
-    if not _uses_device_webrtc():
+    if not _uses_deterministic_realtime_media():
         return None
     owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
     if owner is None or not _direct_volume_owner_is_current(instance, owner):
@@ -1591,7 +1603,7 @@ def _persist_direct_volume(
 
 def _initialize_direct_session_volume(instance: Any, owner: _RealtimeOwner) -> None:
     """Start direct software playback at the persisted bounded device volume."""
-    if not _uses_device_webrtc():
+    if not _uses_deterministic_realtime_media():
         return
     entity = getattr(instance.state, "media_player_entity", None)
     ceiling = _direct_volume_ceiling_percent()
@@ -2040,7 +2052,7 @@ def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
         else:
             _fast_wakeup(instance, wake_word)
         if not previous_active and instance._pipeline_active:  # noqa: SLF001
-            if not realtime_wake or not _uses_device_webrtc():
+            if not realtime_wake or not _uses_deterministic_realtime_media():
                 _nonblocking_led_fire("listening")
 
 

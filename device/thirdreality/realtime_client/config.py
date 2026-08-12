@@ -29,9 +29,7 @@ DEVICE_WEBRTC_TRANSPORT = "device_webrtc"
 SUPPORTED_MEDIA_TRANSPORTS = frozenset({BRIDGE_PCM_TRANSPORT, DEVICE_WEBRTC_TRANSPORT})
 PULSEAUDIO_AEC_CAPTURE = "pulseaudio_aec"
 NATIVE_AEC3_CAPTURE = "native_aec3"
-SUPPORTED_CAPTURE_BACKENDS = frozenset(
-    {PULSEAUDIO_AEC_CAPTURE, NATIVE_AEC3_CAPTURE}
-)
+SUPPORTED_CAPTURE_BACKENDS = frozenset({PULSEAUDIO_AEC_CAPTURE, NATIVE_AEC3_CAPTURE})
 DEFAULT_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_SESSION_SECONDS = 900.0
 DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 5.0
@@ -155,11 +153,8 @@ class RealtimeConfig:
             raise ConfigError(
                 "capture_backend must be 'pulseaudio_aec' or 'native_aec3'"
             )
-        if (
-            self.capture_backend == NATIVE_AEC3_CAPTURE
-            and self.media_transport != DEVICE_WEBRTC_TRANSPORT
-        ):
-            raise ConfigError("native_aec3 capture requires device_webrtc")
+        if self.capture_backend == NATIVE_AEC3_CAPTURE and not self.full_duplex:
+            raise ConfigError("native_aec3 capture requires full_duplex")
         capture_gain = self.direct_capture_gain_db
         if (
             isinstance(capture_gain, bool)
@@ -173,10 +168,11 @@ class RealtimeConfig:
         normalized_capture_gain = float(capture_gain)
         if (
             self.media_transport != DEVICE_WEBRTC_TRANSPORT
+            and self.capture_backend != NATIVE_AEC3_CAPTURE
             and normalized_capture_gain != DEFAULT_DIRECT_CAPTURE_GAIN_DB
         ):
             raise ConfigError(
-                "direct_capture_gain_db requires device_webrtc media transport"
+                "direct_capture_gain_db requires device_webrtc or native_aec3 capture"
             )
         object.__setattr__(
             self,
@@ -428,7 +424,7 @@ def load_config(
         raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
     if media_transport == DEVICE_WEBRTC_TRANSPORT and not full_duplex:
         raise ConfigError("device_webrtc media transport requires full_duplex")
-    capture_backend = _capture_backend(decoded, media_transport=media_transport)
+    capture_backend = _capture_backend(decoded, full_duplex=full_duplex)
     direct_capture_gain_db = _bounded_float(
         decoded,
         "direct_capture_gain_db",
@@ -438,10 +434,11 @@ def load_config(
     )
     if (
         media_transport != DEVICE_WEBRTC_TRANSPORT
+        and capture_backend != NATIVE_AEC3_CAPTURE
         and direct_capture_gain_db != DEFAULT_DIRECT_CAPTURE_GAIN_DB
     ):
         raise ConfigError(
-            "direct_capture_gain_db requires device_webrtc media transport"
+            "direct_capture_gain_db requires device_webrtc or native_aec3 capture"
         )
     pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
     pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
@@ -691,20 +688,12 @@ def _optional_pulse_aec_method(value: dict[str, Any]) -> str | None:
     return candidate
 
 
-def _capture_backend(value: dict[str, Any], *, media_transport: str) -> str:
+def _capture_backend(value: dict[str, Any], *, full_duplex: bool) -> str:
     candidate = value.get("capture_backend", PULSEAUDIO_AEC_CAPTURE)
-    if (
-        not isinstance(candidate, str)
-        or candidate not in SUPPORTED_CAPTURE_BACKENDS
-    ):
-        raise ConfigError(
-            "capture_backend must be 'pulseaudio_aec' or 'native_aec3'"
-        )
-    if (
-        candidate == NATIVE_AEC3_CAPTURE
-        and media_transport != DEVICE_WEBRTC_TRANSPORT
-    ):
-        raise ConfigError("native_aec3 capture requires device_webrtc")
+    if not isinstance(candidate, str) or candidate not in SUPPORTED_CAPTURE_BACKENDS:
+        raise ConfigError("capture_backend must be 'pulseaudio_aec' or 'native_aec3'")
+    if candidate == NATIVE_AEC3_CAPTURE and not full_duplex:
+        raise ConfigError("native_aec3 capture requires full_duplex")
     return candidate
 
 

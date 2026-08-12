@@ -18,14 +18,16 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
-- The current ThirdReality v3 client explicitly requests
+- The current ThirdReality strict-v2 client explicitly requests
   `conversation_mode: "native"`. The bridge ignores any Home Assistant broker
   snapshot for that session and creates one native App Server realtime thread
-  per peer epoch with exactly one dynamic tool, `end_conversation`. The tool has
+  and one server-owned WebRTC peer per conversation, with exactly one dynamic
+  tool, `end_conversation`. The tool has
   an empty-object input schema and only terminates this voice session; the bridge
   rejects every other provider tool request with `do_not_retry` and ends the
-  epoch. It relays validated SDP and lifecycle sideband but never carries v3 PCM
-  or raw provider data. In the current controlled deployment, Okay Nabu selects
+  session. The bridge accepts bounded binary v2 PCM but never exposes raw
+  provider data-channel events to the speaker. In the current controlled
+  deployment, Okay Nabu selects
   this direct route with `realtime_only: true`; Home Assistant Assist/Hermes and
   entity tools are deferred, so it has no Home Assistant control authority.
 - The bridge echoes an accepted explicit mode in `started`; the reference
@@ -73,11 +75,9 @@ sides of a narrow bridge API.
   if a local or managed layer still configures an MCP server.
 - Threads are deliberately non-ephemeral inside that isolated home so App
   Server can delete them immediately with `thread/delete`. Experimental Codex
-  STT, TTS, and realtime threads are deleted when their session ends. A native
-  device epoch owns one realtime thread; rollover may reuse it only when close
-  confirms inside the 100 ms grace. Otherwise the old epoch transfers to tracked
-  isolated-thread cleanup, the replacement uses a new thread, and outer cleanup
-  deletes every thread it owned. A legacy managed session owns two
+  STT, TTS, and realtime threads are deleted when their session ends. An active
+  native-v2 conversation owns one realtime thread and one peer until bounded
+  cleanup. A legacy managed session owns two
   threads, and cleanup independently deletes
   both its tool-free frontend and its executor. Reusable Conversation threads
   are deleted when retired, evicted, or the bridge shuts down.
@@ -89,12 +89,9 @@ sides of a narrow bridge API.
   not receive the ChatGPT credential, bridge bearer, microphone audio, or Home
   Assistant access token, and synthesis does not consume the subscription
   speech lane.
-- Device-facing realtime v3 carries signaling/control only. The isolated
-  device peer carries RTP audio and `oai-events` directly to/from the provider;
-  the bridge rejects binary v3 media, device-declared tools, and device tool
-  results. Provider transcript/model text and arbitrary nested data are removed
-  before lifecycle metadata crosses the sidecar IPC boundary. Device-facing v2
-  remains the explicit bridge-PCM rollback and compatibility path. It rejects
+- Active device-facing realtime v2 carries binary microphone/output PCM and
+  content-free lifecycle only. The bridge owns RTP and `oai-events` to/from the
+  provider; the speaker never sees provider events. V2 rejects
   device-declared tools and device tool results, and never exposes provider
   tool calls or Home Assistant results to the speaker. Explicit native mode
   ignores a separately registered authority. In the legacy automatic managed
@@ -114,32 +111,32 @@ sides of a narrow bridge API.
   teardown the active turn is tombstoned and interrupted before its event
   consumer closes, and provider/thread cleanup remains tracked and shielded
   from request-handler cancellation.
-- Okay Nabu selects explicit native v3 in the current `realtime_only` trial and
+- Okay Nabu selects explicit native v2 in the current `realtime_only` trial and
   gains no Home Assistant authority. Once a direct session owns the device,
   later detector hits are ignored; interruption and follow-up are driven only
   by bounded live-audio/VAD logic. A later split deployment may restore Assist
   and a distinct direct phrase, but that authority split is not active now.
 - The device may retain at most six idle microphone frames in its generic
-  compatibility ring: 384 ms, or 12 KiB of PCM16 in memory only. An accepted v3
-  wake discards all of it and drops every recorder callback during connecting
+  compatibility ring: 384 ms, or 12 KiB of PCM16 in memory only. An accepted
+  active-v2 wake discards all of it and drops every recorder callback during connecting
   and ready-cue playback. The initial peer therefore receives zero wake or
   pre-ready PCM and does not wait on the 64 KiB live input queue. That queue
   opens empty after cue EOF and then bounds accepted live/rollover pressure.
   Stop, mute, disconnect, teardown, deadline, exhaustion, cue failure, and every
-  v3 terminal clear remaining capture without forwarding, persisting, logging,
-  or handing it to Home Assistant. The v2 rollback alone preserves bounded
-  initial pre-roll/headroom and pre-ready Assist replay.
+  terminal clear remaining capture without forwarding, persisting, logging, or
+  handing it to Home Assistant. Pre-ready Assist replay exists only in older
+  optional compatibility configurations, not active native/realtime-only v2.
 - An accepted direct wake queues the thinking/pulsing LED immediately and gives
   at most three fresh session attempts one shared absolute 12-second owner
   deadline. Each session has its own ten-second signaling-handshake bound
-  inside the remaining owner time. Idle process prewarm proves only that the
-  one isolated `Popen` child is alive; it does not request or validate an
-  SDP offer. Construction, AEC/player preflight, offer creation, bridge setup,
+  inside the remaining owner time. Compose keeps the bridge/App Server/media
+  stack warm, but no connected provider peer is assigned before wake.
+  Construction, AEC/player preflight, bridge setup,
   peer readiness, terminal state, deadline, or attempt exhaustion all fail
   closed without widening authority to Home Assistant.
-- `RealtimeSession.ready` is set only after the answer is applied, the peer and
-  `oai-events` channel are ready, the device sends `transport_ready`, and the
-  bridge returns the exact accepted `started`. Only then may the root process
+- `RealtimeSession.ready` is set only after the server has applied the answer,
+  the provider peer and `oai-events` channel are ready, and the bridge returns
+  exact accepted strict-v2 `started`. Only then may the root process
   play once the pinned root-owned PCM16 mono 22,050 Hz cue
   `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`, SHA-256
   `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
@@ -147,14 +144,27 @@ sides of a narrow bridge API.
   direct ownership window, so the wake tail cannot cancel signaling and
   playback echo cannot terminate the live session. Capture remains closed
   through cue EOF; EOF switches to the listening LED and opens live provider
-  capture. Only after that boundary may the isolated worker prepare the initial
-  logical standby peer. Missing EOF or cue failure has a two-second bound and is
-  terminal.
+  capture. Missing EOF or cue failure has a two-second bound and is terminal;
+  there is no device worker or logical standby peer.
   The sole spoken terminal control is `end_conversation`; its result closes the
   session and normal cleanup restores the prior detector membership and idle
   LED.
-- The ThirdReality controller is standard-library code imported into the
-  existing root voice process. Direct media runs in a separate
+- The active ThirdReality controller is standard-library code imported into the
+  existing root voice process. Native AEC3, capture, playback, and the local
+  interruption cut remain on-device; `bridge_pcm` launches no `aiortc` sidecar.
+  The root-owned mode-0600 configuration contains only the route-scoped device
+  bearer, never OAuth or a Home Assistant token. The Compose server runs the
+  media stack and App Server under a non-root UID matching the owner-only OAuth
+  file, with a read-only root filesystem and bounded temporary storage.
+- Active `bridge_pcm` requires full duplex, `capture_backend: "native_aec3"`,
+  the reviewed AEC source/sink and Adrian topology, a 60% fixed sink/playback
+  anchor, and a 100%-relative stream. Dynamic volume is non-amplifying software
+  attenuation, so no second virtual volume lowers output. +12 dB capture gain
+  is saturating, occurs only after AEC, and affects only PCM sent to the bridge.
+  AEC-filtered near-end speech cuts local playback while its original causal
+  PCM continues on the same socket and server peer. Provider VAD owns remote
+  cancellation; the device never asserts that a local cut cancelled it.
+- Dormant v3 direct media ran in a separate
   `/usr/bin/python3 -I -S` child with a complete hash-locked Python
   3.11/aarch64 runtime, root-owned immutable source/runtime paths, and bounded
   sequenced-packet IPC. The launcher assigns UID/GID 65534 with no supplementary
@@ -195,8 +205,8 @@ sides of a narrow bridge API.
   a mismatch is repaired or output fails closed. Home Assistant volume requests
   are applied as bounded software attenuation, and the guarded 50 ms physical-
   button loop restores a displaced anchor. Ordinary interruption performs no
-  blocking volume subprocess work, and the v2 rollback retains its configured
-  stream-volume behavior. The guard compares raw PulseAudio units
+  blocking volume subprocess work. Active v2 uses the same fixed anchor,
+  100%-relative stream, and one software attenuation stage. The guard compares raw PulseAudio units
   to the exact linear ceiling rather than trusting rounded display percentages.
   The installer writes the matching raw setpoint in the static startup block
   immediately after sink creation. The stock voice process later applies its
@@ -207,11 +217,11 @@ sides of a narrow bridge API.
   physical double-talk canary on each installation at its configured sink and
   stream values. The reference device's bounded 25% pass exercised the prior
   v2 path. Its separate v3 canary ran at that installation's qualified 60%
-  setting. Neither result is transferable evidence for another device, and the
-  public example remains at the conservative 25% default.
-- Native hardware-loopback AEC3 remains disabled by default. Its normal
-  selector is `capture_backend: "native_aec3"` in the enabled root-owned
-  mode-0600 `/data/conf/codex-realtime.json` with `device_webrtc`. The overlay
+  setting. Neither result is transferable evidence for another device. The
+  active 60% reference configuration requires its own complete physical canary.
+- Native hardware-loopback AEC3 is explicitly enabled for the active reference
+  route. Its selector is `capture_backend: "native_aec3"` in the root-owned
+  mode-0600 `/data/conf/codex-realtime.json` with `bridge_pcm`. The overlay
   reads that no-follow, bounded configuration before vendor microphone
   selection; `CODEX_AEC3_CAPTURE=1` is only an explicit environment override,
   not a required companion flag. It publishes `CODEX_AEC3_ACTIVE=1` internally
@@ -220,7 +230,7 @@ sides of a narrow bridge API.
   An invalid native library, ABI, device, or capture path fails startup closed.
   Merely installing the library does not select it, never authorizes raw-
   microphone fallback, and does not satisfy physical qualification.
-- Provider response/output lifecycle never labels or gates the normal direct
+- Dormant v3 provider response/output lifecycle never labeled or gated its direct
   RTP lane; local media boundaries come only from first decoded audio and an
   actual roughly 120 ms receiver quiet gap. Trusted AEC-filtered v3 barge-in
   drops queued media, immediately SIGKILLs `paplay` in the privileged parent,
@@ -275,11 +285,11 @@ sides of a narrow bridge API.
   worker PIDs without a cold replacement and retained context twice. Those
   measurements do not physically validate the current single-worker build and
   do not replace the full per-installation acceptance matrix. Current App Server
-  documentation supports realtime WebRTC v1 and v3, not v2; the direct path
-  remains on v3, and a live v1 subscription
-  canary did not complete startup. On the native v2
-  rollback path, resume still requires a sanitized provider
-  `response.cancelled` event correlated to the exact active response. On the
+  documentation supports realtime WebRTC v1 and v3, not v2; that statement
+  concerns the provider surface, not the project's active v2 LAN protocol. A
+  live v1 subscription canary did not complete startup. On active native v2,
+  microphone PCM stays ordered on the same peer, provider VAD handles remote
+  cancellation, and provider `speech_started` independently flushes output. On the
   legacy broker-managed path, a new utterance invalidates the bridge generation
   and best-effort cancellation cannot reopen the local output gate. Before Home
   Assistant tool dispatch, the bridge tombstones and interrupts the executor;
@@ -308,6 +318,16 @@ The bearer-token protocol is suitable for a private, trusted LAN when firewall
 rules restrict the bridge port to the Home Assistant host and intended voice
 endpoints. Use HTTPS/WSS through a reverse proxy across any shared or untrusted
 network. Do not expose port 8787 directly to the internet.
+
+The root Compose deployment uses host networking so server-owned WebRTC avoids
+container NAT. Host firewalling is therefore part of the security boundary.
+The service runs without root or Linux capabilities, with
+`no-new-privileges`, a read-only root filesystem, bounded temporary files, and
+an init process. Only the existing owner-only `auth.json` file is bind-mounted;
+the container UID/GID must match its owner so Codex can refresh it in place.
+Do not mount the whole Codex home. Bearers live in an ignored mode-0600
+environment file. `docker compose config` expands and can print those values,
+so never attach its output to diagnostics.
 
 Wyoming TCP has no application bearer authentication. Bind faster-whisper port
 `10300` and Piper port `10200` only to explicit addresses Home Assistant can

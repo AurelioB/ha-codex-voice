@@ -1,12 +1,10 @@
 # Realtime device wire protocol v2
 
 > [!NOTE]
-> Protocol v2 remains supported as the explicit `media_transport: "bridge_pcm"`
-> rollback and compatibility path. New direct-media deployments use
-> [protocol v3](realtime-wire-v3.md), where the ThirdReality device owns the
-> WebRTC peer and the bridge carries signaling/sideband JSON only. V2 behavior
-> below is intentionally preserved; selecting v3 never silently changes a v2
-> socket's framing or fallback semantics.
+> Protocol v2 is the active server-offloaded `media_transport: "bridge_pcm"`
+> path for constrained ThirdReality speakers. The experimental
+> [protocol v3](realtime-wire-v3.md) remains available as an explicit rollback;
+> selecting either transport never silently changes the other's framing.
 
 This document defines the authenticated device-facing WebSocket contract at
 `GET /v1/realtime`. Version 2 is a narrow, low-latency PCM transport between a
@@ -117,7 +115,9 @@ input/output shapes and capabilities:
     "binary_pcm16": true,
     "local_flush": true,
     "remote_cancel": false,
-    "same_session_interrupt_ack": true
+    "same_session_interrupt_ack": true,
+    "server_owned_media": true,
+    "native_end_conversation": true
   }
 }
 ```
@@ -139,6 +139,11 @@ receive `continuation_safe: true` after the bridge invalidates its owned
 executor/output generation. The latter explicitly keeps
 `remote_cancelled: false`. The bridge never claims that already-played audio
 was unheard or that an uncorrelated response was truncated.
+`server_owned_media: true` proves that the bridge, not the speaker, owns the
+provider WebRTC peer. For an explicit native start,
+`native_end_conversation: true` proves that the sole bridge-owned terminal
+control is available. The reference client requires both capabilities and
+fails closed against an older bridge.
 
 Invalid or ambiguous negotiation produces a JSON `error` and closes the
 socket before a Codex thread is created.
@@ -165,15 +170,13 @@ holds at most 25 chunks (normally roughly 500 ms). Queue overflow and
 unexpected media EOF are terminal protocol errors; audio is not silently
 dropped to hide latency.
 
-The reference ThirdReality client keeps at most 64 KiB of microphone input and
-64 KiB of the same pre-ready audio for Home Assistant fallback. Each represents
-2.048 seconds at 16 kHz mono PCM16; they are parallel ownership copies, not a
-4.096-second serial backlog. After `started`, the client sends queued frames at
-no more than 2× capture rate while more than one frame remains, then returns to
-normal capture cadence. This preserves accepted queued audio without an
-unbounded burst. It shrinks a startup offset but does not remove cold
-thread/WebRTC negotiation or provider response latency. The reference playback
-queue is 48 KiB, about 1.024 seconds at 24 kHz mono PCM16.
+For full-duplex realtime-only operation, the reference ThirdReality client
+discards the wake tail and all pre-ready microphone audio. It plays exactly one
+acknowledgement cue only after `started`; cue EOF atomically opens provider
+capture. There is therefore no startup replay or Home Assistant fallback on
+this path. Once live, microphone frames are paced in real time with a bounded
+64 KiB input queue. The reference playback queue is 48 KiB, about 1.024 seconds
+at 24 kHz mono PCM16.
 
 The provider WebRTC track can contain continuous silence even when the
 assistant is not answering. The bridge drains that track but does not proxy
@@ -250,9 +253,11 @@ WebSocket framing overhead is separate, and the minimum carries one fixed
 2,048-byte recorder frame.
 
 Full duplex is an explicit, fail-closed device option; protocol v2 itself does
-not provide AEC. Before opening the socket, the reference client requires the
-reviewed static PulseAudio `module-echo-cancel` topology with the exact
-configured allowlisted `aec_method`, exact raw hardware masters and AEC endpoint
+not provide AEC. The active ThirdReality deployment uses native AEC3 against
+the device's sample-aligned physical render reference and applies its bounded
+capture gain exactly once before WebSocket egress. Before opening the socket,
+the reference client also verifies the reviewed static PulseAudio topology,
+the configured allowlisted `aec_method`, exact raw hardware masters and AEC endpoint
 names, those endpoints as defaults, and every current-process native capture
 stream routed through the uncorked AEC source. The allowlist is `webrtc`,
 `speex`, and `adrian`; omitted configuration defaults to WebRTC and never falls
@@ -303,8 +308,15 @@ The following client-to-bridge controls remain JSON:
 The v2 device remains audio/control only. A v2 start containing `tools` or an
 incoming device `tool_result` is rejected. Provider tool calls and Home
 Assistant results are never forwarded to the speaker. An explicit native
-session is tool-free even if a Home Assistant realtime authority is currently
-registered. Legacy auto-selected realtime home control is disabled unless
+session exposes exactly one bridge-owned empty-input tool,
+`end_conversation`, even if a Home Assistant realtime authority is currently
+registered. Spanish and English terminal instructions require the model to
+call it immediately without a spoken promise. An exact normalized terminal
+transcript such as `Terminar`, `Terminar llamada`, `goodbye`, or `hang up` is a
+narrow fallback. The bridge then sends
+`{"type":"stopped","reason":"end_conversation"}` and closes the owned
+session. Every other provider tool request is rejected internally. Legacy
+auto-selected realtime home control is disabled unless
 exactly one Home Assistant Conversation subentry is explicitly opted in as
 authority. That subentry opens the separate
 `/v1/home-assistant/tools` WebSocket with the primary bridge token, registers a

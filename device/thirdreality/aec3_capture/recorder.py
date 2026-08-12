@@ -71,25 +71,17 @@ class CaptureSettings:
         if not enabled:
             return None
         settings = cls(
-            library_path=Path(
-                values.get("CODEX_AEC3_LIBRARY", str(_DEFAULT_LIBRARY))
-            ),
+            library_path=Path(values.get("CODEX_AEC3_LIBRARY", str(_DEFAULT_LIBRARY))),
             alsa_device=values.get("CODEX_AEC3_DEVICE", "hw:0,4"),
             channels=_parse_int(values, "CODEX_AEC3_CHANNELS", 4),
             mic_channel=_parse_int(values, "CODEX_AEC3_MIC_CHANNEL", 0),
-            reference_channel_a=_parse_int(
-                values, "CODEX_AEC3_REFERENCE_CHANNEL_A", 2
-            ),
-            reference_channel_b=_parse_int(
-                values, "CODEX_AEC3_REFERENCE_CHANNEL_B", 3
-            ),
+            reference_channel_a=_parse_int(values, "CODEX_AEC3_REFERENCE_CHANNEL_A", 2),
+            reference_channel_b=_parse_int(values, "CODEX_AEC3_REFERENCE_CHANNEL_B", 3),
             ring_frames=_parse_int(values, "CODEX_AEC3_RING_FRAMES", 4_096),
             startup_timeout_ms=_parse_int(
                 values, "CODEX_AEC3_STARTUP_TIMEOUT_MS", 1_000
             ),
-            read_timeout_ms=_parse_int(
-                values, "CODEX_AEC3_READ_TIMEOUT_MS", 2_000
-            ),
+            read_timeout_ms=_parse_int(values, "CODEX_AEC3_READ_TIMEOUT_MS", 2_000),
         )
         settings.validate()
         return settings
@@ -113,28 +105,20 @@ class CaptureSettings:
             raise CaptureConfigurationError("AEC3 reference channel B is out of range")
         reference_channels = {
             self.reference_channel_a,
-            *(
-                ()
-                if self.reference_channel_b == -1
-                else (self.reference_channel_b,)
-            ),
+            *(() if self.reference_channel_b == -1 else (self.reference_channel_b,)),
         }
         if self.mic_channel in reference_channels:
             raise CaptureConfigurationError(
                 "AEC3 microphone and reference channels must be distinct"
             )
-        if len(reference_channels) != (
-            1 if self.reference_channel_b == -1 else 2
-        ):
+        if len(reference_channels) != (1 if self.reference_channel_b == -1 else 2):
             raise CaptureConfigurationError("AEC3 reference channels must be distinct")
         if self.ring_frames < _PERIOD_FRAMES * 2:
             raise CaptureConfigurationError(
                 "AEC3 ring must hold at least two 10 ms periods"
             )
         if self.ring_frames > _SAMPLE_RATE * 2:
-            raise CaptureConfigurationError(
-                "AEC3 ring must not exceed two seconds"
-            )
+            raise CaptureConfigurationError("AEC3 ring must not exceed two seconds")
         if not 100 <= self.startup_timeout_ms <= 10_000:
             raise CaptureConfigurationError(
                 "AEC3 startup timeout must be in 100..10000 ms"
@@ -293,9 +277,7 @@ class _NativeStream:
 
     def _error(self, status: int) -> CaptureRuntimeError:
         handle = self._handle
-        required = int(
-            self._library.codex_aec3_copy_last_error(handle, None, 0)
-        )
+        required = int(self._library.codex_aec3_copy_last_error(handle, None, 0))
         size = max(1, min(required, _MAX_NATIVE_ERROR_BYTES))
         buffer = ctypes.create_string_buffer(size)
         self._library.codex_aec3_copy_last_error(handle, buffer, size)
@@ -321,9 +303,7 @@ class _NativeStream:
             ctypes.POINTER(ctypes.c_int16),
         )
         status = int(
-            self._library.codex_aec3_read(
-                self._handle, pointer, frames, timeout_ms
-            )
+            self._library.codex_aec3_read(self._handle, pointer, frames, timeout_ms)
         )
         if status < 0:
             raise self._error(status)
