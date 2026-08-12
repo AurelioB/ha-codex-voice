@@ -30,6 +30,9 @@ SUPPORTED_MEDIA_TRANSPORTS = frozenset({BRIDGE_PCM_TRANSPORT, DEVICE_WEBRTC_TRAN
 PULSEAUDIO_AEC_CAPTURE = "pulseaudio_aec"
 NATIVE_AEC3_CAPTURE = "native_aec3"
 SUPPORTED_CAPTURE_BACKENDS = frozenset({PULSEAUDIO_AEC_CAPTURE, NATIVE_AEC3_CAPTURE})
+ROLLOVER_BARGE_IN_MODE = "rollover"
+UPSTREAM_BARGE_IN_MODE = "upstream"
+SUPPORTED_BARGE_IN_MODES = frozenset({ROLLOVER_BARGE_IN_MODE, UPSTREAM_BARGE_IN_MODE})
 DEFAULT_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_SESSION_SECONDS = 900.0
 DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 5.0
@@ -69,6 +72,7 @@ _ALLOWED_KEYS = frozenset(
         "full_duplex",
         "media_transport",
         "capture_backend",
+        "barge_in_mode",
         "pulse_aec_source",
         "pulse_aec_sink",
         "pulse_aec_method",
@@ -78,6 +82,27 @@ _ALLOWED_KEYS = frozenset(
         "direct_capture_gain_db",
     }
 )
+
+
+def _validated_barge_in_mode(
+    candidate: object,
+    *,
+    full_duplex: bool,
+    media_transport: str,
+    capture_backend: str,
+) -> str:
+    if not isinstance(candidate, str) or candidate not in SUPPORTED_BARGE_IN_MODES:
+        raise ConfigError("barge_in_mode must be 'rollover' or 'upstream'")
+    if candidate == UPSTREAM_BARGE_IN_MODE and not (
+        full_duplex
+        and media_transport == BRIDGE_PCM_TRANSPORT
+        and capture_backend == NATIVE_AEC3_CAPTURE
+    ):
+        raise ConfigError(
+            "upstream barge_in_mode requires full-duplex bridge_pcm with "
+            "native_aec3 capture"
+        )
+    return candidate
 
 
 class ConfigError(ValueError):
@@ -106,6 +131,7 @@ class RealtimeConfig:
     full_duplex: bool
     media_transport: str = BRIDGE_PCM_TRANSPORT
     capture_backend: str = field(default=PULSEAUDIO_AEC_CAPTURE, kw_only=True)
+    barge_in_mode: str = field(default=ROLLOVER_BARGE_IN_MODE, kw_only=True)
     realtime_only: bool = field(default=False, kw_only=True)
     wake_probability_cutoff: float | None = field(default=None, kw_only=True)
     voice: str | None = None
@@ -155,6 +181,12 @@ class RealtimeConfig:
             )
         if self.capture_backend == NATIVE_AEC3_CAPTURE and not self.full_duplex:
             raise ConfigError("native_aec3 capture requires full_duplex")
+        _validated_barge_in_mode(
+            self.barge_in_mode,
+            full_duplex=self.full_duplex,
+            media_transport=self.media_transport,
+            capture_backend=self.capture_backend,
+        )
         capture_gain = self.direct_capture_gain_db
         if (
             isinstance(capture_gain, bool)
@@ -425,6 +457,12 @@ def load_config(
     if media_transport == DEVICE_WEBRTC_TRANSPORT and not full_duplex:
         raise ConfigError("device_webrtc media transport requires full_duplex")
     capture_backend = _capture_backend(decoded, full_duplex=full_duplex)
+    barge_in_mode = _validated_barge_in_mode(
+        decoded.get("barge_in_mode", ROLLOVER_BARGE_IN_MODE),
+        full_duplex=full_duplex,
+        media_transport=media_transport,
+        capture_backend=capture_backend,
+    )
     direct_capture_gain_db = _bounded_float(
         decoded,
         "direct_capture_gain_db",
@@ -562,6 +600,7 @@ def load_config(
         full_duplex=full_duplex,
         media_transport=media_transport,
         capture_backend=capture_backend,
+        barge_in_mode=barge_in_mode,
         direct_capture_gain_db=direct_capture_gain_db,
         realtime_only=realtime_only,
         wake_probability_cutoff=wake_probability_cutoff,

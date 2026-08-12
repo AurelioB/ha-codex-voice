@@ -22,6 +22,7 @@ from device.thirdreality.realtime_client.config import (
     DEVICE_WEBRTC_TRANSPORT,
     NATIVE_AEC3_CAPTURE,
     PULSEAUDIO_AEC_CAPTURE,
+    UPSTREAM_BARGE_IN_MODE,
     RealtimeConfig,
 )
 from device.thirdreality.realtime_client.session import (
@@ -8055,6 +8056,80 @@ def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
     session.stop()
     assert session.join(1.0)
     assert connection.json_sent.count({"type": "stop"}) == 1
+
+
+def test_upstream_barge_keeps_one_provider_until_model_publishes_user_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module,
+        "_LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS",
+        0.0,
+    )
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    _install_fake_loop_io(monkeypatch, player)
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=12.0,
+            barge_in_mode=UPSTREAM_BARGE_IN_MODE,
+        ),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+        aec_verifier=lambda _config: None,
+        direct_player_factory=lambda _maximum, _sink: player,
+    )
+
+    session.start()
+    assert connection.wait_for_json(
+        {
+            "type": "start",
+            "protocol_version": 2,
+            "conversation_mode": "native",
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
+    )
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+    connection.feed(
+        Message(
+            "text",
+            json.dumps(
+                {
+                    "type": "control",
+                    "event_type": "speaking.started",
+                    "output_epoch": 1,
+                }
+            ),
+        )
+    )
+    assert _wait_for(lambda: session.output_active)
+    _force_render_matched_near_end(session)
+    speech = struct.pack("<1024h", *([1_024, -1_024] * 512))
+
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert session.submit_audio(speech) is SubmitResult.ACCEPTED
+    assert connection.wait_for_binary_count(2)
+    assert {"type": "barge"} not in connection.json_sent
+    assert session.output_active
+    assert player.events == [("prepare", None), ("begin", 1)]
+
+    connection.feed(
+        Message(
+            "text",
+            '{"type":"control","event_type":"turn.created","role":"user"}',
+        )
+    )
+    assert _wait_for(lambda: not session.output_active)
+    assert player.events[-1] == ("abort", None)
+    assert {"type": "barge"} not in connection.json_sent
+    assert session.state is SessionState.READY
+    assert not session.terminal
+
+    session.stop()
+    assert session.join(1.0)
 
 
 def test_network_thread_sends_optional_voice_and_prompt_only_when_configured(

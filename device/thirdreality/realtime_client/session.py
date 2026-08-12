@@ -28,6 +28,7 @@ from .config import (
     NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
     PULSEAUDIO_AEC_CAPTURE,
+    UPSTREAM_BARGE_IN_MODE,
     RealtimeConfig,
     realtime_start_message,
 )
@@ -2472,6 +2473,17 @@ class RealtimeSession:
             render_suppressed_for_bridge = (
                 self._config.media_transport == BRIDGE_PCM_TRANSPORT and suppress_bridge
             )
+            if self._config.barge_in_mode == UPSTREAM_BARGE_IN_MODE:
+                # Match Codex's first-party WebRTC client: keep one continuous
+                # provider session and let the upstream Frameless model publish
+                # the user-turn boundary. The bounded role-only control then
+                # clears any locally queued assistant tail in _handle_message.
+                # Native AEC3 PCM remains continuous and unmodified here.
+                self._local_barge_in_requested_epoch = None
+                self._local_barge_in_requested_watermark = None
+                self._local_barge_in_frames = 0
+                self._local_barge_in_ambiguous_frames = 0
+                return disposition()
             effective_signal = has_signal and not (
                 render_suppressed_for_bridge
                 or (decision is not None and decision.kind is _EchoDecisionKind.ECHO)

@@ -24,6 +24,8 @@ from device.thirdreality.realtime_client.config import (
     NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
     PULSEAUDIO_AEC_CAPTURE,
+    ROLLOVER_BARGE_IN_MODE,
+    UPSTREAM_BARGE_IN_MODE,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -64,6 +66,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.full_duplex is False
     assert config.media_transport == BRIDGE_PCM_TRANSPORT
     assert config.capture_backend == PULSEAUDIO_AEC_CAPTURE
+    assert config.barge_in_mode == ROLLOVER_BARGE_IN_MODE
     assert config.direct_capture_gain_db == DEFAULT_DIRECT_CAPTURE_GAIN_DB
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
@@ -108,6 +111,41 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert config.prompt == private_prompt
     assert config.wake_probability_cutoff == 0.85
     assert private_prompt not in repr(config)
+
+
+def test_config_allows_upstream_barge_in_only_for_native_full_duplex_bridge(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    base = {
+        **_valid_config(),
+        "full_duplex": True,
+        "capture_backend": NATIVE_AEC3_CAPTURE,
+        "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+        "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        "barge_in_mode": UPSTREAM_BARGE_IN_MODE,
+    }
+    _write_config(path, base)
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.barge_in_mode == UPSTREAM_BARGE_IN_MODE
+
+    for incompatible, error in (
+        ({**base, "full_duplex": False}, "native_aec3 capture requires"),
+        (
+            {**base, "capture_backend": PULSEAUDIO_AEC_CAPTURE},
+            "upstream barge_in_mode requires",
+        ),
+        (
+            {**base, "media_transport": DEVICE_WEBRTC_TRANSPORT},
+            "upstream barge_in_mode requires",
+        ),
+    ):
+        _write_config(path, incompatible)
+        with pytest.raises(ConfigError, match=error):
+            load_config(path, expected_uid=os.getuid())
 
 
 def test_config_allows_normal_wake_phrase_only_for_realtime_only(
