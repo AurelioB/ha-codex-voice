@@ -18,7 +18,7 @@
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 60,
-  "playback_volume_percent": 60,
+  "aec_sink_volume_ceiling_percent": 100,
+  "playback_volume_percent": 100,
   "direct_capture_gain_db": 12
 }

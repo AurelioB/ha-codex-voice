@@ -105,7 +105,7 @@ The active latency and safety bounds are:
 | Server input-track age | 2,250 ms | Fails instead of presenting stale microphone audio |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds 24 kHz mono PCM16 output |
 | Capture gain | +12 dB maximum, saturating | Raises post-AEC provider input without changing local wake/AEC samples |
-| Playback | Fixed 60% sink anchor, 100%-relative stream | One later non-amplifying software stage controls audible volume |
+| Playback | Fixed 100% sink anchor, 100%-relative stream | One later non-amplifying software stage exposes mute at 0 and audible levels 1–100% without PCM amplification |
 | Session lifetime | 120 s semantic idle / 900 s hard maximum | Normal provider delay does not end the session; explicit end/terminal state does |
 | Barge-in | Two qualifying AEC-filtered callbacks | Cuts local playback while causal PCM continues on the same peer |
 
@@ -133,7 +133,7 @@ The shipped bounds are intentionally small and fail closed:
 | V3 decoded-receiver quiet boundary | About 120 ms without PCM meeting both peak 64 and RMS 8 | Splits only normal media generations; exact silence and sub-audible Opus residue are not played or semantic, while every decoded RTP frame still participates in the independent interruption fence |
 | V3 first-playback AEC settle | One 512 ms window per fresh peer/new `paplay` onset | Sends timestamp-preserving capture silence and ignores local barge-in evidence while the physical AEC converges; a normal quiet boundary that reuses the player does not restart it |
 | V3 fresh-peer rollover | 4 KiB / 128 ms recent AEC pre-roll; eight detector-quiet 64 ms frames (512 ms) to rearm after a committed interruption; 2.25 s maximum capture age rechecked at RTP consumption; configured handshake deadline | Stops local output immediately; one uninterrupted local speech segment retires only one peer; exactly one reusable worker holds an active plus offer-warm standby PeerConnection and promotes the standby in order; an absent/invalid standby terminates the outer session without another worker; pre-ack output is inaudible within `output_queue_bytes`; negotiation remains measurable |
-| Full-duplex AEC sink ceiling | Configured guard, 1–60% (25% default), restored exactly at direct-session preflight, checked before every response, and reconciled by the guarded 50 ms firmware settings loop after a physical-button change | The ordinary unchanged tick only reads the small settings file; physical reconciliation has one 75 ms whole-transaction deadline, starts a 128 ms stale-tail guard before I/O, and fails output closed if the anchor cannot be restored exactly |
+| Full-duplex AEC sink ceiling | Configured guard, 1–100% (25% default), restored exactly at direct-session preflight, checked before every response, and reconciled by the guarded 50 ms firmware settings loop after a physical-button change | The ordinary unchanged tick only reads the small settings file; physical reconciliation has one 75 ms whole-transaction deadline, starts a 128 ms stale-tail guard before I/O, and fails output closed if the anchor cannot be restored exactly |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
 | Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
 | Legacy managed: App Server tool fallback | 45 s | Remains responsible until the result write completes |
@@ -186,7 +186,7 @@ the microphone gate stays closed from `speaking.started` until the
 corresponding PCM has drained from both the local queue and playback child.
 V3 `device_webrtc` requires full duplex and a reviewed static PulseAudio AEC topology using the
 exact configured allowlisted engine, exact current-process capture and playback
-routing, and a configured sink ceiling from 1–60% with a 25% default. WebRTC is the omitted-value
+routing, and a configured sink ceiling from 1–100% with a 25% default. WebRTC is the omitted-value
 default and never automatically falls back. The stock v1.1.7 build rejects
 WebRTC and Speex, so active stock-device deployments explicitly select Adrian.
 The client checks that topology, method, and ceiling before constructing the
@@ -204,13 +204,15 @@ derives its `paplay` stream volume from the configured percentage.
 
 During a live direct owner, matching Home Assistant volume commands also avoid
 PulseAudio entirely. The overlay consumes volume/mute/unmute before the vendor
-players, caps the desired level at the qualified playback anchor, and updates
-the saved entity state. The parent applies the PulseAudio-compatible cubic
-ratio to PCM at the next 20 ms staging boundary with a 40 ms non-amplifying
-ramp; partially written staged PCM is never transformed twice. Capture and
-local barge-in remain continuous. Consequently the AEC sink stays fixed, its
-render reference contains the exact attenuated waveform, and a requested level
-above the anchor cannot recreate an unqualified acoustic path.
+players, accepts 0 as mute and 1–100% as audible, caps the desired level at the
+configured playback anchor, and updates the saved entity state. The active
+100% anchor therefore lets physical buttons use the full hardware range. A
+deployment may save 80% as its initial audible level; the parent applies the
+PulseAudio-compatible cubic ratio to PCM at the next 20 ms staging boundary
+with a 40 ms non-amplifying ramp. It never boosts PCM above the incoming raw
+amplitude, and partially written staged PCM is never transformed twice. Capture
+and local barge-in remain continuous. Consequently the AEC sink stays fixed
+and its render reference contains the exact attenuated waveform.
 
 The stock physical buttons otherwise bypass Home Assistant and write both the
 default PulseAudio sink and `sound.json`. The guarded overlay reduces the
@@ -398,7 +400,8 @@ thinking LED; at most three attempts in the shared 12-second deadline; exact
 server readiness; one pinned cue and its two-second timeout; zero admitted
 pre-ready PCM; cue-EOF capture opening; long same-peer conversation; first
 audio; queue failure; repeated sessions; and recovery after bridge or Wi-Fi
-loss. At the fixed 60% anchor and all software-volume levels, test no-user
+loss. At the fixed 100% anchor and representative software-volume levels,
+including 0, 1, 25, 60, 80, and 100%, test no-user
 self-echo plus early/middle/late near-end speech. The playback cut must be
 prompt and the causal words must become the next request without replay, a new
 peer, a second sentence, or another wake. Also verify +12 dB saturation,
@@ -869,7 +872,9 @@ route: every installation and increase above its previously qualified values
 needs its own physical double-talk and echo-rejection canaries. Native AEC3 is selected by
 `capture_backend: "native_aec3"` in the secure realtime configuration; the
 environment flag is only an explicit diagnostic override. The active reference
-configuration uses +12 dB post-AEC gain and a 60% sink/playback anchor.
+configuration uses +12 dB post-AEC microphone gain and a 100% sink/playback
+anchor. Its saved starting output may be 80%, implemented as non-amplifying
+software attenuation below that anchor.
 
 ### Finished speaking detection
 

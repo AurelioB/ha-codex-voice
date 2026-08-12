@@ -6,9 +6,9 @@ scripts never restart PulseAudio or the voice service, never change the running
 speaker volume, and never change or disable TCP ADB on port 5555.
 
 The active route is strict-v2 `bridge_pcm` with full duplex, native AEC3,
-+12 dB bounded post-AEC capture gain, and a physically qualified 60%
-sink/playback anchor. `paplay` uses 100% relative stream volume and dynamic
-volume uses one software attenuation stage. The dormant `device_webrtc`
++12 dB bounded post-AEC capture gain, and a fixed 100% sink/playback anchor.
+`paplay` uses 100% relative stream volume and one non-amplifying software stage
+gives the physical buttons their full 0–100% range. The dormant `device_webrtc`
 sidecar is not required for this deployment.
 
 ## Latch configured microphone gain before capture opens
@@ -99,7 +99,7 @@ Speex, or
 [`pulse/codex-echo-cancel-adrian.pa`](pulse/codex-echo-cancel-adrian.pa) for
 Adrian. Only `webrtc`, `speex`, and `adrian` are accepted. Omitting the flag
 selects WebRTC; the helper does not probe engines or fall back automatically.
-`--aec-sink-volume-percent` selects a startup value from 1 through 60 and
+`--aec-sink-volume-percent` selects a startup value from 1 through 100 and
 defaults to 25. The managed block renders the exact PulseAudio raw value
 (`65536 × percent // 100`) immediately after the AEC sink is created.
 `check`, `install`, and `remove` are content-safe and idempotent;
@@ -118,14 +118,13 @@ Example device-side sequence after copying the reviewed assets from a pinned
 release:
 
 ```sh
-python3 prepare_pulseaudio_aec.py check --aec-method adrian --aec-sink-volume-percent 60
-python3 prepare_pulseaudio_aec.py install --aec-method adrian --aec-sink-volume-percent 60
-python3 prepare_pulseaudio_aec.py install --aec-method adrian --aec-sink-volume-percent 60 --apply
+python3 prepare_pulseaudio_aec.py check --aec-method adrian --aec-sink-volume-percent 100
+python3 prepare_pulseaudio_aec.py install --aec-method adrian --aec-sink-volume-percent 100
+python3 prepare_pulseaudio_aec.py install --aec-method adrian --aec-sink-volume-percent 100 --apply
 ```
 
-Use 60 only for an installation that will be physically qualified at 60;
-otherwise omit the option for the safe 25% default or pass the lower reviewed
-value explicitly. A released legacy managed block without a startup volume is
+The active full-range reference uses 100 and must pass its worst-case acoustic
+qualification at that anchor. A released legacy managed block without a startup volume is
 recognized for removal, but is not silently upgraded. Remove it with the dry
 run/apply pair documented below, then reinstall with the chosen method and
 volume so the change remains auditable.
@@ -150,10 +149,11 @@ The source and sink must be `codex_echo_cancel_source` and
 `module-echo-cancel` instance must use `aec_method=adrian` and
 `use_master_format=1` with the reviewed raw masters. The root-only realtime
 configuration must name the same method and its sink ceiling must match the
-managed startup value and the device's Home Assistant media-player volume. At
-60%, the media-player entity must report `volume_level: 0.6`, its vendor
-preference must report `"volume": 60`, and `pactl get-sink-volume` must report
-raw `39321` for every channel; 25% is raw `16384`. The realtime client repeats
+managed startup anchor. At 100%, `pactl get-sink-volume` must report raw
+`65536` for every channel. A saved 80% user level is separately reported as
+`volume_level: 0.8`/`"volume": 80` and is implemented by the runtime
+attenuator; 80% is raw `52428` only when no direct session owns the fixed
+anchor. The realtime client repeats
 these checks before opening the bridge socket and refuses a mismatched or
 unsupported engine instead of falling back. It additionally requires an uncorked
 `protocol-native.c` capture stream owned by its exact process PID (the vendor
@@ -180,11 +180,10 @@ acoustic echo cancellation. For the first physical double-talk canary, read
 `aec_sink_volume_ceiling_percent` from the reviewed root-only realtime config
 and set the AEC sink to it. Active v2 reads
 `playback_volume_percent`; configuration rejects that value above the sink
-ceiling. The active reference explicitly sets both to 60; the schema range is
-1–60. Never
-increase the active value above a previously qualified level without repeating
-AEC qualification at the new value. Lower it for a quiet room or near-field test. Record the
-pre-test volume separately and restore it only after echo-rejection,
+ceiling. The active full-range reference explicitly sets both to 100; the
+schema range is 1–100. A saved level such as 80 is applied later by the single
+non-amplifying runtime attenuator and does not lower this physical anchor.
+Record the pre-test volume separately and restore it only after echo-rejection,
 early/middle/late barge-in, wake, normal Assist, and repeated-turn tests pass.
 The helper intentionally does not change the running sink. Its static startup
 setpoint takes effect on the next controlled PulseAudio/service start; use the
@@ -193,13 +192,13 @@ following runtime command only for the immediate canary.
 For the active reference canary value, the explicit device-side volume command is:
 
 ```sh
-pactl set-sink-volume codex_echo_cancel_sink 60%
+pactl set-sink-volume codex_echo_cancel_sink 100%
 ```
 
-Use the exact configured ceiling. A 60% deployment must explicitly configure
-60 in the installer and root-only realtime configuration, set the official
-Home Assistant media-player entity to 60%, run the sink command with 60% for an
-immediate canary before restart, and pass the complete no-user echo plus
+Use the exact configured anchor. The full-range reference must explicitly
+configure 100 in the installer and root-only realtime configuration, run the
+sink command with 100% for an immediate worst-case canary before restart, and
+pass the complete no-user echo plus
 early/middle/late double-talk canaries before normal use. The static command
 provides the initial setpoint; the vendor media-player preference is the later
 writer and reboot-persistence authority. They must agree. PulseAudio's deferred
@@ -216,15 +215,15 @@ realtime configuration enable the server-offloaded route:
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 60,
-  "playback_volume_percent": 60,
+  "aec_sink_volume_ceiling_percent": 100,
+  "playback_volume_percent": 100,
   "direct_capture_gain_db": 12
 }
 ```
 
 These checks qualify only the AEC topology and acoustics. The earlier 25%
 reference measurements exercised an older v2 bridge-PCM configuration; they do
-not qualify active native-AEC3 v2 at 60%. The dormant v3 build kept one
+not qualify active native-AEC3 v2 at 100%. The dormant v3 build kept one
 isolated sidecar OS process; its active and offer-warm standby peers are logical
 slots within that worker, and the first standby is gated until readiness, cue
 completion, and capture-open. A historical two-worker v3 build separately

@@ -84,7 +84,7 @@ and releases use semantic versioning.
 ### Changed
 
 - Route the current controlled Okay Nabu deployment to full-duplex
-  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 12`, a fixed 60%
+  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 12`, a fixed 100%
   playback anchor, and `realtime_only: true`; defer Home Assistant
   Assist/Hermes and entity tools. The device-owned v3 implementation remains
   available in source as a dormant rollback experiment.
@@ -105,13 +105,18 @@ and releases use semantic versioning.
   cleanup returns the LED to idle.
 - Keep the qualified realtime AEC sink and `paplay` stream gain fixed
   while a realtime session owns audio. Home Assistant volume, mute, and unmute
-  commands are intercepted before the vendor players, capped at the configured
-  playback anchor, persisted, and applied with PulseAudio-compatible cubic
+  commands are intercepted before the vendor players, accepted across mute at
+  0 and audible levels 1–100%, capped at the configured playback anchor,
+  persisted, and applied with PulseAudio-compatible cubic
   attenuation plus a click-free 40 ms ramp at the next 20 ms PCM staging
-  boundary. Guard the pinned firmware's physical-button bridge too: shorten its
-  settings monitor from 500 ms to 50 ms, restore and verify any changed AEC
-  sink before the two-frame local-interruption boundary, and require the exact
-  anchor again before every response. A bounded render-aware double-talk guard
+  boundary. Raise the configuration ceiling from 60% to 100% and fix the active
+  reference anchor at 100%, so the physical buttons can reach the full hardware
+  range; a saved initial level such as 80% remains non-amplifying software
+  attenuation below that anchor. Guard the pinned firmware's physical-button
+  bridge too: shorten its settings monitor from 500 ms to 50 ms, restore and
+  verify any changed AEC sink before the two-frame local-interruption boundary,
+  and require the exact anchor again before every response. A bounded
+  render-aware double-talk guard
   learns only during the existing AEC convergence window and rejects
   high-confidence self-echo while uncertain speech fails open. A trained model
   survives ordinary response gaps. A repaired volume excursion retains only
@@ -141,7 +146,7 @@ and releases use semantic versioning.
   limit remains activity-based; the hard limit still covers local preflight,
   negotiation, runtime, and rollover.
 - Configure the disabled ThirdReality example for the active `bridge_pcm`
-  route, native AEC3, a 12 dB post-AEC capture gain, 60% sink/playback
+  route, native AEC3, a 12 dB post-AEC capture gain, 100% sink/playback
   ceilings, `realtime_only`, Okay Nabu, and a Mexican Spanish prompt.
 - Make direct v3 epoch 1 start with zero captured audio: discard the wake-tail
   history and every connecting/cue frame instead of forwarding the former

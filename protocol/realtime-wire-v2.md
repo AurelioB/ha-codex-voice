@@ -263,10 +263,14 @@ stream routed through the uncorked AEC source. The allowlist is `webrtc`,
 `speex`, and `adrian`; omitted configuration defaults to WebRTC and never falls
 back automatically. Every AEC sink channel must be at or below the configured
 `aec_sink_volume_ceiling_percent`, which defaults to 25 and is limited to
-1–60. The same sink ceiling is rechecked before every speaking epoch, and
+1–100. The same sink ceiling is rechecked before every speaking epoch, and
 `paplay` is pinned to the AEC sink with the independently configured fixed
-linear `playback_volume_percent`, also defaulting to 25 and limited to 1–60.
+linear `playback_volume_percent`, also defaulting to 25 and limited to 1–100.
 Configuration is rejected when playback exceeds the sink ceiling.
+The active reference route fixes both values at 100 so a separate runtime
+software control can expose mute at 0 and audible levels 1–100 without moving
+the AEC anchor. A saved initial level such as 80 is non-amplifying attenuation
+below that anchor; no user-facing setting amplifies playback PCM.
 The reference deployment helper writes the matching raw sink setpoint in the
 static PulseAudio startup block after AEC sink creation. On the stock device,
 the later vendor media-player preference must be persisted at the same value.

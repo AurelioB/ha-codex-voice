@@ -256,6 +256,7 @@ class _EchoDecision:
     correlation_permille: int = 0
     delay_ms: int = 0
     reference_matched: bool = False
+    interrupt_qualified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1230,12 +1231,20 @@ class _RenderEchoGuard:
                             len(ordered_delays) // 2
                         ]
 
+        interrupt_qualified = kind is _EchoDecisionKind.NEAR_END and (
+            correlation <= _RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE
+            or (
+                residual_near_end
+                and (not repair_pending or repair_seeded or fir_valid_frames >= 2)
+            )
+        )
         return _EchoDecision(
             kind,
             output_epoch,
             correlation_permille=correlation,
             delay_ms=round(delay_samples * 1_000 / _RENDER_ECHO_FEATURE_RATE),
             reference_matched=True,
+            interrupt_qualified=interrupt_qualified,
         )
 
     def _append_render_locked(self, samples: list[int]) -> None:
@@ -2372,7 +2381,28 @@ class RealtimeSession:
             transitioning = transitioning or self._local_anchor_transition.is_set()
             suppress_peer_epoch: int | None = None
             suppress_bridge = False
-            if provider_candidate and output_epoch is not None:
+            bridge_output_guarded = (
+                self._config.media_transport == BRIDGE_PCM_TRANSPORT
+                and output_epoch is not None
+            )
+            bridge_positive_near_end = (
+                decision is not None
+                and decision.epoch == output_epoch
+                and decision.kind is _EchoDecisionKind.NEAR_END
+                and decision.reference_matched
+                and decision.interrupt_qualified
+            )
+            if bridge_output_guarded:
+                # V2 keeps one provider peer across interruptions, so it cannot
+                # replay raw capture on a fresh peer after deciding which voice
+                # produced it. While render is active, require affirmative
+                # epoch-scoped near-end evidence before either the local cut or
+                # provider egress sees a frame. Missing/stale/untrained render
+                # deliberately returns an unmatched NEAR_END decision; treating
+                # that fail-open result as speech lets loud playback cancel
+                # itself after two recorder callbacks.
+                suppress_bridge = not bridge_positive_near_end
+            elif provider_candidate and output_epoch is not None:
                 if decision is None:
                     suppress = transitioning or settling
                 elif (
@@ -2401,15 +2431,6 @@ class RealtimeSession:
                 if suppress:
                     if self._config.media_transport == DEVICE_WEBRTC_TRANSPORT:
                         suppress_peer_epoch = peer_epoch
-                    elif decision is None or decision.kind in {
-                        _EchoDecisionKind.ECHO,
-                        _EchoDecisionKind.AMBIGUOUS,
-                    }:
-                        # Protocol v2 retains one provider peer across a local
-                        # interruption. Erase only playback-correlated capture;
-                        # a residual-heavy NEAR_END decision must remain raw on
-                        # that same peer instead of relying on v3 replay.
-                        suppress_bridge = True
 
             def disposition(*, local_interrupt: bool = False) -> _CaptureDisposition:
                 return _CaptureDisposition(

@@ -28,9 +28,10 @@ the idle LED. A later accepted wake creates a fresh WebSocket, peer, and
 realtime thread.
 
 The active configuration is strict-v2 `bridge_pcm`, native mode, full duplex,
-native AEC3, +12 dB bounded post-AEC capture gain, and a qualified 60%
+native AEC3, +12 dB bounded post-AEC capture gain, and a fixed 100%
 sink/playback anchor. The stream itself stays at 100% relative volume and one
-software attenuation stage implements dynamic user volume. During provider
+non-amplifying software stage gives the physical buttons their full 0–100%
+range. During provider
 speech, two-frame qualified near-end detection cuts local `paplay` immediately
 without discarding or replaying the causal microphone frames. The same server
 peer receives those frames in normal order; provider VAD cancels the old
@@ -68,10 +69,10 @@ transport or queue error clear both without persisting audio. The server's
 Native AEC3 is selected early from the root-owned mode-0600 configuration so
 the physical microphone/render-reference relationship remains local. +12 dB
 capture gain is saturating and applied only after cancellation, immediately
-before LAN transmission. Playback uses the dedicated qualified AEC sink at
-60%, a 100%-relative `paplay` stream, and a non-amplifying software attenuator.
-Changing either the sink anchor or maximum operational volume requires a new
-physical echo, normal-distance, and early/middle/late interruption canary.
+before LAN transmission. Playback uses the dedicated AEC sink and `paplay`
+stream at a fixed 100% anchor, plus a non-amplifying software attenuator for the
+saved button level. The active path requires a worst-case physical echo,
+normal-distance, and early/middle/late interruption canary at full output.
 
 The dormant v3 runtime described below is not launched by `bridge_pcm`.
 
@@ -209,8 +210,9 @@ player preparation, while the absolute 12-second owner deadline covers local
 work and all retries. The maximum-session clock remains a separate hard
 lifetime cap. The direct `paplay` child targets that sink with
 `--volume=65536` (100% relative) and never
-enumerates or mutates a sink-input. Configuration rejects a playback value
-above the 1–60% `aec_sink_volume_ceiling_percent`. Active v2 instead uses the
+enumerates or mutates a sink-input. Both volume controls accept 1–100%, and
+configuration rejects a playback value above the selected
+`aec_sink_volume_ceiling_percent`. Active v2 instead uses the
 same fixed sink anchor and 100%-relative stream with software attenuation.
 Matching Home
 Assistant volume, mute, and unmute commands are intercepted before either
@@ -408,12 +410,10 @@ installation's qualified 60% setting, alongside automated
 protocol, sidecar, queue, barge-in, cleanup, and runtime-install coverage. It
 does not qualify another speaker or replace the full acceptance matrix. Install
 and qualify the static PulseAudio AEC assets in [`deploy`](deploy) first. The
-active acoustic canary must use the configured 60% sink/playback anchor and
-100%-relative stream. The schema remains hard-limited to 1–60. Do
-not infer that 60% is qualified elsewhere or increase an active setting above a
-previously qualified level until echo
-rejection and early, middle, and late double-talk barge-in pass at the new value
-on that physical device. Speex is available
+active reference fixes the sink/playback anchor and relative stream at 100%,
+while a saved user level such as 80% is non-amplifying attenuation below that
+anchor. The full-output acoustic canary must pass before normal use; schema
+support alone is not physical qualification. Speex is available
 only on a different firmware build that actually compiles that engine.
 
 The production-qualified fallback remains this static Adrian topology plus the
@@ -647,8 +647,8 @@ realtime-only route; this is the minimal active configuration:
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 60,
-  "playback_volume_percent": 60,
+  "aec_sink_volume_ceiling_percent": 100,
+  "playback_volume_percent": 100,
   "direct_capture_gain_db": 12
 }
 ```
@@ -658,24 +658,25 @@ explicit act. Active v2 does not require the pinned sidecar runtime, but it
 does assert that native AEC3 and the physically qualified AEC/playback topology
 are installed.
 On the observed stock v1.1.7 PulseAudio build, `adrian` is the available engine;
-the AEC names and 60% sink ceiling must exactly match the reviewed static block
+the AEC names and 100% sink ceiling must exactly match the reviewed static block
 and the device's media-player preference. Playback must not exceed that
 ceiling. Do not set only
 `enabled: true` until the
 native-AEC3 build verification, static topology checks, and physical echo/double-talk
 canaries have passed.
 
-The reference deployment uses 60% because that exact speaker was qualified at
-60%; that result is not transferable to another speaker or room.
+The active reference uses a 100% fixed physical anchor so the speaker buttons
+retain their full range. Its previous 60% result is historical and does not
+qualify the new full-output path or another speaker or room.
 
 The configured playback value is the qualified physical anchor, not a hardcoded
 audible level. While direct realtime owns audio, Home Assistant may select any
 level from silence through that anchor without moving the AEC sink; higher
 requests are reported and persisted at the anchor. Qualified deployments may
-set both configuration values up to the enforced 60% maximum, and every anchor
-increase requires a new physical echo/double-talk canary. Render correlation
-does not make an unqualified higher anchor safe: downstream clipping is
-nonlinear and can no longer resemble the reference.
+set both configuration values up to the enforced 100% maximum, but every
+anchor increase requires a new physical echo/double-talk canary. Render
+correlation does not make an unqualified higher anchor safe: downstream
+clipping is nonlinear and can no longer resemble the reference.
 
 Use `wss` with normal certificate validation whenever the path is not a
 source-restricted trusted LAN. `connect_address` must be the numeric address to
@@ -734,7 +735,7 @@ exact fail-closed block after the `hw:0,2` capture and `hw:0,1` playback
 masters. Its `--aec-method` allowlist is `webrtc`, `speex`, and `adrian`; an
 omitted flag means WebRTC and never triggers a fallback. The stock v1.1.7 image
 must use `--aec-method adrian`. The helper never restarts services, changes
-the live volume, or changes ADB. It requires an explicit 1–60% startup sink
+the live volume, or changes ADB. It requires an explicit 1–100% startup sink
 value (`--aec-sink-volume-percent`, default 25) and writes its exact raw
 PulseAudio value into the managed block after sink creation. The stock vendor
 voice process subsequently applies its Home Assistant media-player preference,
@@ -752,8 +753,8 @@ environment edit is required:
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 60,
-  "playback_volume_percent": 60,
+  "aec_sink_volume_ceiling_percent": 100,
+  "playback_volume_percent": 100,
   "direct_capture_gain_db": 12
 }
 ```
@@ -764,14 +765,12 @@ selection hook for controlled diagnostics. It does not replace the validated
 internal proof written only after the early recorder patch succeeds; do not set
 it in the service environment.
 
-To run this device at 60%, install the static block with
-`--aec-sink-volume-percent 60`, set the sink ceiling and active v2 playback
-value to `60`, set the
-live AEC sink to 60% for the immediate canary, and repeat the complete physical
-qualification before normal use. Also set the device's official Home Assistant
-media-player entity to `0.6`; its persisted `sound.json` value is the later
-post-startup writer and must remain `60`. The startup line uses raw `39321` as
-the initial setpoint, and both layers must agree across restart or reboot.
+For the full-range reference, install the static block with
+`--aec-sink-volume-percent 100`, set the sink ceiling and active v2 playback
+anchor to `100`, and set the live AEC sink to 100% for the worst-case acoustic
+canary. The saved device level may start at 80%; it is implemented by the one
+runtime attenuator and the physical buttons can still reach 100%. The startup
+anchor uses raw `65536` and must remain fixed across restart or reboot.
 Existing released blocks without a startup-volume line must be explicitly
 removed and then reinstalled; the helper will not silently rewrite a different
 managed block.
@@ -782,7 +781,7 @@ PulseAudio object names must start with an ASCII letter, contain only ASCII
 letters, digits, `.` or `_`, and be at most 128 characters. Supplying an AEC
 route or method while full duplex is disabled, omitting either route while it
 is enabled, selecting a method outside the three-value allowlist, combining the
-legacy and explicit volume keys, or setting either volume outside 1–60 fails
+legacy and explicit volume keys, or setting either volume outside 1–100 fails
 configuration loading. Omitting the method in
 full duplex selects WebRTC rather than detecting or substituting an available
 engine. The shipped disabled configuration example intentionally names the
@@ -816,8 +815,8 @@ selects the server-offloaded transport:
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
   "pulse_aec_method": "adrian",
-  "aec_sink_volume_ceiling_percent": 60,
-  "playback_volume_percent": 60,
+  "aec_sink_volume_ceiling_percent": 100,
+  "playback_volume_percent": 100,
   "direct_capture_gain_db": 12
 }
 ```
@@ -881,7 +880,7 @@ passes all of the following on the physical speaker:
    idle LED and release ownership. No captured audio enters Assist/Hermes.
 3. Normal, quiet, loud, close, 1.5 m, and room-edge speech reaches provider VAD
    with the configured native AEC3 and +12 dB post-AEC gain without clipping.
-4. At the qualified 60% anchor and every permitted software volume, no-user
+4. At the fixed 100% anchor and representative software levels through 100%, no-user
    playback does not self-interrupt. Early, middle, and late near-end speech
    cuts playback promptly and the exact causal words become the next request;
    no second sentence or wake is needed.

@@ -562,6 +562,21 @@ def _calibrated_render_echo_guard() -> tuple[_RenderEchoGuard, list[int]]:
     return guard, features
 
 
+def _force_render_matched_near_end(session: RealtimeSession) -> None:
+    """Give lifecycle-focused bridge tests affirmative near-end evidence."""
+    guard = session._render_echo_guard
+    assert guard is not None
+    guard.classify = (  # type: ignore[method-assign]
+        lambda *_args, output_epoch, **_kwargs: _EchoDecision(
+            _EchoDecisionKind.NEAR_END,
+            output_epoch,
+            correlation_permille=200,
+            reference_matched=True,
+            interrupt_qualified=True,
+        )
+    )
+
+
 def test_shutdown_closes_idle_prewarmed_sidecar_and_blocks_rewarm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3372,6 +3387,7 @@ def test_render_echo_guard_tracks_cubic_retarget_without_barge_blackout() -> Non
 
     assert mixed_decision is not None
     assert mixed_decision.kind is _EchoDecisionKind.NEAR_END
+    assert mixed_decision.interrupt_qualified
 
 
 def test_render_echo_guard_fails_open_before_calibration() -> None:
@@ -3396,6 +3412,7 @@ def test_render_echo_guard_fails_open_before_calibration() -> None:
 
     assert decision is not None
     assert decision.kind is _EchoDecisionKind.NEAR_END
+    assert not decision.interrupt_qualified
 
 
 def test_render_echo_guard_preserves_genuine_double_talk() -> None:
@@ -3422,6 +3439,7 @@ def test_render_echo_guard_preserves_genuine_double_talk() -> None:
 
     assert decision is not None
     assert decision.kind is _EchoDecisionKind.NEAR_END
+    assert decision.interrupt_qualified
 
 
 def test_render_echo_guard_quiet_stale_and_missing_reference_fail_open() -> None:
@@ -3459,6 +3477,9 @@ def test_render_echo_guard_quiet_stale_and_missing_reference_fail_open() -> None
     assert missing is not None and missing.kind is _EchoDecisionKind.NEAR_END
     assert quiet is not None and quiet.kind is _EchoDecisionKind.NEAR_END
     assert stale is not None and stale.kind is _EchoDecisionKind.NEAR_END
+    assert not missing.interrupt_qualified
+    assert not quiet.interrupt_qualified
+    assert not stale.interrupt_qualified
 
 
 def test_render_echo_guard_is_bounded_and_resets_partial_epoch_state() -> None:
@@ -6469,6 +6490,7 @@ def test_local_barge_in_flushes_after_two_speech_frames_without_stopping(
         output_epoch=None,
         last_output_epoch=0,
     )
+    _force_render_matched_near_end(session)
     now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
     quiet = b"\0" * 2_048
@@ -6642,6 +6664,7 @@ def test_local_barge_in_counter_survives_faster_no_request_network_polls() -> No
         output_epoch=None,
         last_output_epoch=0,
     )
+    _force_render_matched_near_end(session)
     now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
 
@@ -6700,6 +6723,7 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
         output_epoch=None,
         last_output_epoch=0,
     )
+    _force_render_matched_near_end(session)
     now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
@@ -7245,6 +7269,7 @@ def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
             correlation_permille=200,
             delay_ms=160,
             reference_matched=True,
+            interrupt_qualified=True,
         ),
     )
     user_speech = struct.pack("<1024h", *([1_000, -1_000] * 512))
@@ -7359,6 +7384,64 @@ def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
     assert player.events == [("begin", 1), ("abort", None), ("begin", 2)]
 
 
+@pytest.mark.parametrize("missing_decision", [False, True])
+def test_bridge_native_unmatched_capture_during_output_is_silent_without_cut(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_decision: bool,
+) -> None:
+    now = [20.0]
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=12.0,
+            input_queue_bytes=8_192,
+        ),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, output_epoch, last_output_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    guard = session._render_echo_guard
+    assert guard is not None
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
+    if missing_decision:
+        monkeypatch.setattr(guard, "classify", lambda *_args, **_kwargs: None)
+    # With no accepted render writes, the real guard returns its untrained
+    # NEAR_END result with reference_matched=False. This was the physical
+    # self-interruption path: absence of proof must not count as human speech.
+    capture = struct.pack("<1024h", *([1_000, -1_000] * 512))
+    connection = _FakeRealtimeConnection()
+
+    for _ in range(2):
+        assert session.submit_audio(capture) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and packet.data is capture
+        assert packet.suppress_bridge
+
+    assert [value for value, _sent_at in connection.binary_sent] == [
+        bytes(len(capture)),
+        bytes(len(capture)),
+    ]
+    assert session._local_barge_in_requested_epoch is None
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=output_epoch,
+        last_output_epoch=last_output_epoch,
+    ) == (1, None)
+    assert session.output_active
+    assert player.events == [("begin", 1)]
+
+
 def test_bridge_native_decorrelated_near_end_aborts_and_stays_intact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7396,6 +7479,7 @@ def test_bridge_native_decorrelated_near_end_aborts_and_stays_intact(
             correlation_permille=200,
             delay_ms=160,
             reference_matched=True,
+            interrupt_qualified=True,
         ),
     )
     user_speech = struct.pack("<1024h", *([1_000, -1_000] * 512))

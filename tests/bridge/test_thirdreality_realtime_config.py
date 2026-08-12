@@ -406,9 +406,12 @@ def test_config_migrates_legacy_bounded_aec_volume_to_both_controls(
     assert config.aec_test_volume_percent == 12
 
 
-def test_config_accepts_explicit_sixty_percent_aec_and_playback(
+@pytest.mark.parametrize("volume_percent", [80, 100])
+def test_config_accepts_supported_high_volume_aec_and_playback(
     tmp_path: Path,
+    volume_percent: int,
 ) -> None:
+    assert MAX_REALTIME_VOLUME_PERCENT == 100
     path = tmp_path / "realtime.json"
     _write_config(
         path,
@@ -417,16 +420,16 @@ def test_config_accepts_explicit_sixty_percent_aec_and_playback(
             "full_duplex": True,
             "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
             "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
-            "aec_sink_volume_ceiling_percent": MAX_REALTIME_VOLUME_PERCENT,
-            "playback_volume_percent": MAX_REALTIME_VOLUME_PERCENT,
+            "aec_sink_volume_ceiling_percent": volume_percent,
+            "playback_volume_percent": volume_percent,
         },
     )
 
     config = load_config(path, expected_uid=os.getuid())
 
     assert config is not None
-    assert config.aec_sink_volume_ceiling_percent == 60
-    assert config.playback_volume_percent == 60
+    assert config.aec_sink_volume_ceiling_percent == volume_percent
+    assert config.playback_volume_percent == volume_percent
 
 
 def test_config_accepts_playback_below_aec_sink_ceiling(tmp_path: Path) -> None:
@@ -438,17 +441,17 @@ def test_config_accepts_playback_below_aec_sink_ceiling(tmp_path: Path) -> None:
             "full_duplex": True,
             "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
             "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
-            "aec_sink_volume_ceiling_percent": 60,
-            "playback_volume_percent": 40,
+            "aec_sink_volume_ceiling_percent": 80,
+            "playback_volume_percent": 60,
         },
     )
 
     config = load_config(path, expected_uid=os.getuid())
 
     assert config is not None
-    assert config.aec_sink_volume_ceiling_percent == 60
-    assert config.playback_volume_percent == 40
-    assert config.aec_test_volume_percent == 40
+    assert config.aec_sink_volume_ceiling_percent == 80
+    assert config.playback_volume_percent == 60
+    assert config.aec_test_volume_percent == 60
 
 
 def test_config_rejects_playback_above_aec_sink_ceiling(tmp_path: Path) -> None:
@@ -481,14 +484,14 @@ def test_legacy_direct_constructor_argument_still_couples_both_controls(
     assert legacy_config.aec_test_volume_percent == 60
 
 
-def test_direct_config_rejects_volume_above_sixty_percent(tmp_path: Path) -> None:
+def test_direct_config_rejects_volume_above_full_scale(tmp_path: Path) -> None:
     path = tmp_path / "realtime.json"
     _write_config(path, _valid_config())
     config = load_config(path, expected_uid=os.getuid())
     assert config is not None
 
-    with pytest.raises(ConfigError, match=r"playback_volume_percent.*1 through 60"):
-        replace(config, playback_volume_percent=61)
+    with pytest.raises(ConfigError, match=r"playback_volume_percent.*1 through 100"):
+        replace(config, playback_volume_percent=101)
 
 
 def test_direct_config_rejects_invalid_wake_probability_cutoff(
@@ -636,12 +639,12 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ),
         ({"aec_test_volume_percent": True}, "must be an integer"),
         ({"aec_test_volume_percent": 0}, "outside its supported range"),
-        ({"aec_test_volume_percent": 61}, "outside its supported range"),
+        ({"aec_test_volume_percent": 101}, "outside its supported range"),
         ({"playback_volume_percent": True}, "must be an integer"),
         ({"playback_volume_percent": 0}, "outside its supported range"),
-        ({"playback_volume_percent": 61}, "outside its supported range"),
+        ({"playback_volume_percent": 101}, "outside its supported range"),
         (
-            {"aec_sink_volume_ceiling_percent": 61},
+            {"aec_sink_volume_ceiling_percent": 101},
             "outside its supported range",
         ),
         (

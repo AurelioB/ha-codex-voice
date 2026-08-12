@@ -103,9 +103,11 @@ then cancels the response and consumes that utterance. There is no fresh-peer
 rollover or replacement delay. Provider `speech_started` independently fences
 late output; a local cut alone never claims remote cancellation.
 
-The dedicated sink remains at the qualified 60% anchor and `paplay` uses 100%
-relative stream volume. One non-amplifying software attenuator implements
-dynamic user volume, avoiding the earlier v2 double attenuation.
+The dedicated sink and `paplay` stream remain at the fixed 100% physical
+anchor. One non-amplifying software attenuator implements dynamic user volume:
+0 is mute and 1–100% is audible. A saved initial level such as 80% is below the
+anchor and can still be raised to the full hardware range with the physical
+buttons, avoiding the earlier v2 double attenuation.
 
 For legacy auto/managed compatibility, authority is selected from Conversation
 config subentries, not from a device message. Zero or multiple opted-in
@@ -375,8 +377,9 @@ accepted Okay Nabu wake
 provider audio -> server decode -> v2 speaking epoch + 24 kHz PCM16 -> paplay
 ```
 
-The active device is full duplex. Its fixed 60% sink anchor and
-100%-relative playback stream are separated from one software-volume stage.
+The active device is full duplex. Its fixed 100% sink anchor and
+100%-relative playback stream are separated from one non-amplifying
+software-volume stage that implements the physical 0/1–100% range.
 Local AEC-qualified speech cuts output immediately while its samples continue
 to the same peer; provider VAD owns response cancellation. The server exposes
 only `end_conversation`, and realtime-only failure returns idle without an
@@ -425,7 +428,7 @@ provider audio RTP =======================================> device aiortc peer
   -> continuous decoded lane; first audio / ~120 ms quiet media boundaries
   -> bounded 24 kHz mono PCM16 IPC; fixed-argv non-blocking paplay
   -> exact raw sink value; paplay raw relative volume 65536
-  -> AEC sink at configured 1–60% ceiling (25% default)
+  -> AEC sink at configured 1–100% ceiling (25% default)
 
 device v3 WebSocket -> SDP offer/answer + transport_ready/started/ping/stop
                       -> bridge/App Server (no PCM or raw provider data)
@@ -573,9 +576,10 @@ not replace the full per-installation acceptance matrix. The normative
 contract is [wire v3](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 The reference device's earlier 25% echo-residual/double-talk results exercised
-an older v2 bridge-PCM configuration. The active reference configuration is
-60%, but neither that nor the historical v3 qualification transfers to another
-speaker or room.
+an older v2 bridge-PCM configuration, and the historical v3 qualification was
+at 60%. The active reference configuration instead fixes the physical anchor
+at 100% and requires its own full-output qualification; none of those results
+transfers to another speaker or room.
 The v3 protocol, sidecar, runtime installer, queue, cancellation, and cleanup
 paths have automated local coverage plus the hardware canary above, but the
 full physical v3 acceptance matrix remains installation-specific.

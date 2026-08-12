@@ -133,11 +133,12 @@ jitter before cancellation and would make changing speaker volume harder to
 model. The capture gain is applied only after echo cancellation and before the
 PCM is sent to the host; saturation is bounded to signed PCM16.
 
-Playback uses one known sink level with a 100% relative stream. User-facing
-volume changes are applied in one software attenuation stage, so two virtual
-volume controls cannot accidentally make output too quiet. AEC qualification
-must pass at every allowed volume; the reference deployment's physical canary
-is run at 60%.
+Playback fixes the sink and relative stream at a 100% physical anchor.
+User-facing volume changes are applied in one non-amplifying software
+attenuation stage: 0 is mute and 1–100% is audible. A saved initial deployment
+level may be 80%, while the physical buttons remain able to reach full hardware
+output. The reference deployment must pass its physical canary at the 100%
+worst case and exercise representative attenuated levels.
 
 During provider speech the microphone never closes. Qualified near-end speech
 immediately kills and flushes local playback, fences all late PCM from that
@@ -258,8 +259,9 @@ conversation or a credential.
 3. Deploy the full-duplex `bridge_pcm` device configuration atomically. Restart
    only the vendor voice service; never disable ADB TCP and never restart or
    kill PulseAudio.
-4. Run the physical matrix below at 60%, followed by a long soak. Promote the
-   Compose port only after it passes.
+4. Run the physical matrix below at the fixed 100% anchor, including the
+   representative software levels listed below, followed by a long soak.
+   Promote the Compose port only after it passes.
 5. Keep the existing system service and device-owned WebRTC code intact until
    the new path has passed repeated cold boot and soak tests.
 
@@ -282,7 +284,9 @@ ThirdReality unit, not merely in mocked tests:
   sentence;
 - one continuous 10-minute conversation has no spontaneous close, process
   restart, OOM, response truncation, or audible crackle;
-- at 60% output, 20 assistant replies produce no self-interruption;
+- at 100% output, 20 assistant replies produce no self-interruption, and mute
+  plus 1, 25, 60, 80, and 100% physical-button levels all produce the expected
+  non-amplifying software level without moving the anchor;
 - 20 deliberate interruptions cut playback within 250 ms p95, retain the words
   that caused the cut, and produce the replacement response without a fresh
   WebRTC negotiation;
@@ -300,7 +304,7 @@ physical matrix.
 ## Milestones
 
 - **M1 — Server-offloaded native conversation:** Compose bridge, strict-v2
-  binary media, one server peer, deterministic startup, native AEC3, 60%
+  binary media, one server peer, deterministic startup, native AEC3, 100%
   playback, same-peer interruption, and explicit end. Home Assistant is absent.
 - **M2 — Measured latency work:** optimize only the largest measured latency
   segment. Trial one connected server warm slot only if provider negotiation is

@@ -157,10 +157,12 @@ sides of a narrow bridge API.
   media stack and App Server under a non-root UID matching the owner-only OAuth
   file, with a read-only root filesystem and bounded temporary storage.
 - Active `bridge_pcm` requires full duplex, `capture_backend: "native_aec3"`,
-  the reviewed AEC source/sink and Adrian topology, a 60% fixed sink/playback
+  the reviewed AEC source/sink and Adrian topology, a 100% fixed sink/playback
   anchor, and a 100%-relative stream. Dynamic volume is non-amplifying software
-  attenuation, so no second virtual volume lowers output. +12 dB capture gain
-  is saturating, occurs only after AEC, and affects only PCM sent to the bridge.
+  attenuation over mute at 0 and audible levels 1–100%; a saved 80% initial
+  level remains below the anchor and the physical buttons can still reach full
+  hardware output. +12 dB capture gain is saturating, occurs only after AEC,
+  and affects only microphone PCM sent to the bridge, never playback PCM.
   AEC-filtered near-end speech cuts local playback while its original causal
   PCM continues on the same socket and server peer. Provider VAD owns remote
   cancellation; the device never asserts that a local cut cancelled it.
@@ -193,7 +195,7 @@ sides of a narrow bridge API.
   and client never probe or automatically downgrade to another engine. Stock
   v1.1.7 must explicitly select Adrian because its module rejects the uncompiled
   WebRTC and Speex engines. The client checks the exact method before opening
-  the bridge socket, enforces a configured 1–60% sink ceiling with a safe 25%
+  the bridge socket, enforces a configured 1–100% sink ceiling with a safe 25%
   default, then at direct startup uses fixed-argv `pactl` to set and verify the
   dedicated sink at the exact configured raw playback value. Both checks finish
   before the SDP offer or bridge connection. Each attempt's five-second
@@ -218,7 +220,8 @@ sides of a narrow bridge API.
   stream values. The reference device's bounded 25% pass exercised the prior
   v2 path. Its separate v3 canary ran at that installation's qualified 60%
   setting. Neither result is transferable evidence for another device. The
-  active 60% reference configuration requires its own complete physical canary.
+  active 100% reference configuration requires its own complete physical
+  canary.
 - Native hardware-loopback AEC3 is explicitly enabled for the active reference
   route. Its selector is `capture_backend: "native_aec3"` in the root-owned
   mode-0600 `/data/conf/codex-realtime.json` with `bridge_pcm`. The overlay

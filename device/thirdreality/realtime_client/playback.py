@@ -6,7 +6,7 @@ import re
 import subprocess
 from collections.abc import Callable
 
-MAX_VOLUME_PERCENT = 60
+MAX_VOLUME_PERCENT = 100
 _PULSE_VOLUME_NORMAL = 65_536
 _PACTL_ARGV = ("/usr/bin/pactl",)
 _PULSE_RAW_VOLUME = re.compile(rb"([0-9]+)\s*/\s*[0-9]+%")

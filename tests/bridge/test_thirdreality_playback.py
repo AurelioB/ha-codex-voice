@@ -11,14 +11,17 @@ from device.thirdreality.realtime_client.playback import (
 )
 
 
-def test_pactl_volume_controller_uses_fixed_argv_and_exact_raw_units() -> None:
+@pytest.mark.parametrize("volume", [37, 80, 100])
+def test_pactl_volume_controller_uses_fixed_argv_and_exact_raw_units(
+    volume: int,
+) -> None:
     calls: list[tuple[list[str], dict[str, Any]]] = []
-    raw = 65_536 * 37 // 100
+    raw = 65_536 * volume // 100
 
     def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         calls.append((argv, kwargs))
         stdout = (
-            f"Volume: mono: {raw} / 37% / -8.64 dB\n".encode()
+            f"Volume: mono: {raw} / {volume}% / -8.64 dB\n".encode()
             if "get-sink-volume" in argv
             else b""
         )
@@ -26,7 +29,7 @@ def test_pactl_volume_controller_uses_fixed_argv_and_exact_raw_units() -> None:
 
     PactlSinkVolumeController(run=run).set_and_verify(
         "codex_echo_cancel_sink",
-        37,
+        volume,
     )
 
     assert [call[0] for call in calls] == [
@@ -46,7 +49,7 @@ def test_pactl_volume_controller_uses_fixed_argv_and_exact_raw_units() -> None:
     assert all(call[1]["timeout"] == 1.0 for call in calls)
 
 
-@pytest.mark.parametrize("volume", [0, 61, True])
+@pytest.mark.parametrize("volume", [0, 101, True])
 def test_pactl_volume_controller_rejects_out_of_bounds_values(volume: Any) -> None:
     with pytest.raises(PulsePlaybackError, match="out of bounds"):
         PactlSinkVolumeController().set_and_verify("sink", volume)
