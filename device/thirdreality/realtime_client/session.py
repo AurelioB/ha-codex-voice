@@ -23,6 +23,7 @@ from math import isqrt
 from typing import Any, NoReturn, Protocol
 
 from .config import (
+    BRIDGE_PCM_TRANSPORT,
     DEVICE_WEBRTC_TRANSPORT,
     NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
@@ -263,6 +264,7 @@ class _CaptureDisposition:
 
     local_interrupt: bool = False
     suppress_peer_epoch: int | None = None
+    suppress_bridge: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +273,7 @@ class _AudioPacket:
     captured_at: float
     capture_watermark: int
     suppress_peer_epoch: int | None = None
+    suppress_bridge: bool = False
 
 
 @dataclass(slots=True)
@@ -1871,8 +1874,10 @@ class RealtimeSession:
         self._render_echo_guard = (
             _RenderEchoGuard()
             if self._config.full_duplex
-            and self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
-            and self._config.capture_backend != NATIVE_AEC3_CAPTURE
+            and (
+                self._config.media_transport == BRIDGE_PCM_TRANSPORT
+                or self._config.capture_backend != NATIVE_AEC3_CAPTURE
+            )
             else None
         )
         self._direct_player_factory = direct_player_factory or (
@@ -2071,10 +2076,14 @@ class RealtimeSession:
                 captured_at=captured_at,
                 capture_watermark=capture_watermark,
             )
-            if disposition.suppress_peer_epoch is not None:
+            if (
+                disposition.suppress_peer_epoch is not None
+                or disposition.suppress_bridge
+            ):
                 annotated = replace(
                     packet,
                     suppress_peer_epoch=disposition.suppress_peer_epoch,
+                    suppress_bridge=disposition.suppress_bridge,
                 )
                 if not self._audio.replace_tail(packet, annotated):
                     self._fail_direct_anchor_reconciliation_state_locked()
@@ -2362,6 +2371,7 @@ class RealtimeSession:
 
             transitioning = transitioning or self._local_anchor_transition.is_set()
             suppress_peer_epoch: int | None = None
+            suppress_bridge = False
             if provider_candidate and output_epoch is not None:
                 if decision is None:
                     suppress = transitioning or settling
@@ -2389,16 +2399,31 @@ class RealtimeSession:
                         > _RENDER_ECHO_NEAR_END_CORRELATION_PERMILLE
                     )
                 if suppress:
-                    suppress_peer_epoch = peer_epoch
+                    if self._config.media_transport == DEVICE_WEBRTC_TRANSPORT:
+                        suppress_peer_epoch = peer_epoch
+                    elif decision is None or decision.kind in {
+                        _EchoDecisionKind.ECHO,
+                        _EchoDecisionKind.AMBIGUOUS,
+                    }:
+                        # Protocol v2 retains one provider peer across a local
+                        # interruption. Erase only playback-correlated capture;
+                        # a residual-heavy NEAR_END decision must remain raw on
+                        # that same peer instead of relying on v3 replay.
+                        suppress_bridge = True
 
             def disposition(*, local_interrupt: bool = False) -> _CaptureDisposition:
                 return _CaptureDisposition(
                     local_interrupt=local_interrupt,
                     suppress_peer_epoch=suppress_peer_epoch,
+                    suppress_bridge=suppress_bridge,
                 )
 
+            render_suppressed_for_bridge = (
+                self._config.media_transport == BRIDGE_PCM_TRANSPORT and suppress_bridge
+            )
             effective_signal = has_signal and not (
-                decision is not None and decision.kind is _EchoDecisionKind.ECHO
+                render_suppressed_for_bridge
+                or (decision is not None and decision.kind is _EchoDecisionKind.ECHO)
             )
             if transitioning or settling:
                 self._local_barge_in_requested_epoch = None
@@ -2462,8 +2487,10 @@ class RealtimeSession:
                 return disposition()
             if self._local_barge_in_requested_epoch is not None:
                 return disposition()
-            if not has_signal or (
-                decision is not None and decision.kind is _EchoDecisionKind.ECHO
+            if (
+                not has_signal
+                or render_suppressed_for_bridge
+                or (decision is not None and decision.kind is _EchoDecisionKind.ECHO)
             ):
                 self._local_barge_in_frames = 0
                 self._local_barge_in_ambiguous_frames = 0
@@ -2870,12 +2897,15 @@ class RealtimeSession:
                 packet, remaining_packets = self._audio.pop()
                 if packet is None:
                     return None, 0
-            connection.send_binary(
-                _apply_capture_gain_pcm16(
+            provider_pcm = (
+                bytes(len(packet.data))
+                if packet.suppress_bridge
+                else _apply_capture_gain_pcm16(
                     packet.data,
                     self._config.direct_capture_gain_db,
                 )
             )
+            connection.send_binary(provider_pcm)
             self._sent_capture_watermark = packet.capture_watermark
             return packet, remaining_packets
 
@@ -4554,7 +4584,7 @@ class RealtimeSession:
                 # result before publishing this fresh monotonic generation.
                 self._set_local_output_epoch(None)
                 player.begin(epoch)
-                self._set_local_output_epoch(epoch)
+                self._set_local_output_epoch(epoch, settle_barge_in=True)
                 return None, epoch, epoch, True
             if event_type == "speaking.stopped":
                 epoch = _output_epoch(value)

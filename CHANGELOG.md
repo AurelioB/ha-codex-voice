@@ -199,6 +199,17 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Keep server-PCM replies from cancelling themselves after a genuine
+  interruption. The active bridge route now classifies capture against the
+  exact PCM accepted by the speaker, gives every speaking epoch its existing
+  512 ms AEC convergence window, and replaces playback-correlated or ambiguous
+  capture with equal-length silence before provider egress. Decorrelated
+  near-end speech remains intact and still interrupts after two frames.
+- Recognize repeated native terminal requests such as “terminar terminar” and
+  finalize an exact standalone “terminar” after 700 ms of transcript quiet,
+  without waiting indefinitely for provider turn completion. Continuing
+  phrases such as “terminar la música” cancel the terminal decision and release
+  ordinary output immediately.
 - Suspend the ThirdReality vendor's legacy terminal stop-word detector for the
   entire direct ownership window, so the wake tail cannot cancel signaling and
   provider playback echo cannot end a healthy realtime conversation. The sole

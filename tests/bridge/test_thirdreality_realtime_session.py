@@ -5602,6 +5602,7 @@ def test_bridge_native_full_duplex_uses_exact_sink_software_volume_player(
     assert kwargs["sink"] == DEFAULT_PULSE_AEC_SINK
     assert kwargs["volume_percent"] == 60
     assert kwargs["exact_sink_volume"] is True
+    assert kwargs["write_observer"] == session._observe_direct_playback_write
     assert kwargs["popen"] is session._popen
     transform = kwargs["pcm_transform"]
     assert callable(transform)
@@ -6447,11 +6448,13 @@ def test_local_barge_in_flushes_after_two_speech_frames_without_stopping(
     capture_backend: str,
     capture_gain_db: float,
 ) -> None:
+    now = [10.0]
     session = RealtimeSession(
         _duplex_config(
             capture_backend=capture_backend,
             direct_capture_gain_db=capture_gain_db,
         ),
+        clock=lambda: now[0],
         aec_verifier=lambda _config: None,
     )
     with session._state_lock:
@@ -6466,6 +6469,7 @@ def test_local_barge_in_flushes_after_two_speech_frames_without_stopping(
         output_epoch=None,
         last_output_epoch=0,
     )
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
     quiet = b"\0" * 2_048
 
@@ -6620,7 +6624,12 @@ def test_adjacent_quiet_and_new_media_preserve_predecessor_barge_in() -> None:
 
 
 def test_local_barge_in_counter_survives_faster_no_request_network_polls() -> None:
-    session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
+    now = [10.0]
+    session = RealtimeSession(
+        _duplex_config(),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
     with session._state_lock:
         session._state = SessionState.READY
     player = _RecordingPlayer()
@@ -6633,6 +6642,7 @@ def test_local_barge_in_counter_survives_faster_no_request_network_polls() -> No
         output_epoch=None,
         last_output_epoch=0,
     )
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
 
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
@@ -6660,6 +6670,7 @@ def test_local_barge_in_counter_survives_faster_no_request_network_polls() -> No
 def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    now = [10.0]
     detector_entered = threading.Event()
     release_detector = threading.Event()
     second_epoch_guard_entered = threading.Event()
@@ -6673,6 +6684,7 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
 
     session = RealtimeSession(
         _duplex_config(),
+        clock=lambda: now[0],
         aec_verifier=lambda _config: None,
         volume_guard=volume_guard,
     )
@@ -6688,6 +6700,7 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
         output_epoch=None,
         last_output_epoch=0,
     )
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     speech = (1_024).to_bytes(2, "little", signed=True) * 1_024
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
 
@@ -6759,6 +6772,7 @@ def test_local_barge_request_cannot_cross_into_a_new_output_epoch(
 
     # Because the stale request never committed an interruption, epoch 2 must
     # accept a fresh speech edge without an artificial quiet rearm period.
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert session._flush_local_barge_in(
@@ -7189,6 +7203,226 @@ def test_bridge_native_capture_gain_is_applied_once_with_pcm16_saturation() -> N
     assert [value for value, _sent_at in connection.binary_sent] == [
         struct.pack("<6h", 1_995, -1_995, 32_767, -32_768, 32_767, -32_768)
     ]
+
+
+def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=12.0,
+            input_queue_bytes=32_768,
+        ),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, output_epoch, last_output_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    guard = session._render_echo_guard
+    assert guard is not None
+    assert session._local_barge_in_settle_until == pytest.approx(
+        now[0] + session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS
+    )
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
+    monkeypatch.setattr(
+        guard,
+        "classify",
+        lambda *_args, **_kwargs: _EchoDecision(
+            _EchoDecisionKind.NEAR_END,
+            1,
+            correlation_permille=200,
+            delay_ms=160,
+            reference_matched=True,
+        ),
+    )
+    user_speech = struct.pack("<1024h", *([1_000, -1_000] * 512))
+    connection = _FakeRealtimeConnection()
+
+    for _ in range(2):
+        assert session.submit_audio(user_speech) is SubmitResult.ACCEPTED
+    assert session._local_barge_in_requested_epoch == 1
+    for _ in range(2):
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and not packet.suppress_bridge
+    expected_user_pcm = session_module._apply_capture_gain_pcm16(
+        user_speech,
+        12.0,
+    )
+    assert [value for value, _sent_at in connection.binary_sent] == [
+        expected_user_pcm,
+        expected_user_pcm,
+    ]
+
+    output_epoch, trigger_watermark = session._flush_local_barge_in(
+        player,
+        output_epoch=output_epoch,
+        last_output_epoch=last_output_epoch,
+    )
+    assert (output_epoch, trigger_watermark) == (None, 2)
+    assert session._local_barge_in_rearm_required
+
+    quiet = bytes(2_048)
+    for _ in range(session_module._LOCAL_BARGE_IN_REARM_QUIET_FRAMES):
+        assert session.submit_audio(quiet) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and not packet.suppress_bridge
+    assert not session._local_barge_in_rearm_required
+
+    _action, output_epoch, last_output_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":2}',
+        ),
+        player,
+        output_epoch=output_epoch,
+        last_output_epoch=last_output_epoch,
+    )
+    assert session._local_barge_in_settle_until == pytest.approx(
+        now[0] + session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS
+    )
+    # The render reference is sourced from the exact software-attenuated PCM
+    # accepted by paplay, not from pre-volume bridge audio.
+    session._observe_direct_playback_write(struct.pack("<12h", *([2_000, -2_000] * 6)))
+    assert guard._render_samples
+    monkeypatch.setattr(
+        guard,
+        "classify",
+        lambda *_args, **_kwargs: _EchoDecision(
+            _EchoDecisionKind.ECHO,
+            2,
+            correlation_permille=990,
+            delay_ms=160,
+            reference_matched=True,
+        ),
+    )
+    playback_residual = struct.pack("<1024h", *([90, -90] * 25 + [0] * 974))
+
+    for _ in range(2):
+        assert session.submit_audio(playback_residual) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and packet.data == playback_residual
+        assert packet.suppress_bridge
+
+    assert [value for value, _sent_at in connection.binary_sent[-2:]] == [
+        bytes(len(playback_residual)),
+        bytes(len(playback_residual)),
+    ]
+    assert session._local_barge_in_requested_epoch is None
+
+    # After the fresh-epoch settle window, bounded ambiguous render evidence
+    # remains self-audio on v2. It must not reach the provider or trigger the
+    # direct path's four-frame fail-open rollover behavior.
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
+    monkeypatch.setattr(
+        guard,
+        "classify",
+        lambda *_args, **_kwargs: _EchoDecision(
+            _EchoDecisionKind.AMBIGUOUS,
+            2,
+            correlation_permille=500,
+            delay_ms=160,
+            reference_matched=True,
+        ),
+    )
+    for _ in range(session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES):
+        assert session.submit_audio(playback_residual) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and packet.suppress_bridge
+
+    assert [
+        value
+        for value, _sent_at in connection.binary_sent[
+            -session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES :
+        ]
+    ] == [bytes(len(playback_residual))] * (
+        session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES
+    )
+    assert session._local_barge_in_requested_epoch is None
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=output_epoch,
+        last_output_epoch=last_output_epoch,
+    ) == (2, None)
+    assert session.output_active
+    assert player.events == [("begin", 1), ("abort", None), ("begin", 2)]
+
+
+def test_bridge_native_decorrelated_near_end_aborts_and_stays_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [20.0]
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=12.0,
+            input_queue_bytes=8_192,
+        ),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, output_epoch, last_output_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    guard = session._render_echo_guard
+    assert guard is not None
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
+    monkeypatch.setattr(
+        guard,
+        "classify",
+        lambda *_args, **_kwargs: _EchoDecision(
+            _EchoDecisionKind.NEAR_END,
+            1,
+            correlation_permille=200,
+            delay_ms=160,
+            reference_matched=True,
+        ),
+    )
+    user_speech = struct.pack("<1024h", *([1_000, -1_000] * 512))
+    connection = _FakeRealtimeConnection()
+
+    for _ in range(2):
+        assert session.submit_audio(user_speech) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and packet.data is user_speech
+        assert not packet.suppress_bridge
+
+    expected_provider_pcm = session_module._apply_capture_gain_pcm16(
+        user_speech,
+        12.0,
+    )
+    assert [value for value, _sent_at in connection.binary_sent] == [
+        expected_provider_pcm,
+        expected_provider_pcm,
+    ]
+    assert session._local_barge_in_requested_watermark == 2
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=output_epoch,
+        last_output_epoch=last_output_epoch,
+    ) == (None, 2)
+    assert not session.output_active
+    assert player.events == [("begin", 1), ("abort", None)]
 
 
 def test_blocking_bridge_send_does_not_block_microphone_admission() -> None:

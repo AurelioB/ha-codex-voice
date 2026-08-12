@@ -6320,8 +6320,12 @@ async def test_realtime_v3_end_conversation_tool_stops_active_epoch(
         ("¡Terminar llamada!", True),
         ("TERMINAR LA LLAMADA", True),
         ("Adiós.", True),
+        ("Terminar terminar", True),
+        ("Terminar llamada finalizar", True),
         ("Quiero terminar la llamada", False),
         ("Terminar la música", False),
+        ("Terminar terminar la música", False),
+        ("Terminarx", False),
         ("Continuar", False),
     ],
 )
@@ -6344,7 +6348,11 @@ def test_direct_terminal_transcript_matches_only_exact_phrases(
     [
         ("Term", True),
         ("terminar llama", True),
+        ("terminar term", True),
+        ("terminar terminar llama", True),
         ("¡", True),
+        ("terminar terminar la música", False),
+        ("terminarx", False),
         ("What", False),
         ("Stop the kitchen timer", False),
     ],
@@ -6729,6 +6737,193 @@ async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
         "reason": "end_conversation",
     }
     assert fake_rpc.responses == []
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_exact_delta_quiet_finalizes_without_turn_done(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS",
+        0.04,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-end-quiet", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Terminar",
+            },
+        }
+    )
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    assert fake_rpc.responses == []
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_repeated_end_deltas_rearm_quiet_finalizer(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS",
+        0.1,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-end-repeated", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Terminar",
+            },
+        }
+    )
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "end-reply"}})
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    retained = b"\x55\x05" * 480
+    peer.audio.put_nowait(retained)
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.02)
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"id": "user-end-repeated", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.done"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": " terminar",
+            },
+        }
+    )
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_terminal_quiet_finalizer_cancels_on_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS",
+        0.1,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-music", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Terminar",
+            },
+        }
+    )
+    peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    retained = b"\x66\x06" * 480
+    peer.audio.put_nowait(retained)
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.02)
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": " la música",
+            },
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == retained
+    await asyncio.sleep(0.12)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    await device.send_json({"type": "stop"})
     await device.close()
 
 

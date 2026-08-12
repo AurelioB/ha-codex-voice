@@ -205,6 +205,7 @@ REALTIME_NATIVE_TERMINAL_GATE_MAX_BYTES = (
     REALTIME_SAMPLE_RATE * 2 * REALTIME_NATIVE_TERMINAL_GATE_MILLISECONDS // 1_000
 )
 REALTIME_NATIVE_TERMINAL_GATE_TTL_SECONDS = 1.25
+REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS = 0.7
 REALTIME_OUTPUT_SIGNAL_PEAK = 256
 REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS = 0.5
 REALTIME_MAX_PENDING_TOOL_CALLS = 16
@@ -4786,7 +4787,7 @@ def _normalize_direct_terminal_transcript(value: object) -> str:
 
 
 def _direct_provider_transcript_requests_end(event: Mapping[str, Any]) -> bool:
-    """Recognize only an exact user terminal phrase from a completed transcript."""
+    """Recognize only an exact sequence of user terminal phrases."""
     if event.get("method") != "thread/realtime/transcript/done":
         return False
     params = event.get("params")
@@ -4795,18 +4796,55 @@ def _direct_provider_transcript_requests_end(event: Mapping[str, Any]) -> bool:
     role = params.get("role")
     if not isinstance(role, str) or role.casefold() not in {"input", "user"}:
         return False
-    normalized = _normalize_direct_terminal_transcript(params.get("text"))
-    return normalized in _DIRECT_END_CONVERSATION_TRANSCRIPTS
+    return _direct_terminal_transcript_is_exact_sequence(params.get("text"))
+
+
+def _direct_terminal_transcript_is_exact_sequence(value: object) -> bool:
+    """Match one or more complete allowlisted phrases at word boundaries."""
+    normalized = _normalize_direct_terminal_transcript(value)
+    if not normalized:
+        return False
+    pending = [0]
+    reachable = {0}
+    while pending:
+        start = pending.pop()
+        suffix = normalized[start:]
+        for phrase in _DIRECT_END_CONVERSATION_TRANSCRIPTS:
+            if suffix == phrase:
+                return True
+            boundary = len(phrase)
+            if not suffix.startswith(phrase) or suffix[boundary : boundary + 1] != " ":
+                continue
+            next_start = start + boundary + 1
+            if next_start not in reachable:
+                reachable.add(next_start)
+                pending.append(next_start)
+    return False
 
 
 def _direct_terminal_transcript_is_possible_prefix(value: str) -> bool:
-    """Keep output quarantined only while a partial phrase may be terminal."""
+    """Match terminal sequences ending in a partial allowlisted phrase."""
     normalized = _normalize_direct_terminal_transcript(value)
     if not normalized:
         return True
-    return any(
-        phrase.startswith(normalized) for phrase in _DIRECT_END_CONVERSATION_TRANSCRIPTS
-    )
+    pending = [0]
+    reachable = {0}
+    while pending:
+        start = pending.pop()
+        suffix = normalized[start:]
+        if any(
+            phrase.startswith(suffix) for phrase in _DIRECT_END_CONVERSATION_TRANSCRIPTS
+        ):
+            return True
+        for phrase in _DIRECT_END_CONVERSATION_TRANSCRIPTS:
+            boundary = len(phrase)
+            if not suffix.startswith(phrase) or suffix[boundary : boundary + 1] != " ":
+                continue
+            next_start = start + boundary + 1
+            if next_start not in reachable:
+                reachable.add(next_start)
+                pending.append(next_start)
+    return False
 
 
 async def _handle_direct_provider_tool_call(
@@ -5275,6 +5313,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     native_terminal_gate_pending = False
     native_terminal_transcript = ""
     native_terminal_fragment_chars = 0
+    native_terminal_quiet_generation = 0
+    native_terminal_quiet_task: asyncio.Task[None] | None = None
     event_trace = _RealtimeEventTrace()
 
     def uses_native_terminal_gate() -> bool:
@@ -5357,9 +5397,19 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             output_preroll.clear()
             output_preroll_bytes = 0
 
+    def cancel_native_terminal_quiet_finalizer() -> None:
+        """Invalidate the bounded transcript-quiet decision task."""
+        nonlocal native_terminal_quiet_generation, native_terminal_quiet_task
+        native_terminal_quiet_generation += 1
+        task = native_terminal_quiet_task
+        native_terminal_quiet_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
     async def release_native_terminal_gate() -> None:
         """Release quarantined output after terminal intent is resolved."""
         nonlocal native_terminal_gate_pending
+        cancel_native_terminal_quiet_finalizer()
         if not native_terminal_gate_pending:
             return
         native_terminal_gate_pending = False
@@ -5376,6 +5426,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             return
         if native_terminal_turn_tracking:
             return
+        cancel_native_terminal_quiet_finalizer()
         native_terminal_turn_tracking = True
         native_terminal_gate_pending = True
         native_terminal_transcript = ""
@@ -5391,6 +5442,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             return
         if not native_terminal_gate_pending:
             await begin_native_terminal_turn()
+        if not native_terminal_gate_pending:
+            return
+        cancel_native_terminal_quiet_finalizer()
         remaining = 256 - native_terminal_fragment_chars
         if remaining <= 0:
             await release_native_terminal_gate()
@@ -5402,6 +5456,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             native_terminal_transcript
         ):
             await release_native_terminal_gate()
+        elif _direct_terminal_transcript_is_exact_sequence(native_terminal_transcript):
+            arm_native_terminal_quiet_finalizer()
 
     async def resolve_native_terminal_turn(value: object) -> bool:
         """Return true after terminating an exact bilingual end utterance."""
@@ -5411,6 +5467,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         nonlocal output_preroll_bytes
         if not uses_native_terminal_gate():
             return False
+        cancel_native_terminal_quiet_finalizer()
         text = (
             value
             if isinstance(value, str) and value.strip()
@@ -5434,6 +5491,45 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         native_terminal_fragment_chars = 0
         await release_native_terminal_gate()
         return False
+
+    def arm_native_terminal_quiet_finalizer() -> None:
+        """Finalize an exact terminal delta when provider completion is late."""
+        nonlocal native_terminal_quiet_generation, native_terminal_quiet_task
+        cancel_native_terminal_quiet_finalizer()
+        generation = native_terminal_quiet_generation
+
+        async def finalize_after_quiet() -> None:
+            await asyncio.sleep(REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS)
+            if (
+                stop.is_set()
+                or generation != native_terminal_quiet_generation
+                or not native_terminal_gate_pending
+                or not _direct_terminal_transcript_is_exact_sequence(
+                    native_terminal_transcript
+                )
+            ):
+                return
+            await resolve_native_terminal_turn(native_terminal_transcript)
+
+        task = asyncio.create_task(
+            finalize_after_quiet(),
+            name="codex-realtime-native-terminal-quiet-finalizer",
+        )
+        native_terminal_quiet_task = task
+        output_aux_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            nonlocal native_terminal_quiet_task
+            output_aux_tasks.discard(completed)
+            if native_terminal_quiet_task is completed:
+                native_terminal_quiet_task = None
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None and tool_call_failures.empty():
+                tool_call_failures.put_nowait(error)
+
+        task.add_done_callback(finished)
 
     def prune_output_preroll_locked() -> None:
         """Discard PCM not causally bound to the current output arm."""
