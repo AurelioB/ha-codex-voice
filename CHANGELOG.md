@@ -70,18 +70,18 @@ and releases use semantic versioning.
   `realtime_only: true`; defer Home Assistant Assist/Hermes and entity tools.
   An accepted wake immediately queues the thinking/pulsing LED, discards all
   wake and pre-ready PCM, and permits at most three fresh attempts inside one
-  absolute 12-second owner deadline, with a five-second signaling handshake per
+  absolute 12-second owner deadline, with a ten-second signaling handshake per
   attempt. `RealtimeSession.ready` now means answer applied, peer connected,
   `oai-events` ready, `transport_ready` sent, and the exact bridge `started`
   accepted. Only then play once the pinned root-owned PCM16 mono 22,050 Hz cue
   `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`
   (SHA-256 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`,
-  about 0.400 seconds). Keep capture closed and the local stop detector active until
-  cue EOF; then switch the LED to listening, suspend that detector, and open
-  live capture. Cue failure/two-second timeout, terminal state, deadline, or
-  attempt exhaustion returns idle without Home Assistant fallback. A clear
-  live stop/goodbye invokes `end_conversation` and terminal cleanup returns the
-  LED to idle.
+  about 0.400 seconds). Suspend the local stop detector for the entire direct
+  ownership window, keep capture closed until cue EOF, and then switch the LED
+  to listening and open live capture. Cue failure/two-second timeout, terminal
+  state, deadline, or attempt exhaustion returns idle without Home Assistant
+  fallback. The sole spoken terminal control is `end_conversation`; terminal
+  cleanup returns the LED to idle.
 - Keep the qualified direct-WebRTC AEC sink and `paplay` stream gain fixed
   while a realtime session owns audio. Home Assistant volume, mute, and unmute
   commands are intercepted before the vendor players, capped at the configured
@@ -179,11 +179,11 @@ and releases use semantic versioning.
 
 ### Fixed
 
-- Keep the ThirdReality vendor's legacy terminal stop-word detector active as
-  the local cancel path while direct startup connects and while the ready cue
-  plays. Suspend it only when cue EOF opens LIVE capture, so provider playback
-  echo and ordinary reply tails cannot end a healthy realtime conversation;
-  teardown restores the detector's exact prior membership.
+- Suspend the ThirdReality vendor's legacy terminal stop-word detector for the
+  entire direct ownership window, so the wake tail cannot cancel signaling and
+  provider playback echo cannot end a healthy realtime conversation. The sole
+  spoken terminal control is `end_conversation`; teardown restores the
+  detector's exact prior membership.
 - Answer Codex App Server's client-owned `currentTime/read` callback with whole
   Unix seconds, so realtime voice can complete clock questions instead of
   stopping after its acknowledgement. Native direct threads now declare only

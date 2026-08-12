@@ -19,15 +19,15 @@ The current controlled deployment enables one wake route:
 Home Assistant Assist/Hermes and Home Assistant entity tools are deferred for
 this trial. The optional split configuration can later return Okay Nabu to the
 official Assist route and use a separately installed Okay Computer detector for
-direct voice, but that is not the active deployment. While direct startup is
-connecting and while its confirmation cue plays, the legacy terminal stop-word
-detector remains active as the local cancel path. It is suspended only when
-capture enters the live provider phase, where spoken interruptions belong to
-realtime barge-in and playback echo must not tear down the conversation. Its
-exact prior membership is restored on release. Mute, disconnect, idle expiry,
-explicit stop, or otherwise releasing the vendor owner flushes local playback,
-tears down the remote session, and queues the idle LED. A later accepted wake
-creates a fresh WebSocket, peer, and realtime thread.
+direct voice, but that is not the active deployment. The legacy terminal
+stop-word detector is suspended for the entire direct ownership window, so the
+wake tail cannot cancel signaling and playback echo cannot tear down the live
+conversation. The explicit `end_conversation` tool is the sole spoken terminal
+control. Its exact prior detector membership is restored on release. Mute,
+disconnect, idle expiry, tool-requested termination, or otherwise releasing the
+vendor owner flushes local playback, tears down the remote session, and queues
+the idle LED. A later accepted wake creates a fresh WebSocket, peer, and
+realtime thread.
 
 In v3, bounded local AEC-filtered speech detection clears queued playback and
 immediately SIGKILLs the active `paplay` child in the parent, retires the old
@@ -125,7 +125,7 @@ wake pre-roll and never exists before the first cue-gated live phase.
 An accepted direct wake immediately queues the non-blocking thinking/pulsing
 LED and claims the vendor owner. At most three session attempts share one
 absolute 12-second owner deadline; each session retains its own configured
-5-second signaling-handshake bound inside the remaining owner budget. Process
+10-second signaling-handshake bound inside the remaining owner budget. Process
 prewarm only proves that each isolated `Popen` child is still alive. It does
 not create or validate an SDP offer; the selected child must do that during the
 owned attempt, and construction, preflight, offer, bridge, or transport failure
@@ -134,12 +134,14 @@ can consume an attempt.
 `RealtimeSession.ready` is set only after the SDP answer is applied, the peer
 is connected, the `oai-events` data channel is ready, the device has sent
 `transport_ready`, and the bridge has returned the exact accepted `started`
-message. Readiness then starts exactly one pinned, root-owned cue:
+message. The vendor stop detector is suspended for the entire direct ownership
+window so the wake tail cannot immediately cancel signaling and playback echo
+cannot end a live session. The explicit `end_conversation` tool is the sole
+terminal voice control. Readiness then starts exactly one pinned, root-owned cue:
 `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`, SHA-256
 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, PCM16
-mono at 22,050 Hz and about 0.400 seconds. Capture stays closed and the local
-stop detector stays active until cue EOF. EOF switches the LED to listening,
-suspends the local stop detector, and opens live capture. The cue has a
+mono at 22,050 Hz and about 0.400 seconds. Capture stays closed until cue EOF.
+EOF switches the LED to listening and opens live capture. The cue has a
 2-second completion timeout. Cue failure/timeout, a terminal session, the
 absolute deadline, or attempt exhaustion fails closed and returns idle without
 starting Home Assistant.
@@ -177,7 +179,7 @@ bridge connection, a fixed-argv `pactl` controller sets the dedicated AEC sink
 itself to the exact raw `playback_volume_percent` value and verifies it. Every
 new direct response checks that exact raw anchor again before admitting audio;
 an out-of-band mismatch is repaired and verified or output fails closed. The
-per-attempt five-second handshake deadline begins only after this local AEC and
+per-attempt ten-second handshake deadline begins only after this local AEC and
 player preparation, while the absolute 12-second owner deadline covers local
 work and all retries. The maximum-session clock remains a separate hard
 lifetime cap. The direct `paplay` child targets that sink with
@@ -605,7 +607,7 @@ this minimal active configuration:
   "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
-  "handshake_timeout_seconds": 5,
+  "handshake_timeout_seconds": 10,
   "media_transport": "device_webrtc",
   "capture_backend": "native_aec3",
   "full_duplex": true,
@@ -913,7 +915,7 @@ On the physical device, verify these independently:
 4. On each accepted wake, verify that thinking/pulsing is queued immediately;
    the trigger, wake tail, connecting frames, and cue-time frames never reach
    the initial peer. Up to three attempts must share one absolute 12-second
-   owner deadline and each attempt's handshake must remain bounded at five
+   owner deadline and each attempt's handshake must remain bounded at ten
    seconds. Alive-only process prewarm must not be reported as an offer-ready
    peer.
 5. Require SDP applied, peer connected, `oai-events` ready,
@@ -921,8 +923,8 @@ On the physical device, verify these independently:
    verify exactly one root-owned pinned cue (SHA-256
    `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`) and no
    capture until EOF; only EOF may switch the LED to listening. The local stop
-   detector must remain active through connecting/cue and be suspended only in
-   the live phase. Cue timeout at two seconds, forced pre-ready/post-ready
+   detector must remain suspended throughout direct ownership. Cue timeout at
+   two seconds, forced pre-ready/post-ready
    failure, owner-deadline expiry, and attempt exhaustion must return idle with
    no Home Assistant fallback.
 6. Repeated direct turns—and standard turns only during deliberate rollback or

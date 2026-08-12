@@ -490,12 +490,15 @@ def _configure_stop_word_membership(instance: Any) -> tuple[Any, bool]:
     if stop_word_id is None or active is None:
         return None, False
     was_active = stop_word_id in active
-    if bool(getattr(_REALTIME_CONFIG, "full_duplex", False)):
-        # Capture is deliberately closed until the session-ready cue ends, so
-        # the local stop detector remains the only audible cancel path during
-        # CONNECTING/CONFIRMING. It is suspended exactly when live provider
-        # capture opens, before playback echo can turn it into a false stop.
-        active.add(stop_word_id)
+    if _uses_device_webrtc() and bool(
+        getattr(_REALTIME_CONFIG, "full_duplex", False)
+    ):
+        # The direct conversation owns the microphone from wake acceptance
+        # through terminal teardown. Keeping the vendor stop model armed here
+        # can reinterpret the wake tail as a stop and cancel negotiation before
+        # the sidecar even creates its offer. Direct mode therefore exposes the
+        # explicit end-conversation tool as its sole terminal voice control.
+        active.discard(stop_word_id)
     elif not was_active:
         # Half-duplex bridge PCM has no realtime barge-in while output is gated,
         # so preserve its explicit terminal stop control.

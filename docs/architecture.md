@@ -84,7 +84,7 @@ thinking/pulsing LED. Initial v3 startup discards the trigger/wake history and
 every recorder callback produced before local confirmation completes; it does
 not seed or wait on a microphone backlog. At most three fresh session attempts
 share one absolute 12-second owner deadline, while each attempt keeps its own
-5-second signaling-handshake bound inside the remaining budget. Deadline,
+10-second signaling-handshake bound inside the remaining budget. Deadline,
 attempt exhaustion, terminal state, or setup failure releases the owner and
 returns the LED to idle without entering Home Assistant.
 
@@ -95,13 +95,14 @@ accepted `started`. Only then does the device play once the root-owned pinned
 PCM16 mono 22,050 Hz cue
 `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav` (SHA-256
 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
-0.400 seconds). Capture remains closed until cue EOF. The vendor stop-word
-detector remains active through connecting and cue playback; EOF suspends it,
-opens live capture, and switches the LED to listening. The cue must finish
-within two seconds. Cue failure/timeout and any terminal race fail closed. In
-the live phase a clear spoken stop/goodbye is handled by the sole
-`end_conversation` tool; its terminal result tears down the socket and normal
-cleanup restores the detector and idle LED. No Home Assistant tool is present.
+0.400 seconds). The vendor stop-word detector remains suspended throughout the
+direct ownership window, so the wake tail cannot cancel signaling and playback
+echo cannot terminate the live session. Capture remains closed until cue EOF;
+EOF opens live capture and switches the LED to listening. The cue must finish
+within two seconds. Cue failure/timeout and any terminal race fail closed. The
+sole spoken terminal control is `end_conversation`; its terminal result tears
+down the socket and normal cleanup restores the detector and idle LED. No Home
+Assistant tool is present.
 
 For legacy auto/managed compatibility, authority is selected from Conversation
 config subentries, not from a device message. Zero or multiple opted-in
@@ -449,7 +450,7 @@ its active configuration explicitly selects Adrian. Startup verifies the
 topology and ceiling before constructing the peer. Once per direct session,
 before the SDP offer or bridge connection, a fixed-argv `pactl` controller sets
 and verifies the dedicated sink to the exact raw playback setting. The
-per-attempt five-second signaling deadline starts only after that local AEC and
+per-attempt ten-second signaling deadline starts only after that local AEC and
 player preparation finishes, while the absolute 12-second wake-owner deadline
 also bounds preparation and all retries. The maximum-session deadline remains a
 separate hard lifetime cap. Direct

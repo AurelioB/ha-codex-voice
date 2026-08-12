@@ -131,7 +131,7 @@ sides of a narrow bridge API.
   initial pre-roll/headroom and pre-ready Assist replay.
 - An accepted direct wake queues the thinking/pulsing LED immediately and gives
   at most three fresh session attempts one shared absolute 12-second owner
-  deadline. Each session has its own five-second signaling-handshake bound
+  deadline. Each session has its own ten-second signaling-handshake bound
   inside the remaining owner time. Idle process prewarm proves only that the
   two isolated `Popen` children are alive; it does not request or validate an
   SDP offer. Construction, AEC/player preflight, offer creation, bridge setup,
@@ -143,12 +143,14 @@ sides of a narrow bridge API.
   play once the pinned root-owned PCM16 mono 22,050 Hz cue
   `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`, SHA-256
   `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`, about
-  0.400 seconds. Capture remains closed and the local stop detector remains
-  active through cue EOF; EOF switches to the listening LED, suspends that
-  detector, and opens live provider capture. Missing EOF or cue failure has a
-  two-second bound and is terminal. During LIVE, an explicit spoken stop or
-  goodbye invokes `end_conversation`; its result closes the session and normal
-  cleanup restores the prior detector membership and idle LED.
+  0.400 seconds. The local stop detector remains suspended for the entire
+  direct ownership window, so the wake tail cannot cancel signaling and
+  playback echo cannot terminate the live session. Capture remains closed
+  through cue EOF; EOF switches to the listening LED and opens live provider
+  capture. Missing EOF or cue failure has a two-second bound and is terminal.
+  The sole spoken terminal control is `end_conversation`; its result closes the
+  session and normal cleanup restores the prior detector membership and idle
+  LED.
 - The ThirdReality controller is standard-library code imported into the
   existing root voice process. Direct media runs in a separate
   `/usr/bin/python3 -I -S` child with a complete hash-locked Python

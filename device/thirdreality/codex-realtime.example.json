@@ -8,7 +8,7 @@
   "wake_probability_cutoff": 0.85,
   "voice": "cove",
   "prompt": "Responde en español latinoamericano de México salvo que el usuario pida explícitamente otro idioma. Usa un acento mexicano natural, estable y claro; mantén separados el idioma y el acento, y no cambies de idioma solo por el acento del usuario. Sé conciso.",
-  "handshake_timeout_seconds": 5,
+  "handshake_timeout_seconds": 10,
   "idle_timeout_seconds": 120,
   "max_session_seconds": 900,
   "max_message_bytes": 65536,

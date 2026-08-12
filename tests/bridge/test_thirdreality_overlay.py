@@ -2658,7 +2658,7 @@ def test_direct_webrtc_opens_capture_only_after_ready_cue_finishes(
     assert not owner.capture_open
     assert list(owner.fallback_audio) == []
     assert owner.fallback_bytes == 0
-    assert "stop" in instance.state.active_wake_words
+    assert "stop" not in instance.state.active_wake_words
 
     _mark_direct_ready(instance, session)
     instance.handle_audio(_pcm_frame(5))
@@ -3359,7 +3359,7 @@ def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
     _wake(instance, "okay computer")
     owner = instance._codex_realtime_owner
     session = support.sessions[0]  # type: ignore[attr-defined]
-    assert "stop" in instance.state.active_wake_words
+    assert "stop" not in instance.state.active_wake_words
 
     instance.stop()
     module._detach_realtime_owner(instance, owner, unduck=True)
@@ -3372,7 +3372,7 @@ def test_direct_stop_is_idempotently_idle_and_restores_stop_membership(
     assert ("stop" in instance.state.active_wake_words) is stop_word_preexisting
 
 
-def test_direct_owner_suspends_legacy_stop_detector_only_after_capture_opens(
+def test_direct_owner_suspends_legacy_stop_detector_for_entire_session(
     load_overlay: Any,
 ) -> None:
     support = _fake_realtime_support(media_transport="device_webrtc")
@@ -3384,7 +3384,9 @@ def test_direct_owner_suspends_legacy_stop_detector_only_after_capture_opens(
     owner = instance._codex_realtime_owner
     session = support.sessions[0]  # type: ignore[attr-defined]
 
-    assert "stop" in instance.state.active_wake_words
+    # The wake tail must not be eligible for classification as a local stop
+    # while the sidecar offer and bridge handshake are still starting.
+    assert "stop" not in instance.state.active_wake_words
     assert session.interrupted == 0
     assert instance._codex_realtime_owner is owner
     assert instance._pipeline_active
@@ -3394,9 +3396,8 @@ def test_direct_owner_suspends_legacy_stop_detector_only_after_capture_opens(
     callback = instance.state.tts_player.callbacks.pop()
     callback()
 
-    # This is the exact membership gate used by the pinned microphone loop
-    # after its legacy stop model fires. Provider playback echo must not be
-    # allowed to turn a LIVE detection into a terminal local stop.
+    # Provider playback echo must remain unable to turn a LIVE detection into
+    # a terminal local stop after capture opens.
     assert "stop" not in instance.state.active_wake_words
 
     session.terminal = True

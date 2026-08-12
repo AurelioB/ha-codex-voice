@@ -106,7 +106,7 @@ The shipped bounds are intentionally small and fail closed:
 |---|---:|---|
 | Initial v3 wake/pre-ready capture | 0 bytes | Discards the triggering/wake-tail PCM and every connecting/cue callback; epoch 1 starts empty after cue EOF |
 | Direct startup owner | At most 3 attempts / one absolute 12 s deadline | Bounds construction, local preparation, negotiation, retry, and pre-ready terminal races across the accepted wake |
-| Per-attempt v3 signaling handshake | 5 s | Bounds offer/answer, SDP application, peer/data readiness, `transport_ready`, and exact `started` within the remaining owner budget |
+| Per-attempt v3 signaling handshake | 10 s | Bounds offer/answer, SDP application, peer/data readiness, `transport_ready`, and exact `started` within the remaining owner budget |
 | Ready confirmation cue | About 0.400 s; 2 s EOF timeout | Plays the pinned root-owned PCM16 mono 22,050 Hz WAV once after exact readiness; capture remains closed until EOF |
 | Device live microphone queue | 64 KiB / 2.048 s | Bounds accepted post-cue live audio and rollover pressure; it is not a cold-start queue |
 | Device Opus/RTP input frame | 320 source samples / 20 ms, expanded to 960 samples at 48 kHz | Produces exactly one pinned-aiortc Opus payload and one 960-sample RTP timestamp per track read, continuously across 64 ms recorder callback boundaries |
@@ -133,12 +133,13 @@ readiness means SDP applied, peer connected, `oai-events` data ready,
 is `/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav`,
 SHA-256
 `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`.
-The local stop-word detector stays active during connecting and cue playback.
-Cue EOF switches the LED to listening, suspends that detector, and opens
-capture. A two-second cue timeout, session terminal, 12-second owner deadline,
-or three-attempt exhaustion releases the owner and queues idle without Home
-Assistant fallback. Once live, an explicit stop/goodbye invokes the sole
-`end_conversation` tool; terminal cleanup likewise returns idle.
+The local stop-word detector stays suspended for the entire direct ownership
+window, so the wake tail cannot cancel signaling and playback echo cannot end
+the live session. Cue EOF switches the LED to listening and opens capture. A
+two-second cue timeout, session terminal, 12-second owner deadline, or
+three-attempt exhaustion releases the owner and queues idle without Home
+Assistant fallback. The sole spoken terminal control is `end_conversation`;
+terminal cleanup likewise returns idle.
 
 The generic overlay may retain six idle recorder callbacks, but an accepted v3
 wake discards all 12 KiB / 384 ms and drops every subsequent callback until the
@@ -149,7 +150,7 @@ Assist copy, subject to its 32 KiB live-headroom rule. If any v3 startup or
 runtime bound is exhausted, the direct owner clears its queue and returns idle
 without invoking Assist.
 
-For initial v3 startup, each attempt's five-second signaling deadline begins
+For initial v3 startup, each attempt's ten-second signaling deadline begins
 after its local AEC preflight and exact player/sink preparation, but all such
 work and all retries share the absolute 12-second wake-owner deadline. The
 separate maximum-session clock remains a hard lifetime cap. Rollover gets its
@@ -857,12 +858,14 @@ PCM16 mono 22,050 Hz file
 
 All wake-tail, connecting, and cue-time PCM is discarded. Only cue EOF queues
 the listening LED and opens capture, so test users must wait for the sound to
-finish before speaking. The legacy local stop detector remains usable during
-connecting and cue playback and is suspended at that live transition. Missing
-EOF or cue failure is terminal after at most two seconds; no Assist/Hermes
-fallback starts. This is not a cue-free path and it has no 384 ms initial
-pre-roll or 64 KiB cold-start microphone backlog. The distinct 4 KiB / 128 ms
-rollover pre-roll exists only after a live trusted-AEC interruption.
+finish before speaking. The legacy local stop detector remains suspended for
+the entire direct ownership window, so the wake tail cannot cancel signaling
+and playback echo cannot end the live session. The sole spoken terminal control
+is `end_conversation`. Missing EOF or cue failure is terminal after at most two
+seconds; no Assist/Hermes fallback starts. This is not a cue-free path and it
+has no 384 ms initial pre-roll or 64 KiB cold-start microphone backlog. The
+distinct 4 KiB / 128 ms rollover pre-roll exists only after a live trusted-AEC
+interruption.
 
 The prior acoustic path remains Adrian plus the render-aware guard. The
 reference device's historical v2 Adrian canaries passed at 25%, and its
