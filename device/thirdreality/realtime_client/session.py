@@ -1572,11 +1572,29 @@ def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
     _verify_aec_sink_volume(config)
 
 
-def _verify_aec_sink_volume(config: RealtimeConfig) -> None:
-    """Fail closed if the selected AEC sink is above the canary ceiling."""
+def _playback_sink(config: RealtimeConfig) -> str:
+    """Resolve the sink that owns rendered PCM after capture is proven active."""
+    if (
+        config.media_transport == BRIDGE_PCM_TRANSPORT
+        and config.capture_backend == NATIVE_AEC3_CAPTURE
+        and os.environ.get("CODEX_AEC3_ACTIVE") == "1"
+    ):
+        # Native AEC3 receives the codec's synchronized hardware-loopback
+        # channels from hw:0,4. Sending bridge PCM straight to the raw master
+        # therefore preserves its render reference while avoiding a redundant
+        # PulseAudio echo-cancel render path and resampling stage. The internal
+        # environment proof is published only after the native recorder patch
+        # is active; without it, retain the fail-closed virtual route.
+        return _PULSE_SINK_MASTER
     sink = config.pulse_aec_sink
     if sink is None:
         raise WebSocketError("PulseAudio echo cancellation is not configured")
+    return sink
+
+
+def _verify_aec_sink_volume(config: RealtimeConfig) -> None:
+    """Fail closed if the sink that owns rendered PCM exceeds its ceiling."""
+    sink = _playback_sink(config)
     sink_volume = _pactl_output(
         ("get-sink-volume", sink), timeout=config.io_timeout_seconds
     )
@@ -1591,10 +1609,8 @@ def _repair_aec_sink_volume(
     *,
     transaction_timeout_seconds: float = _MEDIA_ANCHOR_REPAIR_TIMEOUT_SECONDS,
 ) -> bool:
-    """Restore the direct sink's exact anchor and report whether it drifted."""
-    sink = config.pulse_aec_sink
-    if sink is None:
-        raise WebSocketError("PulseAudio echo cancellation is not configured")
+    """Restore the rendered-PCM sink's anchor and report whether it drifted."""
+    sink = _playback_sink(config)
     deadline = time.monotonic() + transaction_timeout_seconds
 
     def remaining() -> float:
@@ -2396,21 +2412,26 @@ class RealtimeSession:
                 and decision.interrupt_qualified
             )
             if bridge_output_guarded:
-                # V2 keeps one provider peer across interruptions, so it cannot
-                # replay raw capture on a fresh peer after deciding which voice
-                # produced it. Suppress only affirmative echo/ambiguous render
-                # evidence. An unmatched, untrained, or missing decision stays
-                # raw so the provider's semantic speech events remain the
-                # fallback, but it cannot trigger the two-frame local cut.
-                suppress_bridge = bool(
-                    bridge_decision_matches_output
-                    and decision is not None
-                    and decision.kind
-                    in {
-                        _EchoDecisionKind.ECHO,
-                        _EchoDecisionKind.AMBIGUOUS,
-                    }
-                )
+                if self._config.capture_backend != NATIVE_AEC3_CAPTURE:
+                    # PulseAudio AEC has no second device-side echo suppressor.
+                    # Keep affirmative render evidence away from its persistent
+                    # provider peer, which cannot replay capture after a local
+                    # decision. Missing or unmatched evidence remains raw as
+                    # the provider's semantic speech fallback.
+                    suppress_bridge = bool(
+                        bridge_decision_matches_output
+                        and decision is not None
+                        and decision.kind
+                        in {
+                            _EchoDecisionKind.ECHO,
+                            _EchoDecisionKind.AMBIGUOUS,
+                        }
+                    )
+                # Native AEC3 capture is already echo-cleaned against the
+                # codec's synchronized hardware render loopback. Its PCM must
+                # always reach provider VAD with configured gain; the render
+                # classifier is only an additional high-confidence gate for
+                # the faster two-frame local playback cut below.
             elif provider_candidate and output_epoch is not None:
                 if decision is None:
                     suppress = transitioning or settling
@@ -2945,8 +2966,7 @@ class RealtimeSession:
     ) -> None:
         connection: WebSocketConnection | None = None
         if self._config.full_duplex:
-            sink = self._config.pulse_aec_sink
-            assert sink is not None
+            sink = _playback_sink(self._config)
             player = self._direct_player_factory(
                 self._config.output_queue_bytes,
                 sink,

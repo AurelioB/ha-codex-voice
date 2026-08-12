@@ -196,10 +196,16 @@ selects the backend. The early overlay hook loads and patches the native ABI
 before vendor microphone selection, then sets `CODEX_AEC3_ACTIVE=1` internally
 as proof for the later session preflight. Operators must not set that proof
 variable themselves. A wake additionally proves that the recorder delivers
-frames. Both backends require every live AEC sink channel to be at or below
-`aec_sink_volume_ceiling_percent`; v3 `paplay` playback is pinned to the same
-sink. A failed or mismatched check ends startup before any microphone audio
-leaves the device.
+frames. Both backends require every live rendered-PCM sink channel to be at or
+below `aec_sink_volume_ceiling_percent`. V3 `paplay` playback remains pinned to
+the configured virtual AEC sink. Active `bridge_pcm` with proven `native_aec3`
+capture instead pins playback and volume to its raw
+`alsa_output.hw_0_1` master: AEC3 receives the same rendered audio through the
+codec's synchronized `hw:0,4` hardware-loopback channels, without sending it
+through a redundant PulseAudio echo-cancel render path. The configured virtual
+source, sink, default routes, and module remain required as startup topology
+proof. Without the internal native-active proof, sink selection stays virtual
+and preflight fails closed before any microphone audio leaves the device.
 At direct-session startup, after that preflight and before the SDP offer or
 bridge connection, a fixed-argv `pactl` controller sets the dedicated AEC sink
 itself to the exact raw `playback_volume_percent` value and verifies it. Every
@@ -212,8 +218,8 @@ lifetime cap. The direct `paplay` child targets that sink with
 `--volume=65536` (100% relative) and never
 enumerates or mutates a sink-input. Both volume controls accept 1–100%, and
 configuration rejects a playback value above the selected
-`aec_sink_volume_ceiling_percent`. Active v2 instead uses the
-same fixed sink anchor and 100%-relative stream with software attenuation.
+`aec_sink_volume_ceiling_percent`. Active v2 instead uses its resolved playback
+sink's fixed anchor and 100%-relative stream with software attenuation.
 Matching Home
 Assistant volume, mute, and unmute commands are intercepted before either
 vendor media player or its system-volume callback can change PulseAudio. The
@@ -229,8 +235,8 @@ attenuation immediately before each bounded 20 ms write. The attenuation uses
 PulseAudio's cubic volume curve, so a requested level retains the vendor
 slider's perceived loudness below the fixed anchor. A 40 ms gain ramp prevents
 clicks, while the dedicated sink and `paplay --volume=65536` remain at their
-qualified fixed operating point. This keeps the echo canceller's render
-reference equal to the PCM that reaches the sink.
+qualified fixed operating point. This keeps the active echo canceller's render
+reference equal to the PCM that reaches the selected playback sink.
 
 The parent also retains a bounded 4 kHz representation of only the transformed
 PCM actually accepted by `paplay`. During the existing 512 ms first-playback

@@ -5589,6 +5589,7 @@ def test_bridge_native_full_duplex_uses_exact_sink_software_volume_player(
         "_socket_readable",
         lambda transport, timeout: transport.wait_readable(timeout),
     )
+    monkeypatch.setenv("CODEX_AEC3_ACTIVE", "1")
     session = RealtimeSession(
         _duplex_config(
             capture_backend=NATIVE_AEC3_CAPTURE,
@@ -5620,7 +5621,7 @@ def test_bridge_native_full_duplex_uses_exact_sink_software_volume_player(
     assert player.events[0] == ("prepare", None)
     maximum_bytes, kwargs = constructions[0]
     assert maximum_bytes == session._config.output_queue_bytes
-    assert kwargs["sink"] == DEFAULT_PULSE_AEC_SINK
+    assert kwargs["sink"] == session_module._PULSE_SINK_MASTER
     assert kwargs["volume_percent"] == 60
     assert kwargs["exact_sink_volume"] is True
     assert kwargs["write_observer"] == session._observe_direct_playback_write
@@ -5628,6 +5629,58 @@ def test_bridge_native_full_duplex_uses_exact_sink_software_volume_player(
     transform = kwargs["pcm_transform"]
     assert callable(transform)
     assert transform(struct.pack("<2h", 4_000, -4_000)) == struct.pack("<2h", 500, -500)
+
+
+@pytest.mark.parametrize(
+    ("capture_backend", "media_transport", "native_active", "expected"),
+    [
+        (
+            NATIVE_AEC3_CAPTURE,
+            session_module.BRIDGE_PCM_TRANSPORT,
+            True,
+            session_module._PULSE_SINK_MASTER,
+        ),
+        (
+            NATIVE_AEC3_CAPTURE,
+            session_module.BRIDGE_PCM_TRANSPORT,
+            False,
+            DEFAULT_PULSE_AEC_SINK,
+        ),
+        (
+            NATIVE_AEC3_CAPTURE,
+            DEVICE_WEBRTC_TRANSPORT,
+            True,
+            DEFAULT_PULSE_AEC_SINK,
+        ),
+        (
+            PULSEAUDIO_AEC_CAPTURE,
+            session_module.BRIDGE_PCM_TRANSPORT,
+            True,
+            DEFAULT_PULSE_AEC_SINK,
+        ),
+    ],
+)
+def test_raw_playback_sink_requires_active_native_bridge_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    capture_backend: str,
+    media_transport: str,
+    native_active: bool,
+    expected: str,
+) -> None:
+    if native_active:
+        monkeypatch.setenv("CODEX_AEC3_ACTIVE", "1")
+    else:
+        monkeypatch.delenv("CODEX_AEC3_ACTIVE", raising=False)
+
+    assert (
+        session_module._playback_sink(
+            _duplex_config(
+                capture_backend=capture_backend,
+                media_transport=media_transport,
+            )
+        )
+        == expected
+    )
 
 
 def test_full_duplex_preflight_requires_exact_active_pulseaudio_aec_routes(
@@ -5744,6 +5797,45 @@ def test_native_aec3_preflight_keeps_playback_topology_without_pulse_capture(
         [*_PACTL_ARGV, "get-default-sink"],
         [*_PACTL_ARGV, "list", "short", "modules"],
         [*_PACTL_ARGV, "get-sink-volume", DEFAULT_PULSE_AEC_SINK],
+    ]
+
+
+def test_native_bridge_preflight_keeps_virtual_topology_and_guards_raw_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    responses = {
+        (*_PACTL_ARGV, "get-default-source"): f"{DEFAULT_PULSE_AEC_SOURCE}\n",
+        (*_PACTL_ARGV, "get-default-sink"): f"{DEFAULT_PULSE_AEC_SINK}\n",
+        (*_PACTL_ARGV, "list", "short", "modules"): (
+            "7\tmodule-echo-cancel\t"
+            "source_master=alsa_input.hw_0_2 "
+            "sink_master=alsa_output.hw_0_1 "
+            "source_name=codex_echo_cancel_source "
+            "sink_name=codex_echo_cancel_sink "
+            "aec_method=webrtc use_master_format=1\n"
+        ),
+        (*_PACTL_ARGV, "get-sink-volume", session_module._PULSE_SINK_MASTER): (
+            "Volume: left: 16384 / 25% / -36.12 dB\n"
+        ),
+    }
+
+    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=responses[tuple(argv)].encode()
+        )
+
+    monkeypatch.setenv("CODEX_AEC3_ACTIVE", "1")
+    monkeypatch.setattr(session_module.subprocess, "run", run)
+
+    _verify_pulseaudio_aec(_duplex_config(capture_backend=NATIVE_AEC3_CAPTURE))
+
+    assert calls == [
+        [*_PACTL_ARGV, "get-default-source"],
+        [*_PACTL_ARGV, "get-default-sink"],
+        [*_PACTL_ARGV, "list", "short", "modules"],
+        [*_PACTL_ARGV, "get-sink-volume", session_module._PULSE_SINK_MASTER],
     ]
 
 
@@ -6126,6 +6218,39 @@ def test_exact_sink_anchor_reports_no_drift_or_repairs_every_channel(
 
     assert repaired is expected_repaired
     assert calls == expected_sets
+
+
+def test_native_bridge_anchor_probe_and_repair_target_raw_playback_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probes: list[tuple[str, ...]] = []
+    repairs: list[tuple[str, int]] = []
+
+    class Controller:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def set_and_verify(self, sink: str, volume_percent: int) -> None:
+            repairs.append((sink, volume_percent))
+
+    def probe(arguments: tuple[str, ...], **_kwargs: object) -> str:
+        probes.append(arguments)
+        return "Volume: mono: 32768 / 50% / -6.02 dB\n"
+
+    monkeypatch.setenv("CODEX_AEC3_ACTIVE", "1")
+    monkeypatch.setattr(session_module, "_pactl_output", probe)
+    monkeypatch.setattr(session_module, "PactlSinkVolumeController", Controller)
+
+    assert session_module._repair_aec_sink_volume(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            playback_volume_percent=60,
+            aec_sink_volume_ceiling_percent=60,
+        )
+    )
+
+    assert probes == [("get-sink-volume", session_module._PULSE_SINK_MASTER)]
+    assert repairs == [(session_module._PULSE_SINK_MASTER, 60)]
 
 
 @pytest.mark.parametrize(
@@ -7229,7 +7354,179 @@ def test_bridge_native_capture_gain_is_applied_once_with_pcm16_saturation() -> N
     ]
 
 
-def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
+@pytest.mark.parametrize(
+    ("decision", "expect_local_cut"),
+    [
+        pytest.param(
+            _EchoDecision(
+                _EchoDecisionKind.ECHO,
+                1,
+                correlation_permille=990,
+                delay_ms=160,
+                reference_matched=True,
+            ),
+            False,
+            id="epoch-matched-echo",
+        ),
+        pytest.param(
+            _EchoDecision(
+                _EchoDecisionKind.AMBIGUOUS,
+                1,
+                correlation_permille=500,
+                delay_ms=160,
+                reference_matched=True,
+            ),
+            False,
+            id="epoch-matched-ambiguous",
+        ),
+        pytest.param(
+            _EchoDecision(
+                _EchoDecisionKind.NEAR_END,
+                1,
+                correlation_permille=0,
+                reference_matched=False,
+            ),
+            False,
+            id="unmatched-near-end",
+        ),
+        pytest.param(None, False, id="missing-decision"),
+        pytest.param(
+            _EchoDecision(
+                _EchoDecisionKind.NEAR_END,
+                1,
+                correlation_permille=200,
+                delay_ms=160,
+                reference_matched=True,
+                interrupt_qualified=True,
+            ),
+            True,
+            id="interrupt-qualified-near-end",
+        ),
+    ],
+)
+def test_bridge_native_classifier_never_mutes_provider_egress(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: _EchoDecision | None,
+    expect_local_cut: bool,
+) -> None:
+    now = [10.0]
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=NATIVE_AEC3_CAPTURE,
+            direct_capture_gain_db=6.0,
+        ),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, output_epoch, last_output_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    guard = session._render_echo_guard
+    assert guard is not None
+    monkeypatch.setattr(guard, "classify", lambda *_args, **_kwargs: decision)
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
+    capture = struct.pack("<1024h", *([1_000, -1_000] * 512))
+    expected_provider_pcm = session_module._apply_capture_gain_pcm16(capture, 6.0)
+    connection = _FakeRealtimeConnection()
+
+    for _ in range(session_module._LOCAL_BARGE_IN_FRAMES):
+        assert session.submit_audio(capture) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and packet.data is capture
+        assert not packet.suppress_bridge
+
+    assert [value for value, _sent_at in connection.binary_sent] == [
+        expected_provider_pcm,
+    ] * session_module._LOCAL_BARGE_IN_FRAMES
+    if expect_local_cut:
+        assert session._local_barge_in_requested_watermark == 2
+        assert session._flush_local_barge_in(
+            player,
+            output_epoch=output_epoch,
+            last_output_epoch=last_output_epoch,
+        ) == (None, 2)
+        assert player.events == [("begin", 1), ("abort", None)]
+    else:
+        assert session._local_barge_in_requested_epoch is None
+        assert session._flush_local_barge_in(
+            player,
+            output_epoch=output_epoch,
+            last_output_epoch=last_output_epoch,
+        ) == (1, None)
+        assert player.events == [("begin", 1)]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [_EchoDecisionKind.ECHO, _EchoDecisionKind.AMBIGUOUS],
+)
+def test_bridge_pulseaudio_aec_keeps_matched_render_suppression(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: _EchoDecisionKind,
+) -> None:
+    now = [10.0]
+    session = RealtimeSession(
+        _duplex_config(
+            capture_backend=PULSEAUDIO_AEC_CAPTURE,
+        ),
+        clock=lambda: now[0],
+        aec_verifier=lambda _config: None,
+    )
+    with session._state_lock:
+        session._state = SessionState.READY
+    player = _RecordingPlayer()
+    _action, output_epoch, last_output_epoch, _semantic = session._handle_message(
+        Message(
+            "text",
+            '{"type":"control","event_type":"speaking.started","output_epoch":1}',
+        ),
+        player,
+        output_epoch=None,
+        last_output_epoch=0,
+    )
+    guard = session._render_echo_guard
+    assert guard is not None
+    monkeypatch.setattr(
+        guard,
+        "classify",
+        lambda *_args, **_kwargs: _EchoDecision(
+            kind,
+            1,
+            correlation_permille=(990 if kind is _EchoDecisionKind.ECHO else 500),
+            delay_ms=160,
+            reference_matched=True,
+        ),
+    )
+    now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
+    capture = struct.pack("<1024h", *([1_000, -1_000] * 512))
+    connection = _FakeRealtimeConnection()
+
+    for _ in range(session_module._LOCAL_BARGE_IN_FRAMES):
+        assert session.submit_audio(capture) is SubmitResult.ACCEPTED
+        packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
+        assert packet is not None and packet.suppress_bridge
+
+    assert [value for value, _sent_at in connection.binary_sent] == [
+        bytes(len(capture)),
+    ] * session_module._LOCAL_BARGE_IN_FRAMES
+    assert session._flush_local_barge_in(
+        player,
+        output_epoch=output_epoch,
+        last_output_epoch=last_output_epoch,
+    ) == (1, None)
+    assert player.events == [("begin", 1)]
+
+
+def test_bridge_native_next_reply_capture_stays_raw_after_barge_rearm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = [10.0]
@@ -7338,17 +7635,21 @@ def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
         assert session.submit_audio(playback_residual) is SubmitResult.ACCEPTED
         packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
         assert packet is not None and packet.data == playback_residual
-        assert packet.suppress_bridge
+        assert not packet.suppress_bridge
 
+    expected_residual_pcm = session_module._apply_capture_gain_pcm16(
+        playback_residual,
+        12.0,
+    )
     assert [value for value, _sent_at in connection.binary_sent[-2:]] == [
-        bytes(len(playback_residual)),
-        bytes(len(playback_residual)),
+        expected_residual_pcm,
+        expected_residual_pcm,
     ]
     assert session._local_barge_in_requested_epoch is None
 
-    # After the fresh-epoch settle window, bounded ambiguous render evidence
-    # remains self-audio on v2. It must not reach the provider or trigger the
-    # direct path's four-frame fail-open rollover behavior.
+    # After the fresh-epoch settle window, the classifier still cannot mute
+    # native-AEC3 PCM headed to provider VAD. Ambiguous evidence remains
+    # ineligible for the local cut.
     now[0] += session_module._LOCAL_BARGE_IN_PLAYBACK_SETTLE_SECONDS + 0.001
     monkeypatch.setattr(
         guard,
@@ -7364,16 +7665,14 @@ def test_bridge_native_next_reply_echo_is_silent_after_barge_rearm(
     for _ in range(session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES):
         assert session.submit_audio(playback_residual) is SubmitResult.ACCEPTED
         packet, _remaining = session._send_bridge_audio(connection)  # type: ignore[arg-type]
-        assert packet is not None and packet.suppress_bridge
+        assert packet is not None and not packet.suppress_bridge
 
     assert [
         value
         for value, _sent_at in connection.binary_sent[
             -session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES :
         ]
-    ] == [bytes(len(playback_residual))] * (
-        session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES
-    )
+    ] == [expected_residual_pcm] * (session_module._LOCAL_BARGE_IN_AMBIGUOUS_FRAMES)
     assert session._local_barge_in_requested_epoch is None
     assert session._flush_local_barge_in(
         player,
