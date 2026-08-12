@@ -341,14 +341,15 @@ session would occupy the single subscription speech lane without a documented
 quota-neutral idle lifetime. Experimental Codex adapter optimization is
 therefore limited to capture overlap and progressive TTS delivery. The
 recommended Wyoming providers do not use those remote adapters. The direct
-device prewarms exactly two reusable local isolated `aiortc` processes. Idle
-process prewarm means only that each `Popen` is alive; it does not request,
-drain, or validate an SDP offer. The selected child creates its first offer only
-inside an accepted wake attempt. After the first peer is live, the other process
-can be offer-prepared as the rollover standby; the two then alternate fresh
-PeerConnections and recycle the retired process. An absent or invalid required
-standby ends the outer session without a cold replacement or third process.
-This local process pool does not create a Codex thread, open a bridge socket,
+device prewarms exactly one reusable local isolated `aiortc` worker. Idle
+process prewarm means only that its `Popen` is alive; it does not request,
+drain, or validate an SDP offer. The worker creates its first peer offer only
+inside an accepted wake attempt. After that peer is ready and the confirmation
+cue has completed and opened capture, the same process may prepare one fresh,
+offer-warm logical standby. Rollover promotes it in place, then the worker
+prepares the following standby. An absent or invalid required standby ends the
+outer session without launching another process. This local worker does not
+create a Codex thread, open a bridge socket,
 negotiate remote WebRTC, or consume the speech lane before the explicit wake.
 See [performance and ThirdReality tuning](performance.md) for the live
 measurements and acceptance criteria.
@@ -368,10 +369,10 @@ is not treated as a fallback.
 
 The pinned ThirdReality v1.1.7 overlay targets Python 3.11 on aarch64 Buildroot
 Linux, not Android. Its standard-library controller remains in the existing
-root voice process. Exactly two reusable prewarmed children run `aiortc` from a
+root voice process. Exactly one reusable prewarmed child runs `aiortc` from a
 complete hash-locked runtime under `/usr/bin/python3 -I -S`, with root-owned
-immutable source/runtime paths and one bounded Unix sequenced-packet descriptor
-per child. The launcher gives each child UID/GID 65534, no supplementary groups, and a minimal fixed
+immutable source/runtime paths and one bounded Unix sequenced-packet descriptor.
+The launcher gives the child UID/GID 65534, no supplementary groups, and a minimal fixed
 environment. Mode-0755 directories and mode-0644 source/runtime files remain
 readable but immutable to it; the root-owned mode-0600 device configuration
 and staging archive do not. It is not a separately supervised device daemon or
@@ -487,10 +488,11 @@ During v3 playback, two consecutive qualifying AEC-filtered capture frames
 immediately clear pending playback and SIGKILL `paplay` in the vendor-process
 parent. It retires the old PeerConnection epoch and sends no later capture to that peer. The
 outer vendor owner, session/player objects, bridge WebSocket, and ready latch
-remain attached. The two reusable sidecar processes alternate active/standby
-roles, creating a fresh PeerConnection each epoch and recycling the retired
-epoch's process. Exactly those two prewarmed slots are used; an absent or
-invalid standby ends the outer session. Exactly 4 KiB (two 64 ms frames,
+remain attached. The one reusable sidecar process holds the active peer and at
+most one fresh, offer-warm standby. Its ordered promotion fence stops the old
+peer before later capture reaches the promoted standby; the worker then prepares
+the following standby. The hard process cap is one, and an absent or invalid
+standby ends the outer session. Exactly 4 KiB (two 64 ms frames,
 128 ms) of recent AEC pre-roll through the trigger plus queued/live speech is
 sent once and in order to the replacement.
 The network thread arms a rearm gate only when that current-epoch interruption
@@ -500,8 +502,9 @@ speech edge. Qualifying signal before the eighth resets the quiet count, and
 rejected stale-epoch requests do not arm the gate.
 
 Capture freshness is rechecked at actual RTP consumption; packets older than
-2.25 seconds are terminal. The standby is re-polled immediately before use, and
-an absent or invalid slot terminates the outer session without a cold launch.
+2.25 seconds are terminal. The logical standby is validated immediately before
+use, and an absent or invalid peer terminates the outer session without another
+worker launch.
 Replacement
 lifecycle plus PCM is ordered within configured `output_queue_bytes` and stays
 inaudible until the exact epoch-matching `rollover_started`, then enters the
@@ -535,13 +538,13 @@ Fresh-peer rollover is a safe subscription-backed approximation, not exact
 ChatGPT same-session interruption. Queue/age/timeout, sidecar, or epoch failure
 ends the outer session closed. Manual stop, mute, and disconnect still end it;
 later detector hits remain ignored while the owner is live. No failure forwards
-direct audio to Home Assistant or logs it. At that installation's qualified 60%
-setting, a reference-device
-physical double-interruption canary passed twice with the exact artifact. Four
-cuts were 208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its
-same two worker PIDs without a cold replacement and retained context twice.
-This passes that reference rollover canary, not the full per-installation
-acceptance matrix. The normative
+direct audio to Home Assistant or logs it. A historical two-worker build passed
+a reference-device physical double-interruption canary twice at that
+installation's qualified 60% setting with the exact artifact. Four cuts were
+208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its same two
+worker PIDs without a cold replacement and retained context twice. Those
+measurements do not physically validate the current single-worker build and do
+not replace the full per-installation acceptance matrix. The normative
 contract is [wire v3](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 The reference device's earlier 25% echo-residual/double-talk results exercised

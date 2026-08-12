@@ -5,7 +5,7 @@ realtime client for the Python-based ThirdReality
 `1.01.07`/upstream `v1.1.7` image. This image is a Python 3.11, aarch64
 Buildroot Linux system, not Android. The root voice process keeps only the
 standard-library session/overlay code; direct media runs `aiortc` in exactly
-two reusable isolated children using the deterministic, hash-locked runtime
+one reusable isolated worker using the deterministic, hash-locked runtime
 described in
 [`webrtc-runtime.md`](webrtc-runtime.md). The overlay does not replace
 firmware, add a separately supervised daemon, or change Home Assistant.
@@ -32,12 +32,13 @@ realtime thread.
 In v3, bounded local AEC-filtered speech detection clears queued playback and
 immediately SIGKILLs the active `paplay` child in the parent, retires the old
 PeerConnection epoch, and sends no later capture to that peer. The outer vendor
-owner, session/player objects, bridge WebSocket, and ready latch remain attached. Two
-reusable isolated sidecar processes alternate roles: the standby creates a fresh
-PeerConnection for the next consecutive epoch, then the retired epoch's process
-is recycled as the next standby. Exactly those two prewarmed process slots are
-used. An absent or invalid standby terminates the outer session instead of
-cold-launching a replacement or allocating a third process.
+owner, session/player objects, bridge WebSocket, and ready latch remain attached.
+Exactly one reusable isolated sidecar process holds the active PeerConnection
+and at most one offer-warm standby peer. The first standby is prepared only
+after initial readiness, cue completion, and capture-open. Rollover atomically
+fences and stops the retired peer, promotes the standby, and leaves the same
+worker to prepare the following standby. An absent or invalid standby
+terminates the outer session instead of launching another worker.
 Exactly 4 KiB (two 64 ms frames, 128 ms) of recent AEC pre-roll and queued/live
 speech is sent once and in order to the replacement.
 Queue/age/timeout, sidecar, or epoch failure ends the outer session closed. A
@@ -296,10 +297,12 @@ playback. Two consecutive 64 ms AEC-filtered microphone frames that meet the
 bounded peak and sustained-energy checks kill local playback in the parent and
 drop queued playback IPC. It retires the old PeerConnection epoch and sends no
 later capture to that peer. The outer vendor owner, device session, logical player, bridge
-WebSocket, and ready latch remain attached. Exactly two reusable sidecar
-processes alternate active and standby roles, creating a fresh PeerConnection
-for every epoch and recycling the retired epoch's process. Exactly those two
-prewarmed slots are used; no cold or third process is launched. The parent
+WebSocket, and ready latch remain attached. Exactly one reusable sidecar
+process holds the active peer plus at most one fresh, offer-warm standby peer.
+The first standby is gated until initial readiness, cue completion, and
+capture-open. An ordered promotion fences and stops the retired peer, promotes
+the exact standby epoch, and routes later capture only to it; the same worker
+then prepares the following standby. The hard process cap remains one. The parent
 freezes exactly 4 KiB (two 64 ms frames, 128 ms) of recent AEC
 pre-roll through the trigger and queues live speech, then delivers those samples
 once and in capture order to the replacement peer.
@@ -310,10 +313,10 @@ qualifying signal before the eighth resets the quiet count.
 
 Capture timestamps are checked again when the replacement RTP track actually
 consumes each packet. A packet older than 2.25 seconds is a content-free
-terminal failure even if it passed queue admission. The prewarmed standby is
-health-polled during the active epoch and again immediately before use; exit,
-EOF, fatal/error, or unexpected post-offer output disqualifies that slot and
-terminates the outer session rather than launching a replacement child.
+terminal failure even if it passed queue admission. The logical standby is
+validated during the active epoch and again immediately before use; failure or
+an unexpected peer epoch disqualifies it and terminates the outer session
+rather than launching a replacement worker.
 
 Replacement lifecycle and PCM received during signaling share an ordered
 buffer capped by configured `output_queue_bytes`. Nothing in that buffer is
@@ -351,15 +354,15 @@ old RTP continued beyond the five-second media-fence deadline. The former
 `response.interrupt`/`interrupt.fenced` experiment is retained only as rejected
 evidence, not production behavior. Fresh-peer rollover is a safe
 subscription-backed approximation, not exact ChatGPT same-session semantics,
-and it adds a measurable negotiation handoff. A reference-device hardware
-double-interruption canary passed twice with the exact artifact at that
-installation's qualified 60% setting. Four local cuts were 208–211 ms and four
-rollovers were 1.29–1.57 s; each run recycled its same two worker PIDs without
-a cold replacement and retained context twice. This passes that reference
-canary, not every item in the per-installation acceptance matrix. The retired
-PeerConnection's stop acknowledgement followed replacement negotiation before
-its existing worker was recycled; this device event is separate from the
-bridge's 100 ms App Server close-confirmation barrier. See the
+and it adds a measurable negotiation handoff. A historical two-worker build
+passed a reference-device hardware double-interruption canary twice with the
+exact artifact at that installation's qualified 60% setting. Four local cuts
+were 208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its same
+two worker PIDs without a cold replacement and retained context twice. Those
+measurements do not physically validate the current single-worker build and do
+not replace the per-installation acceptance matrix. The historical device-side
+stop acknowledgement was separate from the bridge's 100 ms App Server
+close-confirmation barrier. See the
 [wire-v3 interruption contract](../../protocol/realtime-wire-v3.md#barge-in-and-interruption).
 
 The v2 path retains its older bridge-mediated interruption acknowledgements,
@@ -564,30 +567,29 @@ directories are root-owned mode 0755 and files mode 0644 so that unprivileged
 smoke/sidecar processes can read but not modify them. Previous release
 directories remain available for explicit runtime rollback.
 
-At voice-process startup the overlay prewarms exactly two reusable isolated
-sidecar processes with `/usr/bin/python3 -I -S`. This idle prewarm is only an
-alive `Popen` pool: it polls for process exit but does not request, drain, or
-validate an SDP offer. The selected process creates and validates its first
-offer only after an accepted wake owns startup. Once an epoch is active, the
-other process may be offer-prepared as the bounded rollover standby; after
-rollover the retired process is recycled and explicitly requalified. An absent
-or invalid required standby terminates the outer session; the client does not
-cold-launch a replacement or third process at that rollover boundary. Every
+At voice-process startup the overlay prewarms exactly one reusable isolated
+sidecar process with `/usr/bin/python3 -I -S`. This idle prewarm proves only
+that the `Popen` is alive; it does not request, drain, or validate an SDP offer.
+That worker creates and validates its initial peer offer only after an accepted
+wake owns startup. Once the peer is ready and the confirmation cue has completed
+and opened capture, the same process may create one bounded, offer-warm logical
+standby. Rollover promotes it in place and then prepares the following standby.
+An absent or invalid required standby terminates the outer session; the client
+does not launch another process at that rollover boundary. Every
 executable, source, runtime, and dependency
 path must resolve to a root-owned file or directory with no group/other write
 access. Source/runtime directories are mode 0755 and files mode 0644 so each
 child can traverse and read them without modifying them. The launcher assigns
 UID/GID 65534, removes supplementary groups, supplies a minimal fixed
-environment, and uses umask 077. Each child receives one bounded Unix
+environment, and uses umask 077. The child receives one bounded Unix
 sequenced-packet descriptor. No long-lived application credential is placed in
 argv or the environment or sent through IPC; offer/answer SDP crosses IPC and
-contains ephemeral ICE credentials and DTLS negotiation material. Neither child
-can read the root-owned mode-0600 realtime configuration or runtime archive.
+contains ephemeral ICE credentials and DTLS negotiation material. The child
+cannot read the root-owned mode-0600 realtime configuration or runtime archive.
 This is privilege separation, not a general filesystem/syscall/network
 sandbox, so treat reviewed sidecar/native dependencies as trusted device code.
 Prewarm failure does not weaken the route: an absent or invalid standby makes
-the first required rollover terminate the outer session without a cold
-replacement or third process.
+the first required rollover terminate the outer session without another worker.
 
 Create `/data/conf/codex-realtime.json` as a root-owned regular file with mode
 0600. Start from [`codex-realtime.example.json`](codex-realtime.example.json),
@@ -845,8 +847,9 @@ SDP negotiation, absence of bridge PCM in v3, bounded sidecar IPC and media
 queues, receiver-owned `media.started`/`media.quiet` boundaries,
 pre-preflight sink restoration plus complete PulseAudio AEC verification,
 continuous full-duplex capture, RTP-before-start and stopped-before-tail
-ordering, trusted-AEC-only fresh-peer rollover, immediate retirement of the old
-sidecar, consecutive epoch validation, bounded pre-roll/live capture replay in
+ordering, trusted-AEC-only fresh-peer rollover, ordered retirement of the old
+logical peer and in-process standby promotion, consecutive epoch validation,
+bounded pre-roll/live capture replay in
 order, actual-RTP-consumption freshness, no post-trigger capture to the old
 peer, queue/age/timeout failure, standby re-poll and terminal invalid-standby failure,
 post-interruption rearm only after eight consecutive detector-quiet 64 ms
@@ -885,18 +888,19 @@ output at 12.046 seconds, and received 536 signal-bearing playback packets with
 no captured audio or transcript persisted. Before 20 ms reframing, the same
 input reached `session.started` but produced no speech lifecycle or playback.
 
-Automated checks are not physical v3 acceptance. At that installation's
-qualified 60% setting, the reference-device hardware double-interruption canary
-passed twice with the exact artifact: four local cuts were 208–211 ms and four
-rollovers were 1.29–1.57 s. Each run recycled its same two worker PIDs without
-a cold replacement and retained context twice. The detector boundary also
-passed a stricter physical rearm probe: seven quiet
+Automated checks are not physical v3 acceptance. A historical two-worker build
+passed the reference-device hardware double-interruption canary twice at that
+installation's qualified 60% setting with the exact artifact: four local cuts
+were 208–211 ms and four rollovers were 1.29–1.57 s. Each run recycled its same
+two worker PIDs without a cold replacement and retained context twice. The
+detector boundary also passed a stricter physical rearm probe: seven quiet
 callbacks did not rearm, eight did, and only the later speech edge caused the
 second rollover. The retired PeerConnection's stop acknowledgement followed
 replacement negotiation before its existing
-worker was recycled;
-this device event is not the bridge's 100 ms App Server close barrier. The
-following full matrix remains required for each deployment.
+worker was recycled. These historical measurements do not physically validate
+the current single-worker build; this device event is not the bridge's 100 ms
+App Server close barrier. The following full matrix remains required for each
+deployment.
 
 On the physical device, verify these independently:
 
@@ -923,7 +927,9 @@ On the physical device, verify these independently:
    verify exactly one root-owned pinned cue (SHA-256
    `6b25dd2abaf7537865222ca9fd6e14fbf723458526fb79bbe29d8261d1320724`) and no
    capture until EOF; only EOF may switch the LED to listening. The local stop
-   detector must remain suspended throughout direct ownership. Cue timeout at
+   detector must remain suspended throughout direct ownership. Verify that the
+   first logical standby offer is requested only after this cue EOF/capture-open
+   boundary, while exactly one sidecar OS process remains alive. Cue timeout at
    two seconds, forced pre-ready/post-ready
    failure, owner-deadline expiry, and attempt exhaustion must return idle with
    no Home Assistant fallback.
@@ -964,8 +970,9 @@ On the physical device, verify these independently:
    RTP consumption and require terminal failure. Inject replacement lifecycle
    and PCM before acknowledgement: it must remain inaudible within
    `output_queue_bytes`, then replay in order only after exact
-   `rollover_started`. Re-poll a failed standby and prove the outer session
-   terminates without cold-launching a replacement or third sidecar process;
+   `rollover_started`. Verify exactly one sidecar process, reject a failed
+   logical standby, and prove the outer session terminates without launching a
+   replacement worker;
    expire a child-close budget and
    prove its daemon reaper owns the final `waitpid`. Reject float/bool protocol
    or epoch values and treat `stop` as normal during each rollover phase.

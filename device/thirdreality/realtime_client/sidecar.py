@@ -215,6 +215,23 @@ class WebRtcSidecarClient:
             )
         )
 
+    def request_standby_offer(
+        self,
+        *,
+        direct_capture_gain_db: float = 0.0,
+    ) -> None:
+        """Prepare one offer-only replacement beside the active peer."""
+        self._send(
+            encode_control(
+                "standby.create_offer",
+                direct_capture_gain_db=direct_capture_gain_db,
+            )
+        )
+
+    def promote_standby(self, peer_epoch: int) -> None:
+        """Fence the active peer and promote the identified warm replacement."""
+        self._send(encode_control("standby.promote", peer_epoch=peer_epoch))
+
     def set_answer(self, sdp: str) -> None:
         """Apply the App Server SDP answer in the device peer."""
         self._send(encode_control("set_answer", sdp=sdp))

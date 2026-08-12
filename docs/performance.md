@@ -14,8 +14,8 @@ media-player buffering all affect a turn.
 > The current Okay Nabu `realtime_only` implementation uses wire v3 and a device-owned
 > `aiortc` peer on the aarch64 Buildroot Linux speaker. The bridge carries
 > OAuth/App Server signaling and sideband only; RTP and `oai-events` bypass it.
-> V3 clears captured direct audio on failure. Its reference-device hardware
-> double-interruption canary passed twice with exact gzip artifact SHA-256
+> V3 clears captured direct audio on failure. A historical two-worker build's
+> reference-device hardware double-interruption canary passed twice with exact gzip artifact SHA-256
 > `5209f6bda3625b50c7413772414a74e12765c6fba2fa23155f79c24d1936e615`
 > at that installation's qualified 60% setting. Cuts were 210/211 ms and
 > 211/208 ms; rollovers were 1,408/1,303 ms and 1,569/1,292 ms. Each run
@@ -23,7 +23,8 @@ media-player buffering all affect a turn.
 > rollovers retained context. A subsequent strict boundary run proved that
 > seven quiet callbacks do not rearm while eight do; it recorded 209/211 ms
 > cuts and 1,432/1,276 ms rollovers with the same two PIDs and retained context
-> twice. This is not the full per-installation acceptance matrix.
+> twice. These results do not physically validate the current single-worker
+> build and are not the full per-installation acceptance matrix.
 > Measurements below that mention bridge PCM,
 > bridge audio queues, v2 interrupt acknowledgements, or Assist replay are
 > retained historical v2/adapter results and do not validate v3.
@@ -118,7 +119,7 @@ The shipped bounds are intentionally small and fail closed:
 | Device playback queue | 48 KiB / about 1.024 s | Bounds v2 child input and the v3 direct player's configured buffer allowance |
 | V3 decoded-receiver quiet boundary | About 120 ms without PCM meeting both peak 64 and RMS 8 | Splits only normal media generations; exact silence and sub-audible Opus residue are not played or semantic, while every decoded RTP frame still participates in the independent interruption fence |
 | V3 first-playback AEC settle | One 512 ms window per fresh peer/new `paplay` onset | Sends timestamp-preserving capture silence and ignores local barge-in evidence while the physical AEC converges; a normal quiet boundary that reuses the player does not restart it |
-| V3 fresh-peer rollover | 4 KiB / 128 ms recent AEC pre-roll; eight detector-quiet 64 ms frames (512 ms) to rearm after a committed interruption; 2.25 s maximum capture age rechecked at RTP consumption; configured handshake deadline | Stops local output immediately; one uninterrupted local speech segment retires only one peer; exactly two reusable sidecar slots alternate fresh PeerConnections; an absent/invalid standby terminates the outer session without a cold launch; pre-ack output is inaudible within `output_queue_bytes`; negotiation remains measurable |
+| V3 fresh-peer rollover | 4 KiB / 128 ms recent AEC pre-roll; eight detector-quiet 64 ms frames (512 ms) to rearm after a committed interruption; 2.25 s maximum capture age rechecked at RTP consumption; configured handshake deadline | Stops local output immediately; one uninterrupted local speech segment retires only one peer; exactly one reusable worker holds an active plus offer-warm standby PeerConnection and promotes the standby in order; an absent/invalid standby terminates the outer session without another worker; pre-ack output is inaudible within `output_queue_bytes`; negotiation remains measurable |
 | Full-duplex AEC sink ceiling | Configured guard, 1–60% (25% default), restored exactly at direct-session preflight, checked before every response, and reconciled by the guarded 50 ms firmware settings loop after a physical-button change | The ordinary unchanged tick only reads the small settings file; physical reconciliation has one 75 ms whole-transaction deadline, starts a 128 ms stale-tail guard before I/O, and fails output closed if the anchor cannot be restored exactly |
 | Legacy managed: Home Assistant tool execution + result send | 25 s + 5 s | Bounds the compatibility authority action and component transport separately |
 | Legacy managed: bridge tool transaction + provider delivery | 35 s + 5 s | Covers send-lock acquisition, WebSocket write, result wait, and App Server response write |
@@ -290,10 +291,11 @@ playback IPC in the parent, retire the old PeerConnection epoch, and prevent
 later capture from reaching it. The outer vendor owner/session/player, bridge WebSocket, and
 ready latch remain attached. Exactly 4 KiB (two 64 ms frames, 128 ms) of recent
 AEC pre-roll is merged with the bounded live queue and delivered once and in
-capture order to the fresh PeerConnection in the standby process. Exactly two
-reusable sidecar processes alternate active/standby roles; the retired epoch's
-process is recycled for the next epoch. An absent or invalid standby ends the
-outer session without cold-launching a replacement or third process.
+capture order to the fresh standby PeerConnection. Exactly one reusable sidecar
+process holds that standby beside the active peer. Ordered promotion fences and
+stops the old peer before later capture reaches the standby, and the same worker
+then prepares the following standby. An absent or invalid standby ends the outer
+session without launching another worker.
 Capture older than 2.25 seconds, queue pressure, handshake timeout, sidecar
 failure, or an invalid epoch closes the outer session.
 After the network thread commits an interruption, it suppresses further
@@ -337,15 +339,16 @@ Fresh-peer rollover is a safe subscription-backed approximation, not exact
 ChatGPT same-session semantics. Measure local stop latency separately from
 rollover offer, old-session close barrier, replacement readiness, and first new
 audible PCM; fresh WebRTC/provider negotiation cannot be optimized away.
-The reference-device double-interruption canary now passes at that
-installation's qualified 60% setting in two consecutive exact-artifact runs.
+The historical two-worker reference-device double-interruption canary passed at
+that installation's qualified 60% setting in two consecutive exact-artifact runs.
 Local cuts were 210/211 ms and 211/208 ms; fresh-peer rollovers were
 1,408/1,303 ms and 1,569/1,292 ms. Each run recycled its same two worker PIDs
 without a cold replacement and retained context twice. Each installation must
 still repeat the complete physical acceptance matrix. A separate strict
 seven-versus-eight-quiet-callback run also passed at 209/211 ms local cuts and
 1,432/1,276 ms rollovers, with the same two PIDs reused and context retained
-twice. The retired
+twice. These measurements do not physically validate the current single-worker
+build. The retired
 PeerConnection's stop acknowledgement followed replacement negotiation before
 its existing worker was recycled. That device event is distinct from the
 bridge's independent 100 ms App Server close-confirmation barrier.
@@ -394,9 +397,9 @@ replay, 2.25-second capture-age rejection, configured handshake timeout that
 starts after local AEC/player preparation within the absolute owner deadline,
 exactly-once ordered replacement
 writes, outer-session retention, bridge close-barrier thread reuse within the
-100 ms grace, tracked isolated-thread cleanup after ambiguity, exactly two
-alternating reusable sidecar process slots with terminal failure for an absent
-or invalid standby and no cold/third launch,
+100 ms grace, tracked isolated-thread cleanup after ambiguity, exactly one
+reusable sidecar process with active/standby peer slots, ordered promotion, and
+terminal failure for an absent or invalid standby without another worker,
 post-interruption suppression of a continuing-speech retrigger, seven quiet
 callbacks being insufficient, signal resetting the partial quiet count, eight
 consecutive detector-quiet 64 ms callbacks rearming a later speech edge,
@@ -810,8 +813,8 @@ future wake word. Home Assistant exposes no custom STT-provider callback before
 wake detection; the earliest reliable component hook is the STT stream itself,
 which already overlaps setup with capture. The ThirdReality direct client can
 start its remote session only at its own wake callback, so the Codex/App
-Server/WebRTC conversation remains cold and explicitly owned even though two
-local sidecar processes are already warm.
+Server/WebRTC conversation remains cold and explicitly owned even though one
+local sidecar process is already warm.
 
 Always-on remote prewarming would also:
 
@@ -827,13 +830,14 @@ provides usage and rate-limit observability, but no idle realtime-session cost
 or lifetime guarantee. Any future *remote* prewarm experiment must therefore be
 explicit, one-shot, short-lived, owner/profile-bound, and measured against a
 no-prewarm control. It must not silently replenish itself. The implemented
-local-only design keeps exactly two reusable isolated processes: one active and
-one reserved for the next role. Before wake, "warm" means only an alive
-`Popen`; no SDP offer has been requested or validated. The first selected child
-must create its offer inside the bounded startup attempt. Only after the active
-peer is established may the second child be offer-prepared for rollover. They
-then alternate fresh PeerConnections; an absent or invalid required standby
-ends the outer session without a cold or third launch. The alive-only pool
+local-only design keeps exactly one reusable isolated process. Before wake,
+"warm" means only an alive `Popen`; no SDP offer has been requested or
+validated. That worker creates its first offer inside the bounded startup
+attempt. Only after the active peer is ready and the confirmation cue has
+completed and opened capture may it prepare one fresh offer-warm standby. An
+ordered promotion swaps that standby into the active slot, and the worker then
+prepares the next one. An absent or invalid required standby ends the outer
+session without launching another worker. The alive-only worker
 consumes no remote speech lane before wake.
 
 ## ThirdReality safe performance settings

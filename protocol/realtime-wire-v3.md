@@ -286,10 +286,13 @@ include samples already delivered to the retired peer. The device writes each
 retained/replayed sample exactly once and in order to the replacement peer, but
 the protocol does not claim provider-wide exactly-once interpretation.
 
-The prewarmed standby is health-polled while the active peer runs and re-polled
-immediately before rollover use. Exit, EOF, fatal/error output, or any
-unexpected post-offer output disqualifies it and terminates the outer session;
-the fixed two-slot pool does not cold-launch a replacement or third child.
+Exactly one isolated sidecar worker owns an active peer and at most one logical
+offer-warm standby peer. The first standby is not requested until the initial
+peer is ready, the confirmation cue completes, and capture opens. It is
+validated while the active peer runs and immediately before rollover use.
+Failure, an invalid epoch, or unexpected control output disqualifies it and
+terminates the outer session; the hard one-process cap does not launch another
+worker.
 Replacement lifecycle and decoded PCM received before acknowledgement share one
 ordered buffer bounded by configured `output_queue_bytes`. They remain
 inaudible and cannot mutate player lifecycle until the exact matching
@@ -368,8 +371,8 @@ Qualified full-duplex AEC keeps device capture active during provider
 playback. Exactly two consecutive locally qualifying AEC-filtered capture
 frames trigger fresh-peer rollover. The vendor-process parent immediately
 drops queued playback PCM and IPC, closes player stdin, and sends SIGKILL to
-the active `paplay` child. It then retires the old sidecar and sends no later
-capture to that peer.
+the active `paplay` child. It then retires the old logical peer and sends no
+later capture to that peer.
 
 The network thread arms a post-interruption detector gate only after it accepts
 the request for the current output epoch and commits the local playback abort.
@@ -383,10 +386,13 @@ gate.
 
 The outer vendor owner, realtime-session object, logical player, bridge
 WebSocket, and ready latch remain attached. The device freezes a bounded recent
-AEC-filtered pre-roll through the trigger and queues subsequent live speech
-while a fresh prewarmed sidecar creates the next epoch's offer. After the
-rollover handshake, it replays those samples exactly once and in capture order
-to the replacement peer, then resumes live pacing. No audio is persisted or
+AEC-filtered pre-roll through the trigger and queues subsequent live speech.
+The single worker's ordered promotion command fences and stops the active peer,
+promotes the exact offer-warm standby epoch, and guarantees that capture ordered
+after the command reaches only that replacement. After the rollover handshake,
+the device replays those samples exactly once and in capture order to the
+replacement peer, then resumes live pacing and prepares the following standby
+inside the same worker. No audio is persisted or
 logged. Queue capacity, maximum sample age, handshake timeout, sidecar error,
 or invalid epoch fails the entire direct session closed; captured Okay Computer
 audio is never handed to Home Assistant.
@@ -422,11 +428,13 @@ Fresh-peer rollover is therefore a safe subscription-backed approximation,
 not exact ChatGPT same-session interruption semantics. It removes stale local
 audio and prevents subsequent capture from reaching the retired peer, but
 fresh WebRTC/provider negotiation adds measurable handoff latency. On the
-reference installation's qualified 60% setting, the physical double-interruption
-canary passed twice with the exact artifact: four local cuts were 208–211 ms and
-four rollovers were 1.29–1.57 s. Each run recycled its same two worker PIDs
-without a cold replacement and retained context twice. Every installation still
-requires its own physical acceptance matrix.
+reference installation's qualified 60% setting, a historical two-worker build
+passed the physical double-interruption canary twice with the exact artifact:
+four local cuts were 208–211 ms and four rollovers were 1.29–1.57 s. Each run
+recycled its same two worker PIDs without a cold replacement and retained
+context twice. Those measurements do not physically validate the current
+single-worker build. Every installation still requires its own physical
+acceptance matrix.
 
 ## Sideband controls and termination
 

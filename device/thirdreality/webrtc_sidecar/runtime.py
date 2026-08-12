@@ -6,6 +6,7 @@ import asyncio
 import socket
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Protocol
 
 from .protocol import (
@@ -64,8 +65,23 @@ class RuntimeErrorCode(RuntimeError):
         self.code = code
 
 
+@dataclass(slots=True)
+class _PeerSlot:
+    """One epoch-tagged peer and its local negotiation state."""
+
+    epoch: int
+    peer: PeerLike
+    offer_created: bool = False
+    answer_applied: bool = False
+    capture_committed: bool = False
+    capture_ready: bool = False
+    stopped: bool = False
+    failed: bool = False
+    failure_reported: bool = False
+
+
 class SidecarRuntime:
-    """Drive one peer from bounded sequenced-packet IPC."""
+    """Drive one active peer plus one offer-warm standby from bounded IPC."""
 
     def __init__(
         self,
@@ -73,33 +89,43 @@ class SidecarRuntime:
         *,
         peer_factory: PeerFactory | None = None,
     ) -> None:
-        """Adopt one child socket and construct its single peer."""
+        """Adopt one child socket and construct its initial active peer."""
         self._transport = transport
         self._transport.setblocking(False)
         self._fatal = asyncio.Event()
         self._fatal_code: str | None = None
         self._shutdown = False
-        self._offer_created = False
-        self._answer_applied = False
-        self._capture_committed = False
-        self._capture_ready = False
-        self._stopped = False
         if peer_factory is None:
             from .peer import DeviceWebRtcPeer  # noqa: PLC0415
 
             peer_factory = DeviceWebRtcPeer
         self._peer_factory = peer_factory
-        self._peer = self._new_peer()
+        self._next_peer_epoch = 1
+        self._active = self._new_peer()
+        self._standby: _PeerSlot | None = None
+        self._standby_offer_task: asyncio.Task[None] | None = None
 
-    def _new_peer(self) -> PeerLike:
-        """Construct one fresh peer while retaining the imported child runtime."""
-        return self._peer_factory(
-            emit_lifecycle=self._emit_lifecycle,
-            emit_playback=self._emit_playback,
-            emit_capture_metrics=self._emit_capture_metrics,
-            emit_state=self._emit_state,
-            emit_fatal=self._fail,
+    def _new_peer(self, *, epoch: int | None = None) -> _PeerSlot:
+        """Construct one fresh epoch-tagged peer in the imported child runtime."""
+        peer_epoch = self._allocate_peer_epoch() if epoch is None else epoch
+        peer = self._peer_factory(
+            emit_lifecycle=lambda values: self._emit_lifecycle(peer_epoch, values),
+            emit_playback=lambda value: self._emit_playback(peer_epoch, value),
+            emit_capture_metrics=lambda values: self._emit_capture_metrics(
+                peer_epoch,
+                values,
+            ),
+            emit_state=lambda state: self._emit_state(peer_epoch, state),
+            emit_fatal=lambda code: self._fail_peer(peer_epoch, code),
         )
+        return _PeerSlot(peer_epoch, peer)
+
+    def _allocate_peer_epoch(self) -> int:
+        epoch = self._next_peer_epoch
+        if epoch > 0xFFFFFFFF:
+            raise RuntimeErrorCode("peer_epoch_exhausted")
+        self._next_peer_epoch += 1
+        return epoch
 
     async def run(self) -> int:
         """Run until shutdown, peer failure, parent EOF, or protocol failure."""
@@ -137,12 +163,10 @@ class SidecarRuntime:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(receive_task, fatal_task, return_exceptions=True)
-            if not self._stopped:
-                try:
-                    await self._peer.stop()
-                    self._stopped = True
-                except Exception:  # noqa: BLE001 - peer cleanup must not escape.
-                    code = 1
+            try:
+                await self._stop_owned_peers()
+            except Exception:  # noqa: BLE001 - peer cleanup must not escape.
+                code = 1
             self._transport.close()
         return code
 
@@ -161,10 +185,16 @@ class SidecarRuntime:
                 # returns the answer. The bounded track/socket queues retain
                 # wake audio without putting a second realtime clock in front
                 # of the eventual RTP sender.
-                if not self._offer_created or self._stopped:
+                active = self._active
+                if (
+                    active is None
+                    or not active.offer_created
+                    or active.stopped
+                    or active.failed
+                ):
                     raise RuntimeErrorCode("capture_outside_session")
                 try:
-                    self._peer.feed_capture(decoded)
+                    active.peer.feed_capture(decoded)
                 except Exception as exc:
                     raise RuntimeErrorCode("capture_rejected") from exc
                 continue
@@ -174,91 +204,238 @@ class SidecarRuntime:
 
     async def _handle_control(self, message: ControlMessage) -> None:
         if message.type == "create_offer":
-            if self._stopped:
+            active = self._active
+            if active is None:
                 try:
-                    self._peer = self._new_peer()
+                    active = self._new_peer()
                 except Exception as exc:
                     raise RuntimeErrorCode("offer_failed") from exc
-                self._offer_created = False
-                self._answer_applied = False
-                self._capture_committed = False
-                self._capture_ready = False
-                self._stopped = False
-            if self._offer_created:
+                self._active = active
+            if active.offer_created or active.stopped or active.failed:
                 raise RuntimeErrorCode("offer_state_invalid")
             gain_db = message.values.get("direct_capture_gain_db", 0.0)
             assert isinstance(gain_db, (int, float)) and not isinstance(gain_db, bool)
             try:
-                self._peer.set_capture_gain_db(float(gain_db))
-                sdp = await self._peer.create_offer()
+                active.peer.set_capture_gain_db(float(gain_db))
+                sdp = await active.peer.create_offer()
             except Exception as exc:
                 raise RuntimeErrorCode("offer_failed") from exc
-            self._offer_created = True
+            active.offer_created = True
             self._send(encode_control("offer", sdp=sdp))
             return
+        if message.type == "standby.create_offer":
+            self._start_standby_offer(message)
+            return
+        if message.type == "standby.promote":
+            epoch = message.values.get("peer_epoch")
+            assert isinstance(epoch, int) and not isinstance(epoch, bool)
+            await self._promote_standby(epoch)
+            return
         if message.type == "set_answer":
-            if not self._offer_created or self._answer_applied or self._stopped:
+            active = self._active
+            if (
+                active is None
+                or not active.offer_created
+                or active.answer_applied
+                or active.stopped
+                or active.failed
+            ):
                 raise RuntimeErrorCode("answer_state_invalid")
             sdp = message.values.get("sdp")
             assert isinstance(sdp, str)
             try:
-                await self._peer.set_answer(sdp)
+                await active.peer.set_answer(sdp)
             except Exception as exc:
                 raise RuntimeErrorCode("answer_failed") from exc
-            self._answer_applied = True
+            active.answer_applied = True
             self._send(encode_control("answer.applied"))
             return
         if message.type == "capture.commit":
+            active = self._active
             if (
-                not self._answer_applied
-                or self._capture_committed
-                or self._stopped
+                active is None
+                or not active.answer_applied
+                or active.capture_committed
+                or active.stopped
+                or active.failed
             ):
                 raise RuntimeErrorCode("capture_commit_state_invalid")
             # Set the latch first: a zero-packet epoch can acknowledge
             # synchronously from inside commit_capture().
-            self._capture_committed = True
+            active.capture_committed = True
             try:
-                self._peer.commit_capture()
+                active.peer.commit_capture()
             except Exception as exc:
                 raise RuntimeErrorCode("capture_commit_failed") from exc
             return
         if message.type == "response.interrupt":
-            if not self._answer_applied or self._stopped:
+            active = self._active
+            if (
+                active is None
+                or not active.answer_applied
+                or active.stopped
+                or active.failed
+            ):
                 raise RuntimeErrorCode("interrupt_state_invalid")
             try:
-                self._peer.interrupt_response()
+                active.peer.interrupt_response()
             except Exception as exc:
                 raise RuntimeErrorCode("interrupt_failed") from exc
             return
         if message.type == "stop":
-            if not self._stopped:
-                try:
-                    await self._peer.stop()
-                except Exception as exc:
-                    raise RuntimeErrorCode("stop_failed") from exc
-                self._stopped = True
+            try:
+                await self._stop_owned_peers()
+            except Exception as exc:
+                raise RuntimeErrorCode("stop_failed") from exc
             self._send(encode_control("stopped"))
             return
         if message.type == "shutdown":
-            if not self._stopped:
-                try:
-                    await self._peer.stop()
-                except Exception as exc:
-                    raise RuntimeErrorCode("stop_failed") from exc
-                self._stopped = True
+            try:
+                await self._stop_owned_peers()
+            except Exception as exc:
+                raise RuntimeErrorCode("stop_failed") from exc
             self._send(encode_control("shutdown.complete"))
             self._shutdown = True
             return
         raise RuntimeErrorCode("control_direction_invalid")
 
-    def _emit_lifecycle(self, values: dict[str, str | int]) -> None:
+    def _start_standby_offer(self, message: ControlMessage) -> None:
+        """Start one offer without pausing capture processing for the active peer."""
+        active = self._active
+        if (
+            active is None
+            or not active.offer_created
+            or active.stopped
+            or active.failed
+        ):
+            raise RuntimeErrorCode("standby_state_invalid")
+        if self._standby is not None:
+            raise RuntimeErrorCode("standby_state_invalid")
+
+        epoch = self._allocate_peer_epoch()
+        try:
+            standby = self._new_peer(epoch=epoch)
+            gain_db = message.values.get("direct_capture_gain_db", 0.0)
+            assert isinstance(gain_db, (int, float)) and not isinstance(gain_db, bool)
+            standby.peer.set_capture_gain_db(float(gain_db))
+        except Exception:  # noqa: BLE001 - standby failure must preserve active media.
+            self._send_standby_failed(epoch)
+            return
+        self._standby = standby
+        task = asyncio.create_task(
+            self._finish_standby_offer(standby),
+            name="codex-device-webrtc-standby-offer",
+        )
+        self._standby_offer_task = task
+        task.add_done_callback(self._standby_offer_done)
+
+    async def _finish_standby_offer(self, standby: _PeerSlot) -> None:
+        try:
+            sdp = await standby.peer.create_offer()
+            if self._standby is not standby:
+                return
+            if standby.failed or standby.stopped:
+                self._standby = None
+                with suppress(Exception):
+                    await self._stop_peer(standby)
+                return
+            standby.offer_created = True
+            self._send(
+                encode_control(
+                    "standby.offer",
+                    sdp=sdp,
+                    peer_epoch=standby.epoch,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - peer boundary maps to fixed IPC state.
+            if self._standby is standby:
+                self._standby = None
+            with suppress(Exception):
+                await self._stop_peer(standby)
+            if not standby.failure_reported:
+                standby.failure_reported = True
+                self._send_standby_failed(standby.epoch)
+
+    def _standby_offer_done(self, task: asyncio.Task[None]) -> None:
+        if self._standby_offer_task is task:
+            self._standby_offer_task = None
+        if task.cancelled():
+            return
+        with suppress(Exception):
+            task.result()
+
+    async def _promote_standby(self, epoch: int) -> None:
+        """Fence the current peer before making the exact warm epoch active."""
+        standby = self._standby
+        active = self._active
+        if (
+            active is None
+            or standby is None
+            or standby.epoch != epoch
+            or not standby.offer_created
+            or standby.failed
+            or standby.stopped
+        ):
+            raise RuntimeErrorCode("standby_state_invalid")
+
+        # Clearing active ownership is the callback fence. The ordered promote
+        # acknowledgement is emitted only after stop() has drained the old peer,
+        # so no retired lifecycle or playback callback can cross that barrier.
+        self._active = None
+        try:
+            await self._stop_peer(active)
+        except Exception as exc:
+            raise RuntimeErrorCode("promotion_stop_failed") from exc
+        if standby.failed or standby.stopped:
+            self._standby = None
+            with suppress(Exception):
+                await self._stop_peer(standby)
+            raise RuntimeErrorCode("standby_state_invalid")
+        self._standby = None
+        self._active = standby
+        self._send(encode_control("standby.promoted", peer_epoch=epoch))
+
+    async def _stop_peer(self, slot: _PeerSlot) -> None:
+        if slot.stopped:
+            return
+        slot.stopped = True
+        await slot.peer.stop()
+
+    async def _stop_owned_peers(self) -> None:
+        offer_task = self._standby_offer_task
+        self._standby_offer_task = None
+        if offer_task is not None and not offer_task.done():
+            offer_task.cancel()
+            await asyncio.gather(offer_task, return_exceptions=True)
+        active = self._active
+        standby = self._standby
+        self._active = None
+        self._standby = None
+        slots = [slot for slot in (active, standby) if slot is not None]
+        if not slots:
+            return
+        results = await asyncio.gather(
+            *(self._stop_peer(slot) for slot in slots),
+            return_exceptions=True,
+        )
+        if any(isinstance(result, BaseException) for result in results):
+            raise RuntimeErrorCode("stop_failed")
+
+    def _emit_lifecycle(self, epoch: int, values: dict[str, str | int]) -> None:
+        if not self._is_active_epoch(epoch):
+            return
         self._send(encode_control("lifecycle", **values))
 
-    def _emit_playback(self, value: PlaybackAudio) -> None:
+    def _emit_playback(self, epoch: int, value: PlaybackAudio) -> None:
+        if not self._is_active_epoch(epoch):
+            return
         self._send(encode_playback_audio(value))
 
-    def _emit_capture_metrics(self, values: dict[str, int]) -> None:
+    def _emit_capture_metrics(self, epoch: int, values: dict[str, int]) -> None:
+        if not self._is_active_epoch(epoch):
+            return
         # Optional diagnostics are deliberately lossy. A full parent socket
         # must not turn clipping telemetry into a fatal media-path failure.
         packet = encode_control("capture.metrics", **values)
@@ -267,23 +444,53 @@ class SidecarRuntime:
         except (BlockingIOError, OSError):
             return
 
-    def _emit_state(self, state: str) -> None:
+    def _emit_state(self, epoch: int, state: str) -> None:
+        active = self._active
+        if active is None or active.epoch != epoch or active.stopped or active.failed:
+            return
         if state == "capture.ready":
             if (
-                not self._capture_committed
-                or self._capture_ready
+                not active.capture_committed
+                or active.capture_ready
                 or self._fatal_code is not None
             ):
                 if self._fatal_code is None:
                     self._fail("state_invalid")
                 return
-            self._capture_ready = True
+            active.capture_ready = True
             self._send(encode_control(state))
             return
         if state not in {"connected", "data.ready"}:
             self._fail("state_invalid")
             return
         self._send(encode_control(state))
+
+    def _is_active_epoch(self, epoch: int) -> bool:
+        active = self._active
+        return (
+            active is not None
+            and active.epoch == epoch
+            and not active.stopped
+            and not active.failed
+            and self._fatal_code is None
+        )
+
+    def _fail_peer(self, epoch: int, code: str) -> None:
+        active = self._active
+        if active is not None and active.epoch == epoch and not active.stopped:
+            active.failed = True
+            self._fail(code)
+            return
+        standby = self._standby
+        if standby is None or standby.epoch != epoch or standby.stopped:
+            return
+        standby.failed = True
+        if not standby.failure_reported:
+            standby.failure_reported = True
+            self._send_standby_failed(epoch)
+
+    def _send_standby_failed(self, epoch: int) -> None:
+        self._send(encode_control("standby.failed", peer_epoch=epoch))
 
     def _fail(self, code: str) -> None:
         if self._fatal_code is None:

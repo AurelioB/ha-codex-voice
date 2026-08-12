@@ -26,6 +26,7 @@ from .config import (
     DEVICE_WEBRTC_TRANSPORT,
     NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
+    PULSEAUDIO_AEC_CAPTURE,
     RealtimeConfig,
     realtime_start_message,
 )
@@ -37,7 +38,6 @@ from .playback import (
 from .sidecar import (
     ControlMessage,
     PlaybackAudio,
-    SidecarClosed,
     SidecarError,
     WebRtcSidecarClient,
 )
@@ -48,6 +48,8 @@ _INPUT_BYTES_PER_SECOND = 16_000 * 2
 _INPUT_ACTIVITY_SIGNAL_PEAK = 256
 _LOCAL_BARGE_IN_SIGNAL_PEAK = 1_024
 _LOCAL_BARGE_IN_SIGNAL_RMS = 384
+_NATIVE_AEC3_LOCAL_BARGE_IN_POST_GAIN_PEAK = 256
+_NATIVE_AEC3_LOCAL_BARGE_IN_POST_GAIN_RMS = 96
 _LOCAL_BARGE_IN_FRAMES = 2
 _LOCAL_BARGE_IN_AMBIGUOUS_FRAMES = 4
 _LOCAL_BARGE_IN_REARM_QUIET_FRAMES = 8
@@ -273,10 +275,11 @@ class _AudioPacket:
 
 @dataclass(slots=True)
 class _DirectStandby:
-    """One fresh isolated peer being prepared for the next local barge-in."""
+    """One offer-warm logical peer inside the active sidecar process."""
 
     sidecar: WebRtcSidecarClient
     offer_sdp: str | None = None
+    peer_epoch: int | None = None
 
 
 @dataclass(slots=True)
@@ -1725,7 +1728,8 @@ def _pactl_output(arguments: tuple[str, ...], *, timeout: float) -> str:
 _SESSIONS: weakref.WeakSet[RealtimeSession] = weakref.WeakSet()
 _SESSIONS_LOCK = threading.Lock()
 _PREWARM_LOCK = threading.Condition()
-_PREWARMED_SIDECAR_COUNT = 2
+_PREWARMED_SIDECAR_COUNT = 1
+_GLOBAL_SIDECAR_PROCESS_CAP = 1
 _SIDECAR_SLOT_WAIT_SECONDS = 1.0
 _SIDECAR_SLOT_POLL_SECONDS = 0.02
 _PREWARMED_SIDECARS: deque[WebRtcSidecarClient] = deque()
@@ -1743,7 +1747,7 @@ def _prune_global_sidecars_locked() -> None:
 def _launch_global_sidecar_locked() -> WebRtcSidecarClient:
     """Launch one child only when the hard process-wide slot cap permits it."""
     _prune_global_sidecars_locked()
-    if len(_GLOBAL_SIDECAR_PROCESSES) >= _PREWARMED_SIDECAR_COUNT:
+    if len(_GLOBAL_SIDECAR_PROCESSES) >= _GLOBAL_SIDECAR_PROCESS_CAP:
         raise SidecarError("all device WebRTC process slots are occupied")
     sidecar = WebRtcSidecarClient.launch()
     _GLOBAL_SIDECAR_PROCESSES[id(sidecar)] = sidecar
@@ -1751,7 +1755,7 @@ def _launch_global_sidecar_locked() -> WebRtcSidecarClient:
 
 
 def prewarm_device_webrtc() -> bool:
-    """Keep initial and first-rollover peers warm between voice sessions."""
+    """Keep exactly one device WebRTC worker warm between voice sessions."""
     with _PREWARM_LOCK:
         if _SHUTTING_DOWN:
             return False
@@ -1777,7 +1781,7 @@ def prewarm_device_webrtc() -> bool:
 
 
 def _take_prewarmed_sidecar() -> WebRtcSidecarClient:
-    """Transfer a warm peer without exceeding the global two-child cap."""
+    """Transfer a warm peer without exceeding the one-worker global cap."""
     deadline = time.monotonic() + _SIDECAR_SLOT_WAIT_SECONDS
     with _PREWARM_LOCK:
         while True:
@@ -1792,7 +1796,7 @@ def _take_prewarmed_sidecar() -> WebRtcSidecarClient:
                 with suppress(Exception):
                     sidecar.close()
                 _prune_global_sidecars_locked()
-            if len(_GLOBAL_SIDECAR_PROCESSES) < _PREWARMED_SIDECAR_COUNT:
+            if len(_GLOBAL_SIDECAR_PROCESSES) < _GLOBAL_SIDECAR_PROCESS_CAP:
                 return _launch_global_sidecar_locked()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1868,6 +1872,7 @@ class RealtimeSession:
             _RenderEchoGuard()
             if self._config.full_duplex
             and self._config.media_transport == DEVICE_WEBRTC_TRANSPORT
+            and self._config.capture_backend != NATIVE_AEC3_CAPTURE
             else None
         )
         self._direct_player_factory = direct_player_factory or (
@@ -1895,6 +1900,7 @@ class RealtimeSession:
         self._wake_network = threading.Event()
         self._stop_requested = threading.Event()
         self._interrupt_requested = threading.Event()
+        self._live_capture_opened = threading.Event()
         self._interrupt_preserve_session = True
         self._direct_output_fenced = threading.Event()
         self._local_anchor_transition = threading.Event()
@@ -1986,6 +1992,16 @@ class RealtimeSession:
                 self._state = SessionState.FAILED
             self._terminal.set()
             raise
+
+    def notify_live_capture_opened(self) -> None:
+        """Permit direct rollover prewarm after the audible ready boundary."""
+        if self._config.media_transport != DEVICE_WEBRTC_TRANSPORT:
+            return
+        with self._state_lock:
+            if self._state is not SessionState.READY:
+                return
+            self._live_capture_opened.set()
+        self._wake_network.set()
 
     def submit_audio(self, value: bytes) -> SubmitResult:
         """Queue one microphone frame without blocking the capture thread."""
@@ -2291,9 +2307,11 @@ class RealtimeSession:
             transitioning = self._local_anchor_transition.is_set()
             settling = captured_at < self._local_barge_in_settle_until
             peak, rms = _pcm_peak_and_rms(value)
-            has_signal = (
-                peak >= _LOCAL_BARGE_IN_SIGNAL_PEAK
-                and rms >= _LOCAL_BARGE_IN_SIGNAL_RMS
+            has_signal = _levels_have_local_barge_in_signal(
+                peak,
+                rms,
+                capture_backend=self._config.capture_backend,
+                direct_capture_gain_db=self._config.direct_capture_gain_db,
             )
             provider_threshold = max(
                 1,
@@ -3232,7 +3250,8 @@ class RealtimeSession:
                 outcome="live",
             )
 
-            standby = self._start_direct_standby(sidecar)
+            standby = None
+            initial_standby_requested = False
             peer_epoch = 1
 
             last_semantic_activity = self._clock()
@@ -3273,6 +3292,9 @@ class RealtimeSession:
                     sidecar.stop()
                     connection.send_json({"type": "stop"})
                     return
+                if not initial_standby_requested and self._live_capture_opened.is_set():
+                    initial_standby_requested = True
+                    standby = self._start_direct_standby(sidecar)
                 previous_generation = state.active_generation
                 active_generation, requested_watermark = self._flush_local_barge_in(
                     player,
@@ -3294,8 +3316,6 @@ class RealtimeSession:
                     last_semantic_activity = now
                     peer_epoch += 1
                     self._set_direct_peer_epoch(peer_epoch)
-                    replacement = standby
-                    standby = None
                     diagnostics.phase = "rollover"
                     (
                         sidecar,
@@ -3303,11 +3323,10 @@ class RealtimeSession:
                         pacer,
                         sample_index,
                         context_retained,
-                        recycled_sidecar,
                     ) = self._rollover_direct_peer(
                         connection,
                         sidecar,
-                        replacement,
+                        standby,
                         player,
                         epoch=peer_epoch,
                         session_deadline=(
@@ -3322,10 +3341,7 @@ class RealtimeSession:
                         _LOGGER.warning(
                             "ThirdReality direct rollover did not retain context"
                         )
-                    standby = self._start_direct_standby(
-                        sidecar,
-                        recycled=recycled_sidecar,
-                    )
+                    standby = self._start_direct_standby(sidecar)
                     last_semantic_activity = self._clock()
                     next_ping_at = (
                         last_semantic_activity + self._config.ping_interval_seconds
@@ -3350,6 +3366,10 @@ class RealtimeSession:
                     player,
                     state,
                 )
+                controls, standby = self._update_direct_standby_from_controls(
+                    controls,
+                    standby,
+                )
                 if controls:
                     raise SidecarError(  # noqa: TRY301
                         "sidecar emitted an unexpected runtime event"
@@ -3368,9 +3388,6 @@ class RealtimeSession:
                             outcome="live",
                         )
                     next_syslog_at = now + _DIRECT_SYSLOG_INTERVAL_SECONDS
-
-                if standby is not None:
-                    standby = self._poll_direct_standby(standby)
 
                 if pending_ping is None and now >= next_ping_at:
                     pending_ping = os.urandom(8)
@@ -3467,9 +3484,6 @@ class RealtimeSession:
                         sidecar.stop()
                     with suppress(Exception):
                         sidecar.close()
-                if standby is not None:
-                    with suppress(Exception):
-                        standby.sidecar.close()
                 if connection is not None:
                     with suppress(Exception):
                         connection.send_close()
@@ -3611,126 +3625,95 @@ class RealtimeSession:
     def _start_direct_standby(
         self,
         active: WebRtcSidecarClient,
-        *,
-        recycled: WebRtcSidecarClient | None = None,
     ) -> _DirectStandby | None:
-        """Best-effort offer-prewarm a recycled or freshly launched peer."""
-        candidate: WebRtcSidecarClient | None = None
+        """Best-effort prewarm one logical peer in the active worker process."""
         try:
-            candidate = recycled if recycled is not None else self._sidecar_factory()
-            if candidate is active:
-                # Preserve compatibility with factories that model one fixed
-                # peer. Such a factory cannot satisfy rollover and is retried
-                # only when a real interruption requires a replacement.
-                return None
-            if recycled is not None:
-                self._consume_direct_stopped(candidate)
-            candidate.request_offer(
+            active.request_standby_offer(
                 direct_capture_gain_db=self._config.direct_capture_gain_db,
             )
-            return _DirectStandby(candidate)
+            return _DirectStandby(active)
         except Exception:  # noqa: BLE001 - active conversation remains usable
-            if candidate is not None and candidate is not active:
-                with suppress(Exception):
-                    candidate.close(timeout=0.0)
             _LOGGER.warning(
                 "ThirdReality direct rollover prewarm failed",
                 exc_info=False,
             )
             return None
 
-    def _consume_direct_stopped(self, sidecar: WebRtcSidecarClient) -> None:
-        """Prove the old peer stopped after discarding only bounded retired output."""
-        if sidecar.closed or not _socket_readable(sidecar, 0):
-            raise SidecarError("retired sidecar did not confirm its stop before reuse")
-        messages = sidecar.drain_messages()
-        stopped = ControlMessage("stopped", {})
-        if not messages or messages[-1] != stopped:
-            raise SidecarError(
-                "retired sidecar returned an invalid stop acknowledgement"
-            )
-        for message in messages[:-1]:
-            self._observe_direct_sidecar_message(message)
-            if isinstance(message, PlaybackAudio):
+    def _update_direct_standby_from_controls(
+        self,
+        controls: list[ControlMessage],
+        standby: _DirectStandby | None,
+    ) -> tuple[list[ControlMessage], _DirectStandby | None]:
+        """Consume standby controls interleaved with active-peer media."""
+        remaining: list[ControlMessage] = []
+        for control in controls:
+            if control.type == "standby.offer":
+                if standby is None or standby.offer_sdp is not None:
+                    raise SidecarError("sidecar emitted an unexpected standby offer")
+                sdp, peer_epoch = self._direct_standby_offer(control)
+                standby.offer_sdp = sdp
+                standby.peer_epoch = peer_epoch
                 continue
-            if message.type == "capture.metrics":
+            if control.type == "standby.failed":
+                if standby is None:
+                    raise SidecarError("sidecar emitted an unexpected standby failure")
+                failed_epoch = control.values.get("peer_epoch")
+                if type(failed_epoch) is not int or failed_epoch < 1:
+                    raise SidecarError("sidecar standby failure epoch is invalid")
+                standby = None
+                _LOGGER.warning(
+                    "ThirdReality direct rollover prewarm failed",
+                    exc_info=False,
+                )
                 continue
-            if message.type != "lifecycle":
-                raise SidecarError(
-                    "retired sidecar emitted an invalid pre-stop control"
-                )
-            event_type = message.values.get("event_type")
-            generation = message.values.get("generation")
-            if (
-                not isinstance(event_type, str)
-                or event_type not in _CONTROL_EVENTS
-                or event_type in {"error", "invalid_request_error"}
-                or event_type.endswith("_error")
-                or type(generation) is not int
-                or generation < 0
-            ):
-                raise SidecarError(
-                    "retired sidecar emitted an invalid pre-stop lifecycle"
-                )
-        # ``drain_messages`` is bounded. A full window with more ordered IPC
-        # behind the stop marker would make that marker ambiguous, so refuse
-        # reuse instead of admitting any packet across the fresh-peer boundary.
-        if _socket_readable(sidecar, 0):
-            raise SidecarError("retired sidecar emitted output after stop")
+            remaining.append(control)
+        return remaining, standby
 
-    def _poll_direct_standby(
+    @staticmethod
+    def _direct_standby_offer(control: ControlMessage) -> tuple[str, int]:
+        """Validate one logical standby offer and its process-local epoch."""
+        sdp = control.values.get("sdp")
+        peer_epoch = control.values.get("peer_epoch")
+        if (
+            not isinstance(sdp, str)
+            or not sdp.startswith("v=0")
+            or "\x00" in sdp
+            or type(peer_epoch) is not int
+            or peer_epoch < 1
+        ):
+            raise SidecarError("sidecar emitted an invalid standby offer")
+        return sdp, peer_epoch
+
+    def _wait_for_direct_standby_offer(
         self,
         standby: _DirectStandby,
-    ) -> _DirectStandby | None:
-        """Collect and health-poll one standby without disturbing active media."""
-        if standby.sidecar.closed:
-            with suppress(Exception):
-                standby.sidecar.close(timeout=0.0)
-            _LOGGER.warning(
-                "ThirdReality direct rollover standby exited",
-                exc_info=False,
+        deadline: float,
+    ) -> None:
+        """Wait boundedly for the in-process standby while discarding old output."""
+        while standby.offer_sdp is None:
+            self._raise_if_direct_startup_cancelled(deadline)
+            if not _socket_readable(standby.sidecar, 0):
+                self._wake_network.wait(_DIRECT_HANDSHAKE_TICK_SECONDS)
+                self._wake_network.clear()
+                continue
+            controls: list[ControlMessage] = []
+            for message in standby.sidecar.drain_messages(maximum=8):
+                self._observe_direct_sidecar_message(message)
+                if isinstance(message, PlaybackAudio):
+                    continue
+                if message.type in {"capture.metrics", "lifecycle"}:
+                    continue
+                if message.type == "error":
+                    raise SidecarError("device WebRTC sidecar reported an error")
+                controls.append(message)
+            controls, current = self._update_direct_standby_from_controls(
+                controls,
+                standby,
             )
-            return None
-        if not _socket_readable(standby.sidecar, 0):
-            return standby
-        invalid_output = False
-        try:
-            if standby.offer_sdp is None:
-                standby.offer_sdp = self._drain_direct_offer(standby.sidecar)
-            elif standby.sidecar.drain_messages():
-                # An offer-complete standby has no valid asynchronous output
-                # before set_answer. A fatal/error or EOF must disqualify it
-                # while the active peer is still available.
-                invalid_output = True
-        except (SidecarError, SidecarClosed):
-            invalid_output = True
-        if invalid_output:
-            with suppress(Exception):
-                standby.sidecar.close(timeout=0.0)
-            _LOGGER.warning(
-                "ThirdReality direct rollover prewarm failed",
-                exc_info=False,
-            )
-            return None
-        return standby
-
-    def _drain_direct_offer(self, sidecar: WebRtcSidecarClient) -> str:
-        """Consume exactly one isolated-peer offer and no unrelated events."""
-        messages = sidecar.drain_messages()
-        if len(messages) != 1:
-            raise SidecarError("sidecar emitted an invalid offer sequence")
-        message = messages[0]
-        if (
-            isinstance(message, ControlMessage)
-            and message.type == "offer"
-            and isinstance(message.values.get("sdp"), str)
-        ):
-            sdp = str(message.values["sdp"])
-            if sdp and "\x00" not in sdp and sdp.startswith("v=0"):
-                return sdp
-        if isinstance(message, ControlMessage) and message.type == "error":
-            raise SidecarError("sidecar could not create an offer")
-        raise SidecarError("sidecar emitted an unexpected offer event")
+            if current is None:
+                raise SidecarError("direct rollover standby failed")
+            if controls:
+                raise SidecarError("sidecar emitted an unexpected standby event")
 
     def _rollover_direct_peer(
         self,
@@ -3748,47 +3731,45 @@ class RealtimeSession:
         _AudioPacer,
         int,
         bool,
-        WebRtcSidecarClient,
     ]:
-        """Replace one frameless peer without releasing the outer voice session."""
+        """Promote one in-process peer without releasing the outer voice session."""
         now = self._clock()
         deadline = min(
             session_deadline,
             now + self._config.handshake_timeout_seconds,
         )
-        replacement: WebRtcSidecarClient | None = None
         pending_output = _DirectPendingOutput(self._config.output_queue_bytes)
         try:
-            if standby is not None:
-                standby = self._poll_direct_standby(standby)
             if standby is None:
                 raise SidecarError(  # noqa: TRY301
                     "direct rollover has no healthy offer-warm standby"
                 )
-            replacement = standby.sidecar
-            offer_sdp: str | None = standby.offer_sdp
-
-            if offer_sdp is None:
-                offer_sdp = self._wait_for_direct_offer(replacement, deadline)
-            if replacement.closed:
+            if standby.sidecar is not old_sidecar:
+                raise SidecarError(  # noqa: TRY301
+                    "direct rollover standby escaped its active worker"
+                )
+            self._wait_for_direct_standby_offer(standby, deadline)
+            offer_sdp = standby.offer_sdp
+            if offer_sdp is None or standby.peer_epoch != epoch:
+                raise SidecarError(  # noqa: TRY301
+                    "direct rollover standby epoch is incompatible"
+                )
+            if old_sidecar.closed:
                 raise SidecarError(  # noqa: TRY301
                     "direct rollover replacement exited before use"
                 )
 
-            # The player was already killed at the detector boundary. Retire
-            # the old endpoint only after a healthy replacement has produced
-            # its complete offer. A missing or unhealthy standby makes rollover
-            # terminal instead of allocating a third isolated process.
+            # One ordered command fences and stops the active logical peer,
+            # then promotes the offer-warm peer inside the same OS process.
+            # Send bridge rollover immediately afterward so the old provider's
+            # close cannot win the device-control race.
             try:
-                old_sidecar.stop()
+                old_sidecar.promote_standby(epoch)
             except Exception as exc:
-                # A failed ordered stop cannot prove that the retired peer was
-                # fenced. Kill its isolated process immediately and terminate
-                # rollover before the bridge can admit the replacement epoch.
                 with suppress(Exception):
                     old_sidecar.close(timeout=0.0)
                 raise SidecarError(
-                    "retired direct sidecar could not be stopped"
+                    "direct sidecar standby could not be promoted"
                 ) from exc
 
             connection.send_json(
@@ -3799,14 +3780,13 @@ class RealtimeSession:
                     "transport": {"type": "webrtc", "sdp": offer_sdp},
                 }
             )
-            # The offer-created child accepts timestamped capture before the
-            # remote answer arrives. Feed it immediately so SDP/provider work
-            # cannot age the original barge-in frames in the parent queue.
+            # Capture sent after the promote command is ordered behind the
+            # runtime's stop/swap barrier and reaches only the promoted peer.
             pacer = _AudioPacer()
             sample_index = 0
             answer_sdp, sample_index = self._wait_for_direct_rollover_answer(
                 connection,
-                replacement,
+                old_sidecar,
                 deadline,
                 epoch=epoch,
                 pacer=pacer,
@@ -3814,7 +3794,7 @@ class RealtimeSession:
                 capture_ages_ms=capture_ages_ms,
                 pending_output=pending_output,
             )
-            replacement.set_answer(answer_sdp)
+            old_sidecar.set_answer(answer_sdp)
 
             # Every replacement peer owns a new contiguous RTP input timeline.
             # Capture watermarks remain process-global solely for dedupe, while
@@ -3824,7 +3804,7 @@ class RealtimeSession:
                 sample_index
             )
             capture_committed = self._maybe_commit_direct_capture(
-                replacement,
+                old_sidecar,
                 sample_index=sample_index,
                 startup_sample_end=startup_capture_sample_end,
                 committed=False,
@@ -3840,7 +3820,7 @@ class RealtimeSession:
                 self._raise_if_direct_startup_cancelled(deadline)
                 now = self._clock()
                 sample_index, _ = self._send_direct_audio(
-                    replacement,
+                    old_sidecar,
                     pacer,
                     peer_epoch=epoch,
                     sample_index=sample_index,
@@ -3853,13 +3833,13 @@ class RealtimeSession:
                     ),
                 )
                 capture_committed = self._maybe_commit_direct_capture(
-                    replacement,
+                    old_sidecar,
                     sample_index=sample_index,
                     startup_sample_end=startup_capture_sample_end,
                     committed=capture_committed,
                 )
                 controls = self._drain_direct_handshake_sidecar(
-                    replacement,
+                    old_sidecar,
                     pending_output,
                 )
                 for control in controls:
@@ -3881,7 +3861,7 @@ class RealtimeSession:
             )
             context_retained = self._wait_for_direct_rollover_started(
                 connection,
-                replacement,
+                old_sidecar,
                 pacer,
                 sample_index=sample_index,
                 deadline=deadline,
@@ -3892,7 +3872,7 @@ class RealtimeSession:
             sample_index = context_retained[0]
             self._replay_direct_pending_output(
                 pending_output,
-                replacement,
+                old_sidecar,
                 player,
                 playback_state,
             )
@@ -3903,17 +3883,13 @@ class RealtimeSession:
                     )
                 self._state = SessionState.READY
             return (
-                replacement,
+                old_sidecar,
                 playback_state,
                 pacer,
                 sample_index,
                 context_retained[1],
-                old_sidecar,
             )
         except Exception:
-            if replacement is not None and replacement is not old_sidecar:
-                with suppress(Exception):
-                    replacement.close(timeout=0.0)
             with suppress(Exception):
                 old_sidecar.close(timeout=0.0)
             raise
@@ -3930,8 +3906,10 @@ class RealtimeSession:
         capture_ages_ms: deque[float],
         pending_output: _DirectPendingOutput,
     ) -> tuple[str, int]:
-        """Wait for the exact epoch-tagged replacement SDP answer."""
-        while True:
+        """Wait for both the ordered promotion barrier and bridge SDP answer."""
+        answer_sdp: str | None = None
+        promoted = False
+        while answer_sdp is None or not promoted:
             self._raise_if_direct_startup_cancelled(deadline)
             now = self._clock()
             sample_index, _ = self._send_direct_audio(
@@ -3943,8 +3921,34 @@ class RealtimeSession:
                 capture_ages_ms=capture_ages_ms,
                 capture_max_age_seconds=_DIRECT_STARTUP_CAPTURE_MAX_AGE_SECONDS,
             )
-            if self._drain_direct_handshake_sidecar(sidecar, pending_output):
-                raise SidecarError("sidecar failed while awaiting rollover answer")
+            if _socket_readable(sidecar, 0):
+                for sidecar_message in sidecar.drain_messages(maximum=8):
+                    self._observe_direct_sidecar_message(sidecar_message)
+                    if not promoted:
+                        if (
+                            isinstance(sidecar_message, ControlMessage)
+                            and sidecar_message.type == "standby.promoted"
+                        ):
+                            acknowledged_epoch = sidecar_message.values.get(
+                                "peer_epoch"
+                            )
+                            if acknowledged_epoch != epoch:
+                                raise SidecarError(
+                                    "sidecar promoted an incompatible standby epoch"
+                                )
+                            promoted = True
+                            continue
+                        if isinstance(
+                            sidecar_message, ControlMessage
+                        ) and sidecar_message.type in {"error", "standby.failed"}:
+                            raise SidecarError("sidecar standby promotion failed")
+                        # The promotion acknowledgement is an ordered fence:
+                        # everything before it belongs to the retired peer.
+                        continue
+                    self._append_direct_pending_handshake_output(
+                        sidecar_message,
+                        pending_output,
+                    )
             if _socket_readable(connection, 0):
                 message = connection.receive_message()
                 if message is None:
@@ -3956,8 +3960,38 @@ class RealtimeSession:
                 value = _json_object(message.data)
                 if value.get("type") == "error":
                     raise WebSocketError("bridge rejected direct rollover")
-                return _direct_rollover_answer_sdp(value, epoch=epoch), sample_index
+                if answer_sdp is not None:
+                    raise WebSocketError("bridge emitted duplicate rollover answer")
+                answer_sdp = _direct_rollover_answer_sdp(value, epoch=epoch)
             self._wait_direct_tick(pacer, now, deadline)
+        return answer_sdp, sample_index
+
+    def _append_direct_pending_handshake_output(
+        self,
+        message: ControlMessage | PlaybackAudio,
+        pending_output: _DirectPendingOutput,
+    ) -> None:
+        """Retain only new-peer output observed after the promotion barrier."""
+        if isinstance(message, PlaybackAudio):
+            pending_output.append(message)
+            return
+        if message.type == "capture.metrics":
+            return
+        if message.type in {"error", "standby.failed"}:
+            raise SidecarError("device WebRTC sidecar reported an error")
+        if message.type != "lifecycle":
+            raise SidecarError("sidecar emitted an unexpected promotion event")
+        event_type = message.values.get("event_type")
+        generation = message.values.get("generation")
+        if (
+            not isinstance(event_type, str)
+            or type(generation) is not int
+            or generation < 0
+            or event_type in {"error", "invalid_request_error"}
+            or event_type.endswith("_error")
+        ):
+            raise SidecarError("sidecar lifecycle metadata is invalid")
+        pending_output.append(message)
 
     def _wait_for_direct_rollover_started(
         self,
@@ -4650,19 +4684,36 @@ def _scale_pcm16(value: bytes, gain: float) -> bytes:
     return bytes(scaled)
 
 
-def _pcm_has_local_barge_in_signal(value: bytes) -> bool:
+def _levels_have_local_barge_in_signal(
+    peak: int,
+    rms: int,
+    *,
+    capture_backend: str,
+    direct_capture_gain_db: float,
+) -> bool:
+    """Apply the capture-path-specific peak and sustained-energy boundary."""
+    if capture_backend == NATIVE_AEC3_CAPTURE:
+        gain = 10 ** (direct_capture_gain_db / 20)
+        return (
+            peak * gain >= _NATIVE_AEC3_LOCAL_BARGE_IN_POST_GAIN_PEAK
+            and rms * gain >= _NATIVE_AEC3_LOCAL_BARGE_IN_POST_GAIN_RMS
+        )
+    return peak >= _LOCAL_BARGE_IN_SIGNAL_PEAK and rms >= _LOCAL_BARGE_IN_SIGNAL_RMS
+
+
+def _pcm_has_local_barge_in_signal(
+    value: bytes,
+    *,
+    capture_backend: str = PULSEAUDIO_AEC_CAPTURE,
+    direct_capture_gain_db: float = 0.0,
+) -> bool:
     """Require both a speech-scale peak and sustained frame energy."""
-    sample_count = len(value) // 2
-    if sample_count == 0:
-        return False
-    peak = 0
-    energy = 0
-    for (sample,) in struct.iter_unpack("<h", value):
-        magnitude = abs(sample)
-        peak = max(peak, magnitude)
-        energy += sample * sample
-    return peak >= _LOCAL_BARGE_IN_SIGNAL_PEAK and energy >= (
-        _LOCAL_BARGE_IN_SIGNAL_RMS**2 * sample_count
+    peak, rms = _pcm_peak_and_rms(value)
+    return _levels_have_local_barge_in_signal(
+        peak,
+        rms,
+        capture_backend=capture_backend,
+        direct_capture_gain_db=direct_capture_gain_db,
     )
 
 

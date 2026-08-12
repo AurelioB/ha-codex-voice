@@ -133,7 +133,7 @@ sides of a narrow bridge API.
   at most three fresh session attempts one shared absolute 12-second owner
   deadline. Each session has its own ten-second signaling-handshake bound
   inside the remaining owner time. Idle process prewarm proves only that the
-  two isolated `Popen` children are alive; it does not request or validate an
+  one isolated `Popen` child is alive; it does not request or validate an
   SDP offer. Construction, AEC/player preflight, offer creation, bridge setup,
   peer readiness, terminal state, deadline, or attempt exhaustion all fail
   closed without widening authority to Home Assistant.
@@ -147,7 +147,9 @@ sides of a narrow bridge API.
   direct ownership window, so the wake tail cannot cancel signaling and
   playback echo cannot terminate the live session. Capture remains closed
   through cue EOF; EOF switches to the listening LED and opens live provider
-  capture. Missing EOF or cue failure has a two-second bound and is terminal.
+  capture. Only after that boundary may the isolated worker prepare the initial
+  logical standby peer. Missing EOF or cue failure has a two-second bound and is
+  terminal.
   The sole spoken terminal control is `end_conversation`; its result closes the
   session and normal cleanup restores the prior detector membership and idle
   LED.
@@ -224,11 +226,12 @@ sides of a narrow bridge API.
   drops queued media, immediately SIGKILLs `paplay` in the privileged parent,
   retires the old PeerConnection epoch, and prevents later capture from reaching
   that peer. The outer vendor owner/session/player, authenticated bridge
-  WebSocket, and ready latch remain attached. Exactly two reusable isolated
-  sidecar processes alternate active/standby roles with a fresh PeerConnection
-  each epoch, and the retired epoch's process is recycled. Exactly those two
-  prewarmed slots are used; an absent or invalid standby terminates the outer
-  session without a cold replacement or third process. Exactly 4 KiB (two 64 ms
+  WebSocket, and ready latch remain attached. Exactly one reusable isolated
+  sidecar process holds the active peer and at most one fresh, offer-warm
+  standby peer. Ordered promotion fences and stops the retired peer before
+  later capture reaches the standby, and the same worker then prepares the
+  following standby. The hard process cap remains one; an absent or invalid
+  standby terminates the outer session without another worker. Exactly 4 KiB (two 64 ms
   frames, 128 ms) of recent AEC pre-roll and
   the live speech queue is written once and in order to the replacement peer.
   A committed interruption disarms further triggers from the same uninterrupted
@@ -243,8 +246,8 @@ sides of a narrow bridge API.
   ignored while the owner is live. Captured direct audio is neither handed to
   Home Assistant nor persisted/logged.
 - Capture age is checked again at actual RTP consumption; anything older than
-  2.25 seconds is terminal. Standby health is re-polled before use, and an absent
-  or invalid slot terminates the outer session. Pre-ack replacement lifecycle and PCM
+  2.25 seconds is terminal. The logical standby is validated before use, and an
+  absent or invalid peer terminates the outer session. Pre-ack replacement lifecycle and PCM
   share the configured `output_queue_bytes` bound and remain inaudible until an
   exact matching `rollover_started`, then replay in order. Protocol/epoch
   integers reject floats and booleans. `stop` remains normal during all phases.
@@ -265,12 +268,13 @@ sides of a narrow bridge API.
   old RTP continued beyond the five-second media-fence deadline; the former
   `response.interrupt`/`interrupt.fenced` experiment is not production
   behavior. Fresh-peer rollover is a safe subscription-backed approximation,
-  not exact ChatGPT same-session semantics. A reference-device physical
-  double-interruption canary passed twice with the exact artifact at that
-  installation's qualified 60% setting. Four cuts were 208–211 ms and four
-  rollovers were 1.29–1.57 s; each run recycled its same two worker PIDs without
-  a cold replacement and retained context twice. This passes that reference canary, not the full
-  per-installation acceptance matrix. Current App Server
+  not exact ChatGPT same-session semantics. A historical two-worker build
+  passed a reference-device physical double-interruption canary twice with the
+  exact artifact at that installation's qualified 60% setting. Four cuts were
+  208–211 ms and four rollovers were 1.29–1.57 s; each run recycled its same two
+  worker PIDs without a cold replacement and retained context twice. Those
+  measurements do not physically validate the current single-worker build and
+  do not replace the full per-installation acceptance matrix. Current App Server
   documentation supports realtime WebRTC v1 and v3, not v2; the direct path
   remains on v3, and a live v1 subscription
   canary did not complete startup. On the native v2

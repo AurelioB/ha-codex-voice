@@ -146,6 +146,43 @@ def test_ipc_round_trips_strict_capture_gain(gain_db: float) -> None:
     )
 
 
+def test_ipc_round_trips_epoch_tagged_standby_controls() -> None:
+    assert decode_packet(
+        encode_control("standby.create_offer", direct_capture_gain_db=6.0)
+    ) == ControlMessage(
+        type="standby.create_offer",
+        values={"direct_capture_gain_db": 6.0},
+    )
+    assert decode_packet(
+        encode_control("standby.offer", sdp="v=0\r\n", peer_epoch=2)
+    ) == ControlMessage(
+        type="standby.offer",
+        values={"peer_epoch": 2, "sdp": "v=0\r\n"},
+    )
+    for message_type in ("standby.promote", "standby.promoted", "standby.failed"):
+        assert decode_packet(
+            encode_control(message_type, peer_epoch=2)
+        ) == ControlMessage(message_type, {"peer_epoch": 2})
+
+
+@pytest.mark.parametrize("peer_epoch", [False, 0, -1, 0x1_0000_0000])
+def test_ipc_rejects_invalid_standby_peer_epoch(peer_epoch: object) -> None:
+    with pytest.raises(ProtocolError, match="peer epoch"):
+        encode_control("standby.promote", peer_epoch=peer_epoch)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    ["standby.promote", "standby.offer", "standby.promoted", "standby.failed"],
+)
+def test_ipc_requires_epoch_on_every_tagged_standby_control(
+    message_type: str,
+) -> None:
+    values = {"sdp": "v=0\r\n"} if message_type == "standby.offer" else {}
+    with pytest.raises(ProtocolError, match="invalid fields"):
+        encode_control(message_type, **values)
+
+
 @pytest.mark.parametrize(
     "gain_db",
     [True, float("nan"), float("inf"), -0.01, 12.01, 10**400],
@@ -341,6 +378,16 @@ def test_launcher_uses_isolated_interpreter_and_explicit_runtime_path(
         assert client.drain_messages() == [
             ControlMessage(type="offer", values={"sdp": "v=0\r\n"})
         ]
+        client.request_standby_offer(direct_capture_gain_db=4.5)
+        assert decode_packet(probe.recv(4096)) == ControlMessage(
+            type="standby.create_offer",
+            values={"direct_capture_gain_db": 4.5},
+        )
+        client.promote_standby(2)
+        assert decode_packet(probe.recv(4096)) == ControlMessage(
+            type="standby.promote",
+            values={"peer_epoch": 2},
+        )
     finally:
         client.close()
         probe.close()
@@ -609,6 +656,127 @@ async def test_runtime_drives_offer_answer_audio_interrupt_and_clean_shutdown() 
         )
         assert await asyncio.wait_for(run_task, timeout=1) == 0
         assert peers[1].stop_count == 1
+    finally:
+        parent.close()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_warms_and_promotes_second_peer_without_pausing_active_capture() -> (
+    None
+):
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parent.setblocking(False)
+    peers: list[FakePeer] = []
+    standby_offer_started = asyncio.Event()
+    release_standby_offer = asyncio.Event()
+
+    class WarmPeer(FakePeer):
+        def __init__(self, *, index: int, **callbacks: Any) -> None:
+            super().__init__(**callbacks)
+            self.index = index
+
+        async def create_offer(self) -> str:
+            if self.index == 1:
+                standby_offer_started.set()
+                await release_standby_offer.wait()
+            return f"v=0\r\na=fake-offer-{self.index}\r\n"
+
+    def peer_factory(**callbacks: Any) -> FakePeer:
+        peer = WarmPeer(index=len(peers), **callbacks)
+        peers.append(peer)
+        return peer
+
+    runtime = SidecarRuntime(child, peer_factory=peer_factory)
+    run_task = asyncio.create_task(runtime.run())
+    first_capture = CaptureAudio(0, 1, b"\x01\x00" * 320)
+    second_capture = CaptureAudio(320, 2, b"\x02\x00" * 320)
+    old_playback = PlaybackAudio(1, 0, 0, b"\x03\x00" * 480)
+    new_playback = PlaybackAudio(1, 0, 0, b"\x04\x00" * 480)
+    try:
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("create_offer"),
+        )
+        assert (await _recv_packet(parent)).type == "offer"
+
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("standby.create_offer", direct_capture_gain_db=8.0),
+        )
+        await asyncio.wait_for(standby_offer_started.wait(), timeout=1)
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_capture_audio(
+                first_capture.pcm,
+                sample_index=first_capture.sample_index,
+                capture_monotonic_ns=first_capture.capture_monotonic_ns,
+            ),
+        )
+        async with asyncio.timeout(1):
+            while peers[0].captures != [first_capture]:
+                await asyncio.sleep(0)
+        peers[0].emit_playback(old_playback)
+        assert await _recv_packet(parent) == old_playback
+
+        release_standby_offer.set()
+        assert await _recv_packet(parent) == ControlMessage(
+            "standby.offer",
+            {
+                "peer_epoch": 2,
+                "sdp": "v=0\r\na=fake-offer-1\r\n",
+            },
+        )
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("standby.promote", peer_epoch=2),
+        )
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_capture_audio(
+                second_capture.pcm,
+                sample_index=second_capture.sample_index,
+                capture_monotonic_ns=second_capture.capture_monotonic_ns,
+            ),
+        )
+        assert await _recv_packet(parent) == ControlMessage(
+            "standby.promoted",
+            {"peer_epoch": 2},
+        )
+        async with asyncio.timeout(1):
+            while peers[1].captures != [second_capture]:
+                await asyncio.sleep(0)
+        assert peers[0].captures == [first_capture]
+        assert peers[0].stop_count == 1
+
+        # Retired callbacks carry their closed-over epoch and cannot cross the
+        # promotion acknowledgement. Only the promoted peer remains observable.
+        peers[0].emit_playback(old_playback)
+        peers[0].emit_lifecycle({"event_type": "media.started", "generation": 9})
+        peers[0].emit_fatal("connection_failed")
+        peers[1].emit_playback(new_playback)
+        assert await _recv_packet(parent) == new_playback
+        assert not run_task.done()
+
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("standby.create_offer"),
+        )
+        assert (await _recv_packet(parent)).type == "standby.offer"
+        assert len(peers) == 3
+        await asyncio.get_running_loop().sock_sendall(
+            parent,
+            encode_control("shutdown"),
+        )
+        assert await _recv_packet(parent) == ControlMessage(
+            "shutdown.complete",
+            {},
+        )
+        assert await asyncio.wait_for(run_task, timeout=1) == 0
+        assert peers[1].stop_count == 1
+        assert peers[2].stop_count == 1
     finally:
         parent.close()
         if not run_task.done():
@@ -1153,9 +1321,7 @@ async def test_capture_track_commit_cutoff_selects_exact_runtime_age_bound(
         await track.recv()
         await track.recv()
         await track.recv()
-        now[0] = post_cutoff_at + (
-            MAX_CAPTURE_AGE_MILLISECONDS + 1
-        ) * 1_000_000
+        now[0] = post_cutoff_at + (MAX_CAPTURE_AGE_MILLISECONDS + 1) * 1_000_000
         with pytest.raises(PeerBackpressure, match="age bound"):
             track.feed(
                 CaptureAudio(

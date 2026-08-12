@@ -215,11 +215,15 @@ realtime configuration enable:
 
 These checks qualify only the AEC topology and acoustics. The earlier 25%
 reference measurements exercised v2 bridge PCM; they are not themselves proof
-of the device-owned WebRTC v3 path. A separate reference-device v3 hardware
-double-interruption canary, run at that installation's qualified 60% setting,
-passed twice with the exact artifact: four local cuts were 208–211 ms and four
-rollovers were 1.29–1.57 s. Each run recycled its same two worker PIDs without
-a cold replacement and retained context twice. The 25%-default example above
+of the device-owned WebRTC v3 path. The current v3 build must keep exactly one
+isolated sidecar OS process; its active and offer-warm standby peers are logical
+slots within that worker, and the first standby is gated until readiness, cue
+completion, and capture-open. A historical two-worker v3 build separately
+passed a reference-device hardware double-interruption canary twice at that
+installation's qualified 60% setting with the exact artifact: four local cuts
+were 208–211 ms and four rollovers were 1.29–1.57 s. Each run recycled its same
+two worker PIDs without a cold replacement and retained context twice. Those
+measurements do not physically validate the current single-worker build. The 25%-default example above
 remains conservative, and 60% qualification is not transferable. Each
 installation still requires the complete acceptance matrix.
 

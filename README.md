@@ -29,7 +29,8 @@ ThirdReality: "Okay Nabu"
   -> speaker
 
 ThirdReality: "Okay Computer"
-  -> in-process stdlib controller + exactly two reusable aiortc sidecars
+  -> in-process stdlib controller + exactly one reusable aiortc worker
+     (one active peer + at most one offer-warm standby peer)
   -> realtime wire v3 SDP/sideband -> bridge -> Codex App Server/OAuth
   -> direct device/provider WebRTC RTP + oai-events -> speaker
 
@@ -126,12 +127,15 @@ not part of the component-only HACS ZIP.
   bridge WebSocket, and ready latch while negotiating a fresh peer epoch. A
   bounded recent AEC pre-roll plus queued/live speech is replayed once and in
   order to the replacement. Queue/age/timeout or epoch failure ends the outer
-  session without Home Assistant fallback or audio logging. Exactly two reusable
-  isolated sidecar processes alternate roles: one owns the active PeerConnection
-  while the other prepares a fresh one, then the retired epoch's process is
-  recycled as the next standby. Exactly those two prewarmed process slots are
-  used: if the standby is absent or invalid, the outer session terminates
-  instead of cold-launching a replacement or allocating a third process.
+  session without Home Assistant fallback or audio logging. Exactly one reusable
+  isolated sidecar process holds the active PeerConnection and at most one fresh,
+  offer-warm standby PeerConnection. The standby is not prepared until the
+  initial peer is ready, the confirmation cue has completed, and capture is
+  open. On barge-in, one ordered promotion fences and stops the retired peer,
+  promotes the standby, and routes all later capture only to it; the same worker
+  then prepares the following standby. The hard process cap remains one: if the
+  logical standby is absent or invalid, the outer session terminates instead of
+  launching another worker.
   Manual stop, mute, and disconnect still end the outer session. Later wake
   detections are suppressed while realtime owns the microphone, preventing a
   false normal-wake match from replacing live VAD with single-turn Assist. The
@@ -148,12 +152,14 @@ not part of the component-only HACS ZIP.
   Fresh negotiation adds a measurable handoff, and every installation still
   requires its own documented physical acceptance matrix.
 - The v3 implementation and pinned runtime have automated protocol/static
-  coverage plus a reference-device physical double-interruption canary. The
-  exact artifact passed twice at that installation's qualified 60% setting:
+  coverage. A historical two-worker build also passed a reference-device
+  physical double-interruption canary twice at that installation's qualified
+  60% setting:
   four local cuts were 208–211 ms and four fresh-peer rollovers were
   1.29–1.57 s. Each run recycled its same two worker PIDs without a cold
-  replacement, and every rollover retained context. It does not replace the
-  per-installation acceptance matrix.
+  replacement, and every rollover retained context. Those results predate and
+  do not physically validate the current single-worker build; they also do not
+  replace the per-installation acceptance matrix.
   Wire v2 `bridge_pcm` remains documented and supported for rollback.
 - Target Home Assistant version: 2026.8.0 or newer.
 - Target Codex CLI version: 0.147.0 or newer.
@@ -496,11 +502,14 @@ Qualified full duplex detects two consecutive AEC-filtered speech frames and
 immediately kills local `paplay`, drops queued playback IPC, retires the old
 PeerConnection epoch, and stops sending later capture to that peer. The outer vendor owner,
 session/player objects, bridge WebSocket, and ready latch remain attached. The
-two reusable isolated sidecar processes alternate: the standby creates a fresh
-PeerConnection for the next consecutive epoch, then the retired epoch's process
-is recycled as the following standby. Exactly those two prewarmed process slots
-are used. If the standby is absent or invalid, rollover terminates the outer
-session instead of cold-launching a replacement or allocating a third process.
+one reusable isolated sidecar process holds the active PeerConnection and one
+fresh, offer-warm standby PeerConnection. After the initial peer is ready, the
+confirmation cue completes, and capture opens, that logical standby is prepared
+for the next consecutive epoch. Rollover uses an ordered in-process promotion
+that fences and stops the retired peer before later capture reaches the promoted
+standby; the worker then prepares the following standby. The hard process cap is
+one. If the standby is absent or invalid, rollover terminates the outer session
+instead of launching another worker.
 Exactly 4 KiB (two 64 ms frames, 128 ms) of recent AEC pre-roll
 plus queued/live speech is delivered once and in order to the replacement peer.
 After the network thread commits that interruption, continuing speech cannot
@@ -509,8 +518,8 @@ retire the replacement epoch. Eight consecutive detector-quiet 64 ms callbacks
 qualifying signal before the eighth resets the quiet count.
 
 Capture age is rechecked when RTP actually consumes each packet; capture older
-than 2.25 seconds is terminal even if it passed queue admission. The standby
-child is re-polled before use; an absent or invalid slot terminates the outer
+than 2.25 seconds is terminal even if it passed queue admission. The logical
+standby is validated before use; an absent or invalid peer terminates the outer
 session. Replacement lifecycle and PCM remain inaudible in one ordered
 `output_queue_bytes`-bounded buffer until the exact matching
 `rollover_started`, then replay through normal handlers. Float/bool protocol or
@@ -547,16 +556,15 @@ Fresh-peer rollover is a safe subscription-backed approximation, not exact
 ChatGPT same-session interruption. It adds a measurable WebRTC/provider
 negotiation handoff. Queue/age/timeout, sidecar, and epoch errors fail the outer
 session closed; manual stop, mute, and disconnect still end it. Later detector
-hits are ignored until realtime releases the microphone. A reference-device
-hardware double-interruption canary cut playback in
-208–211 ms and completed rollovers in 1.29–1.57 s across two consecutive
-exact-artifact runs at that installation's qualified 60% setting. Each run
-recycled the same two worker PIDs with no cold replacement and retained context
-on both rollovers. This passes the reference double-interruption rollover
-canary, not the full acceptance matrix for every installation. The retired
-PeerConnection's stop acknowledgement followed replacement negotiation before
-its existing worker was recycled; that device event is not the bridge's
-independent 100 ms App Server close-confirmation barrier.
+hits are ignored until realtime releases the microphone. A historical
+two-worker build cut playback in 208–211 ms and completed rollovers in
+1.29–1.57 s across two consecutive exact-artifact runs at that installation's
+qualified 60% setting. Each run recycled the same two worker PIDs with no cold
+replacement and retained context on both rollovers. Those measurements do not
+physically validate the current single-worker build and do not replace the full
+acceptance matrix for any installation. The historical retired-PeerConnection
+stop acknowledgement was separate from the bridge's independent 100 ms App
+Server close-confirmation barrier.
 
 V3 failures never hand captured Okay Computer audio to Home Assistant. Startup,
 runtime, transport, backpressure, or playback failure clears the direct queues
@@ -661,10 +669,12 @@ stage does not use this remote handoff mechanism.
 Always-on remote prewarming is not enabled: there is no provider hook before a
 wake word, an idle WebRTC peer still sends silent RTP, App Server does not
 document idle sessions as quota-neutral, and speculative sessions would occupy
-the single speech lane. The v3 overlay instead keeps exactly two reusable local
-isolated sidecar processes warm. They alternate fresh PeerConnections across
-epochs. An absent or invalid standby ends the outer session instead of starting
-a replacement or third process. The local pool creates no Codex thread, bridge
+the single speech lane. The v3 overlay instead keeps exactly one reusable local
+isolated sidecar process warm. Before wake, this means only that its `Popen` is
+alive. After the initial peer is ready and the confirmation cue opens capture,
+the worker may hold one fresh offer-warm standby beside the active peer. An
+absent or invalid standby ends the outer session instead of starting another
+worker. The local worker creates no Codex thread, bridge
 socket, or remote peer until wake. See
 [performance and ThirdReality
 tuning](docs/performance.md) for measurement scope, handoff privacy and
@@ -737,9 +747,11 @@ opt-in and must never print OAuth tokens or recorded audio.
   WebRTC and Speex and must explicitly select Adrian. A reference device
   passed bounded echo-residual and staged barge-in canaries at 25% on the prior
   v2 path. Its v3 double-interruption canary separately passed at the reference
-  installation's qualified 60% setting in two exact-artifact runs, with four
+  installation's qualified 60% setting in two exact-artifact runs of the
+  historical two-worker architecture, with four
   208–211 ms cuts, four 1.29–1.57 s rollovers, and the same two worker PIDs
-  recycled within each run without a cold replacement. Neither result nor a syntactically valid
+  recycled within each run without a cold replacement. That result does not
+  physically validate the current single-worker build. Neither result nor a syntactically valid
   Adrian topology is proof for another installation;
   do not enable it there before physical double-talk and rollback canaries pass
   at the configured sink value (and the separate stream value when testing v2).

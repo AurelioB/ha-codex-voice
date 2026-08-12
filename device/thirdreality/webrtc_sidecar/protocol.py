@@ -49,6 +49,8 @@ _PARENT_CONTROL_TYPES = frozenset(
     {
         "capture.commit",
         "create_offer",
+        "standby.create_offer",
+        "standby.promote",
         "set_answer",
         "response.interrupt",
         "stop",
@@ -58,6 +60,9 @@ _PARENT_CONTROL_TYPES = frozenset(
 _CHILD_CONTROL_TYPES = frozenset(
     {
         "offer",
+        "standby.offer",
+        "standby.promoted",
+        "standby.failed",
         "answer.applied",
         "connected",
         "capture.ready",
@@ -312,11 +317,16 @@ def _validate_control(
     allowed: dict[str, frozenset[str]] = {
         "capture.commit": frozenset(),
         "create_offer": frozenset({"direct_capture_gain_db"}),
+        "standby.create_offer": frozenset({"direct_capture_gain_db"}),
+        "standby.promote": frozenset({"peer_epoch"}),
         "set_answer": frozenset({"sdp"}),
         "response.interrupt": frozenset(),
         "stop": frozenset(),
         "shutdown": frozenset(),
         "offer": frozenset({"sdp"}),
+        "standby.offer": frozenset({"sdp", "peer_epoch"}),
+        "standby.promoted": frozenset({"peer_epoch"}),
+        "standby.failed": frozenset({"peer_epoch"}),
         "answer.applied": frozenset(),
         "connected": frozenset(),
         "capture.ready": frozenset(),
@@ -351,12 +361,31 @@ def _validate_control(
     }
     if set(values) - allowed[message_type]:
         raise ProtocolError("sidecar control packet contains an unexpected field")
+    if (
+        message_type
+        in {
+            "standby.promote",
+            "standby.offer",
+            "standby.promoted",
+            "standby.failed",
+        }
+        and set(values) != allowed[message_type]
+    ):
+        raise ProtocolError("sidecar standby control has invalid fields")
     if "direct_capture_gain_db" in values:
         _validate_capture_gain(values["direct_capture_gain_db"])
-    if message_type in {"set_answer", "offer"}:
+    if message_type in {"set_answer", "offer", "standby.offer"}:
         sdp = values.get("sdp")
         if not isinstance(sdp, str) or not sdp or len(sdp) > MAX_SDP_CHARACTERS:
             raise ProtocolError("sidecar SDP has an invalid size")
+    if "peer_epoch" in values:
+        value = values["peer_epoch"]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 0xFFFFFFFF
+        ):
+            raise ProtocolError("sidecar peer epoch is invalid")
     if "response_id" in values and _safe_token(values["response_id"]) is None:
         raise ProtocolError("sidecar response identifier is invalid")
     if message_type == "error" and _safe_token(values.get("code")) is None:

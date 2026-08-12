@@ -490,9 +490,7 @@ def _configure_stop_word_membership(instance: Any) -> tuple[Any, bool]:
     if stop_word_id is None or active is None:
         return None, False
     was_active = stop_word_id in active
-    if _uses_device_webrtc() and bool(
-        getattr(_REALTIME_CONFIG, "full_duplex", False)
-    ):
+    if _uses_device_webrtc() and bool(getattr(_REALTIME_CONFIG, "full_duplex", False)):
         # The direct conversation owns the microphone from wake acceptance
         # through terminal teardown. Keeping the vendor stop model armed here
         # can reinterpret the wake tail as a stop and cancel negotiation before
@@ -718,9 +716,7 @@ def _start_realtime_wakeup(
         # triggering audio and every frame recorded while signaling are stale
         # by the time RTP starts, so never enqueue them. The ready cue below is
         # the single, audible boundary after which capture becomes live.
-        preroll_audio, maximum_attempts = _prepare_realtime_startup_audio(
-            preroll_audio
-        )
+        preroll_audio, maximum_attempts = _prepare_realtime_startup_audio(preroll_audio)
         startup_deadline = (
             time.monotonic() + _DIRECT_STARTUP_DEADLINE_SECONDS
             if _uses_device_webrtc()
@@ -988,6 +984,7 @@ def _complete_direct_ready_confirmation(
         _suspend_live_stop_word(instance, owner)
         owner.capture_open = True
         _nonblocking_led_fire("listening")
+        owner.session.notify_live_capture_opened()
         with suppress(Exception):
             syslog.syslog(
                 syslog.LOG_INFO,
@@ -1070,13 +1067,39 @@ def _reconcile_realtime_owner(instance: Any) -> _RealtimeOwner | None:
         return getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
 
 
-def _interrupt_realtime_owner(instance: Any, owner: _RealtimeOwner) -> None:
+def _interrupt_realtime_owner(
+    instance: Any,
+    owner: _RealtimeOwner,
+    *,
+    source: str = "internal",
+) -> None:
     """Interrupt and release one current owner without starting HA fallback."""
     with _realtime_state_lock(instance):
         if owner.released:
             return
         if getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner:
             return
+        safe_source = (
+            source
+            if source
+            in {
+                "audio_submit_exception",
+                "audio_submit_rejected",
+                "internal",
+                "mute",
+                "vendor_stop",
+                "volume_command",
+                "volume_sync",
+            }
+            else "internal"
+        )
+        with suppress(Exception):
+            syslog.syslog(
+                syslog.LOG_INFO,
+                "codex-voice realtime_interrupt "
+                f"source={safe_source} "
+                f"phase={'live' if owner.capture_open else 'startup'}",
+            )
         try:
             # Vendor teardown releases the microphone owner immediately. Even
             # when the bridge confirms provider cancellation, this session
@@ -1224,7 +1247,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             return
         if instance.state.muted:
             owner.stop_requested = True
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="mute")
             return
         if _uses_device_webrtc() and not owner.capture_open:
             # The lifecycle watcher exclusively owns CONNECTING/CONFIRMING.
@@ -1260,7 +1283,11 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             elif not owner.ready_seen:
                 _fallback_realtime_to_ha(instance, owner)
             else:
-                _interrupt_realtime_owner(instance, owner)
+                _interrupt_realtime_owner(
+                    instance,
+                    owner,
+                    source="audio_submit_exception",
+                )
             return
         if owner.stop_requested or owner.released:
             return
@@ -1274,7 +1301,11 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             # WebRTC intentionally retains no compatibility copy and closes.
             _fallback_realtime_to_ha(instance, owner)
             return
-        _interrupt_realtime_owner(instance, owner)
+        _interrupt_realtime_owner(
+            instance,
+            owner,
+            source="audio_submit_rejected",
+        )
         _LOGGER.warning("ThirdReality realtime audio session ended safely")
 
 
@@ -1629,7 +1660,7 @@ def _handle_direct_media_volume(instance: Any, message: Any) -> tuple[bool, Any]
         if status is _DirectVolumeRequestStatus.OWNER_LOST:
             return False, None
         if status is not _DirectVolumeRequestStatus.APPLIED or applied is None:
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_command")
         else:
             _log_direct_volume_change(0, applied)
             if not bool(getattr(entity, "muted", False)):
@@ -1653,7 +1684,11 @@ def _handle_direct_media_volume(instance: Any, message: Any) -> tuple[bool, Any]
                 if status is _DirectVolumeRequestStatus.OWNER_LOST:
                     return False, None
                 if status is not _DirectVolumeRequestStatus.APPLIED or applied is None:
-                    _interrupt_realtime_owner(instance, owner)
+                    _interrupt_realtime_owner(
+                        instance,
+                        owner,
+                        source="volume_command",
+                    )
                 else:
                     _log_direct_volume_change(desired, applied)
                     entity.volume = applied / 100
@@ -1677,14 +1712,14 @@ def _handle_direct_media_volume(instance: Any, message: Any) -> tuple[bool, Any]
     if status is _DirectVolumeRequestStatus.OWNER_LOST:
         return False, None
     if status is not _DirectVolumeRequestStatus.APPLIED or applied is None:
-        _interrupt_realtime_owner(instance, owner)
+        _interrupt_realtime_owner(instance, owner, source="volume_command")
     elif muted:
         _log_direct_volume_change(requested, applied)
         entity.previous_volume = desired / 100
         if _persist_direct_volume(instance, entity, entity.previous_volume):
             instance._last_system_volume = entity.previous_volume  # noqa: SLF001
         else:
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_command")
     else:
         _log_direct_volume_change(requested, applied)
         entity.volume = applied / 100
@@ -1692,7 +1727,7 @@ def _handle_direct_media_volume(instance: Any, message: Any) -> tuple[bool, Any]
         if _persist_direct_volume(instance, entity):
             instance._last_system_volume = entity.volume  # noqa: SLF001
         else:
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_command")
     return True, entity._update_state(entity.state)  # noqa: SLF001
 
 
@@ -1727,12 +1762,19 @@ def _realtime_sync_volume_from_system(
         if owner is None:
             _VENDOR_TR_SYNC_VOLUME_FROM_SYSTEM(instance, force=force)
             return
+        if not owner.capture_open:
+            # Startup already applies the persisted logical volume before the
+            # session starts. The vendor's 50 ms monitor must not enter a
+            # CONNECTING session and interrupt its blocking media preflight.
+            # A physical key change during this short window remains in
+            # sound.json and is reconciled on the first LIVE poll.
+            return
 
         entity = getattr(instance.state, "media_player_entity", None)
         ceiling = _direct_volume_ceiling_percent()
         if entity is None or ceiling is None:
             _LOGGER.warning("ThirdReality realtime system volume is unavailable")
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_sync")
             return
         muted = bool(getattr(entity, "muted", False))
         sound_signature = _sound_config_signature()
@@ -1764,7 +1806,7 @@ def _realtime_sync_volume_from_system(
             desired = _bounded_direct_volume_percent(current, ceiling)
             if desired is None:
                 _LOGGER.warning("ThirdReality current realtime volume is invalid")
-                _interrupt_realtime_owner(instance, owner)
+                _interrupt_realtime_owner(instance, owner, source="volume_sync")
                 return
             status, applied = _request_direct_volume(
                 instance,
@@ -1777,9 +1819,9 @@ def _realtime_sync_volume_from_system(
                 _VENDOR_TR_SYNC_VOLUME_FROM_SYSTEM(instance, force=force)
             elif status is _DirectVolumeRequestStatus.APPLIED and applied is not None:
                 _log_direct_volume_change(desired, applied, source="system_guard")
-                _interrupt_realtime_owner(instance, owner)
+                _interrupt_realtime_owner(instance, owner, source="volume_sync")
             else:
-                _interrupt_realtime_owner(instance, owner)
+                _interrupt_realtime_owner(instance, owner, source="volume_sync")
             return
         try:
             logical_volume_changed = (
@@ -1791,7 +1833,7 @@ def _realtime_sync_volume_from_system(
             )
         except (TypeError, ValueError):
             _LOGGER.warning("ThirdReality system volume state is invalid")
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_sync")
             return
         # This is the hot 50 ms path. Do not enter the session (and therefore
         # do not run pactl) unless sound.json or the persisted state changed.
@@ -1811,7 +1853,7 @@ def _realtime_sync_volume_from_system(
             _VENDOR_TR_SYNC_VOLUME_FROM_SYSTEM(instance, force=force)
             return
         if status is not _DirectVolumeRequestStatus.APPLIED or applied is None:
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_sync")
             return
 
         if anchor_dirty and not logical_volume_changed:
@@ -1830,7 +1872,7 @@ def _realtime_sync_volume_from_system(
             entity.previous_volume = entity.volume
             logical_volume = entity.volume
         if not _persist_direct_volume(instance, entity, logical_volume):
-            _interrupt_realtime_owner(instance, owner)
+            _interrupt_realtime_owner(instance, owner, source="volume_sync")
             return
         instance._last_system_volume = logical_volume  # noqa: SLF001
         try:
@@ -1852,7 +1894,7 @@ def _realtime_stop(instance: Any) -> None:
             owner = getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None)
             if owner is not None:
                 owner.stop_requested = True
-                _interrupt_realtime_owner(instance, owner)
+                _interrupt_realtime_owner(instance, owner, source="vendor_stop")
             try:
                 _VENDOR_BASE_STOP(instance)
             finally:

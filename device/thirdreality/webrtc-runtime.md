@@ -4,15 +4,18 @@ The target is the ThirdReality `1.01.07`/upstream `v1.1.7` aarch64 Buildroot
 Linux image with Python 3.11 and glibc 2.28 or newer. It is not an Android
 runtime.
 
-The direct-media client runs `aiortc` in exactly two reusable isolated Python
-processes so the vendor voice process never imports its native libraries. One
-process owns the active PeerConnection while the other prepares a fresh standby;
-rollover stops the retired PeerConnection, recycles its process as standby,
-and alternates the two roles. Exactly those two prewarmed process slots are
-used; an absent or invalid standby terminates the outer session instead of
-cold-launching a replacement or allocating a third process. Each
-sidecar runs with UID/GID 65534, no supplementary groups, a minimal fixed
-environment, and a umask of 077. Each process uses only the device standard
+The direct-media client runs `aiortc` in exactly one reusable isolated Python
+worker so the vendor voice process never imports its native libraries. The
+worker holds the active PeerConnection and at most one fresh, offer-warm
+standby PeerConnection. It prepares the initial standby only after the active
+peer is ready, the confirmation cue completes, and capture opens. Rollover
+uses one ordered in-process promotion to fence and stop the retired peer,
+promote the exact standby epoch, and ensure later capture reaches only the new
+peer; the same worker then prepares the following standby. The hard process cap
+is one, and an absent or invalid standby terminates the outer session instead
+of launching another worker. The sidecar runs with UID/GID 65534, no
+supplementary groups, a minimal fixed environment, and a umask of 077. The
+process uses only the device standard
 library, reviewed sidecar source, and a root-owned
 but sidecar-readable dependency runtime. It receives no Home Assistant token,
 Codex OAuth credential, prompt, transcript, or other application secret through
@@ -21,8 +24,8 @@ transcript/model text, tool data, or raw provider data-channel payload crosses
 IPC. Offer/answer SDP necessarily does cross IPC and contains ephemeral ICE
 credentials and DTLS negotiation material.
 
-`-I -S`, explicit import paths, the separate processes, and their unprivileged
-identities isolate dependency loading and prevent either sidecar from reading the
+`-I -S`, explicit import paths, the separate process, and its unprivileged
+identity isolate dependency loading and prevent the sidecar from reading the
 root-owned mode-0600 realtime configuration or staging archive. This is still
 not a general filesystem, syscall, or network sandbox: treat the reviewed
 sidecar and every pinned native wheel as trusted device code.
@@ -43,7 +46,8 @@ The exact aiortc and PyAV pins are compatibility and media-correctness
 boundaries for offer creation, SDP handling, RTP capture timestamps, decoding,
 and resampling. Production interruption does not reuse a peer or reset private
 receiver queues, jitter buffers, or resampler state: every rollover constructs
-a fresh `RTCPeerConnection` in the other prewarmed process slot. Any dependency
+a fresh `RTCPeerConnection` as the logical standby inside the same prewarmed
+worker, then promotes it only after fencing and stopping the old peer. Any dependency
 version change therefore requires the full automated suite and physical
 double-interruption canary before deployment. That canary must also prove that
 continuous speech cannot retire the replacement peer, seven detector-quiet

@@ -1038,6 +1038,13 @@ def _mark_direct_ready(instance: Any, session: Any) -> None:
     raise AssertionError("direct ready cue did not start")
 
 
+def _open_direct_capture_for_volume_test(instance: Any) -> None:
+    """Place a direct owner at the post-cue volume-monitor boundary."""
+    owner = instance._codex_realtime_owner
+    assert owner is not None
+    owner.capture_open = True
+
+
 def _volume_command(volume: float, *, key: int = 17) -> _FakeMediaPlayerCommandRequest:
     return _FakeMediaPlayerCommandRequest(
         key=key,
@@ -1115,6 +1122,7 @@ def _fake_realtime_support(
             self.stopped = 0
             self.interrupted = 0
             self.interrupt_preserve_session: list[bool] = []
+            self.live_capture_opened = 0
             self.audio: list[bytes] = []
             self.volume_requests: list[int] = []
             self.volume_request_states: list[_FakeSessionState] = []
@@ -1150,6 +1158,9 @@ def _fake_realtime_support(
                 raise RuntimeError("test submit barrier timed out")
             self.audio.append(value)
             return self.submit_result
+
+        def notify_live_capture_opened(self) -> None:
+            self.live_capture_opened += 1
 
         def request_playback_volume(self, percent: int) -> int:
             self.volume_requests.append(percent)
@@ -1311,6 +1322,7 @@ def test_live_direct_volume_is_clamped_in_software_before_state_and_persistence(
     entity.previous_volume = 0.4
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     instance.events.clear()
     session.volume_requests.clear()
     diagnostics: list[str] = []
@@ -1418,6 +1430,7 @@ def test_physical_volume_reconciles_anchor_without_mpv_setters(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     if muted:
         entity.muted = True
@@ -1459,6 +1472,7 @@ def test_physical_volume_above_ceiling_is_rewritten_then_next_poll_is_noop(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     session.reconcile_requests.clear()
     instance.state.persisted_volumes.clear()
@@ -1501,6 +1515,7 @@ def test_repeated_physical_down_uses_normalized_ten_percent_steps(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     session.reconcile_requests.clear()
     instance.state.persisted_volumes.clear()
@@ -1532,6 +1547,7 @@ def test_sound_config_update_failure_fences_active_owner(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     session.reconcile_requests.clear()
     instance.state.persisted_volumes.clear()
@@ -1671,6 +1687,7 @@ def test_unchanged_physical_volume_poll_avoids_session_and_mpv_work(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     instance._last_system_volume = 0.6
     instance.state.volume = 0.6
@@ -1689,6 +1706,37 @@ def test_unchanged_physical_volume_poll_avoids_session_and_mpv_work(
     assert entity.announce_player.volume_calls == []
 
 
+def test_startup_volume_poll_defers_change_until_capture_opens(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(media_transport="device_webrtc")
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    owner = instance._codex_realtime_owner
+    session.reconcile_requests.clear()
+    instance.state.persisted_volumes.clear()
+    instance.write_physical_volume(30)
+
+    instance._sync_volume_from_system(force=True)
+
+    assert owner is instance._codex_realtime_owner
+    assert not owner.capture_open
+    assert session.reconcile_requests == []
+    assert session.interrupted == 0
+    assert instance.state.persisted_volumes == []
+    assert instance.sound_config["volume"] == 30
+
+    _open_direct_capture_for_volume_test(instance)
+    instance._sync_volume_from_system()
+
+    assert session.reconcile_requests == [30]
+    assert session.interrupted == 0
+    assert instance.state.persisted_volumes == [0.3]
+    assert instance.state.media_player_entity.volume == 0.3
+
+
 def test_unreadable_physical_volume_repairs_anchor_without_changing_bookkeeping(
     load_overlay: Any,
 ) -> None:
@@ -1697,6 +1745,7 @@ def test_unreadable_physical_volume_repairs_anchor_without_changing_bookkeeping(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     session.reconcile_requests.clear()
     instance.state.persisted_volumes.clear()
@@ -1762,6 +1811,7 @@ def test_accepted_physical_reconciliation_never_also_runs_vendor_after_stop(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     session.reconcile_requests.clear()
     instance.state.persisted_volumes.clear()
@@ -1793,6 +1843,7 @@ def test_physical_owner_loss_before_session_call_falls_back_exactly_once(
     instance = protocol()
     _wake(instance, "okay computer")
     session = support.sessions[0]  # type: ignore[attr-defined]
+    _open_direct_capture_for_volume_test(instance)
     entity = instance.state.media_player_entity
     session.reconcile_requests.clear()
     instance.state.persisted_volumes.clear()
@@ -2667,6 +2718,7 @@ def test_direct_webrtc_opens_capture_only_after_ready_cue_finishes(
     assert owner.ready_seen
     assert owner.ready_confirmation_pending
     assert not owner.capture_open
+    assert session.live_capture_opened == 0
     assert instance.events == ["duck", "cue"]
 
     callback = instance.state.tts_player.callbacks.pop()
@@ -2676,6 +2728,7 @@ def test_direct_webrtc_opens_capture_only_after_ready_cue_finishes(
     assert session.audio == [_pcm_frame(6)]
     assert owner.capture_open
     assert not owner.ready_confirmation_pending
+    assert session.live_capture_opened == 1
     assert "stop" not in instance.state.active_wake_words
     assert not instance.requests
     assert not instance.audio
