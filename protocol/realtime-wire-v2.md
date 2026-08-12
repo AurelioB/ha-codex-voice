@@ -496,6 +496,11 @@ device control. Transcript fragments, deltas, tool payloads, delegation
 payloads, unknown future events, malformed JSON, and every other provider field
 are dropped at the trust boundary.
 
+A user turn start carries the single bounded marker `"role":"user"`. The
+speaker uses that marker to discard already-buffered assistant audio instead of
+gracefully draining an unheard response tail. No turn identifier, transcript,
+or other provider field crosses the boundary.
+
 ## Version 1 compatibility
 
 Existing clients may continue to omit `protocol_version` and send:

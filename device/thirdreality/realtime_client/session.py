@@ -4660,7 +4660,10 @@ class RealtimeSession:
                     raise WebSocketError("speaking stop does not match active epoch")
                 player.finish(epoch)
                 return None, None, last_output_epoch, True
-            if event_type == "input_audio_buffer.speech_started":
+            user_turn_started = (
+                event_type == "turn.created" and value.get("role") == "user"
+            )
+            if event_type == "input_audio_buffer.speech_started" or user_turn_started:
                 if self._config.full_duplex and (
                     output_epoch is not None or player.active
                 ):

@@ -49,8 +49,9 @@ LEGACY_PCM_START_FIELDS = frozenset(
 )
 
 # These events carry useful lifecycle signals, but their provider payloads may
-# also contain transcripts or other conversation content. Only the type name is
-# ever exposed to a device client.
+# also contain transcripts or other conversation content. Only the type name
+# and, for a user turn start, the bounded role marker are exposed to a device
+# client.
 DATA_CONTROL_EVENT_TYPES = frozenset(
     {
         "input_audio_buffer.committed",
@@ -82,7 +83,10 @@ class RealtimeDataControl:
     transcript: str | None = None
 
     def wire_value(self) -> dict[str, str]:
-        return {"type": "control", "event_type": self.event_type}
+        value = {"type": "control", "event_type": self.event_type}
+        if self.event_type == "turn.created" and self.role == "user":
+            value["role"] = "user"
+        return value
 
 
 @dataclass(frozen=True, slots=True)

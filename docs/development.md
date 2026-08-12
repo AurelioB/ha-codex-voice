@@ -14,24 +14,34 @@ Install the development dependencies once:
 uv sync --extra test --extra lint
 ```
 
-Run the smallest relevant component test while editing, then the full component
-suite:
+Run only the smallest relevant test while editing:
 
 ```bash
 uv run pytest tests/component/test_config_flow.py
-uv run pytest tests/component
 ```
 
 Bridge and standalone-script tests do not need the Home Assistant pytest
-plugin:
+plugin. Select the exact regression or test class during the edit/deploy loop;
+do not run the whole bridge suite after every change:
 
 ```bash
-uv run pytest -p no:homeassistant tests/bridge
+uv run pytest -p no:homeassistant \
+  tests/bridge/test_thirdreality_realtime_session.py::test_full_duplex_user_start_quarantines_tail_after_speaking_stop
 ```
 
-Before handing off a change, run Ruff as described in the repository
-`README.md`. Pytest remains the fastest loop because it avoids container
-startup and onboarding entirely.
+Use three validation tiers:
+
+1. **Edit loop:** one to five directly affected tests and Ruff only on changed
+   files.
+2. **Pre-deploy:** the affected test file or a narrow `-k` selection, followed
+   by the physical canary that exercises the reported behavior.
+3. **Release:** the complete component and bridge suites, full Ruff, hassfest,
+   and HACS validation.
+
+The complete 1,000-plus-test suite is a release gate, not an inner-loop gate.
+Do not delete behavior coverage merely to shorten the edit loop; select less of
+it until a release candidate exists. Pytest remains the fastest automated loop
+because it avoids container startup and onboarding entirely.
 
 ## Inner loop: local Home Assistant
 

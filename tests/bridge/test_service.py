@@ -7460,7 +7460,11 @@ async def test_realtime_v2_native_ordinary_prefix_adds_no_output_gate(
     peer = fake_rpc.peers[-1]
 
     peer.data.put_nowait(json.dumps({"type": "turn.created", "turn": {"role": "user"}}))
-    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "turn.created",
+        "role": "user",
+    }
     await fake_rpc.broadcast(
         {
             "method": "thread/realtime/transcript/delta",

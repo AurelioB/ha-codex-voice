@@ -654,6 +654,28 @@ def test_data_control_event_prefers_nested_turn_id() -> None:
     assert control.turn_id == "nested-turn"
 
 
+def test_user_turn_start_exposes_only_the_bounded_role_marker() -> None:
+    control = parse_data_control_event(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {
+                    "id": "private-turn",
+                    "role": "user",
+                    "transcript": "private spoken content",
+                },
+            }
+        )
+    )
+
+    assert control is not None
+    assert control.wire_value() == {
+        "type": "control",
+        "event_type": "turn.created",
+        "role": "user",
+    }
+
+
 def test_data_control_event_keeps_turn_transcript_internal() -> None:
     control = parse_data_control_event(
         json.dumps(

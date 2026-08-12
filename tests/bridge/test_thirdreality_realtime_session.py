@@ -6988,7 +6988,16 @@ def test_full_duplex_rechecks_volume_ceiling_before_every_response() -> None:
     assert player.events == [("begin", 1), ("finish", 1), ("begin", 2)]
 
 
-def test_full_duplex_speech_start_quarantines_tail_after_speaking_stop() -> None:
+@pytest.mark.parametrize(
+    "user_start_control",
+    [
+        '{"type":"control","event_type":"input_audio_buffer.speech_started"}',
+        '{"type":"control","event_type":"turn.created","role":"user"}',
+    ],
+)
+def test_full_duplex_user_start_quarantines_tail_after_speaking_stop(
+    user_start_control: str,
+) -> None:
     session = RealtimeSession(_duplex_config(), aec_verifier=lambda _config: None)
     player = _RecordingPlayer()
     _action, epoch, last_epoch, _semantic = session._handle_message(
@@ -7013,10 +7022,7 @@ def test_full_duplex_speech_start_quarantines_tail_after_speaking_stop() -> None
     assert player.active
 
     assert session._handle_message(
-        Message(
-            "text",
-            '{"type":"control","event_type":"input_audio_buffer.speech_started"}',
-        ),
+        Message("text", user_start_control),
         player,
         output_epoch=epoch,
         last_output_epoch=last_epoch,
