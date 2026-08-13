@@ -28,7 +28,8 @@ the idle LED. A later accepted wake creates a fresh WebSocket, peer, and
 realtime thread.
 
 The active configuration is strict-v2 `bridge_pcm`, native mode, full duplex,
-native AEC3, +12 dB bounded post-AEC capture gain, and a fixed 100%
+native AEC3 with 10 dB limited capture gain and moderate noise suppression,
+2 dB bounded transport gain, and a fixed 100%
 sink/playback anchor. The stream itself stays at 100% relative volume and one
 non-amplifying software stage gives the physical buttons their full 0–100%
 range. During provider
@@ -71,9 +72,11 @@ transport or queue error clear both without persisting audio. The server's
 2,250 ms input-track bound is enforced when it consumes active v2 PCM.
 
 Native AEC3 is selected early from the root-owned mode-0600 configuration so
-the physical microphone/render-reference relationship remains local. +12 dB
-capture gain is saturating and applied only after cancellation, immediately
-before LAN transmission. Playback uses the dedicated AEC sink and `paplay`
+the physical microphone/render-reference relationship remains local. The APM
+stage applies 10 dB fixed-digital gain with a limiter and moderate noise
+suppression before the same samples reach wake detection and realtime capture.
+The configured 2 dB saturating transport gain is applied immediately before
+LAN transmission. Playback uses the dedicated AEC sink and `paplay`
 stream at a fixed 100% anchor, plus a non-amplifying software attenuator for the
 saved button level. The active path requires a worst-case physical echo,
 normal-distance, and early/middle/late interruption canary at full output.
@@ -287,18 +290,15 @@ entity, and each new direct session starts at that saved level.
 The preflight and exact preparation compare raw PulseAudio units rather than
 trusting rounded displayed percentages.
 
-`direct_capture_gain_db` is an explicit post-AEC outbound microphone gain from
-0 through 12 dB. Active bridge PCM uses 12 dB; dormant v3 may use the same
-bounded stage. Gain is applied after the 16 kHz AEC capture frame is assembled
-and before LAN transmission or WebRTC resampling, using saturating PCM16 arithmetic; it
-does not change the wake detector, Home Assistant Assist audio, or the local
-barge-in detector. Keep it at 0 unless privacy-safe peak/RMS telemetry and a
-physical speech canary demonstrate that provider input is missing low-level
-speech. Start such a canary at 6 dB, test close/normal/far and loud speech plus
-playback echo and interruption, and increase no further than the 12 dB hard
-limit only when the 6 dB evidence still requires it. This is fixed gain, not
-automatic gain control, so it cannot pump ambient noise or AEC residual between
-utterances.
+`direct_capture_gain_db` is an additional outbound microphone gain from 0
+through 12 dB. The native APM profile already applies 10 dB fixed-digital gain
+with a limiter and moderate noise suppression before wake detection, local
+barge-in, and realtime capture. Active bridge PCM therefore uses only 2 dB at
+the transport boundary, retaining the previous nominal 12 dB total without
+amplifying ambient noise by 12 dB after suppression. The transport stage uses
+saturating PCM16 arithmetic immediately before LAN transmission or WebRTC
+resampling. Any increase still requires close/normal/far, clipping, echo, and
+interruption canaries.
 
 V3 owns at most one fixed-argv `paplay` child at a time. It accepts raw 24 kHz
 mono signed-16-bit PCM, requests 60 ms latency and 20 ms process time, and uses
@@ -669,7 +669,7 @@ realtime-only route; this is the minimal active configuration:
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 100,
   "playback_volume_percent": 100,
-  "direct_capture_gain_db": 12
+  "direct_capture_gain_db": 2
 }
 ```
 
@@ -775,7 +775,7 @@ environment edit is required:
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 100,
   "playback_volume_percent": 100,
-  "direct_capture_gain_db": 12
+  "direct_capture_gain_db": 2
 }
 ```
 
@@ -837,7 +837,7 @@ selects the server-offloaded transport:
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 100,
   "playback_volume_percent": 100,
-  "direct_capture_gain_db": 12
+  "direct_capture_gain_db": 2
 }
 ```
 
@@ -899,7 +899,8 @@ passes all of the following on the physical speaker:
 2. Forced connection, readiness, cue, and playback failures always restore the
    idle LED and release ownership. No captured audio enters Assist/Hermes.
 3. Normal, quiet, loud, close, 1.5 m, and room-edge speech reaches the active
-   provider with the configured native AEC3 and +12 dB post-AEC gain without
+   provider with the configured native 10 dB limited gain/noise-suppression
+   profile and 2 dB transport gain without
    clipping.
 4. At the fixed 100% anchor and representative software levels through 100%, no-user
    playback does not self-interrupt. Early, middle, and late near-end speech

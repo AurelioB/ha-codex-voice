@@ -108,7 +108,7 @@ The active latency and safety bounds are:
 | Live input queue | 64 KiB / 2.048 s | Bounds post-cue scheduling pressure, never cold-start replay |
 | Server input-track age | 2,250 ms | Fails instead of presenting stale microphone audio |
 | Device playback queue | 48 KiB / about 1.024 s | Bounds 24 kHz mono PCM16 output |
-| Capture gain | +12 dB maximum, saturating | Raises post-AEC provider input without changing local wake/AEC samples |
+| Capture conditioning | +10 dB in APM with limiter and moderate NS; +2 dB transport | Raises and cleans both wake/realtime capture while retaining the prior nominal +12 dB provider level |
 | Playback | Fixed 100% sink anchor, 100%-relative stream | One later non-amplifying software stage exposes mute at 0 and audible levels 1–100% without PCM amplification |
 | Session lifetime | 120 s semantic idle / 900 s hard maximum | Normal provider delay does not end the session; explicit end/terminal state does |
 | Barge-in | Two qualifying AEC-filtered callbacks | Cuts local playback, sends exact `provider_barge`, then cancels and clears output on the same provider peer while microphone pacing continues |
@@ -416,7 +416,8 @@ loss. At the fixed 100% anchor and representative software-volume levels,
 including 0, 1, 25, 60, 80, and 100%, test no-user
 self-echo plus early/middle/late near-end speech. The playback cut must be
 prompt and the causal words must be replayed exactly once to the replacement
-provider without a second sentence, reconnect, or another wake. Also verify +12 dB saturation,
+provider without a second sentence, reconnect, or another wake. Also verify the
+10 dB limited APM profile plus 2 dB transport saturation,
 normal-distance recognition, single-stage volume, absence of persistent
 crackle, sole-tool Spanish/English termination, bounded memory/player cleanup,
 no Home Assistant authority or fallback, and unchanged TCP ADB port 5555.
@@ -883,7 +884,8 @@ route: every installation and increase above its previously qualified values
 needs its own physical double-talk and echo-rejection canaries. Native AEC3 is selected by
 `capture_backend: "native_aec3"` in the secure realtime configuration; the
 environment flag is only an explicit diagnostic override. The active reference
-configuration uses +12 dB post-AEC microphone gain and a 100% sink/playback
+configuration uses 10 dB limited native microphone gain, moderate noise
+suppression, 2 dB transport gain, and a 100% sink/playback
 anchor. Its saved starting output may be 80%, implemented as non-amplifying
 software attenuation below that anchor.
 

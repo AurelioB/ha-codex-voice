@@ -83,8 +83,9 @@ historical.
   native v2 ignores every broker snapshot, rejects device-declared tools, and
   exposes only the server-owned empty-input `end_conversation` tool. Home
   Assistant compatibility code remains dormant.
-- The active reference configuration uses `native_aec3`, +12 dB bounded
-  post-AEC capture gain, a fixed 100% AEC/playback anchor, a 100%-relative
+- The active reference configuration uses `native_aec3` with the newer
+  ThirdReality 10 dB limited microphone profile and moderate noise suppression,
+  plus 2 dB bounded transport gain, a fixed 100% AEC/playback anchor, a 100%-relative
   playback stream, and one non-amplifying software-volume stage. The physical
   controls retain their full range: 0 is mute and 1–100% is audible. A saved
   initial level such as 80% is attenuation below the anchor, not PCM
@@ -253,7 +254,7 @@ The active root-owned mode-0600 configuration uses these values:
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 100,
   "playback_volume_percent": 100,
-  "direct_capture_gain_db": 12
+  "direct_capture_gain_db": 2
 }
 ```
 
@@ -263,8 +264,10 @@ URL, route-scoped token, voice, Mexican Spanish prompt, deadlines, and queue
 bounds.
 
 Native AEC3 is selected before vendor microphone construction and uses the
-physical render reference. +12 dB is bounded saturating gain applied after AEC
-and only to microphone PCM sent over the bridge. The playback sink and
+physical render reference. Its 10 dB fixed-digital gain, limiter, and moderate
+noise suppression condition the samples used by both wake detection and live
+capture. A further 2 dB bounded saturating gain is applied only to microphone
+PCM sent over the bridge. The playback sink and
 `paplay` stream stay at their fixed 100% physical anchor. User-facing volume is
 0 for mute or 1–100% audible and uses one non-amplifying software attenuator;
 the reference deployment may start from a saved 80% level without preventing
@@ -705,7 +708,8 @@ opt-in and must never print OAuth tokens or recorded audio.
   Docker Compose deployment.
 - The active ThirdReality configuration must explicitly select strict-v2
   `bridge_pcm`, `conversation_mode: "native"`, full duplex, `native_aec3`, the
-  reviewed PulseAudio route, +12 dB bounded post-AEC capture gain, and a 100%
+  reviewed PulseAudio route, the 10 dB limited native microphone profile with
+  moderate noise suppression, 2 dB transport gain, and a 100%
   fixed sink/playback anchor. The output stream stays at 100% relative volume;
   only one non-amplifying software attenuator implements the physical 0/1–100%
   user range. A syntactically valid topology is not acoustic proof, so qualify

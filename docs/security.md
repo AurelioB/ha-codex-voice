@@ -164,8 +164,10 @@ sides of a narrow bridge API.
   anchor, and a 100%-relative stream. Dynamic volume is non-amplifying software
   attenuation over mute at 0 and audible levels 1–100%; a saved 80% initial
   level remains below the anchor and the physical buttons can still reach full
-  hardware output. +12 dB capture gain is saturating, occurs only after AEC,
-  and affects only microphone PCM sent to the bridge, never playback PCM.
+  hardware output. Native capture applies 10 dB fixed-digital gain with a
+  limiter and moderate noise suppression inside APM; 2 dB additional transport
+  gain is saturating and affects only microphone PCM sent to the bridge, never
+  playback PCM.
   AEC-filtered near-end speech cuts local playback while its original causal
   PCM continues on the same socket. The device sends one exact nonterminal
   `barge`; the bridge fences the retired generation, keeps up to 320 ms of

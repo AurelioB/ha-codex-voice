@@ -15,6 +15,11 @@ namespace codex::aec3 {
 
 namespace {
 
+// Match ThirdReality's newer native voice-assistant processing profile.  Gain
+// belongs inside APM so the limiter protects close speech and the vendor wake
+// detector receives the same conditioned samples as realtime capture.
+constexpr int kCaptureGainDb = 10;
+
 std::string AlsaError(const char* operation, int error) {
     return std::string(operation) + ": " + snd_strerror(error);
 }
@@ -181,6 +186,15 @@ bool CaptureEngine::BuildProcessor(std::string* error) {
     processing_config.echo_canceller.mobile_mode = false;
     processing_config.echo_canceller.enforce_high_pass_filtering = true;
     processing_config.high_pass_filter.enabled = true;
+    processing_config.gain_controller1.enabled = true;
+    processing_config.gain_controller1.mode =
+        webrtc::AudioProcessing::Config::GainController1::kFixedDigital;
+    processing_config.gain_controller1.target_level_dbfs = 3;
+    processing_config.gain_controller1.compression_gain_db = kCaptureGainDb;
+    processing_config.gain_controller1.enable_limiter = true;
+    processing_config.noise_suppression.enabled = true;
+    processing_config.noise_suppression.level =
+        webrtc::AudioProcessing::Config::NoiseSuppression::kModerate;
     processor->ApplyConfig(processing_config);
 
     processor_ = processor;

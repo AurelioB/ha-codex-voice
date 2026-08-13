@@ -279,3 +279,17 @@ def test_release_archive_contains_native_aec3_sources() -> None:
     assert "release/thirdreality-realtime/aec3_capture/cmake" in workflow
     assert "device/thirdreality/aec3_capture/build_aarch64.py" in workflow
     assert "device/thirdreality/aec3_capture/src/*" in workflow
+
+
+def test_native_processor_conditions_capture_before_vendor_wake_and_realtime() -> None:
+    root = Path(__file__).parents[2]
+    source = (
+        root / "device/thirdreality/aec3_capture/src/capture_engine.cpp"
+    ).read_text()
+
+    assert "constexpr int kCaptureGainDb = 10;" in source
+    assert "processing_config.gain_controller1.enabled = true;" in source
+    assert "GainController1::kFixedDigital" in source
+    assert "processing_config.gain_controller1.enable_limiter = true;" in source
+    assert "processing_config.noise_suppression.enabled = true;" in source
+    assert "NoiseSuppression::kModerate" in source

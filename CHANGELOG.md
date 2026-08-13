@@ -97,6 +97,11 @@ and releases use semantic versioning.
 
 ### Changed
 
+- Condition ThirdReality microphone audio inside native AEC3 using the newer
+  vendor profile: 10 dB fixed-digital gain, a limiter, and moderate noise
+  suppression now feed both wake detection and realtime capture. Reduce the
+  active post-APM transport gain from 12 dB to 2 dB so nominal provider level
+  remains bounded while low-level speech gains signal-to-noise ratio.
 - Keep one bounded, audio-empty strict-v2 provider session warm on the
   ThirdReality appliance: five minutes after startup or a completed
   conversation, and ten seconds after a probable 0.50 wake-model score. A real
@@ -105,7 +110,7 @@ and releases use semantic versioning.
   Pulse/AEC topology proof for the voice-process lifetime; retain per-response
   sink-volume verification and the unchanged bounded cold/retry path.
 - Route the current controlled Okay Nabu deployment to full-duplex
-  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 12`, a fixed 100%
+  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 2`, a fixed 100%
   playback anchor, and `realtime_only: true`; defer Home Assistant
   Assist/Hermes and entity tools. The device-owned v3 implementation remains
   available in source as a dormant rollback experiment.

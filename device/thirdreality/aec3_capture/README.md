@@ -27,8 +27,9 @@ buffering, resampling, and the physical sink by a variable interval.
 
 Nothing in this package runs merely because it is installed. The Python
 facade is normally selected by `capture_backend: "native_aec3"` in the enabled,
-root-owned mode-0600 `/data/conf/codex-realtime.json`; that configuration must
-also select `media_transport: "device_webrtc"`. The latency overlay reads and
+root-owned mode-0600 `/data/conf/codex-realtime.json`; the active configuration
+selects full-duplex `media_transport: "bridge_pcm"`, while dormant v3 also
+supports the same capture backend. The latency overlay reads and
 validates this configuration before vendor microphone selection. Installing the
 package alone does not activate it.
 
@@ -52,7 +53,7 @@ operators must not set this proof variable. Supplying `CODEX_AEC3_CAPTURE=1`
 in the service environment is an explicit diagnostic override of early
 selection, not the normal activation path and not a replacement for the
 persistent `capture_backend` session contract. The override still requires a
-valid enabled `device_webrtc` configuration.
+valid enabled native-AEC3 configuration.
 
 An enabled native load, ABI, device, startup, ring, or processing failure fails
 closed instead of returning raw microphone audio. The vendor command must also
@@ -158,10 +159,13 @@ vendor's `record(1024)` request. The Python facade returns float32 shape
 `(1024, 1)`, preserving the existing 64 ms callback, wake-word processing,
 384 ms pre-roll, official Home Assistant path, and direct WebRTC reframer.
 
-Initial production qualification should leave the vendor mic AGC and noise
-suppression at zero. The native path enables only AEC3 and its required
-high-pass filter; adding another adaptive stage before double-talk testing can
-mask near-end damage.
+The production profile mirrors ThirdReality's newer native audio processor:
+AEC3 and its required high-pass filter, 10 dB fixed-digital gain with a -3 dBFS
+target and limiter, and moderate WebRTC noise suppression. Conditioning happens
+inside APM, so the vendor wake detector and realtime path receive the same
+cleaned samples. The active deployment keeps only 2 dB of additional bounded
+transport gain, preserving the previous nominal total while avoiding a second
+12 dB amplification of residual noise.
 
 ## What needs a reboot
 

@@ -6,7 +6,8 @@ scripts never restart PulseAudio or the voice service, never change the running
 speaker volume, and never change or disable TCP ADB on port 5555.
 
 The active route is strict-v2 `bridge_pcm` with full duplex, native AEC3,
-+12 dB bounded post-AEC capture gain, and a fixed 100% sink/playback anchor.
+10 dB limited native capture gain with moderate noise suppression, 2 dB
+bounded transport gain, and a fixed 100% sink/playback anchor.
 `paplay` uses 100% relative stream volume and one non-amplifying software stage
 gives the physical buttons their full 0–100% range. The dormant `device_webrtc`
 sidecar is not required for this deployment.
@@ -217,7 +218,7 @@ realtime configuration enable the server-offloaded route:
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 100,
   "playback_volume_percent": 100,
-  "direct_capture_gain_db": 12
+  "direct_capture_gain_db": 2
 }
 ```
 
