@@ -13,6 +13,15 @@ and releases use semantic versioning.
   ThirdReality personalized-wake setting loads one microWakeWord-compatible
   JSON/TFLite artifact at startup and replaces exactly one matching vendor
   detector, preserving one-model inference and fail-closed rollback.
+- Add opt-in accepted-wake capture, explicit false-wake labeling, and a
+  deterministic recording-session-split export manifest for external
+  microWakeWord training. Disabled collection has no writer, uploader, or
+  recording mount.
+- Add optional local speaker identification as a separate pinned Compose image.
+  The bridge asynchronously submits one bounded post-wake window, the worker
+  verifies an exact TitaNet model and private enrolled centroids, and only a
+  confident score-plus-margin match becomes advisory context. Unknown or failed
+  identity never delays or terminates realtime audio.
 - Add desktop-compatible same-peer native interruption. The speaker's
   AEC-qualified cut sends exact `provider_barge`; the bridge sends
   `response.cancel` followed by `output_audio_buffer.clear` on the active
@@ -23,8 +32,9 @@ and releases use semantic versioning.
   keeps the speaker on wake, LED, native AEC3, local barge-in, and raw PCM while
   the local bridge owns Codex App Server, OAuth, the WebRTC peer, resampling,
   provider lifecycle, and output epochs. The stable device WebSocket remains
-  open across follow-up speech and interruption; Home Assistant and Hermes
-  remain outside this first conversation-only path.
+  open across follow-up speech and interruption; Home Assistant Assist and
+  Hermes remain outside the media path, while Home Assistant exposed-entity
+  tools are the default smart-home authority.
 - Add exact native-v2 `barge` rollover for the non-interruptible Frameless
   provider path. A qualified local cut keeps device capture and the WebSocket
   live while the bridge fences the old generation, retains up to 320 ms of

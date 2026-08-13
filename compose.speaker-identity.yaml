@@ -1,0 +1,66 @@
+services:
+  bridge:
+    environment:
+      HA_CODEX_SPEAKER_IDENTITY_TOKEN: "${HA_CODEX_SPEAKER_IDENTITY_TOKEN:?Set a distinct speaker-identity token}"
+      HA_CODEX_SPEAKER_IDENTITY_URL: "http://127.0.0.1:${HA_CODEX_SPEAKER_IDENTITY_PORT:-8790}/identify"
+
+  speaker-identity:
+    build:
+      context: .
+      dockerfile: deploy/docker/SpeakerIdentity.Dockerfile
+    image: "ha-codex-speaker-identity:${HA_CODEX_SPEAKER_IDENTITY_IMAGE_TAG:-1.13.4}"
+    init: true
+    user: "${HA_CODEX_UID:-1000}:${HA_CODEX_GID:-1000}"
+    read_only: true
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HA_CODEX_SPEAKER_IDENTITY_PORT: "${HA_CODEX_SPEAKER_IDENTITY_PORT:-8790}"
+      HA_CODEX_SPEAKER_IDENTITY_TOKEN: "${HA_CODEX_SPEAKER_IDENTITY_TOKEN:?Set a distinct speaker-identity token}"
+      HOME: /tmp
+    command:
+      - --model
+      - /models/nemo_en_titanet_large.onnx
+      - --model-sha256
+      - d51abcf31717ef28162f26acb9d44dd4127c3d44c9b8624f699f3425daca8e77
+      - serve
+      - --profiles
+      - /profiles
+      - --host
+      - 127.0.0.1
+      - --port
+      - "${HA_CODEX_SPEAKER_IDENTITY_PORT:-8790}"
+      - --match-threshold
+      - "${HA_CODEX_SPEAKER_IDENTITY_MATCH_THRESHOLD:-0.55}"
+      - --margin-threshold
+      - "${HA_CODEX_SPEAKER_IDENTITY_MARGIN_THRESHOLD:-0.08}"
+    volumes:
+      - type: bind
+        source: "${HA_CODEX_SPEAKER_IDENTITY_MODEL_HOST:?Set the exact TitaNet ONNX model path}"
+        target: /models/nemo_en_titanet_large.onnx
+        read_only: true
+      - type: bind
+        source: "${HA_CODEX_SPEAKER_PROFILES_HOST:?Set an owner-only profile directory}"
+        target: /profiles
+        read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - /app/deploy/docker/speaker_identity_healthcheck.py
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

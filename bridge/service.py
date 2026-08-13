@@ -67,6 +67,7 @@ from .realtime_wire import (
     validate_direct_webrtc_rollover_ready,
 )
 from .runtime import IsolatedCodexRuntime, codex_child_environment
+from .speaker_identity import SpeakerIdentityBroker, SpeakerIdentityProbe
 from .tool_broker import (
     MAX_TOOL_BROKER_MESSAGE_BYTES,
     HomeAssistantToolBroker,
@@ -266,8 +267,11 @@ class _NativeV2InputContinuity:
     recent_bytes: int = 0
     rollover: list[bytes] | None = None
     rollover_bytes: int = 0
+    identity_probe: SpeakerIdentityProbe | None = field(default=None, repr=False)
 
     def feed_live(self, value: bytes, session: RealtimeSession) -> None:
+        if self.identity_probe is not None:
+            self.identity_probe.feed(value)
         converted = self.resampler.feed(value)
         if not converted:
             return
@@ -285,6 +289,8 @@ class _NativeV2InputContinuity:
     def buffer_rollover(self, value: bytes) -> None:
         if self.rollover is None:
             raise ProtocolError("native realtime rollover is not active")
+        if self.identity_probe is not None:
+            self.identity_probe.feed(value)
         converted = self.resampler.feed(value)
         if not converted:
             return
@@ -972,6 +978,11 @@ class BridgeState:
             task_timeout=config.agent_task_timeout,
         )
         self.voice_samples = VoiceSampleInbox(config.voice_sample_root)
+        self.speaker_identity = SpeakerIdentityBroker(
+            config.speaker_identity_url,
+            token=config.speaker_identity_token,
+            timeout=config.speaker_identity_timeout,
+        )
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
         self._speech_state_lock = asyncio.Lock()
@@ -1416,15 +1427,18 @@ class BridgeState:
                 await self.agent_tools.close()
             finally:
                 try:
-                    await self.rpc.close()
+                    await self.speaker_identity.close()
                 finally:
-                    self.voice_samples.close()
-                    if self._temporary_cwd is not None:
-                        self._temporary_cwd.cleanup()
-                        self._temporary_cwd = None
-                    if self._isolated_runtime is not None:
-                        self._isolated_runtime.cleanup()
-                        self._isolated_runtime = None
+                    try:
+                        await self.rpc.close()
+                    finally:
+                        self.voice_samples.close()
+                        if self._temporary_cwd is not None:
+                            self._temporary_cwd.cleanup()
+                            self._temporary_cwd = None
+                        if self._isolated_runtime is not None:
+                            self._isolated_runtime.cleanup()
+                            self._isolated_runtime = None
 
     async def _prune_conversations(self) -> None:
         now = time.monotonic()
@@ -2106,6 +2120,7 @@ async def _health(request: web.Request) -> web.Response:
             "agent_tools": state.agent_tools.health(),
             "agent_announcements": state.agent_announcements.health(),
             "voice_samples": state.voice_samples.health(),
+            "speaker_identity": state.speaker_identity.health(),
         },
         status=200 if ready else 503,
     )
@@ -4378,6 +4393,7 @@ def _native_realtime_base_instructions(
     broker_snapshot: ToolBrokerSnapshot | None,
     agent_tools: AgentToolBroker,
     voice_samples: VoiceSampleInbox,
+    speaker_identity: SpeakerIdentityBroker,
 ) -> str:
     """Build trusted native instructions for one immutable tool snapshot."""
     instructions = DIRECT_REALTIME_BASE_INSTRUCTIONS
@@ -4402,6 +4418,13 @@ def _native_realtime_base_instructions(
             "\n\nPrivate wake-sample collection was explicitly enabled. Call "
             "mark_false_wake only when the user clearly says this session began "
             "from a false or accidental wake. Do not infer or auto-label one."
+        )
+    if speaker_identity.enabled:
+        instructions += (
+            "\n\nA local speaker-identity worker may append advisory developer "
+            "context after the conversation starts. Use a confident match only "
+            "for names or low-risk personalization. It is not authentication and "
+            "must never relax confirmation, authorization, or Home Assistant policy."
         )
     return instructions
 
@@ -5480,6 +5503,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                         broker_snapshot,
                         state.agent_tools,
                         state.voice_samples,
+                        state.speaker_identity,
                     ),
                 )
                 created_thread = True
@@ -5627,7 +5651,8 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
         state.track_realtime_provider_cleanup(cleanup_task)
 
     continuity = _NativeV2InputContinuity(
-        Pcm16Mono24KhzResampler(wire_protocol.input_sample_rate)
+        Pcm16Mono24KhzResampler(wire_protocol.input_sample_rate),
+        identity_probe=state.speaker_identity.new_probe(),
     )
 
     async def run_active_socket() -> _NativeV2Barge | None:
@@ -5664,6 +5689,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                 broker_snapshot=broker_snapshot,
                 native_input=continuity,
                 announcements=announcements,
+                identity_probe=continuity.identity_probe,
             )
 
     try:
@@ -5803,21 +5829,25 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
         try:
             await cleanup_provider(active, delete_thread=True)
         finally:
-            residual_thread_ids = tuple(owned_thread_ids)
-            owned_thread_ids.clear()
-            if residual_thread_ids:
-                await asyncio.gather(
-                    *(
-                        _dispose_thread(state.rpc, thread_id)
-                        for thread_id in residual_thread_ids
-                    ),
-                    return_exceptions=True,
-                )
-            if retired_tasks:
-                await asyncio.gather(
-                    *(asyncio.shield(task) for task in tuple(retired_tasks)),
-                    return_exceptions=True,
-                )
+            try:
+                residual_thread_ids = tuple(owned_thread_ids)
+                owned_thread_ids.clear()
+                if residual_thread_ids:
+                    await asyncio.gather(
+                        *(
+                            _dispose_thread(state.rpc, thread_id)
+                            for thread_id in residual_thread_ids
+                        ),
+                        return_exceptions=True,
+                    )
+                if retired_tasks:
+                    await asyncio.gather(
+                        *(asyncio.shield(task) for task in tuple(retired_tasks)),
+                        return_exceptions=True,
+                    )
+            finally:
+                if continuity.identity_probe is not None:
+                    await continuity.identity_probe.close()
 
 
 async def _settle_managed_realtime_startup(session: RealtimeSession) -> None:
@@ -5926,6 +5956,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     managed_interrupt_continuation: bool = False,
     native_input: _NativeV2InputContinuity | None = None,
     announcements: asyncio.Queue[_AgentAnnouncementRequest] | None = None,
+    identity_probe: SpeakerIdentityProbe | None = None,
 ) -> _NativeV2Barge | None:
     bridge_managed_realtime = executor_thread_id is not None
     executor_subscription = state.rpc.subscribe() if bridge_managed_realtime else None
@@ -8238,6 +8269,24 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         "Realtime executor did not terminate before teardown"
                     )
 
+    async def append_speaker_identity_context() -> None:
+        """Append a late advisory match without gating or failing the voice path."""
+        if identity_probe is None:
+            return
+        result = await identity_probe.wait()
+        context = result.context
+        LOGGER.info(
+            "Realtime local speaker identity completed status=%s",
+            result.status,
+        )
+        if context is None or stop.is_set():
+            return
+        try:
+            async with asyncio.timeout(REALTIME_CONTROL_TIMEOUT_SECONDS):
+                await session.append_text(context, role="developer")
+        except Exception:  # noqa: BLE001 - identity never affects voice availability.
+            LOGGER.warning("Could not append advisory speaker identity context")
+
     tasks = {
         asyncio.create_task(receive(), name="codex-realtime-receiver"),
         asyncio.create_task(events(), name="codex-realtime-events"),
@@ -8253,6 +8302,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 agent_announcements(), name="codex-realtime-agent-announcements"
             )
         )
+    if identity_probe is not None:
+        identity_context_task = asyncio.create_task(
+            append_speaker_identity_context(),
+            name="codex-realtime-speaker-identity-context",
+        )
+        output_aux_tasks.add(identity_context_task)
     executor_event_task: asyncio.Task[None] | None = None
     if executor_subscription is not None:
         executor_event_task = asyncio.create_task(

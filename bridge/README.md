@@ -205,6 +205,32 @@ recent unreviewed record to `wake-negative`/`false-activation`. It never infers
 labels automatically. Remove the override and speaker flag to restore the
 zero-allocation default.
 
+### Optional local speaker identification
+
+Speaker identification is disabled by default. Enabling
+`compose.speaker-identity.yaml` starts a separate non-root worker with pinned
+`sherpa-onnx`/NumPy dependencies and an exact hash-verified TitaNet model. The
+ordinary bridge image remains unchanged. Configure a distinct token and
+owner-only model/profile paths:
+
+```bash
+export HA_CODEX_SPEAKER_IDENTITY_TOKEN="replace-with-a-distinct-random-token"
+export HA_CODEX_SPEAKER_IDENTITY_MODEL_HOST="/absolute/private/nemo_en_titanet_large.onnx"
+export HA_CODEX_SPEAKER_PROFILES_HOST="/absolute/private/speaker-profiles"
+docker compose --env-file .codex-voice/compose.env \
+  -f compose.yaml -f compose.speaker-identity.yaml \
+  up -d --build
+```
+
+The bridge captures at most one five-second post-wake PCM window and submits it
+asynchronously over loopback. The worker strips silence and requires both a
+calibrated cosine threshold and separation margin. A confident match is
+appended later as advisory developer context; `unknown`, timeout, worker
+failure, or an absent profile changes nothing. Identity never delays readiness,
+capture, interruption, or the first response and never authorizes a sensitive
+Home Assistant action. Enrollment and threshold evaluation are documented in
+[`docs/development.md`](../docs/development.md#optional-speaker-identification).
+
 The Compose service keeps the bridge, App Server, OAuth state, media stack, and
 listener warm. It still creates the provider thread and peer at wake; a
 connected standby session is deliberately deferred until measurement proves

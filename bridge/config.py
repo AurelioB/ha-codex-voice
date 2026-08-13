@@ -76,6 +76,36 @@ def _parse_boolean_environment(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be one of 0/1, false/true, no/yes, off/on")
 
 
+def _validate_speaker_identity_config(config: BridgeConfig) -> None:
+    if (config.speaker_identity_url is None) != (config.speaker_identity_token is None):
+        raise ValueError("speaker identity requires both an endpoint URL and a token")
+    if config.speaker_identity_url is not None:
+        parsed_identity_url = urlsplit(config.speaker_identity_url)
+        if (
+            parsed_identity_url.scheme not in {"http", "https"}
+            or not parsed_identity_url.netloc
+            or parsed_identity_url.username is not None
+            or parsed_identity_url.password is not None
+            or len(config.speaker_identity_url) > 2_048
+        ):
+            raise ValueError("speaker_identity_url must be a bounded HTTP(S) URL")
+        if (
+            config.speaker_identity_token is None
+            or not 24 <= len(config.speaker_identity_token) <= 512
+        ):
+            raise ValueError("speaker_identity_token must contain 24 to 512 characters")
+        if config.speaker_identity_token in {
+            config.bearer_token,
+            config.realtime_device_token,
+            config.agent_announce_token,
+        }:
+            raise ValueError(
+                "speaker_identity_token must differ from other bridge tokens"
+            )
+    if not 0.5 <= config.speaker_identity_timeout <= 15.0:
+        raise ValueError("speaker_identity_timeout must be between 0.5 and 15 seconds")
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     """Configuration shared by the HTTP service and Codex child process."""
@@ -106,6 +136,9 @@ class BridgeConfig:
     agent_task_timeout: float = 35.0
     voice_sample_root: str | None = None
     voice_sample_consent: bool = False
+    speaker_identity_url: str | None = None
+    speaker_identity_token: str | None = field(default=None, repr=False)
+    speaker_identity_timeout: float = 4.0
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -167,6 +200,7 @@ class BridgeConfig:
                 )
             ):
                 raise ValueError("voice_sample_root must be a bounded absolute path")
+        _validate_speaker_identity_config(self)
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -237,5 +271,14 @@ class BridgeConfig:
             voice_sample_root=os.environ.get("HA_CODEX_VOICE_SAMPLE_ROOT") or None,
             voice_sample_consent=_parse_boolean_environment(
                 "HA_CODEX_VOICE_SAMPLE_CONSENT"
+            ),
+            speaker_identity_url=(
+                os.environ.get("HA_CODEX_SPEAKER_IDENTITY_URL") or None
+            ),
+            speaker_identity_token=(
+                os.environ.get("HA_CODEX_SPEAKER_IDENTITY_TOKEN") or None
+            ),
+            speaker_identity_timeout=float(
+                os.environ.get("HA_CODEX_SPEAKER_IDENTITY_TIMEOUT", "4")
             ),
         )

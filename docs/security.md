@@ -27,6 +27,15 @@ sides of a narrow bridge API.
   Compose voice-lab override and the root-owned speaker flag, stores private
   mode-`0600` files under an owner-only directory, and never infers a training
   label from model confidence alone.
+- Speaker identification is absent from the standard bridge image and runtime.
+  The optional Compose worker binds to loopback, receives a distinct bearer and
+  one bounded five-second PCM window per enabled session, verifies the exact
+  TitaNet model hash, and reads owner-managed profiles through a read-only
+  mount. A timeout, malformed result, insufficient voiced audio, low score, or
+  insufficient margin returns `unknown` without affecting voice availability.
+  Only a confident profile ID may be appended as advisory personalization
+  context; it never authenticates the caller or expands Home Assistant tool
+  authority.
 - The current ThirdReality strict-v2 client explicitly requests
   `conversation_mode: "native"`. The bridge captures the current immutable Home
   Assistant broker snapshot and keeps one active native App Server realtime

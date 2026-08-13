@@ -185,8 +185,9 @@ does not change wake-to-ready p95 by more than 10 ms and cannot block capture.
 
 ### M4 — personalized wake model
 
-Status: compatible one-model activation path implemented; training and physical
-qualification pending.
+Status: compatible one-model activation and deterministic session-split
+training-manifest export implemented; external training and physical
+qualification require consented recordings and remain pending.
 
 - Train on the Compose host from owner positives, room-specific negatives, and
   augmentation for distance, noise, reverberation, and speaker playback.
@@ -212,12 +213,19 @@ qualified vendor detector.
 
 ### M5 — speaker enrollment and identification
 
+Status: private centroid builder, pinned optional Compose worker, asynchronous
+five-second bridge probe, conservative unknown fallback, and advisory context
+injection implemented; household enrollment and physical threshold calibration
+remain pending.
+
 - Enroll each person from several sessions and distances, not one phrase.
 - Compute embeddings on the Compose host from AEC-cleaned user speech after wake.
 - Compare against a small closed-set profile store with calibrated accept and
   reject thresholds; return `unknown` when confidence or margin is insufficient.
 - Aggregate across multiple speech regions in a session and allow identity to
-  stabilize rather than oscillate on every frame.
+  stabilize rather than oscillate on every frame. The first implementation
+  embeds one silence-stripped bounded post-wake window and publishes at most one
+  result per device session.
 - Inject an advisory identity context update only after a confident result. Do
   not restart the provider or delay its first response.
 - Add an explicit profile delete/re-enroll workflow and threshold evaluation for
@@ -228,6 +236,10 @@ unknown speakers remain unknown, and identification work causes no audio queue
 growth or response-start regression.
 
 ### M6 — deployment and burn-in
+
+Status: ordinary and optional Compose packaging implemented; the standard
+bridge remains free of identity dependencies. Physical burn-in awaits enrolled
+profiles and a qualified personalized wake artifact.
 
 - Package the voice lab and future trainer/identity worker in Docker Compose
   profiles so the ordinary bridge image stays small.

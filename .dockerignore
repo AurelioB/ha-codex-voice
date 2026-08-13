@@ -20,4 +20,5 @@ docs
 htmlcov
 protocol
 scripts
+!scripts/speaker_identity.py
 tests

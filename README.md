@@ -36,8 +36,9 @@ The aarch64 Buildroot Linux speaker—not Android—is intentionally a small aud
 appliance. It does not import `aiortc`, create SDP, hold OAuth state, interpret
 general tools, or call Home Assistant. Native AEC3 remains on the speaker so
 capture and the physical render reference stay sample-aligned. The bridge owns
-Codex App Server, OAuth, WebRTC, provider lifecycle, and exactly one native
-tool: `end_conversation`.
+Codex App Server, OAuth, WebRTC, provider lifecycle, bridge-owned
+`end_conversation`, the default Home Assistant exposed-entity tool snapshot,
+and optional external-agent tools.
 
 An accepted wake pulses the LED and claims the microphone, but does not admit
 speech. The bridge completes the initial provider session, returns strict-v2
@@ -50,8 +51,10 @@ that same provider peer while the utterance continues upstream. Startup failure 
 never falls through to a single-turn Assist request.
 
 The standard Home Assistant Conversation/STT/TTS integration is retained in
-the repository, but Home Assistant Assist, Hermes, and entity tools are
-deferred while this conversation path is qualified. The former wire-v3
+the repository, but Home Assistant Assist and Hermes remain outside this media
+path. Home Assistant is nevertheless the default smart-home tool authority:
+its selected Conversation subentry exposes only Home Assistant-approved tools
+to the native realtime model. The former wire-v3
 device-owned WebRTC/sidecar implementation is also retained, disabled, as a
 rollback and research artifact; its measurements below are labeled
 historical.
@@ -108,7 +111,8 @@ historical.
 
 The retained Assist pipeline remains turn-based. The active Okay Nabu route is
 a separate full-duplex server-owned WebRTC conversation, not an STT/text/TTS
-simulation. Home control is deferred.
+simulation. Home control uses the default Home Assistant exposed-entity tool
+authority, while external memory/deep-task agent access is optional.
 
 ## Quick start
 
@@ -165,6 +169,21 @@ The Compose service uses host networking for reliable server-owned WebRTC, so
 apply a host firewall rule for port 8787. See the
 [server-offloaded realtime architecture](server-offloaded-realtime-architecture.md)
 for setup, security, lifecycle, rollout, and physical acceptance details.
+
+Optional local speaker identification is a separate image and never enlarges
+the normal bridge container. After enrolling private profiles and downloading
+the exact documented TitaNet model, enable it explicitly with:
+
+```bash
+docker compose --env-file .codex-voice/compose.env \
+  -f compose.yaml -f compose.speaker-identity.yaml \
+  up --detach --build
+```
+
+The worker receives one bounded post-wake PCM window over loopback, returns
+`unknown` unless score and margin both pass, and can only add advisory
+personalization context. It is never an authentication factor. See
+[development](docs/development.md#optional-speaker-identification).
 
 ### 3. Add reliable local STT
 

@@ -1072,6 +1072,38 @@ def test_voice_sample_collection_requires_explicit_root_and_consent(
         )
 
 
+def test_speaker_identity_is_optional_and_requires_a_distinct_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "bridge-token")
+    monkeypatch.delenv("HA_CODEX_SPEAKER_IDENTITY_URL", raising=False)
+    monkeypatch.delenv("HA_CODEX_SPEAKER_IDENTITY_TOKEN", raising=False)
+    assert BridgeConfig.from_env().speaker_identity_url is None
+
+    monkeypatch.setenv(
+        "HA_CODEX_SPEAKER_IDENTITY_URL",
+        "http://127.0.0.1:8790/identify",
+    )
+    with pytest.raises(ValueError, match="requires both"):
+        BridgeConfig.from_env()
+
+    monkeypatch.setenv(
+        "HA_CODEX_SPEAKER_IDENTITY_TOKEN",
+        "speaker-specific-token-123456",
+    )
+    config = BridgeConfig.from_env()
+    assert config.speaker_identity_url == "http://127.0.0.1:8790/identify"
+    assert config.speaker_identity_token == "speaker-specific-token-123456"
+    assert config.speaker_identity_timeout == 4.0
+
+    with pytest.raises(ValueError, match="must differ"):
+        BridgeConfig(
+            bearer_token="speaker-specific-token-123456",
+            speaker_identity_url="http://127.0.0.1:8790/identify",
+            speaker_identity_token="speaker-specific-token-123456",
+        )
+
+
 @pytest.mark.parametrize(
     "url",
     ["file:///tmp/agent", "http://user:secret@agent.local/task", "agent.local"],
@@ -1859,6 +1891,15 @@ async def test_health_requires_bearer_and_reports_ready(
             "samples_stored": 0,
             "false_wakes_labeled": 0,
             "failures": 0,
+        },
+        "speaker_identity": {
+            "enabled": False,
+            "requests_started": 0,
+            "requests_succeeded": 0,
+            "requests_failed": 0,
+            "matches": 0,
+            "unknown": 0,
+            "last_duration_ms": None,
         },
     }
 
@@ -6889,6 +6930,64 @@ async def test_realtime_v2_explicit_native_executes_optional_agent_tool(
         "answer": "Resultado del agente"
     }
 
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_optional_identity_appends_late_advisory_context(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    observed: list[bytes] = []
+
+    async def identify_handler(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == (
+            "Bearer speaker-specific-token-123456"
+        )
+        observed.append(await request.read())
+        return web.json_response(
+            {
+                "status": "match",
+                "speaker_id": "owner",
+                "score": 0.81,
+                "margin": 0.29,
+            }
+        )
+
+    identity_app = web.Application()
+    identity_app.router.add_post("/identify", identify_handler)
+    identity_server = await aiohttp_server(identity_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            speaker_identity_url=str(identity_server.make_url("/identify")),
+            speaker_identity_token="speaker-specific-token-123456",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    for _ in range(5):
+        await device.send_bytes(b"\x01\x00" * 16_000)
+    async with asyncio.timeout(1):
+        while not any(
+            method == "thread/realtime/appendText"
+            and params.get("role") == "developer"
+            and "[local speaker identity]" in str(params.get("text"))
+            for method, params in fake_rpc.calls
+        ):
+            await asyncio.sleep(0)
+
+    assert len(observed) == 1
+    assert len(observed[0]) == 5 * 16_000 * 2
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
     await device.send_json({"type": "stop"})
     await device.close()
 
