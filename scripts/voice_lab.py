@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+WAKE_MANIFEST_SCHEMA_VERSION = 1
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
@@ -222,6 +223,7 @@ def add_sample(
     phrase: str | None = None,
     outcome: str = "not-evaluated",
     provenance: str = "manual-import",
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate and copy one immutable sample into the private dataset."""
     if not consent:
@@ -236,6 +238,7 @@ def add_sample(
     normalized_provenance = _validated_text(
         provenance, name="provenance", required=True, limit=120
     )
+    normalized_session_id = _validated_id(session_id, required=False)
     pcm, frames = _read_pcm(audio)
     duration_ms = round(frames * 1_000 / SAMPLE_RATE)
     minimum, maximum = _DURATION_LIMITS[kind]
@@ -255,6 +258,7 @@ def add_sample(
         "phrase": normalized_phrase,
         "detector_outcome": outcome,
         "provenance": normalized_provenance,
+        "session_id": normalized_session_id,
         "consented_at": _utc_now(),
         "sample_rate": SAMPLE_RATE,
         "channels": CHANNELS,
@@ -342,6 +346,92 @@ def list_samples(
     ]
 
 
+def export_wake_manifest(
+    root: Path,
+    output: Path,
+    *,
+    phrase: str,
+    validation_percent: int = 20,
+) -> dict[str, Any]:
+    """Export a deterministic session-split manifest for microWakeWord training."""
+    normalized_phrase = _validated_text(
+        phrase,
+        name="wake phrase",
+        required=True,
+        limit=80,
+    )
+    if not 1 <= validation_percent <= 50:
+        raise VoiceLabError("validation percent must be between 1 and 50")
+    verification = verify_lab(root)
+    if verification["errors"]:
+        raise VoiceLabError("voice lab must verify cleanly before export")
+    resolved_root = root.resolve()
+    resolved_output = output.resolve()
+    if not resolved_output.is_relative_to(resolved_root):
+        raise VoiceLabError("wake manifest must remain inside the private voice lab")
+    index = load_index(root)
+    samples: list[dict[str, Any]] = []
+    positive = 0
+    negative = 0
+    for sample_id, record in sorted(index["samples"].items()):
+        kind = record.get("kind")
+        record_phrase = record.get("phrase")
+        if kind == "wake-positive":
+            if (
+                not isinstance(record_phrase, str)
+                or record_phrase.casefold() != normalized_phrase.casefold()
+                or record.get("detector_outcome") not in {"hit", "miss"}
+            ):
+                continue
+            label = "positive"
+            positive += 1
+        elif kind in {"wake-negative", "background"}:
+            label = "negative"
+            negative += 1
+        else:
+            continue
+        group = record.get("session_id") or record.get("provenance")
+        if not isinstance(group, str) or not group:
+            raise VoiceLabError("training sample has no session split group")
+        bucket = int.from_bytes(hashlib.sha256(group.encode()).digest()[:4], "big")
+        split = "validation" if bucket % 100 < validation_percent else "train"
+        samples.append(
+            {
+                "id": sample_id,
+                "file": record["file"],
+                "label": label,
+                "split": split,
+                "group": group,
+                "detector_outcome": record.get("detector_outcome"),
+            }
+        )
+    if positive == 0 or negative == 0:
+        raise VoiceLabError(
+            "wake export requires at least one matching positive and one negative"
+        )
+    _private_directory(resolved_output.parent)
+    manifest: dict[str, Any] = {
+        "schema_version": WAKE_MANIFEST_SCHEMA_VERSION,
+        "target_phrase": normalized_phrase,
+        "sample_rate": SAMPLE_RATE,
+        "sample_width": SAMPLE_WIDTH,
+        "channels": CHANNELS,
+        "split_unit": "recording-session",
+        "validation_percent": validation_percent,
+        "dataset_index_sha256": hashlib.sha256(
+            _marker_path(root).read_bytes()
+        ).hexdigest(),
+        "counts": {
+            "positive": positive,
+            "negative": negative,
+            "total": len(samples),
+        },
+        "samples": samples,
+    }
+    _atomic_json(resolved_output, manifest)
+    return manifest
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
@@ -355,6 +445,7 @@ def _arguments() -> argparse.Namespace:
     add.add_argument("--phrase")
     add.add_argument("--outcome", choices=sorted(OUTCOMES), default="not-evaluated")
     add.add_argument("--provenance", default="manual-import")
+    add.add_argument("--session-id")
     add.add_argument("--consent", action="store_true")
 
     listing = commands.add_parser("list")
@@ -364,6 +455,10 @@ def _arguments() -> argparse.Namespace:
     commands.add_parser("verify")
     remove = commands.add_parser("remove")
     remove.add_argument("sample_id")
+    wake_export = commands.add_parser("export-wake")
+    wake_export.add_argument("--output", type=Path, required=True)
+    wake_export.add_argument("--phrase", required=True)
+    wake_export.add_argument("--validation-percent", type=int, default=20)
     return parser.parse_args()
 
 
@@ -383,6 +478,7 @@ def main() -> int:
                 phrase=args.phrase,
                 outcome=args.outcome,
                 provenance=args.provenance,
+                session_id=args.session_id,
             )
         elif args.command == "list":
             result = list_samples(args.root, kind=args.kind, speaker_id=args.speaker_id)
@@ -391,6 +487,13 @@ def main() -> int:
             if result["errors"]:
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 1
+        elif args.command == "export-wake":
+            result = export_wake_manifest(
+                args.root,
+                args.output,
+                phrase=args.phrase,
+                validation_percent=args.validation_percent,
+            )
         else:
             result = remove_sample(args.root, args.sample_id)
     except (OSError, VoiceLabError) as exc:

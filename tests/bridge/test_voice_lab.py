@@ -9,6 +9,7 @@ import pytest
 from scripts.voice_lab import (
     VoiceLabError,
     add_sample,
+    export_wake_manifest,
     init_lab,
     list_samples,
     load_index,
@@ -17,9 +18,15 @@ from scripts.voice_lab import (
 )
 
 
-def _wav(path: Path, *, frames: int = 16_000, sample_rate: int = 16_000) -> Path:
+def _wav(
+    path: Path,
+    *,
+    frames: int = 16_000,
+    sample_rate: int = 16_000,
+    amplitude: int = 1_000,
+) -> Path:
     pcm = b"".join(
-        (1_000 if index % 2 else -1_000).to_bytes(2, "little", signed=True)
+        (amplitude if index % 2 else -amplitude).to_bytes(2, "little", signed=True)
         for index in range(frames)
     )
     with wave.open(str(path), "wb") as target:
@@ -138,3 +145,53 @@ def test_existing_index_is_idempotent_and_loaded(tmp_path: Path) -> None:
 
     assert init_lab(root) == created
     assert load_index(root) == created
+
+
+def test_wake_export_is_private_deterministic_and_grouped_by_session(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lab"
+    init_lab(root)
+    for index, (kind, session_id) in enumerate(
+        [
+            ("wake-positive", "positive-session"),
+            ("wake-positive", "positive-session"),
+            ("wake-negative", "negative-session"),
+            ("background", "background-session"),
+        ],
+        start=1,
+    ):
+        add_sample(
+            root,
+            _wav(tmp_path / f"sample-{index}.wav", amplitude=1_000 + index),
+            kind=kind,
+            consent=True,
+            phrase="Okay Nabu" if kind == "wake-positive" else None,
+            outcome="hit" if kind == "wake-positive" else "not-evaluated",
+            provenance=f"capture-{index}",
+            session_id=session_id,
+        )
+
+    output = root / "artifacts" / "okay-nabu-training.json"
+    first = export_wake_manifest(root, output, phrase="okay nabu")
+    first_bytes = output.read_bytes()
+    second = export_wake_manifest(root, output, phrase="okay nabu")
+
+    assert first == second
+    assert output.read_bytes() == first_bytes
+    assert stat.S_IMODE(output.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert first["counts"] == {"positive": 2, "negative": 2, "total": 4}
+    positive_splits = {
+        sample["split"]
+        for sample in first["samples"]
+        if sample["group"] == "positive-session"
+    }
+    assert len(positive_splits) == 1
+
+    with pytest.raises(VoiceLabError, match="inside the private voice lab"):
+        export_wake_manifest(
+            root,
+            tmp_path / "public.json",
+            phrase="okay nabu",
+        )
