@@ -73,6 +73,11 @@ from .tool_broker import (
     ToolBrokerSnapshot,
     ToolBrokerUnavailable,
 )
+from .voice_samples import (
+    MAX_WAKE_SAMPLE_BYTES,
+    VoiceSampleInbox,
+    VoiceSampleUnavailable,
+)
 from .webrtc import WebRtcPeer
 
 LOGGER = logging.getLogger(__name__)
@@ -966,6 +971,7 @@ class BridgeState:
             recall_timeout=config.agent_recall_timeout,
             task_timeout=config.agent_task_timeout,
         )
+        self.voice_samples = VoiceSampleInbox(config.voice_sample_root)
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
         self._speech_state_lock = asyncio.Lock()
@@ -1412,6 +1418,7 @@ class BridgeState:
                 try:
                     await self.rpc.close()
                 finally:
+                    self.voice_samples.close()
                     if self._temporary_cwd is not None:
                         self._temporary_cwd.cleanup()
                         self._temporary_cwd = None
@@ -1945,6 +1952,7 @@ def create_app(
     app.router.add_post("/v1/synthesize/stream", _synthesize_stream)
     app.router.add_post("/v1/speech-session/release", _release_speech_session)
     app.router.add_post("/v1/agent/announce", _agent_announce)
+    app.router.add_post("/v1/voice-lab/wake-sample", _voice_lab_wake_sample)
     app.router.add_get("/v1/home-assistant/tools", _home_assistant_tools)
     app.router.add_get("/v1/realtime", _realtime)
     app.on_shutdown.append(_close_active_websockets)
@@ -2019,7 +2027,15 @@ async def _bearer_middleware(request: web.Request, handler: Any) -> web.StreamRe
     )
     if supplied and primary_match:
         request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_PRIMARY
-    elif supplied and request.path == "/v1/realtime" and device_match:
+    elif (
+        supplied
+        and request.path
+        in {
+            "/v1/realtime",
+            "/v1/voice-lab/wake-sample",
+        }
+        and device_match
+    ):
         # Carry only a non-secret identity marker. The realtime handler admits
         # this restricted credential after a valid v2 negotiation is parsed.
         request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_REALTIME_DEVICE
@@ -2055,6 +2071,8 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
         )
     except AgentAnnouncementUnavailable as exc:
         return web.json_response({"error": str(exc)}, status=503)
+    except VoiceSampleUnavailable as exc:
+        return web.json_response({"error": str(exc)}, status=503)
     except BridgeError as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -2087,6 +2105,7 @@ async def _health(request: web.Request) -> web.Response:
             "home_assistant_tools": state.home_assistant_tools.health(),
             "agent_tools": state.agent_tools.health(),
             "agent_announcements": state.agent_announcements.health(),
+            "voice_samples": state.voice_samples.health(),
         },
         status=200 if ready else 503,
     )
@@ -2123,6 +2142,32 @@ async def _agent_announce(request: web.Request) -> web.Response:
     state: BridgeState = request.app[STATE_KEY]
     await state.agent_announcements.announce(text.strip())
     return web.json_response({"accepted": True})
+
+
+async def _voice_lab_wake_sample(request: web.Request) -> web.Response:
+    """Store one bounded device wake capture outside the realtime media path."""
+    state: BridgeState = request.app[STATE_KEY]
+    if not state.voice_samples.enabled:
+        raise VoiceSampleUnavailable("voice sample collection is disabled")
+    if (
+        request.content_length is not None
+        and request.content_length > MAX_WAKE_SAMPLE_BYTES
+    ):
+        raise ProtocolError("wake sample exceeded the size limit")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.content.iter_chunked(8 * 1024):
+        size += len(chunk)
+        if size > MAX_WAKE_SAMPLE_BYTES:
+            raise ProtocolError("wake sample exceeded the size limit")
+        chunks.append(chunk)
+    phrase = request.headers.get("X-Voice-Wake-Phrase", "")
+    await asyncio.to_thread(
+        state.voice_samples.store_wake,
+        b"".join(chunks),
+        phrase=phrase,
+    )
+    return web.json_response({"stored": True})
 
 
 async def _transcribe(request: web.Request) -> web.Response:
@@ -4309,12 +4354,15 @@ async def _realtime(request: web.Request) -> web.WebSocketResponse:
 def _native_realtime_tools(
     broker_snapshot: ToolBrokerSnapshot | None,
     agent_tools: AgentToolBroker,
+    voice_samples: VoiceSampleInbox,
 ) -> list[dict[str, Any]]:
     """Merge bridge, agent, and Home Assistant tools with explicit ownership."""
     tools: list[dict[str, Any]] = [DIRECT_END_CONVERSATION_TOOL]
+    tools.extend(voice_samples.tools)
     tools.extend(agent_tools.tools)
     reserved_names = {
         DIRECT_END_CONVERSATION_TOOL_NAME,
+        *(tool["name"] for tool in voice_samples.tools),
         *(tool["name"] for tool in agent_tools.tools),
     }
     if broker_snapshot is not None:
@@ -4329,6 +4377,7 @@ def _native_realtime_tools(
 def _native_realtime_base_instructions(
     broker_snapshot: ToolBrokerSnapshot | None,
     agent_tools: AgentToolBroker,
+    voice_samples: VoiceSampleInbox,
 ) -> str:
     """Build trusted native instructions for one immutable tool snapshot."""
     instructions = DIRECT_REALTIME_BASE_INSTRUCTIONS
@@ -4347,6 +4396,12 @@ def _native_realtime_base_instructions(
             "recall_memory. Use it for memory, research, cross-application, or deeper "
             "tasks only. Never use it for Home Assistant entity state or control; use "
             "the declared Home Assistant tools directly for those requests."
+        )
+    if voice_samples.enabled:
+        instructions += (
+            "\n\nPrivate wake-sample collection was explicitly enabled. Call "
+            "mark_false_wake only when the user clearly says this session began "
+            "from a false or accidental wake. Do not infer or auto-label one."
         )
     return instructions
 
@@ -4379,7 +4434,11 @@ async def _realtime_admitted(
             else None
         )
         configured_tools = normalize_dynamic_tools(
-            _native_realtime_tools(broker_snapshot, state.agent_tools)
+            _native_realtime_tools(
+                broker_snapshot,
+                state.agent_tools,
+                state.voice_samples,
+            )
             if (
                 wire_protocol.uses_binary_audio
                 and wire_protocol.requests_native_conversation
@@ -5420,6 +5479,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                     base_instructions=_native_realtime_base_instructions(
                         broker_snapshot,
                         state.agent_tools,
+                        state.voice_samples,
                     ),
                 )
                 created_thread = True
@@ -6653,12 +6713,19 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         arguments: object,
         background_turn_generation: int | None,
     ) -> None:
-        """Execute one declared Home Assistant or optional-agent tool call."""
+        """Execute one declared Home Assistant, agent, or bridge-owned tool."""
         nonlocal tool_authority_failed_closed
         correlation = tool_correlation(request_id, call_id)
         started_at = time.monotonic()
+        sample_owned = state.voice_samples.owns(name)
         agent_owned = state.agent_tools.owns(name)
-        owner = "agent" if agent_owned else "home_assistant"
+        owner = (
+            "voice_samples"
+            if sample_owned
+            else "agent"
+            if agent_owned
+            else "home_assistant"
+        )
         LOGGER.info(
             "Realtime owned tool call started owner=%s correlation=%s",
             owner,
@@ -6669,7 +6736,25 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             "error": f"{owner}_tool_unavailable",
             "do_not_retry": True,
         }
-        if agent_owned and isinstance(name, str) and isinstance(arguments, Mapping):
+        if sample_owned and isinstance(arguments, Mapping):
+            if arguments:
+                result = {
+                    "error": "mark_false_wake_requires_empty_arguments",
+                    "do_not_retry": True,
+                }
+            else:
+                try:
+                    result = await asyncio.to_thread(
+                        state.voice_samples.mark_latest_false_wake
+                    )
+                except VoiceSampleUnavailable:
+                    LOGGER.warning(
+                        "Realtime wake-label tool failed correlation=%s",
+                        correlation,
+                    )
+                else:
+                    success = True
+        elif agent_owned and isinstance(name, str) and isinstance(arguments, Mapping):
             try:
                 broker_result = await state.agent_tools.call(
                     name=name,
@@ -6759,6 +6844,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         cancel_tool_continuation_watchdog()
         name = params.get("tool")
         arguments = params.get("arguments", {})
+        bridge_owned = state.voice_samples.owns(name)
         agent_owned = state.agent_tools.owns(name)
         owned_background_generation = (
             active_background_turn_generation if bridge_managed_realtime else None
@@ -6768,7 +6854,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         session_limit_exceeded = (
             len(seen_tool_request_ids) > REALTIME_MAX_TOOL_CALLS_PER_SESSION
         )
-        if tool_authority_failed_closed and not agent_owned:
+        if tool_authority_failed_closed and not agent_owned and not bridge_owned:
             rejection = {
                 "error": "home_assistant_tool_session_unavailable",
                 "do_not_retry": True,
@@ -7657,8 +7743,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         if tool_name == DIRECT_END_CONVERSATION_TOOL_NAME:
             action = await _handle_direct_provider_tool_call(session, event)
             return action == "end"
-        if state.agent_tools.owns(tool_name) or (
-            broker_snapshot is not None and tool_name in broker_snapshot.tool_names
+        if (
+            state.voice_samples.owns(tool_name)
+            or state.agent_tools.owns(tool_name)
+            or (broker_snapshot is not None and tool_name in broker_snapshot.tool_names)
         ):
             start_owned_tool_call(event)
             return False

@@ -739,6 +739,14 @@ closed instead of silently reverting to another wake model. Leave this setting
 absent until the artifact has passed the offline and physical gates in
 [`advanced-realtime-features-plan.md`](../../advanced-realtime-features-plan.md).
 
+`voice_sample_collection_enabled` is an optional boolean and defaults to
+`false`. When explicitly enabled together with the bridge's private voice-lab
+Compose override, the overlay keeps a bounded three-second AEC-cleaned idle
+ring and hands immutable frame references to a lazy background uploader after
+an accepted wake. Disabled mode allocates no ring or worker and sends no sample
+traffic. Captures are unreviewed until the tester explicitly labels them; do
+not enable this setting without household consent.
+
 For a reversible realtime-only trial, set `wake_phrase` to `okay nabu`, set
 `realtime_only` to `true`, and leave only `okay_nabu` active in
 `/data/conf/sound.json`. This intentionally replaces the normal Assist wake

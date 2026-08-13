@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlsplit
 
 DEFAULT_PERMISSION_PROFILE = "ha-voice-minimal"
@@ -103,6 +104,8 @@ class BridgeConfig:
     agent_room: str = "home"
     agent_recall_timeout: float = 8.0
     agent_task_timeout: float = 35.0
+    voice_sample_root: str | None = None
+    voice_sample_consent: bool = False
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -150,6 +153,20 @@ class BridgeConfig:
             raise ValueError("agent_recall_timeout must be between 0.5 and 40 seconds")
         if not 0.5 <= self.agent_task_timeout <= 40.0:
             raise ValueError("agent_task_timeout must be between 0.5 and 40 seconds")
+        if (self.voice_sample_root is None) != (not self.voice_sample_consent):
+            raise ValueError(
+                "voice sample collection requires both an absolute root and consent"
+            )
+        if self.voice_sample_root is not None:
+            sample_root = Path(self.voice_sample_root)
+            if (
+                not sample_root.is_absolute()
+                or len(self.voice_sample_root) > 1_024
+                or any(
+                    not character.isprintable() for character in self.voice_sample_root
+                )
+            ):
+                raise ValueError("voice_sample_root must be a bounded absolute path")
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -216,5 +233,9 @@ class BridgeConfig:
             ),
             agent_task_timeout=float(
                 os.environ.get("HA_CODEX_AGENT_TASK_TIMEOUT", "35")
+            ),
+            voice_sample_root=os.environ.get("HA_CODEX_VOICE_SAMPLE_ROOT") or None,
+            voice_sample_consent=_parse_boolean_environment(
+                "HA_CODEX_VOICE_SAMPLE_CONSENT"
             ),
         )

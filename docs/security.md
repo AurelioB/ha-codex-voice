@@ -23,6 +23,10 @@ sides of a narrow bridge API.
   `/v1/agent/announce`; it cannot access health, media, Home Assistant tools, or
   OAuth. Reports are bounded, accepted only by an idle active voice session,
   and never wake or reopen a speaker after the user leaves.
+- Voice samples have no default storage mount. Collection requires both the
+  Compose voice-lab override and the root-owned speaker flag, stores private
+  mode-`0600` files under an owner-only directory, and never infers a training
+  label from model confidence alone.
 - The current ThirdReality strict-v2 client explicitly requests
   `conversation_mode: "native"`. The bridge captures the current immutable Home
   Assistant broker snapshot and keeps one active native App Server realtime

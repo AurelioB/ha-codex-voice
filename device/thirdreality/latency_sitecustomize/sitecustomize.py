@@ -248,6 +248,7 @@ _REALTIME_CONFIG: Any = None
 _REALTIME_PATCH_ACTIVE = False
 _REALTIME_OWNER_ATTRIBUTE = "_codex_realtime_owner"
 _REALTIME_PREROLL_ATTRIBUTE = "_codex_realtime_preroll"
+_VOICE_SAMPLE_PREROLL_ATTRIBUTE = "_codex_voice_sample_preroll"
 _REALTIME_LOCK_ATTRIBUTE = "_codex_realtime_lock"
 _REALTIME_STOP_REQUESTED_ATTRIBUTE = "_codex_realtime_stop_requested"
 _REALTIME_SOUND_SIGNATURE_ATTRIBUTE = "_codex_realtime_sound_signature"
@@ -256,6 +257,7 @@ _REALTIME_ANCHOR_DIRTY_ATTRIBUTE = "_codex_realtime_anchor_dirty"
 # idle frames only for the bridge-PCM path; device WebRTC deliberately drops
 # all pre-cue PCM and opens live capture after its audible ready boundary.
 _REALTIME_PREROLL_MAX_BYTES = 12 * 1024
+_VOICE_SAMPLE_PREROLL_MAX_BYTES = 96 * 1024
 # Preserve one second of bridge-PCM capacity behind pre-roll so legal, smaller
 # custom queues do not fall back merely because their handshake is pending.
 _REALTIME_STARTUP_HEADROOM_BYTES = 32 * 1024
@@ -273,6 +275,22 @@ _SOUND_CONFIG_LOCK_PATH = "/tmp/sound_config.lock"  # noqa: S108 - vendor ABI
 _SOUND_CONFIG_LOCK_TIMEOUT_SECONDS = 0.250
 _SOUND_CONFIG_LOCK_RETRY_SECONDS = 0.005
 _SOUND_CONFIG_MAX_BYTES = 64 * 1024
+
+_WAKE_SAMPLE_UPLOADER: Any = None
+if _VALID_REALTIME_CONFIG and getattr(
+    _EARLY_REALTIME_CONFIG, "voice_sample_collection_enabled", False
+):
+    try:
+        _WAKE_SAMPLE_MODULE = importlib.import_module("realtime_client.voice_samples")
+        _WAKE_SAMPLE_UPLOADER = _WAKE_SAMPLE_MODULE.WakeSampleUploader(
+            _EARLY_REALTIME_CONFIG
+        )
+        atexit.register(_WAKE_SAMPLE_UPLOADER.close)
+    except Exception:  # noqa: BLE001 - collection never affects voice availability
+        _WAKE_SAMPLE_UPLOADER = None
+        logging.getLogger("linux_voice_assistant.realtime").warning(
+            "ThirdReality wake sample collection is unavailable"
+        )
 
 _LED_TIMEOUT_SECONDS = 2.0
 _LED_THREAD_PREFIX = "thirdreality-led"
@@ -642,6 +660,31 @@ def _remember_realtime_preroll(instance: Any, audio_chunk: bytes) -> None:
         retained_bytes -= len(preroll.popleft())
 
 
+def _remember_voice_sample_preroll(instance: Any, audio_chunk: bytes) -> None:
+    """Retain a larger idle ring only when collection was explicitly enabled."""
+    if _WAKE_SAMPLE_UPLOADER is None:
+        return
+    preroll = getattr(instance, _VOICE_SAMPLE_PREROLL_ATTRIBUTE, None)
+    if not isinstance(preroll, deque):
+        preroll = deque()
+        setattr(instance, _VOICE_SAMPLE_PREROLL_ATTRIBUTE, preroll)
+    retained = bytes(audio_chunk)
+    if retained:
+        preroll.append(retained)
+    retained_bytes = sum(map(len, preroll))
+    while preroll and retained_bytes > _VOICE_SAMPLE_PREROLL_MAX_BYTES:
+        retained_bytes -= len(preroll.popleft())
+
+
+def _take_voice_sample_preroll(instance: Any) -> list[bytes]:
+    """Detach the opt-in ring without joining bytes on the microphone thread."""
+    preroll = getattr(instance, _VOICE_SAMPLE_PREROLL_ATTRIBUTE, None)
+    setattr(instance, _VOICE_SAMPLE_PREROLL_ATTRIBUTE, None)
+    if not isinstance(preroll, deque):
+        return []
+    return list(preroll)
+
+
 def _take_realtime_preroll(instance: Any) -> list[bytes]:
     """Atomically detach idle pre-roll on the pinned microphone thread."""
     preroll = getattr(instance, _REALTIME_PREROLL_ATTRIBUTE, None)
@@ -839,6 +882,7 @@ def _start_realtime_wakeup(
     instance: Any,
     wake_word: Any,
     preroll_audio: list[bytes],
+    wake_sample_audio: list[bytes] | None = None,
 ) -> None:
     """Claim audio for a fresh direct session without touching HA networking."""
     with _realtime_state_lock(instance):
@@ -937,6 +981,9 @@ def _start_realtime_wakeup(
         instance._pipeline_active = True  # noqa: SLF001
         instance._is_streaming_audio = True  # noqa: SLF001
         _activate_realtime_owner(instance, owner, preroll_audio)
+        if wake_sample_audio and _WAKE_SAMPLE_UPLOADER is not None:
+            with suppress(Exception):
+                _WAKE_SAMPLE_UPLOADER.submit(wake_sample_audio)
 
 
 def _retry_direct_realtime_startup(
@@ -1386,6 +1433,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
                 and not instance.state.muted
             ):
                 _maybe_prewarm_probable_realtime_wake(instance)
+                _remember_voice_sample_preroll(instance, audio_chunk)
                 _remember_realtime_preroll(instance, audio_chunk)
             else:
                 _discard_realtime_preroll(instance)
@@ -2179,12 +2227,18 @@ def _fast_thirdreality_wakeup(instance: Any, wake_word: Any) -> None:
             selection,
         )
         preroll_audio = _take_realtime_preroll(instance)
+        wake_sample_audio = _take_voice_sample_preroll(instance)
         if realtime_only_blocked:
             _LOGGER.debug("Ignoring non-realtime wake word in realtime-only mode")
             return
         previous_active = instance._pipeline_active  # noqa: SLF001
         if realtime_wake:
-            _start_realtime_wakeup(instance, wake_word, preroll_audio)
+            _start_realtime_wakeup(
+                instance,
+                wake_word,
+                preroll_audio,
+                wake_sample_audio,
+            )
         else:
             _fast_wakeup(instance, wake_word)
         if not previous_active and instance._pipeline_active:  # noqa: SLF001

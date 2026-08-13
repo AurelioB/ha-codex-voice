@@ -181,6 +181,30 @@ accepts at most 600 characters, refuses busy/idle sessions, and never receives
 Home Assistant or Codex credentials. It deliberately does not create a new
 speaker connection after the user has ended a conversation.
 
+### Private wake-sample collection
+
+Wake-sample collection is disabled by default and the normal Compose service
+has no writable recording mount. To opt in for a controlled training session,
+create an owner-only directory, set `HA_CODEX_VOICE_SAMPLE_ROOT_HOST` to its
+absolute path, and add the explicit override:
+
+```bash
+install -d -m 700 /absolute/private/voice-samples
+docker compose -f compose.yaml -f compose.voice-lab.yaml \
+  --env-file .codex-voice/compose.env up -d --build bridge
+```
+
+Also set `voice_sample_collection_enabled: true` in the root-owned speaker
+configuration. The speaker retains at most three seconds of AEC-cleaned idle
+PCM in memory, detaches that ring at an accepted wake, and queues it to a lazy
+background uploader. The microphone callback never performs HTTP or file I/O.
+The bridge writes mode-`0600` WAV/JSON pairs beneath the mode-`0700` inbox and
+initially labels each capture `unreviewed-wake`. When the user explicitly says
+the wake was accidental, the native-only `mark_false_wake` tool changes only a
+recent unreviewed record to `wake-negative`/`false-activation`. It never infers
+labels automatically. Remove the override and speaker flag to restore the
+zero-allocation default.
+
 The Compose service keeps the bridge, App Server, OAuth state, media stack, and
 listener warm. It still creates the provider thread and peer at wake; a
 connected standby session is deliberately deferred until measurement proves

@@ -1087,6 +1087,26 @@ def _player_command(command: _FakeMediaPlayerCommand) -> _FakeMediaPlayerCommand
     )
 
 
+def test_opt_in_voice_sample_ring_is_bounded_and_detached_without_joining(
+    load_overlay: Any,
+) -> None:
+    _protocol, module, _tr_satellite = load_overlay(
+        _REALTIME_HASHES,
+        _fake_realtime_support(),
+    )
+    module._WAKE_SAMPLE_UPLOADER = object()
+    instance = SimpleNamespace()
+    chunks = [bytes((index, 0)) * 1_024 for index in range(50)]
+
+    for chunk in chunks:
+        module._remember_voice_sample_preroll(instance, chunk)
+    retained = module._take_voice_sample_preroll(instance)
+
+    assert retained == chunks[-48:]
+    assert sum(map(len, retained)) == 96 * 1_024
+    assert module._take_voice_sample_preroll(instance) == []
+
+
 def _fake_realtime_support(
     *,
     fallback_buffer_bytes: int = 64 * 1024,

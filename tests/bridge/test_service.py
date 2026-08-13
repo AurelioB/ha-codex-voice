@@ -1045,6 +1045,33 @@ def test_optional_agent_configuration_is_disabled_by_default_and_loaded_from_env
     assert config.agent_room == "cocina"
 
 
+def test_voice_sample_collection_requires_explicit_root_and_consent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_VOICE_SAMPLE_ROOT", raising=False)
+    monkeypatch.delenv("HA_CODEX_VOICE_SAMPLE_CONSENT", raising=False)
+    assert BridgeConfig.from_env().voice_sample_root is None
+    assert BridgeConfig.from_env().voice_sample_consent is False
+
+    root = tmp_path / "voice-samples"
+    monkeypatch.setenv("HA_CODEX_VOICE_SAMPLE_ROOT", str(root))
+    with pytest.raises(ValueError, match="requires both"):
+        BridgeConfig.from_env()
+
+    monkeypatch.setenv("HA_CODEX_VOICE_SAMPLE_CONSENT", "true")
+    config = BridgeConfig.from_env()
+    assert config.voice_sample_root == str(root)
+    assert config.voice_sample_consent is True
+
+    with pytest.raises(ValueError, match="requires both"):
+        BridgeConfig(
+            bearer_token="test-token",
+            voice_sample_consent=True,
+        )
+
+
 @pytest.mark.parametrize(
     "url",
     ["file:///tmp/agent", "http://user:secret@agent.local/task", "agent.local"],
@@ -1826,6 +1853,12 @@ async def test_health_requires_bearer_and_reports_ready(
             "active_session": False,
             "accepted": 0,
             "unavailable": 0,
+        },
+        "voice_samples": {
+            "enabled": False,
+            "samples_stored": 0,
+            "false_wakes_labeled": 0,
+            "failures": 0,
         },
     }
 
@@ -6612,7 +6645,11 @@ def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
         task_timeout=1,
     )
 
-    tools = bridge_service._native_realtime_tools(snapshot, agent)
+    tools = bridge_service._native_realtime_tools(
+        snapshot,
+        agent,
+        bridge_service.VoiceSampleInbox(None),
+    )
 
     assert [tool["name"] for tool in tools] == [
         "end_conversation",
@@ -6897,6 +6934,79 @@ async def test_agent_report_back_is_route_scoped_and_uses_active_native_session(
         if method == "thread/realtime/appendSpeech"
     )
     assert append["text"] == "Terminé la investigación"
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_opt_in_device_wake_sample_can_be_explicitly_marked_false_by_voice(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "voice-samples"
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            realtime_device_token="device-token",
+            voice_sample_root=str(root),
+            voice_sample_consent=True,
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device_auth = {"Authorization": "Bearer device-token"}
+    uploaded = await client.post(
+        "/v1/voice-lab/wake-sample",
+        headers={**device_auth, "X-Voice-Wake-Phrase": "okay nabu"},
+        data=b"\0\0" * 16_000,
+    )
+    assert uploaded.status == 200
+    assert await uploaded.json() == {"stored": True}
+
+    device = await client.ws_connect("/v1/realtime", headers=device_auth)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "mark_false_wake",
+    ]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "false-wake-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "false-wake-call",
+                "tool": "mark_false_wake",
+                "arguments": {},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "false-wake-request" for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "false-wake-request"
+    )
+    assert response["success"] is True
+    assert json.loads(response["contentItems"][0]["text"])["status"] == "marked"
+    metadata_path = next((root / "inbox").glob("wake-*.json"))
+    assert (
+        json.loads(metadata_path.read_text(encoding="utf-8"))["detector_outcome"]
+        == "false-activation"
+    )
 
     await device.send_json({"type": "stop"})
     await device.close()

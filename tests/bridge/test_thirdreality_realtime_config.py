@@ -63,6 +63,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.realtime_only is False
     assert config.wake_probability_cutoff is None
     assert config.personalized_wake_config_path is None
+    assert config.voice_sample_collection_enabled is False
     assert config.voice is None
     assert config.prompt is None
     assert config.full_duplex is False
@@ -140,6 +141,28 @@ def test_config_accepts_only_an_absolute_personalized_wake_json_path(
         )
         with pytest.raises(ConfigError, match="absolute JSON path"):
             load_config(path, expected_uid=os.getuid())
+
+
+def test_config_requires_an_explicit_boolean_for_voice_sample_collection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {**_valid_config(), "voice_sample_collection_enabled": True},
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.voice_sample_collection_enabled is True
+
+    _write_config(
+        path,
+        {**_valid_config(), "voice_sample_collection_enabled": "true"},
+    )
+    with pytest.raises(ConfigError, match="must be a boolean"):
+        load_config(path, expected_uid=os.getuid())
 
 
 @pytest.mark.parametrize(

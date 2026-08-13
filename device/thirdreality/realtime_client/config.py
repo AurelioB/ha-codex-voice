@@ -64,6 +64,7 @@ _ALLOWED_KEYS = frozenset(
         "realtime_only",
         "wake_probability_cutoff",
         "personalized_wake_config_path",
+        "voice_sample_collection_enabled",
         "voice",
         "prompt",
         "connect_timeout_seconds",
@@ -134,6 +135,11 @@ def _validated_personalized_wake_config_path(candidate: object) -> str | None:
     return candidate
 
 
+def _require_boolean(candidate: object, name: str) -> None:
+    if not isinstance(candidate, bool):
+        raise ConfigError(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True, slots=True)
 class RealtimeConfig:
     """Validated, bounded settings for one fresh realtime session."""
@@ -160,6 +166,7 @@ class RealtimeConfig:
     realtime_only: bool = field(default=False, kw_only=True)
     wake_probability_cutoff: float | None = field(default=None, kw_only=True)
     personalized_wake_config_path: str | None = field(default=None, kw_only=True)
+    voice_sample_collection_enabled: bool = field(default=False, kw_only=True)
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
     pulse_aec_source: str | None = None
@@ -182,6 +189,10 @@ class RealtimeConfig:
             raise ConfigError("full_duplex must be a boolean")
         if not isinstance(self.realtime_only, bool):
             raise ConfigError("realtime_only must be a boolean")
+        _require_boolean(
+            self.voice_sample_collection_enabled,
+            "voice_sample_collection_enabled",
+        )
         if (
             not self.realtime_only
             and isinstance(self.wake_phrase, str)
@@ -444,6 +455,13 @@ def load_config(
         maximum=0.99,
     )
     personalized_wake_config_path = _optional_personalized_wake_config_path(decoded)
+    voice_sample_collection_enabled = decoded.get(
+        "voice_sample_collection_enabled", False
+    )
+    _require_boolean(
+        voice_sample_collection_enabled,
+        "voice_sample_collection_enabled",
+    )
 
     input_queue_bytes = _bounded_int(
         decoded,
@@ -639,6 +657,7 @@ def load_config(
         realtime_only=realtime_only,
         wake_probability_cutoff=wake_probability_cutoff,
         personalized_wake_config_path=personalized_wake_config_path,
+        voice_sample_collection_enabled=voice_sample_collection_enabled,
         voice=voice,
         prompt=prompt,
         pulse_aec_source=pulse_aec_source,

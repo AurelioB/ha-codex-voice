@@ -166,6 +166,9 @@ PCM or shadowing Home Assistant control.
 
 ### M3 — explicit sample capture and labeling
 
+Status: accepted-wake capture and explicit false-wake labeling implemented;
+missed-wake import and physical performance qualification pending.
+
 - Add a disabled-by-default speaker-to-host sample channel separate from the
   realtime media socket.
 - Accepted wake capture: retain a bounded pre-wake window and short post-wake
