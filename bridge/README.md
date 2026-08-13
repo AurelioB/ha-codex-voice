@@ -137,15 +137,16 @@ Okay Nabu uses strict v2 `bridge_pcm`, explicit native mode, and full duplex.
 The speaker continuously sends 16 kHz mono PCM16; the bridge resamples and
 paces it into the active provider WebRTC peer, then returns 24 kHz mono PCM16
 inside monotonic speaking epochs. The device WebSocket remains open across
-responses and interruptions. A qualified local cut sends exact `{"type":"barge"}`;
-the bridge fences the old provider generation, retains up to 320 ms of causal
-microphone pre-roll, buffers live input within the 2,250 ms bound, and feeds it
-once at normal media pace to a replacement peer.
+responses and interruptions. The active provider-control policy sends exact
+`{"type":"provider_barge"}` after a qualified local cut. The bridge mirrors the
+desktop WebRTC hush pair (`response.cancel`, then
+`output_audio_buffer.clear`) while keeping that peer and its input stream live.
+The bridge explicitly requests `gpt-live-1-codex`; the model is overridable by
+`HA_CODEX_REALTIME_MODEL` for a controlled rollback or canary.
 
-The tagged App Server Frameless path exposes neither a dependable
-active-response VAD boundary nor a supported cancel/truncate control. The
-bridge therefore does not wait for `speech_started` or claim same-peer provider
-cancellation. It requires strict stop and a matching
+The bridge does not wait for a provider VAD boundary. If same-peer provider
+control is unavailable, `barge_in_mode: "rollover"` retains the conservative
+generation-replacement path: strict stop and a matching
 `thread/realtime/closed` notification within the 100 ms reuse grace before
 reusing the existing thread with startup context. An error, timeout, or
 otherwise ambiguous close starts the replacement on a fresh isolated thread so
@@ -301,12 +302,12 @@ It then returns `fresh_session_required: false`, `remote_cancelled: false`, and
 without claiming remote cancellation. A legacy client gets the established
 fresh-session fallback and socket teardown.
 
-The active explicit-native client instead sends the exact nonterminal `barge`
-control after its local AEC-qualified cut. Capture and the device WebSocket stay
-live while the bridge replaces the non-interruptible provider generation and
-replays bounded causal pre-roll plus during-rollover PCM exactly once. The
-bridge never relies on provider VAD or a provider cancellation acknowledgement
-for this path.
+The active explicit-native client instead sends exact nonterminal
+`provider_barge` after its local AEC-qualified cut. Capture and the device
+WebSocket stay live while the bridge sends `response.cancel` and
+`output_audio_buffer.clear` over the same provider peer. The bridge never waits
+for provider VAD. Exact `barge` remains the conservative peer-replacement
+fallback.
 
 ### Dormant v3 rollover details
 

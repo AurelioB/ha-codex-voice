@@ -146,30 +146,23 @@ worst case and exercise representative attenuated levels.
 
 During provider speech the microphone never closes. Qualified near-end speech
 immediately kills and flushes local playback and sends exactly
-`{"type":"barge"}` on the same LAN socket. `barge` is nonterminal: the device
+`{"type":"provider_barge"}` on the same LAN socket. The control is nonterminal: the device
 keeps its owner, LED, capture queue, pacing, and WebSocket alive and continues
 sending PCM. With active native AEC3, the render classifier qualifies the local
 cut but never zeroes or rewrites accepted outbound capture.
 
-The server atomically advances its provider generation and fences every old
-generation output sender. Its socket-lifetime resampler has retained up to 320
-ms of already-resampled causal PCM; subsequent PCM is buffered in capture order
-within the 2,250 ms total rollover bound. After the replacement is ready, the
-bridge feeds that retained sequence exactly once through the new normally paced
-input track. Output epochs keep increasing across replacements.
-
-The bridge strictly stops the retired provider. A matching
-`thread/realtime/closed` within the 100 ms reuse grace permits same-thread
-startup-context reuse. An RPC/provider error, timeout, provider/App Server
-disconnect, or otherwise ambiguous outcome transfers the retired thread to
-bounded cleanup and starts an isolated replacement without startup context. A
-delayed old stop therefore cannot terminate the active generation.
+The server sends `response.cancel` followed by `output_audio_buffer.clear` over
+the active WebRTC data channel and fences queued old output locally. It keeps
+the same provider peer and continuously paced microphone track, so the complete
+replacement instruction remains one upstream utterance. Output epochs keep
+increasing when the provider begins its next response. Strict provider
+replacement remains available as the `rollover` policy if these controls
+regress.
 
 The device must not use simple microphone energy as its only barge-in signal:
 the decision is made from AEC-filtered near-end speech with a short consecutive
-frame requirement. Tagged Frameless supplies neither a dependable
-active-response VAD boundary nor a supported response cancel/truncate control,
-so correctness does not depend on provider `speech_started` or cancellation.
+frame requirement. The speaker initiates interruption locally, so correctness
+does not depend on provider `speech_started`.
 
 ## Ending a conversation
 
@@ -317,8 +310,8 @@ ThirdReality unit, not merely in mocked tests:
   idle and a later wake succeeds without rebooting the speaker.
 
 Automated gates cover strict-v2 framing, state transitions, retry ownership,
-PCM gain/saturation, output-epoch fencing, exact `barge`, bounded exactly-once
-rollover replay, strict-close reuse/isolation, end-tool/fallback behavior,
+PCM gain/saturation, output-epoch fencing, exact `provider_barge`, ordered
+same-peer cancel/clear, rollover fallback, end-tool/fallback behavior,
 cleanup, Compose parsing, image build, non-root imports, and secure OAuth
 mounting. A green automated suite is necessary but does not replace the physical
 matrix.
@@ -327,7 +320,7 @@ matrix.
 
 - **M1 — Server-offloaded native conversation:** Compose bridge, strict-v2
   binary media, one active provider generation, deterministic startup, native
-  AEC3, 100% playback, stable-socket provider rollover, and explicit end. Home
+  AEC3, 100% playback, stable-socket same-peer interruption, and explicit end. Home
   Assistant is absent.
 - **M2 — Measured latency work:** optimize only the largest measured latency
   segment. Trial one connected server warm slot only if provider negotiation is

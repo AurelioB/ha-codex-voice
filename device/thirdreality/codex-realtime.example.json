@@ -14,6 +14,7 @@
   "max_message_bytes": 65536,
   "media_transport": "bridge_pcm",
   "capture_backend": "native_aec3",
+  "barge_in_mode": "provider_control",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",

@@ -59,6 +59,7 @@ DATA_CONTROL_EVENT_TYPES = frozenset(
         "input_audio_buffer.speech_stopped",
         "output_audio_buffer.started",
         "output_audio_buffer.stopped",
+        "output_audio_buffer.cleared",
         "response.cancelled",
         "response.created",
         "response.done",

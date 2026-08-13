@@ -7,6 +7,7 @@ import shlex
 from dataclasses import dataclass, field
 
 DEFAULT_PERMISSION_PROFILE = "ha-voice-minimal"
+DEFAULT_REALTIME_MODEL = "gpt-live-1-codex"
 DEFAULT_CODEX_COMMAND = (
     "codex",
     "app-server",
@@ -79,6 +80,7 @@ class BridgeConfig:
     transcript_timeout: float = 90.0
     synthesis_timeout: float = 90.0
     realtime_version: str = "v3"
+    realtime_model: str = DEFAULT_REALTIME_MODEL
     silence_ms: int = 0
     live_fragment_quiet_seconds: float = 2.0
 
@@ -94,6 +96,8 @@ class BridgeConfig:
             raise ValueError("port must be between 1 and 65535")
         if self.realtime_version not in {"v1", "v3"}:
             raise ValueError("realtime_version must be v1 or v3 for WebRTC")
+        if not self.realtime_model or len(self.realtime_model) > 128:
+            raise ValueError("realtime_model must be a non-empty bounded model name")
         if not self.codex_command:
             raise ValueError("codex_command must not be empty")
         if not self.permission_profile:
@@ -142,6 +146,9 @@ class BridgeConfig:
                 os.environ.get("HA_CODEX_BRIDGE_SYNTHESIS_TIMEOUT", "90")
             ),
             realtime_version=os.environ.get("HA_CODEX_REALTIME_VERSION", "v3"),
+            realtime_model=os.environ.get(
+                "HA_CODEX_REALTIME_MODEL", DEFAULT_REALTIME_MODEL
+            ),
             silence_ms=int(os.environ.get("HA_CODEX_TRANSCRIBE_SILENCE_MS", "0")),
             live_fragment_quiet_seconds=float(
                 os.environ.get(

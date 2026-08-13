@@ -21,6 +21,7 @@ from device.thirdreality.realtime_client.config import (
     DEFAULT_PULSE_AEC_SOURCE,
     DEVICE_WEBRTC_TRANSPORT,
     NATIVE_AEC3_CAPTURE,
+    PROVIDER_CONTROL_BARGE_IN_MODE,
     PULSEAUDIO_AEC_CAPTURE,
     UPSTREAM_BARGE_IN_MODE,
     RealtimeConfig,
@@ -7943,8 +7944,17 @@ def test_network_thread_runs_v2_audio_turn_and_drains_before_stop(
     assert player.events[-1] == ("abort", None)
 
 
+@pytest.mark.parametrize(
+    ("barge_in_mode", "barge_control"),
+    [
+        ("rollover", {"type": "barge"}),
+        (PROVIDER_CONTROL_BARGE_IN_MODE, {"type": "provider_barge"}),
+    ],
+)
 def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
     monkeypatch: pytest.MonkeyPatch,
+    barge_in_mode: str,
+    barge_control: dict[str, str],
 ) -> None:
     monkeypatch.setattr(
         session_module,
@@ -7958,6 +7968,7 @@ def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
         _duplex_config(
             capture_backend=NATIVE_AEC3_CAPTURE,
             direct_capture_gain_db=12.0,
+            barge_in_mode=barge_in_mode,
         ),
         connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
         aec_verifier=lambda _config: None,
@@ -7994,9 +8005,9 @@ def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
 
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
-    assert connection.wait_for_json({"type": "barge"})
+    assert connection.wait_for_json(barge_control)
     assert _wait_for(lambda: not session.output_active)
-    assert connection.json_sent.count({"type": "barge"}) == 1
+    assert connection.json_sent.count(barge_control) == 1
     assert connection.json_sent.count({"type": "interrupt"}) == 0
     assert session.state is SessionState.READY
     assert not session.terminal
@@ -8022,7 +8033,7 @@ def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert connection.wait_for_binary_count(baseline + 2)
-    assert connection.json_sent.count({"type": "barge"}) == 1
+    assert connection.json_sent.count(barge_control) == 1
 
     quiet = bytes(2_048)
     for _ in range(session_module._LOCAL_BARGE_IN_REARM_QUIET_FRAMES):
@@ -8048,7 +8059,7 @@ def test_bridge_local_barge_keeps_socket_capture_and_pacing_live(
     assert _wait_for(lambda: session.output_active)
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
     assert session.submit_audio(speech) is SubmitResult.ACCEPTED
-    assert _wait_for(lambda: connection.json_sent.count({"type": "barge"}) == 2)
+    assert _wait_for(lambda: connection.json_sent.count(barge_control) == 2)
     assert connection.json_sent.count({"type": "interrupt"}) == 0
     assert session.state is SessionState.READY
     assert not session.terminal

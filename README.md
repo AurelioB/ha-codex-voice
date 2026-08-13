@@ -44,9 +44,9 @@ speech. The bridge completes the initial provider session, returns strict-v2
 `started`, and only then does the speaker play the acknowledgement cue. Cue EOF
 changes the LED to listening and opens capture. During playback the microphone remains
 open; qualified AEC-filtered near-end speech cuts local playback immediately
-and sends exact `{"type":"barge"}` while the device socket and capture stay
-open. The bridge replaces the provider generation and feeds the retained
-utterance once to its paced input track. Startup failure returns to idle and
+and sends exact `{"type":"provider_barge"}` while the device socket and
+capture stay open. The bridge cancels the response and clears queued output on
+that same provider peer while the utterance continues upstream. Startup failure returns to idle and
 never falls through to a single-turn Assist request.
 
 The standard Home Assistant Conversation/STT/TTS integration is retained in
@@ -392,17 +392,15 @@ bridge, and receives binary 24 kHz mono PCM16 inside monotonic speaking epochs.
 
 The bridge constructs and paces the active WebRTC provider generation. On
 qualified native-AEC3 near-end speech, the device immediately cuts playback,
-sends exact `barge`, and keeps its WebSocket and capture open. The bridge fences
-the old generation, retains up to 320 ms of causal already-resampled PCM,
-buffers live input within the 2,250 ms total bound, and feeds it once at normal
-pace to a replacement peer. Output epochs remain monotonic across replacements.
+sends exact `provider_barge`, and keeps its WebSocket and capture open. The
+bridge sends `response.cancel` followed by `output_audio_buffer.clear` on the
+same provider WebRTC peer, matching the public desktop-compatible hush flow.
+The model and input stream stay live, and output epochs remain monotonic.
 
-The tagged App Server Frameless path exposes no dependable active-response VAD
-boundary or supported cancel/truncate control. Strict stop plus a matching
-`thread/realtime/closed` within the 100 ms reuse grace permits same-thread
-startup-context reuse; an ambiguous outcome uses a fresh isolated thread. The
-active path therefore does not depend on provider `speech_started` or remote
-cancellation. There is no transcript executor or synthesized turn handoff.
+The active path does not depend on provider `speech_started`: the speaker's
+qualified local AEC boundary initiates cancellation. Conservative peer
+replacement remains available as `barge_in_mode: "rollover"` if same-peer
+controls regress. There is no transcript executor or synthesized turn handoff.
 
 Strict-v2 `started` is the session-readiness boundary. The speaker plays its
 pinned cue only after that message and opens capture only at cue EOF. The

@@ -7,6 +7,12 @@ and releases use semantic versioning.
 
 ### Added
 
+- Add desktop-compatible same-peer native interruption. The speaker's
+  AEC-qualified cut sends exact `provider_barge`; the bridge sends
+  `response.cancel` followed by `output_audio_buffer.clear` on the active
+  provider WebRTC peer while microphone pacing continues. Native v2 now
+  explicitly requests `gpt-live-1-codex`; strict provider rollover remains a
+  reversible fallback.
 - Add the server-offloaded ThirdReality realtime route. Strict wire v2 now
   keeps the speaker on wake, LED, native AEC3, local barge-in, and raw PCM while
   the local bridge owns Codex App Server, OAuth, the WebRTC peer, resampling,

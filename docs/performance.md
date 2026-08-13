@@ -109,7 +109,7 @@ The active latency and safety bounds are:
 | Capture gain | +12 dB maximum, saturating | Raises post-AEC provider input without changing local wake/AEC samples |
 | Playback | Fixed 100% sink anchor, 100%-relative stream | One later non-amplifying software stage exposes mute at 0 and audible levels 1–100% without PCM amplification |
 | Session lifetime | 120 s semantic idle / 900 s hard maximum | Normal provider delay does not end the session; explicit end/terminal state does |
-| Barge-in | Two qualifying AEC-filtered callbacks; 320 ms server pre-roll; 2,250 ms total rollover input bound | Cuts local playback, sends exact `barge`, and replays causal PCM once through a replacement provider generation while the device socket stays open |
+| Barge-in | Two qualifying AEC-filtered callbacks | Cuts local playback, sends exact `provider_barge`, then cancels and clears output on the same provider peer while microphone pacing continues |
 
 ### Historical device-owned v3 bounds and measurements
 
@@ -388,16 +388,13 @@ dispatched call.
 The v2 ThirdReality path advertises
 `User-Agent: ha-codex-voice-thirdreality/2`; this retains compatibility with the
 managed `continuation_safe` acknowledgement but does not select that route.
-Active v2 native interruption uses exact `{"type":"barge"}`, not the legacy
-interrupt acknowledgement. The device immediately cuts playback and continues
-capture on the same WebSocket. The bridge fences the old generation, retains
-up to 320 ms of already-resampled causal PCM, buffers live speech within the
-2,250 ms total bound, and feeds it exactly once at normal pace to the replacement
-peer. Confirmed `thread/realtime/closed` within the 100 ms reuse grace permits
-same-thread context reuse; ambiguous closure uses a fresh isolated thread.
-Frameless supplies no usable
-same-peer cancel/VAD boundary, so neither `speech_started` nor provider
-cancellation is required for correctness.
+Active v2 native interruption uses exact `{"type":"provider_barge"}`, not the
+legacy interrupt acknowledgement. The device immediately cuts playback and
+continues capture on the same WebSocket. The bridge sends `response.cancel`
+then `output_audio_buffer.clear` on the same provider WebRTC peer while the
+replacement instruction continues upstream. It does not wait for provider
+`speech_started`. Exact `barge` and strict provider replacement remain the
+reversible fallback policy.
 
 Adrian loading with the reviewed raw masters and creating 16 kHz mono endpoints
 is a static-topology result, not an acoustic result. On the reference device's

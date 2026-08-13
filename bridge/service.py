@@ -5314,7 +5314,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
             )
             await candidate_session.start(
                 prompt=normalized_prompt,
-                model=None,
+                model=state.config.realtime_model,
                 voice=normalized_voice,
                 include_startup_context=include_startup_context,
                 client_managed_handoffs=False,
@@ -7293,6 +7293,15 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 native_barge = native_input.begin_barge()
                 stop.set()
                 return
+            elif message_type == "provider_barge":
+                if native_input is None or set(message) != {"type"}:
+                    raise ProtocolError(
+                        "provider_barge requires an exact explicit native realtime "
+                        "control"
+                    )
+                session.request_response_cancel_and_clear_output()
+                await end_output(after_tail=False)
+                continue
             elif message_type == "stop":
                 stop.set()
                 return
@@ -7564,6 +7573,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
 
     def control_ends_output(control: RealtimeDataControl) -> bool:
         return control.event_type in {
+            "output_audio_buffer.cleared",
             "output_audio_buffer.stopped",
             "response.done",
         } or (
@@ -7712,7 +7722,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 complete_tool_continuation_after_terminal(
                     control.event_type, control.response_id
                 )
-                await end_output(after_tail=True)
+                await end_output(
+                    after_tail=control.event_type != "output_audio_buffer.cleared"
+                )
                 await send(control.wire_value())
                 continue
             await send(control.wire_value())

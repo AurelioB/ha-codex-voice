@@ -511,6 +511,17 @@ class RealtimeSession:
             json.dumps({"type": "response.cancel"}, separators=(",", ":"))
         )
 
+    def request_response_cancel_and_clear_output(self) -> None:
+        """Mirror the Codex desktop WebRTC hush controls on the active peer."""
+        if not self._started:
+            raise ProtocolError("realtime session has not started")
+        self.peer.send_data_event(
+            json.dumps({"type": "response.cancel"}, separators=(",", ":"))
+        )
+        self.peer.send_data_event(
+            json.dumps({"type": "output_audio_buffer.clear"}, separators=(",", ":"))
+        )
+
     def discard_pending_input(self) -> None:
         """Drop finite STT PCM that has not yet left the paced input track."""
         self.peer.discard_pending_input()

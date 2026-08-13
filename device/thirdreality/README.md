@@ -33,10 +33,10 @@ sink/playback anchor. The stream itself stays at 100% relative volume and one
 non-amplifying software stage gives the physical buttons their full 0–100%
 range. During provider
 speech, two-frame qualified near-end detection cuts local `paplay` immediately
-and sends one exact `{"type":"barge"}` boundary without stopping capture or
-closing the device WebSocket. The server retains up to 320 ms of causal
-microphone pre-roll, buffers subsequent PCM within its 2,250 ms input bound,
-and feeds it exactly once to a replacement provider generation.
+and sends one exact `{"type":"provider_barge"}` boundary without stopping
+capture or closing the device WebSocket. The server sends `response.cancel`
+then `output_audio_buffer.clear` on the same provider peer while the complete
+replacement utterance continues upstream.
 
 An accepted wake claims the vendor owner and pulses the LED. Up to three
 startup attempts share one absolute 12-second owner deadline. Capture stays
@@ -659,6 +659,7 @@ realtime-only route; this is the minimal active configuration:
   "handshake_timeout_seconds": 10,
   "media_transport": "bridge_pcm",
   "capture_backend": "native_aec3",
+  "barge_in_mode": "provider_control",
   "full_duplex": true,
   "pulse_aec_source": "codex_echo_cancel_source",
   "pulse_aec_sink": "codex_echo_cancel_sink",
@@ -901,8 +902,8 @@ passes all of the following on the physical speaker:
    playback does not self-interrupt. Early, middle, and late near-end speech
    cuts playback promptly and the exact causal words become the next request;
    no second sentence or wake is needed.
-5. Long multi-turn conversation stays on one device WebSocket across every
-   provider replacement. Output epochs remain strictly increasing; replies
+5. Long multi-turn conversation stays on one device WebSocket and provider
+   peer across interruptions. Output epochs remain strictly increasing; replies
    have no systematic prefix/tail loss or crackle, and volume changes do not
    move the fixed sink anchor or introduce a second attenuation stage.
 6. Spanish `terminar`/`terminar llamada`, an unambiguous English end request,

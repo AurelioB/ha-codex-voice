@@ -98,15 +98,12 @@ Assistant tool is present.
 
 During provider playback the microphone stays open. Qualified AEC-filtered
 near-end speech immediately kills and flushes local playback and sends one
-exact `barge` boundary on the same device socket. The bridge fences the old
-provider generation, retains 320 ms of recent already-resampled microphone
-PCM, buffers live PCM within the 2,250 ms total rollover bound while it replaces
-the provider peer, and replays that causal audio once through the new paced
-input track. A confirmed provider close within the 100 ms reuse grace reuses
-the thread and its context; an ambiguous close starts an isolated thread
-instead of risking cross-generation output. The App Server Frameless path does
-not provide a usable active-response VAD/cancel boundary, so correctness does
-not depend on provider `speech_started`.
+exact `provider_barge` boundary on the same device socket. The bridge sends the
+desktop-compatible `response.cancel` and `output_audio_buffer.clear` pair on
+the current provider WebRTC data channel, fences queued local output, and keeps
+the thread, peer, capture, and input pacing live. Correctness does not depend on
+provider `speech_started`; `barge_in_mode: "rollover"` retains strict provider
+replacement as a conservative fallback.
 
 The dedicated sink and `paplay` stream remain at the fixed 100% physical
 anchor. One non-amplifying software attenuator implements dynamic user volume:

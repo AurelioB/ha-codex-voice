@@ -817,6 +817,19 @@ def test_response_cancel_uses_provider_data_channel() -> None:
     assert peer.sent_data_events == ['{"type":"response.cancel"}']
 
 
+def test_desktop_hush_cancels_response_then_clears_output_on_same_peer() -> None:
+    peer = FakePeer()
+    session = RealtimeSession(SdpFirstRpc(), "thread-1", peer=peer, timeout=1)
+    session._started = True
+
+    session.request_response_cancel_and_clear_output()
+
+    assert peer.sent_data_events == [
+        '{"type":"response.cancel"}',
+        '{"type":"output_audio_buffer.clear"}',
+    ]
+
+
 def test_response_cancel_requires_a_started_session() -> None:
     session = RealtimeSession(SdpFirstRpc(), "thread-1", peer=FakePeer(), timeout=1)
 

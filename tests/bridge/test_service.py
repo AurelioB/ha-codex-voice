@@ -19,7 +19,7 @@ from aiohttp import WSCloseCode, WSMsgType, WSServerHandshakeError, web
 
 from bridge import __main__ as bridge_main
 from bridge import service as bridge_service
-from bridge.config import DEFAULT_CODEX_COMMAND, BridgeConfig
+from bridge.config import DEFAULT_CODEX_COMMAND, DEFAULT_REALTIME_MODEL, BridgeConfig
 from bridge.errors import AppServerExited, BridgeBusyError, ProtocolError
 from bridge.runtime import IsolatedCodexRuntime
 from bridge.service import BridgeState, _codex_child_environment, create_app
@@ -994,6 +994,21 @@ def test_realtime_device_token_is_optional_and_loaded_from_env(
 
     monkeypatch.setenv("HA_CODEX_REALTIME_DEVICE_TOKEN", "device-token")
     assert BridgeConfig.from_env().realtime_device_token == "device-token"
+
+
+def test_desktop_realtime_model_is_default_and_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_REALTIME_MODEL", raising=False)
+
+    assert BridgeConfig.from_env().realtime_model == "gpt-live-1-codex"
+    assert BridgeConfig(bearer_token="test-token").realtime_model == (
+        DEFAULT_REALTIME_MODEL
+    )
+
+    monkeypatch.setenv("HA_CODEX_REALTIME_MODEL", "gpt-live-canary")
+    assert BridgeConfig.from_env().realtime_model == "gpt-live-canary"
 
 
 def test_config_can_replace_only_the_codex_executable(
@@ -6615,6 +6630,78 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
             await device.send_json({"type": "stop"})
             await device.close()
         await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_provider_barge_hushes_same_desktop_model_peer(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    peer = fake_rpc.peers[0]
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert len(starts) == 1
+    assert starts[0]["model"] == DEFAULT_REALTIME_MODEL
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    first_output = b"\x01\x11" * 48
+    peer.audio.put_nowait(first_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == first_output
+
+    await device.send_json({"type": "provider_barge"})
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 1,
+    }
+    assert peer.sent_data_events == [
+        '{"type":"response.cancel"}',
+        '{"type":"output_audio_buffer.clear"}',
+    ]
+    assert len(fake_rpc.peers) == 1
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.cleared"}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "output_audio_buffer.cleared",
+    }
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    second_output = b"\x02\x22" * 48
+    peer.audio.put_nowait(second_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 2,
+    }
+    assert (await device.receive(timeout=1)).data == second_output
+
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert len(starts) == 1
+    assert len(fake_rpc.peers) == 1
+
+    await device.send_json({"type": "stop"})
+    await device.close()
 
 
 @pytest.mark.asyncio

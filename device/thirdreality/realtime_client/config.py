@@ -32,7 +32,14 @@ NATIVE_AEC3_CAPTURE = "native_aec3"
 SUPPORTED_CAPTURE_BACKENDS = frozenset({PULSEAUDIO_AEC_CAPTURE, NATIVE_AEC3_CAPTURE})
 ROLLOVER_BARGE_IN_MODE = "rollover"
 UPSTREAM_BARGE_IN_MODE = "upstream"
-SUPPORTED_BARGE_IN_MODES = frozenset({ROLLOVER_BARGE_IN_MODE, UPSTREAM_BARGE_IN_MODE})
+PROVIDER_CONTROL_BARGE_IN_MODE = "provider_control"
+SUPPORTED_BARGE_IN_MODES = frozenset(
+    {
+        ROLLOVER_BARGE_IN_MODE,
+        UPSTREAM_BARGE_IN_MODE,
+        PROVIDER_CONTROL_BARGE_IN_MODE,
+    }
+)
 DEFAULT_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_SESSION_SECONDS = 900.0
 DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 5.0
@@ -92,14 +99,16 @@ def _validated_barge_in_mode(
     capture_backend: str,
 ) -> str:
     if not isinstance(candidate, str) or candidate not in SUPPORTED_BARGE_IN_MODES:
-        raise ConfigError("barge_in_mode must be 'rollover' or 'upstream'")
-    if candidate == UPSTREAM_BARGE_IN_MODE and not (
+        raise ConfigError(
+            "barge_in_mode must be 'rollover', 'provider_control', or 'upstream'"
+        )
+    if candidate in {PROVIDER_CONTROL_BARGE_IN_MODE, UPSTREAM_BARGE_IN_MODE} and not (
         full_duplex
         and media_transport == BRIDGE_PCM_TRANSPORT
         and capture_backend == NATIVE_AEC3_CAPTURE
     ):
         raise ConfigError(
-            "upstream barge_in_mode requires full-duplex bridge_pcm with "
+            f"{candidate} barge_in_mode requires full-duplex bridge_pcm with "
             "native_aec3 capture"
         )
     return candidate

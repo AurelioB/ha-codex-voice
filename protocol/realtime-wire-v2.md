@@ -175,9 +175,31 @@ holds at most 25 chunks (normally roughly 500 ms). Queue overflow and
 unexpected media EOF are terminal protocol errors; audio is not silently
 dropped to hide latency.
 
-### Native barge rollover
+### Native same-peer provider control
 
-An explicit native v2 client interrupts assistant playback with exactly this
+A native v2 client using the desktop-compatible provider-control policy sends
+exactly:
+
+```json
+{"type":"provider_barge"}
+```
+
+The bridge immediately fences local output, then sends `response.cancel`
+followed by `output_audio_buffer.clear` on the existing provider WebRTC data
+channel. The device keeps the same WebSocket and microphone stream alive; the
+bridge keeps the same Codex thread and provider peer. A later provider
+`output_audio_buffer.cleared` event is forwarded as content-free lifecycle
+metadata. The next audible response receives the next monotonic device output
+epoch.
+
+This mode requires explicit native binary v2. No extra fields are accepted.
+The reference speaker qualifies the same local AEC-backed near-end boundary as
+rollover mode, so it cuts local playback before sending this control and never
+waits for upstream VAD.
+
+### Native barge rollover fallback
+
+The conservative fallback interrupts assistant playback with exactly this
 JSON object:
 
 ```json

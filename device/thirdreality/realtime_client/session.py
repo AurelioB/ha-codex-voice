@@ -27,6 +27,7 @@ from .config import (
     DEVICE_WEBRTC_TRANSPORT,
     NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
+    PROVIDER_CONTROL_BARGE_IN_MODE,
     PULSEAUDIO_AEC_CAPTURE,
     UPSTREAM_BARGE_IN_MODE,
     RealtimeConfig,
@@ -116,6 +117,7 @@ _CONTROL_EVENTS = frozenset(
         "input_audio_buffer.speech_stopped",
         "output_audio_buffer.started",
         "output_audio_buffer.stopped",
+        "output_audio_buffer.cleared",
         "response.created",
         "response.cancelled",
         "response.done",
@@ -136,6 +138,7 @@ _DIRECT_SEMANTIC_LIFECYCLE_EVENTS = frozenset(
         "input_audio_buffer.speech_stopped",
         "output_audio_buffer.started",
         "output_audio_buffer.stopped",
+        "output_audio_buffer.cleared",
         "response.created",
         "response.cancelled",
         "response.done",
@@ -3067,12 +3070,20 @@ class RealtimeSession:
                         last_output_epoch=last_output_epoch,
                     )
                     if barge_watermark is not None:
-                        # This is a nonterminal provider-generation boundary.
                         # Keep the stable v2 socket, capture queue, pacer, and
-                        # device session alive while the bridge replaces its
-                        # non-interruptible upstream peer. The watermark stays
-                        # local; the wire boundary is intentionally exact.
-                        connection.send_json({"type": "barge"})
+                        # device session alive. Provider-control mode uses the
+                        # same peer and mirrors the desktop WebRTC hush pair;
+                        # rollover remains the conservative fallback path.
+                        connection.send_json(
+                            {
+                                "type": (
+                                    "provider_barge"
+                                    if self._config.barge_in_mode
+                                    == PROVIDER_CONTROL_BARGE_IN_MODE
+                                    else "barge"
+                                )
+                            }
+                        )
                         last_semantic_activity = now
 
                 player.service()

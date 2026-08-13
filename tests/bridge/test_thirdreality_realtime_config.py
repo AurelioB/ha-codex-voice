@@ -23,6 +23,7 @@ from device.thirdreality.realtime_client.config import (
     MAX_REALTIME_VOLUME_PERCENT,
     NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
+    PROVIDER_CONTROL_BARGE_IN_MODE,
     PULSEAUDIO_AEC_CAPTURE,
     ROLLOVER_BARGE_IN_MODE,
     UPSTREAM_BARGE_IN_MODE,
@@ -113,8 +114,13 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert private_prompt not in repr(config)
 
 
-def test_config_allows_upstream_barge_in_only_for_native_full_duplex_bridge(
+@pytest.mark.parametrize(
+    "barge_in_mode",
+    [PROVIDER_CONTROL_BARGE_IN_MODE, UPSTREAM_BARGE_IN_MODE],
+)
+def test_config_allows_continuous_peer_barge_modes_only_for_native_full_duplex_bridge(
     tmp_path: Path,
+    barge_in_mode: str,
 ) -> None:
     path = tmp_path / "realtime.json"
     base = {
@@ -123,24 +129,24 @@ def test_config_allows_upstream_barge_in_only_for_native_full_duplex_bridge(
         "capture_backend": NATIVE_AEC3_CAPTURE,
         "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
         "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
-        "barge_in_mode": UPSTREAM_BARGE_IN_MODE,
+        "barge_in_mode": barge_in_mode,
     }
     _write_config(path, base)
 
     config = load_config(path, expected_uid=os.getuid())
 
     assert config is not None
-    assert config.barge_in_mode == UPSTREAM_BARGE_IN_MODE
+    assert config.barge_in_mode == barge_in_mode
 
     for incompatible, error in (
         ({**base, "full_duplex": False}, "native_aec3 capture requires"),
         (
             {**base, "capture_backend": PULSEAUDIO_AEC_CAPTURE},
-            "upstream barge_in_mode requires",
+            rf"{barge_in_mode} barge_in_mode requires",
         ),
         (
             {**base, "media_transport": DEVICE_WEBRTC_TRANSPORT},
-            "upstream barge_in_mode requires",
+            rf"{barge_in_mode} barge_in_mode requires",
         ),
     ):
         _write_config(path, incompatible)
