@@ -177,20 +177,27 @@ device-declared tools fail closed.
 
 ### Default public-web search
 
-The normal Compose stack starts a digest-pinned SearXNG service whose published
-port is restricted to `127.0.0.1`. The bridge advertises `search_web` whenever
-`HA_CODEX_WEB_SEARCH_URL` is configured (Compose supplies it automatically).
-Each call accepts one bounded query and returns at most six bounded public HTTP
-or HTTPS results with title, URL, excerpt, and optional publication date. It
-does not expose a general browser, arbitrary fetch endpoint, host network tool,
-or OpenAI API key.
+When managed Codex OAuth is configured, the bridge advertises `search_web` and
+uses the same subscription-backed `alpha/search` endpoint as the pinned Codex
+App Server. It reads the managed OAuth snapshot for each request so App Server
+token refreshes remain authoritative; credentials and raw provider payloads are
+never returned to the realtime model. This is an experimental Codex endpoint,
+so it is version-pinned and not treated as a stable public API.
+
+The normal Compose stack also starts a digest-pinned SearXNG service whose
+published port is restricted to `127.0.0.1`. It is an automatic fallback when
+subscription search is unavailable and is the primary backend only when no
+managed OAuth file is configured. Each call accepts one bounded query and
+returns at most six bounded public HTTP or HTTPS results with title, URL,
+excerpt, and optional publication date. It does not expose a general browser,
+arbitrary fetch endpoint, host network tool, or OpenAI API key.
 
 Search is independent of PCM forwarding and Home Assistant authority. Results
 are explicitly untrusted and may contain inaccurate or adversarial text; the
 model is instructed to compare sources and never treat web content as
 authorization or smart-home state. Set a different local SearXNG endpoint with
-`HA_CODEX_WEB_SEARCH_URL`, or omit that variable when running the bridge
-without Compose to advertise no web tool.
+`HA_CODEX_WEB_SEARCH_URL`. With managed OAuth present, omitting that variable
+disables only the local fallback, not subscription search.
 
 An optional agent may report a completed background task to the currently
 active session through `/v1/agent/announce`. This path has a separate bearer,

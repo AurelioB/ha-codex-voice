@@ -987,6 +987,7 @@ class BridgeState:
         self.web_search = WebSearchBroker(
             config.web_search_url,
             timeout=config.web_search_timeout,
+            subscription_auth_file=config.codex_auth_file,
         )
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
@@ -6813,7 +6814,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     success = True
         elif web_owned and isinstance(name, str) and isinstance(arguments, Mapping):
             try:
-                broker_result = await state.web_search.call(
+                web_result = await state.web_search.call(
                     name=name,
                     arguments=arguments,
                 )
@@ -6824,11 +6825,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     exc_info=True,
                 )
             else:
-                success = broker_result.success
-                result = broker_result.result
+                success = web_result.success
+                result = web_result.result
         elif agent_owned and isinstance(name, str) and isinstance(arguments, Mapping):
             try:
-                broker_result = await state.agent_tools.call(
+                agent_result = await state.agent_tools.call(
                     name=name,
                     arguments=arguments,
                 )
@@ -6839,8 +6840,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     exc_info=True,
                 )
             else:
-                success = broker_result.success
-                result = broker_result.result
+                success = agent_result.success
+                result = agent_result.result
         elif (
             broker_snapshot is not None
             and isinstance(name, str)
@@ -6848,7 +6849,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             and name in broker_snapshot.tool_names
         ):
             try:
-                broker_result = await state.home_assistant_tools.call(
+                home_assistant_result = await state.home_assistant_tools.call(
                     broker_snapshot,
                     name=name,
                     arguments=arguments,
@@ -6873,8 +6874,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     exc_info=True,
                 )
             else:
-                success = broker_result.success
-                result = broker_result.result
+                success = home_assistant_result.success
+                result = home_assistant_result.result
                 if (
                     not success
                     and isinstance(result, Mapping)

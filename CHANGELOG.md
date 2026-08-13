@@ -7,10 +7,11 @@ and releases use semantic versioning.
 
 ### Added
 
-- Add default subscription-realtime public web search through a digest-pinned,
-  loopback-only SearXNG Compose service. The bridge-owned `search_web` tool
-  returns at most six bounded source excerpts, executes off the PCM path, and
-  treats all results as untrusted evidence rather than Home Assistant authority.
+- Add default subscription-backed public web search through the Codex OAuth
+  search endpoint, with the digest-pinned loopback-only SearXNG Compose service
+  retained as an automatic fallback. The bridge-owned `search_web` tool returns
+  at most six bounded source excerpts, executes off the PCM path, and treats all
+  results as untrusted evidence rather than Home Assistant authority.
 - Add an on-demand realtime session reporter plus a dependency-free private
   voice lab for consented wake and speaker-enrollment WAV samples. Dataset
   commands are never imported by the bridge or speaker runtime. The optional

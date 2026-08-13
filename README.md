@@ -166,12 +166,13 @@ start it with:
 docker compose --env-file .codex-voice/compose.env up --detach --build
 ```
 
-The default Compose stack also runs a digest-pinned SearXNG metasearch service
-bound only to host loopback. Native conversations receive a bounded
-`search_web` tool, so current-information questions do not require an OpenAI
-API key or the optional external agent. Queries leave the host for the public
-search engines selected by SearXNG; returned titles, URLs, and excerpts are
-untrusted evidence and cannot authorize Home Assistant actions.
+Native conversations receive a bounded `search_web` tool backed first by the
+same Codex search endpoint and OAuth subscription used by the pinned App Server;
+no OpenAI API key or optional external agent is required. The default Compose
+stack also runs a digest-pinned SearXNG service bound only to host loopback and
+uses it automatically if subscription search is unavailable. Returned titles,
+URLs, and excerpts are untrusted evidence and cannot authorize Home Assistant
+actions.
 
 The Compose service uses host networking for reliable server-owned WebRTC, so
 apply a host firewall rule for port 8787. See the
