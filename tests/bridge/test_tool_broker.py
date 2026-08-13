@@ -45,6 +45,10 @@ def _registration(**overrides: Any) -> dict[str, Any]:
         "protocol_version": 1,
         "authority_id": "entry:conversation",
         "language": "es-MX",
+        "timezone": "America/Mexico_City",
+        "location": "Casa",
+        "latitude": 19.4326,
+        "longitude": -99.1332,
         "instructions": "Only control exposed Home Assistant entities.",
         "tools": [
             {
@@ -73,6 +77,10 @@ async def test_registration_and_correlated_tool_result() -> None:
         "generation": snapshot.generation,
     }
     assert snapshot.language == "es-MX"
+    assert snapshot.timezone == "America/Mexico_City"
+    assert snapshot.location == "Casa"
+    assert snapshot.latitude == 19.4326
+    assert snapshot.longitude == -99.1332
     assert snapshot.tool_names == {"HassTurnOn"}
 
     call = asyncio.create_task(
@@ -98,6 +106,7 @@ async def test_registration_and_correlated_tool_result() -> None:
     assert result.result == {"speech": "Encendí la luz"}
     health = broker.health()
     assert health["connected"] is True
+    assert health["local_context_available"] is True
     assert health["tool_count"] == 1
     assert health["pending_calls"] == 0
     assert health["calls_started"] == 1
@@ -240,6 +249,8 @@ async def test_closed_authority_replacement_fails_old_pending_generation() -> No
     [
         ({"protocol_version": 2}, "unsupported"),
         ({"language": "es MX"}, "BCP-47"),
+        ({"timezone": "Mars/Olympus"}, "valid IANA timezone"),
+        ({"longitude": None}, "coordinates must be paired"),
         ({"tools": "HassTurnOn"}, "bounded list"),
         (
             {"tools": [{"name": "bad name", "description": "", "parameters": {}}]},

@@ -369,6 +369,18 @@ class RealtimeToolBroker:
             "protocol_version": REALTIME_TOOL_PROTOCOL_VERSION,
             "authority_id": authority_id,
             "language": language,
+            "timezone": _bounded_string(
+                self._hass.config.time_zone,
+                "timezone",
+                _MAX_TOOL_NAME_CHARS,
+            ),
+            "location": _bounded_string(
+                self._hass.config.location_name,
+                "location",
+                _MAX_AUTHORITY_ID_CHARS,
+            ),
+            "latitude": float(self._hass.config.latitude),
+            "longitude": float(self._hass.config.longitude),
             "instructions": instructions,
             "tools": tools,
         }

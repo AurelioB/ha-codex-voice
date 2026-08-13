@@ -170,6 +170,8 @@ The native thread exposes bridge-owned `end_conversation`, configured
 `get_current_time`, and `search_web`, the current Home Assistant exposed-entity
 tools, and optional agent
 recall/deep-task tools. Its
+effective location and timezone come from the same immutable Home Assistant
+authority snapshot when connected, with Compose values as fallback. Its
 Spanish and English instructions say to call the terminal tool when the user
 clearly asks to end the conversation, including “terminar” and “terminar llamada”. The
 server accepts only that tool name and an empty object, emits a terminal

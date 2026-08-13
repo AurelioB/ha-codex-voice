@@ -18,6 +18,11 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
+- A connected Home Assistant authority also sends its configured location
+  name, latitude/longitude, and timezone. The bridge places that owner-managed
+  metadata in the provider instructions and local clock-tool result; it never
+  sends it to the speaker or a web-search backend. Compose location/timezone
+  values are used only when HA metadata is unavailable.
 - Default web search sends one bounded query to the Codex subscription search
   endpoint with the managed OAuth snapshot and accepts at most six bounded
   public HTTP(S) result excerpts. The OAuth value is never logged or returned

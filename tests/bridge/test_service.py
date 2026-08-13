@@ -97,24 +97,36 @@ def _realtime_v3_rollover(epoch: int) -> dict[str, Any]:
     }
 
 
-async def _register_test_realtime_tool_authority(client: Any) -> tuple[Any, str]:
+async def _register_test_realtime_tool_authority(
+    client: Any,
+    *,
+    include_location: bool = False,
+) -> tuple[Any, str]:
     authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
-    await authority.send_json(
-        {
-            "type": "register",
-            "protocol_version": 1,
-            "authority_id": "conversation-profile",
-            "language": "es-MX",
-            "instructions": "Controla solo las entidades expuestas.",
-            "tools": [
-                {
-                    "name": "HassTurnOn",
-                    "description": "Enciende una entidad expuesta",
-                    "parameters": {"type": "object"},
-                }
-            ],
-        }
-    )
+    registration = {
+        "type": "register",
+        "protocol_version": 1,
+        "authority_id": "conversation-profile",
+        "language": "es-MX",
+        "instructions": "Controla solo las entidades expuestas.",
+        "tools": [
+            {
+                "name": "HassTurnOn",
+                "description": "Enciende una entidad expuesta",
+                "parameters": {"type": "object"},
+            }
+        ],
+    }
+    if include_location:
+        registration.update(
+            {
+                "timezone": "America/Cancun",
+                "location": "Casa HA",
+                "latitude": 21.1619,
+                "longitude": -86.8515,
+            }
+        )
+    await authority.send_json(registration)
     registered = await authority.receive_json(timeout=1)
     assert registered["type"] == "registered"
     return authority, registered["generation"]
@@ -7090,6 +7102,10 @@ async def test_realtime_v2_exposes_and_executes_fresh_local_context(
         peer_factory=fake_rpc.peer_factory,
     )
     client = await aiohttp_client(app)
+    authority, _ = await _register_test_realtime_tool_authority(
+        client,
+        include_location=True,
+    )
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
 
     await device.send_json(_realtime_v2_start(conversation_mode="native"))
@@ -7100,9 +7116,12 @@ async def test_realtime_v2_exposes_and_executes_fresh_local_context(
     assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
         "end_conversation",
         "get_current_time",
+        "HassTurnOn",
     ]
-    assert "Location: Mexico City, Mexico" in thread_start["baseInstructions"]
-    assert "Time zone: America/Mexico_City" in thread_start["baseInstructions"]
+    assert "Location: Casa HA" in thread_start["baseInstructions"]
+    assert "Coordinates: 21.1619, -86.8515" in thread_start["baseInstructions"]
+    assert "Time zone: America/Cancun" in thread_start["baseInstructions"]
+    assert "Context source: home_assistant" in thread_start["baseInstructions"]
 
     await fake_rpc.broadcast(
         {
@@ -7131,13 +7150,17 @@ async def test_realtime_v2_exposes_and_executes_fresh_local_context(
     result = json.loads(response["contentItems"][0]["text"])
     assert (
         result["local_date"]
-        == datetime.now(ZoneInfo("America/Mexico_City")).date().isoformat()
+        == datetime.now(ZoneInfo("America/Cancun")).date().isoformat()
     )
-    assert result["timezone"] == "America/Mexico_City"
-    assert result["location"] == "Mexico City, Mexico"
+    assert result["timezone"] == "America/Cancun"
+    assert result["location"] == "Casa HA"
+    assert result["latitude"] == 21.1619
+    assert result["longitude"] == -86.8515
+    assert result["source"] == "home_assistant"
 
     await device.send_json({"type": "stop"})
     await device.close()
+    await authority.close()
 
 
 @pytest.mark.asyncio

@@ -4411,6 +4411,21 @@ def _native_realtime_tools(
     return normalize_dynamic_tools(tools)
 
 
+def _assistant_context_for_snapshot(
+    fallback: AssistantContext,
+    broker_snapshot: ToolBrokerSnapshot | None,
+) -> AssistantContext:
+    """Prefer HA's immutable location metadata for one provider session."""
+    if broker_snapshot is None:
+        return fallback
+    return fallback.with_home_assistant(
+        timezone_name=broker_snapshot.timezone,
+        location=broker_snapshot.location,
+        latitude=broker_snapshot.latitude,
+        longitude=broker_snapshot.longitude,
+    )
+
+
 def _native_realtime_base_instructions(
     broker_snapshot: ToolBrokerSnapshot | None,
     agent_tools: AgentToolBroker,
@@ -4490,13 +4505,17 @@ async def _realtime_admitted(
             if wire_protocol.uses_binary_audio
             else None
         )
+        assistant_context = _assistant_context_for_snapshot(
+            state.assistant_context,
+            broker_snapshot,
+        )
         configured_tools = normalize_dynamic_tools(
             _native_realtime_tools(
                 broker_snapshot,
                 state.agent_tools,
                 state.voice_samples,
                 state.web_search,
-                state.assistant_context,
+                assistant_context,
             )
             if (
                 wire_protocol.uses_binary_audio
@@ -5541,7 +5560,10 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                         state.voice_samples,
                         state.speaker_identity,
                         state.web_search,
-                        state.assistant_context,
+                        _assistant_context_for_snapshot(
+                            state.assistant_context,
+                            broker_snapshot,
+                        ),
                     ),
                 )
                 created_thread = True
@@ -5996,6 +6018,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     announcements: asyncio.Queue[_AgentAnnouncementRequest] | None = None,
     identity_probe: SpeakerIdentityProbe | None = None,
 ) -> _NativeV2Barge | None:
+    assistant_context = _assistant_context_for_snapshot(
+        state.assistant_context,
+        broker_snapshot,
+    )
     bridge_managed_realtime = executor_thread_id is not None
     executor_subscription = state.rpc.subscribe() if bridge_managed_realtime else None
     send_lock = asyncio.Lock()
@@ -6788,7 +6814,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         started_at = time.monotonic()
         sample_owned = state.voice_samples.owns(name)
         web_owned = state.web_search.owns(name)
-        context_owned = state.assistant_context.owns(name)
+        context_owned = assistant_context.owns(name)
         agent_owned = state.agent_tools.owns(name)
         owner = (
             "voice_samples"
@@ -6813,7 +6839,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         }
         if context_owned and isinstance(name, str):
             try:
-                result = state.assistant_context.call(
+                result = assistant_context.call(
                     name=name,
                     arguments=arguments,
                 )
@@ -6951,7 +6977,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         bridge_owned = (
             state.voice_samples.owns(name)
             or state.web_search.owns(name)
-            or state.assistant_context.owns(name)
+            or assistant_context.owns(name)
         )
         agent_owned = state.agent_tools.owns(name)
         owned_background_generation = (
@@ -7854,7 +7880,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         if (
             state.voice_samples.owns(tool_name)
             or state.web_search.owns(tool_name)
-            or state.assistant_context.owns(tool_name)
+            or assistant_context.owns(tool_name)
             or state.agent_tools.owns(tool_name)
             or (broker_snapshot is not None and tool_name in broker_snapshot.tool_names)
         ):

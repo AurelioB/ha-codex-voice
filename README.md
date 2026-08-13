@@ -177,12 +177,13 @@ uses it automatically if subscription search is unavailable. Returned titles,
 URLs, and excerpts are untrusted evidence and cannot authorize Home Assistant
 actions.
 
-The reference Compose deployment sets `HA_CODEX_ASSISTANT_TIMEZONE` to
-`America/Mexico_City` and `HA_CODEX_ASSISTANT_LOCATION` to
-`Mexico City, Mexico`. These values enter trusted startup instructions, and
-`get_current_time` reads the local clock again whenever exact date or time is
-needed. Override either value for another installation; the timezone must be a
-valid IANA name.
+When the Home Assistant tool authority is connected, its configured location
+name, latitude/longitude, and IANA timezone are authoritative for new voice
+sessions. The reference Compose deployment keeps
+`HA_CODEX_ASSISTANT_TIMEZONE=America/Mexico_City` and
+`HA_CODEX_ASSISTANT_LOCATION=Mexico City, Mexico` only as the disconnected or
+older-component fallback. `get_current_time` reads the bridge clock again in
+the effective timezone whenever exact date or time is needed.
 
 The Compose service uses host networking for reliable server-owned WebRTC, so
 apply a host firewall rule for port 8787. See the

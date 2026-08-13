@@ -263,6 +263,10 @@ async def test_authenticated_registration_and_generation_scoped_calls(
     assert registration["protocol_version"] == 1
     assert registration["authority_id"] == authority.subentry_id
     assert registration["language"] == "es-MX"
+    assert registration["timezone"] == hass.config.time_zone
+    assert registration["location"] == hass.config.location_name
+    assert registration["latitude"] == hass.config.latitude
+    assert registration["longitude"] == hass.config.longitude
     assert "assistant for test home" in registration["instructions"]
     assert "Only operate entities exposed" in registration["instructions"]
     assert "Respond using language and locale es-MX" in registration["instructions"]

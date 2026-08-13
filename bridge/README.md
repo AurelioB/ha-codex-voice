@@ -135,7 +135,8 @@ requires the primary Home Assistant bridge token.
 
 Authenticated health includes a content-free `home_assistant_tools` object:
 registration/open-transport readiness, locale, tool count, pending calls,
-exclusive process-lifetime outcome counters, and the duration of the most
+local-context availability, exclusive process-lifetime outcome counters, and
+the duration of the most
 recent completed attempt. It never includes authority IDs, tool names,
 schemas, arguments, results, prompts, or conversation content.
 
@@ -173,7 +174,9 @@ cue-gated capture boundary. Native v2 has no completed-transcript executor or
 Assistant tools from the generation snapshot captured before `thread/start`,
 and—only when configured—`get_current_time`, `ask_agent`, and `recall_memory`.
 Trusted local context includes a provider-start timestamp; the clock tool
-returns a fresh value for exact date/time requests without web access. Calls
+returns a fresh value for exact date/time requests without web access. A live
+Home Assistant authority overrides the deployment fallback with its immutable
+location name, coordinates, and timezone snapshot for that session. Calls
 execute asynchronously so PCM forwarding continues. The narrow bilingual
 terminal-phrase fallback still emits terminal `stopped`; undeclared and
 device-declared tools fail closed.

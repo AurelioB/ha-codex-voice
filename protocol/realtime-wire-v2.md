@@ -405,8 +405,10 @@ subentries remain non-authoritative unless selected explicitly. That subentry
 opens the separate
 `/v1/home-assistant/tools` WebSocket with the primary bridge token, registers a
 bounded snapshot of its selected Home Assistant LLM API tools and rendered
-instructions, and executes correlated calls locally. Its locale defaults to
-`es-MX`. The route-scoped device bearer cannot open that broker, and zero,
+instructions, plus its configured location name, latitude/longitude, and IANA
+timezone. The bridge prefers that immutable metadata over its deployment
+fallback for the complete session and executes correlated calls locally. Its
+locale defaults to `es-MX`. The route-scoped device bearer cannot open that broker, and zero,
 ambiguous, stale, disconnected, timed-out, or invalid authority fails closed.
 Legacy v1 keeps its existing device-visible tool exchange for compatibility.
 
