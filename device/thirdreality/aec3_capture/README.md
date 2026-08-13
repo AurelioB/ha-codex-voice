@@ -159,13 +159,13 @@ vendor's `record(1024)` request. The Python facade returns float32 shape
 `(1024, 1)`, preserving the existing 64 ms callback, wake-word processing,
 384 ms pre-roll, official Home Assistant path, and direct WebRTC reframer.
 
-The production profile mirrors ThirdReality's newer native audio processor:
-AEC3 and its required high-pass filter, 10 dB fixed-digital gain with a -3 dBFS
-target and limiter, and moderate WebRTC noise suppression. Conditioning happens
-inside APM, so the vendor wake detector and realtime path receive the same
-cleaned samples. The active deployment keeps only 2 dB of additional bounded
-transport gain, preserving the previous nominal total while avoiding a second
-12 dB amplification of residual noise.
+The production profile extends ThirdReality's newer native audio processor:
+AEC3 and its required high-pass filter, a 10 dB fixed baseline followed by
+AGC2 adaptive digital gain, its limiter, and moderate WebRTC noise suppression.
+AGC2 may raise distant speech further but caps the amplified output noise floor
+at -50 dBFS. Conditioning happens inside APM, so the vendor wake detector and
+realtime path receive the same cleaned samples. The active deployment keeps
+transport gain at 0 dB to avoid a second gain stage after the limiter.
 
 ## What needs a reboot
 

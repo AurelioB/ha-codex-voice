@@ -15,10 +15,12 @@ namespace codex::aec3 {
 
 namespace {
 
-// Match ThirdReality's newer native voice-assistant processing profile.  Gain
-// belongs inside APM so the limiter protects close speech and the vendor wake
-// detector receives the same conditioned samples as realtime capture.
-constexpr int kCaptureGainDb = 10;
+// Keep ThirdReality's newer 10 dB native baseline, then let AGC2 adapt for
+// distance without raising the output noise floor above -50 dBFS. Gain belongs
+// inside APM so its limiter protects close speech and the vendor wake detector
+// receives the same conditioned samples as realtime capture.
+constexpr float kFixedCaptureGainDb = 10.0F;
+constexpr float kMaximumOutputNoiseDbfs = -50.0F;
 
 std::string AlsaError(const char* operation, int error) {
     return std::string(operation) + ": " + snd_strerror(error);
@@ -186,12 +188,12 @@ bool CaptureEngine::BuildProcessor(std::string* error) {
     processing_config.echo_canceller.mobile_mode = false;
     processing_config.echo_canceller.enforce_high_pass_filtering = true;
     processing_config.high_pass_filter.enabled = true;
-    processing_config.gain_controller1.enabled = true;
-    processing_config.gain_controller1.mode =
-        webrtc::AudioProcessing::Config::GainController1::kFixedDigital;
-    processing_config.gain_controller1.target_level_dbfs = 3;
-    processing_config.gain_controller1.compression_gain_db = kCaptureGainDb;
-    processing_config.gain_controller1.enable_limiter = true;
+    processing_config.gain_controller2.enabled = true;
+    processing_config.gain_controller2.fixed_digital.gain_db =
+        kFixedCaptureGainDb;
+    processing_config.gain_controller2.adaptive_digital.enabled = true;
+    processing_config.gain_controller2.adaptive_digital
+        .max_output_noise_level_dbfs = kMaximumOutputNoiseDbfs;
     processing_config.noise_suppression.enabled = true;
     processing_config.noise_suppression.level =
         webrtc::AudioProcessing::Config::NoiseSuppression::kModerate;

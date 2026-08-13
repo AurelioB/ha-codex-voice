@@ -60,10 +60,10 @@ The device is the aarch64 Buildroot Linux speaker, not Android, and remains an
 untrusted audio endpoint. It never receives a Home Assistant credential or
 Codex OAuth state, imports `aiortc`, creates SDP, advertises tools, or receives
 transcript content. Native AEC3 stays local because the microphone and physical
-render reference are sample-aligned there. A 10 dB limited fixed-digital gain
-and moderate noise suppression run inside APM, so wake detection and realtime
-capture share conditioned samples; only 2 dB of additional saturating gain is
-applied to outgoing bridge PCM.
+render reference are sample-aligned there. A 10 dB baseline, noise-limited
+adaptive digital gain, a limiter, and moderate noise suppression run inside
+APM, so wake detection and realtime capture share conditioned samples;
+outgoing bridge PCM uses 0 dB transport gain.
 
 The always-running server owns the authenticated v2 socket, the managed Codex
 login, the App Server realtime provider generation, its paced WebRTC peer,

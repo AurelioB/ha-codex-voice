@@ -287,9 +287,11 @@ def test_native_processor_conditions_capture_before_vendor_wake_and_realtime() -
         root / "device/thirdreality/aec3_capture/src/capture_engine.cpp"
     ).read_text()
 
-    assert "constexpr int kCaptureGainDb = 10;" in source
-    assert "processing_config.gain_controller1.enabled = true;" in source
-    assert "GainController1::kFixedDigital" in source
-    assert "processing_config.gain_controller1.enable_limiter = true;" in source
+    assert "constexpr float kFixedCaptureGainDb = 10.0F;" in source
+    assert "constexpr float kMaximumOutputNoiseDbfs = -50.0F;" in source
+    assert "processing_config.gain_controller2.enabled = true;" in source
+    assert (
+        "processing_config.gain_controller2.adaptive_digital.enabled = true;" in source
+    )
     assert "processing_config.noise_suppression.enabled = true;" in source
     assert "NoiseSuppression::kModerate" in source
