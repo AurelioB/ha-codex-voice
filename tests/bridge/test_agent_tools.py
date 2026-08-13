@@ -7,7 +7,12 @@ from typing import Any
 import pytest
 from aiohttp import web
 
-from bridge.agent_tools import AgentToolBroker, AgentToolUnavailable
+from bridge.agent_tools import (
+    AgentAnnouncementHub,
+    AgentAnnouncementUnavailable,
+    AgentToolBroker,
+    AgentToolUnavailable,
+)
 from bridge.errors import ProtocolError
 
 
@@ -26,6 +31,29 @@ async def test_agent_tools_are_absent_when_not_configured() -> None:
     assert broker.owns("ask_agent") is False
     assert broker.health()["calls_started"] == 0
     await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_announcement_hub_exists_only_during_attachment() -> None:
+    hub = AgentAnnouncementHub()
+    delivered: list[str] = []
+
+    with pytest.raises(AgentAnnouncementUnavailable, match="no active"):
+        await hub.announce("before")
+
+    async def accept(text: str) -> None:
+        delivered.append(text)
+
+    async with hub.attach(accept):
+        assert hub.health()["active_session"] is True
+        await hub.announce("ready")
+
+    assert delivered == ["ready"]
+    assert hub.health() == {
+        "active_session": False,
+        "accepted": 1,
+        "unavailable": 1,
+    }
 
 
 @pytest.mark.asyncio

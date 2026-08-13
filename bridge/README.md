@@ -109,6 +109,11 @@ requires the primary Home Assistant bridge token.
   bounded immutable generation of rendered instructions, locale, and selected
   LLM API tools; correlated tool calls/results remain on this socket. The
   route-scoped realtime-device token is never accepted here.
+- `POST /v1/agent/announce`: optional report-back with exact JSON
+  `{"text":"..."}`. A distinct `HA_CODEX_AGENT_ANNOUNCE_TOKEN` is valid only
+  on this route; the primary bridge token is also accepted for operator tests.
+  The message is appended for speech only while an idle native session is
+  active. It returns 503 rather than waking or reopening an idle speaker.
 - `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages, strict v2
   binary PCM16, or strict v3 device-owned WebRTC signaling. V3 relays a
   validated SDP offer/answer and then carries JSON lifeline controls only;
@@ -169,6 +174,12 @@ and—only when configured—`ask_agent` and `recall_memory`. Calls execute
 asynchronously so PCM forwarding continues. The narrow bilingual
 terminal-phrase fallback still emits terminal `stopped`; undeclared and
 device-declared tools fail closed.
+
+An optional agent may report a completed background task to the currently
+active session through `/v1/agent/announce`. This path has a separate bearer,
+accepts at most 600 characters, refuses busy/idle sessions, and never receives
+Home Assistant or Codex credentials. It deliberately does not create a new
+speaker connection after the user has ended a conversation.
 
 The Compose service keeps the bridge, App Server, OAuth state, media stack, and
 listener warm. It still creates the provider thread and peer at wake; a

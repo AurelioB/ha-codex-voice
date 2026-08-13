@@ -1035,11 +1035,13 @@ def test_optional_agent_configuration_is_disabled_by_default_and_loaded_from_env
 
     monkeypatch.setenv("HA_CODEX_AGENT_URL", "http://agent.local:8090/task")
     monkeypatch.setenv("HA_CODEX_AGENT_TOKEN", "agent-token")
+    monkeypatch.setenv("HA_CODEX_AGENT_ANNOUNCE_TOKEN", "announce-token")
     monkeypatch.setenv("HA_CODEX_AGENT_ROOM", "cocina")
     config = BridgeConfig.from_env()
 
     assert config.agent_url == "http://agent.local:8090/task"
     assert config.agent_token == "agent-token"
+    assert config.agent_announce_token == "announce-token"
     assert config.agent_room == "cocina"
 
 
@@ -1050,6 +1052,14 @@ def test_optional_agent_configuration_is_disabled_by_default_and_loaded_from_env
 def test_optional_agent_url_rejects_unsafe_shapes(url: str) -> None:
     with pytest.raises(ValueError, match="agent_url"):
         BridgeConfig(bearer_token="test-token", agent_url=url)
+
+
+def test_agent_announcement_token_must_be_route_specific() -> None:
+    with pytest.raises(ValueError, match="must differ"):
+        BridgeConfig(
+            bearer_token="same-token",
+            agent_announce_token="same-token",
+        )
 
 
 def test_config_can_replace_only_the_codex_executable(
@@ -1811,6 +1821,11 @@ async def test_health_requires_bearer_and_reports_ready(
             "calls_succeeded": 0,
             "calls_failed": 0,
             "last_call_duration_ms": None,
+        },
+        "agent_announcements": {
+            "active_session": False,
+            "accepted": 0,
+            "unavailable": 0,
         },
     }
 
@@ -6836,6 +6851,52 @@ async def test_realtime_v2_explicit_native_executes_optional_agent_tool(
     assert json.loads(response["contentItems"][0]["text"]) == {
         "answer": "Resultado del agente"
     }
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_report_back_is_route_scoped_and_uses_active_native_session(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            agent_announce_token="report-token",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    report_auth = {"Authorization": "Bearer report-token"}
+
+    idle = await client.post(
+        "/v1/agent/announce",
+        headers=report_auth,
+        json={"text": "Terminé la investigación"},
+    )
+    assert idle.status == 503
+    assert (await client.get("/health", headers=report_auth)).status == 401
+
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    report = await client.post(
+        "/v1/agent/announce",
+        headers=report_auth,
+        json={"text": "Terminé la investigación"},
+    )
+    assert report.status == 200
+    assert await report.json() == {"accepted": True}
+    append = next(
+        params
+        for method, params in fake_rpc.calls
+        if method == "thread/realtime/appendSpeech"
+    )
+    assert append["text"] == "Terminé la investigación"
 
     await device.send_json({"type": "stop"})
     await device.close()

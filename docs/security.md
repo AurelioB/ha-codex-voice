@@ -18,6 +18,11 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
+- Optional agent calls use an explicitly configured endpoint and optional
+  outbound bearer. Agent report-back uses a different bearer accepted only by
+  `/v1/agent/announce`; it cannot access health, media, Home Assistant tools, or
+  OAuth. Reports are bounded, accepted only by an idle active voice session,
+  and never wake or reopen a speaker after the user leaves.
 - The current ThirdReality strict-v2 client explicitly requests
   `conversation_mode: "native"`. The bridge captures the current immutable Home
   Assistant broker snapshot and keeps one active native App Server realtime

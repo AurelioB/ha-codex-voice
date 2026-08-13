@@ -140,8 +140,8 @@ authority loss fails closed and no ambiguous action is retried.
 
 ### M2 — optional external agent interactivity
 
-Status: synchronous recall/deep-task adapter implemented; asynchronous
-report-back is deferred to its explicitly authenticated delivery slice.
+Status: synchronous recall/deep-task adapter and active-session report-back
+implemented; physical agent canary pending.
 
 Follow the useful split in
 [`voicepe-realtime`](https://github.com/TristanBrotherton/voicepe-realtime):
@@ -157,8 +157,8 @@ agent is optional and handles memory or deeper cross-application work.
   response sizes and keep timeouts below App Server's tool deadline.
 - Do not grant the agent shell, OAuth, Home Assistant credentials, or an
   implicit route to execute smart-home actions.
-- Add asynchronous report-back/announcement later through its own authenticated
-  bounded channel; it must not reopen a closed session unexpectedly.
+- Deliver asynchronous report-back through its own route-scoped bearer and a
+  bounded active-session channel; never reopen a closed session unexpectedly.
 
 Exit gate: no agent configuration means no advertised tools or runtime work;
 when configured, recall and deep-task calls return exactly once without delaying

@@ -99,6 +99,7 @@ class BridgeConfig:
     realtime_log_transcripts: bool = False
     agent_url: str | None = None
     agent_token: str | None = field(default=None, repr=False)
+    agent_announce_token: str | None = field(default=None, repr=False)
     agent_room: str = "home"
     agent_recall_timeout: float = 8.0
     agent_task_timeout: float = 35.0
@@ -133,6 +134,16 @@ class BridgeConfig:
                 or len(self.agent_url) > 2_048
             ):
                 raise ValueError("agent_url must be a bounded HTTP(S) URL")
+        if self.agent_announce_token is not None:
+            if not self.agent_announce_token:
+                raise ValueError("agent_announce_token must not be empty")
+            if self.agent_announce_token in {
+                self.bearer_token,
+                self.realtime_device_token,
+            }:
+                raise ValueError(
+                    "agent_announce_token must differ from bridge and device tokens"
+                )
         if not self.agent_room or len(self.agent_room) > 128:
             raise ValueError("agent_room must be a non-empty bounded value")
         if not 0.5 <= self.agent_recall_timeout <= 40.0:
@@ -196,6 +207,9 @@ class BridgeConfig:
             ),
             agent_url=os.environ.get("HA_CODEX_AGENT_URL") or None,
             agent_token=os.environ.get("HA_CODEX_AGENT_TOKEN") or None,
+            agent_announce_token=(
+                os.environ.get("HA_CODEX_AGENT_ANNOUNCE_TOKEN") or None
+            ),
             agent_room=os.environ.get("HA_CODEX_AGENT_ROOM", "home"),
             agent_recall_timeout=float(
                 os.environ.get("HA_CODEX_AGENT_RECALL_TIMEOUT", "8")

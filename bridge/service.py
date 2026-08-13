@@ -29,7 +29,12 @@ from typing import Any, cast
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
-from .agent_tools import AgentToolBroker, AgentToolUnavailable
+from .agent_tools import (
+    AgentAnnouncementHub,
+    AgentAnnouncementUnavailable,
+    AgentToolBroker,
+    AgentToolUnavailable,
+)
 from .app_server import CodexAppServer
 from .audio import (
     REALTIME_SAMPLE_RATE,
@@ -77,6 +82,8 @@ ACTIVE_WEBSOCKETS_KEY: web.AppKey[set[web.WebSocketResponse]] = web.AppKey(
     set,
 )
 MAX_AUDIO_BYTES = 24 * 1024 * 1024
+MAX_AGENT_ANNOUNCE_BYTES = 4 * 1024
+MAX_AGENT_ANNOUNCE_CHARS = 600
 SERVER_WEBSOCKET_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS = 2_250
 REALTIME_MANAGED_STARTUP_TIMEOUT_SECONDS = 5.0
@@ -382,6 +389,7 @@ _REALTIME_TRACE_ITEM_TYPES = frozenset(
 _AUTH_IDENTITY_REQUEST_KEY = "ha_codex_voice.auth_identity"
 _AUTH_IDENTITY_PRIMARY = "primary"
 _AUTH_IDENTITY_REALTIME_DEVICE = "realtime_device"
+_AUTH_IDENTITY_AGENT_ANNOUNCE = "agent_announce"
 
 
 class _TranscriptionAttemptTimeout(TimeoutError):
@@ -950,6 +958,7 @@ class BridgeState:
             self.rpc = rpc
         self.peer_factory = peer_factory
         self.home_assistant_tools = HomeAssistantToolBroker()
+        self.agent_announcements = AgentAnnouncementHub()
         self.agent_tools = AgentToolBroker(
             config.agent_url,
             token=config.agent_token,
@@ -1935,6 +1944,7 @@ def create_app(
     app.router.add_post("/v1/synthesize", _synthesize)
     app.router.add_post("/v1/synthesize/stream", _synthesize_stream)
     app.router.add_post("/v1/speech-session/release", _release_speech_session)
+    app.router.add_post("/v1/agent/announce", _agent_announce)
     app.router.add_get("/v1/home-assistant/tools", _home_assistant_tools)
     app.router.add_get("/v1/realtime", _realtime)
     app.on_shutdown.append(_close_active_websockets)
@@ -2003,12 +2013,18 @@ async def _bearer_middleware(request: web.Request, handler: Any) -> web.StreamRe
     device_match = device_token is not None and hmac.compare_digest(
         supplied, device_token
     )
+    announce_token = state.config.agent_announce_token
+    announce_match = announce_token is not None and hmac.compare_digest(
+        supplied, announce_token
+    )
     if supplied and primary_match:
         request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_PRIMARY
     elif supplied and request.path == "/v1/realtime" and device_match:
         # Carry only a non-secret identity marker. The realtime handler admits
         # this restricted credential after a valid v2 negotiation is parsed.
         request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_REALTIME_DEVICE
+    elif supplied and request.path == "/v1/agent/announce" and announce_match:
+        request[_AUTH_IDENTITY_REQUEST_KEY] = _AUTH_IDENTITY_AGENT_ANNOUNCE
     else:
         raise web.HTTPUnauthorized(
             text=json.dumps({"error": "unauthorized"}),
@@ -2037,6 +2053,8 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
         return web.json_response(
             {"error": str(exc), "code": "authentication_required"}, status=503
         )
+    except AgentAnnouncementUnavailable as exc:
+        return web.json_response({"error": str(exc)}, status=503)
     except BridgeError as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -2068,9 +2086,43 @@ async def _health(request: web.Request) -> web.Response:
             "app_server": health,
             "home_assistant_tools": state.home_assistant_tools.health(),
             "agent_tools": state.agent_tools.health(),
+            "agent_announcements": state.agent_announcements.health(),
         },
         status=200 if ready else 503,
     )
+
+
+async def _agent_announce(request: web.Request) -> web.Response:
+    """Deliver one authenticated, bounded report to an active native session."""
+    if (
+        request.content_length is not None
+        and request.content_length > MAX_AGENT_ANNOUNCE_BYTES
+    ):
+        raise ProtocolError("agent announcement exceeded the size limit")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.content.iter_chunked(1_024):
+        size += len(chunk)
+        if size > MAX_AGENT_ANNOUNCE_BYTES:
+            raise ProtocolError("agent announcement exceeded the size limit")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolError("agent announcement must be a JSON object") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"text"}:
+        raise ProtocolError("agent announcement requires exactly text")
+    text = payload.get("text")
+    if (
+        not isinstance(text, str)
+        or not text.strip()
+        or len(text) > MAX_AGENT_ANNOUNCE_CHARS
+    ):
+        raise ProtocolError("agent announcement text must be non-empty and bounded")
+    state: BridgeState = request.app[STATE_KEY]
+    await state.agent_announcements.announce(text.strip())
+    return web.json_response({"accepted": True})
 
 
 async def _transcribe(request: web.Request) -> web.Response:
@@ -5300,6 +5352,14 @@ class _NativeV2Provider:
     thread_id: str
 
 
+@dataclass(slots=True)
+class _AgentAnnouncementRequest:
+    """One report-back request owned by the active native socket."""
+
+    text: str
+    result: asyncio.Future[None]
+
+
 async def _serve_native_v2_realtime_session(  # noqa: C901
     state: BridgeState,
     websocket: web.WebSocketResponse,
@@ -5510,6 +5570,42 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
         Pcm16Mono24KhzResampler(wire_protocol.input_sample_rate)
     )
 
+    async def run_active_socket() -> _NativeV2Barge | None:
+        """Expose report-back only while one provider/socket pair is live."""
+        assert active is not None
+        announcements: asyncio.Queue[_AgentAnnouncementRequest] = asyncio.Queue(
+            maxsize=1
+        )
+
+        async def enqueue_announcement(text: str) -> None:
+            result = asyncio.get_running_loop().create_future()
+            try:
+                announcements.put_nowait(_AgentAnnouncementRequest(text, result))
+            except asyncio.QueueFull as exc:
+                raise AgentAnnouncementUnavailable("voice session is busy") from exc
+            try:
+                async with asyncio.timeout(REALTIME_CONTROL_TIMEOUT_SECONDS + 1):
+                    await asyncio.shield(result)
+            except asyncio.CancelledError:
+                result.cancel()
+                raise
+            except TimeoutError as exc:
+                result.cancel()
+                raise AgentAnnouncementUnavailable(
+                    "voice session did not accept the announcement"
+                ) from exc
+
+        async with state.agent_announcements.attach(enqueue_announcement):
+            return await _run_realtime_socket(
+                state,
+                websocket,
+                active.session,
+                wire_protocol,
+                broker_snapshot=broker_snapshot,
+                native_input=continuity,
+                announcements=announcements,
+            )
+
     try:
         LOGGER.info(
             "Realtime conversation route selected: route=native selection=explicit"
@@ -5546,14 +5642,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
         )
 
         while True:
-            barge = await _run_realtime_socket(
-                state,
-                websocket,
-                active.session,
-                wire_protocol,
-                broker_snapshot=broker_snapshot,
-                native_input=continuity,
-            )
+            barge = await run_active_socket()
             if barge is None:
                 return
             rollover_started_at = time.monotonic()
@@ -5776,6 +5865,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     executor_thread_id: str | None = None,
     managed_interrupt_continuation: bool = False,
     native_input: _NativeV2InputContinuity | None = None,
+    announcements: asyncio.Queue[_AgentAnnouncementRequest] | None = None,
 ) -> _NativeV2Barge | None:
     bridge_managed_realtime = executor_thread_id is not None
     executor_subscription = state.rpc.subscribe() if bridge_managed_realtime else None
@@ -7778,6 +7868,50 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 complete_tool_continuation_after_output()
                 mark_native_barge("first_output_pcm")
 
+    async def agent_announcements() -> None:
+        """Append reports only while this native provider is idle and current."""
+        if announcements is None:
+            await asyncio.Future()
+            return
+        current: _AgentAnnouncementRequest | None = None
+        try:
+            while not stop.is_set():
+                current = await announcements.get()
+                if current.result.cancelled():
+                    current = None
+                    continue
+                async with output_state_lock:
+                    busy = (
+                        output_speaking or output_armed or native_terminal_gate_pending
+                    )
+                if busy:
+                    current.result.set_exception(
+                        AgentAnnouncementUnavailable("voice session is busy")
+                    )
+                    current = None
+                    continue
+                try:
+                    async with asyncio.timeout(REALTIME_CONTROL_TIMEOUT_SECONDS):
+                        await session.append_speech(current.text)
+                except BaseException as exc:  # noqa: BLE001 - return exact outcome.
+                    if not current.result.done():
+                        current.result.set_exception(exc)
+                else:
+                    if not current.result.done():
+                        current.result.set_result(None)
+                current = None
+        finally:
+            unavailable = AgentAnnouncementUnavailable("voice session ended")
+            if current is not None and not current.result.done():
+                current.result.set_exception(unavailable)
+            while True:
+                try:
+                    pending = announcements.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not pending.result.done():
+                    pending.result.set_exception(unavailable)
+
     async def handle_managed_backend_terminal(
         control: RealtimeDataControl, *, cancelled: bool
     ) -> None:
@@ -8025,6 +8159,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             raise_tool_call_failure(), name="codex-realtime-tool-failure"
         ),
     }
+    if announcements is not None:
+        tasks.add(
+            asyncio.create_task(
+                agent_announcements(), name="codex-realtime-agent-announcements"
+            )
+        )
     executor_event_task: asyncio.Task[None] | None = None
     if executor_subscription is not None:
         executor_event_task = asyncio.create_task(

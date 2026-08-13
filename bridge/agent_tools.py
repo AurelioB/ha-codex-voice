@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,12 +70,66 @@ class AgentToolUnavailable(BridgeError):
     """The optional external agent did not return a trustworthy result."""
 
 
+class AgentAnnouncementUnavailable(BridgeError):
+    """No active native voice session can accept an announcement."""
+
+
 @dataclass(frozen=True, slots=True)
 class AgentToolResult:
     """Canonical result returned to App Server."""
 
     success: bool
     result: Any
+
+
+class AgentAnnouncementHub:
+    """Bind one active native session to the optional report-back endpoint."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._handler: Callable[[str], Awaitable[None]] | None = None
+        self._accepted = 0
+        self._unavailable = 0
+
+    @contextlib.asynccontextmanager
+    async def attach(
+        self, handler: Callable[[str], Awaitable[None]]
+    ) -> AsyncIterator[None]:
+        """Expose one session handler only for its live socket lifetime."""
+        async with self._lock:
+            if self._handler is not None:
+                raise AgentAnnouncementUnavailable(
+                    "another voice session already owns agent announcements"
+                )
+            self._handler = handler
+        try:
+            yield
+        finally:
+            async with self._lock:
+                if self._handler is handler:
+                    self._handler = None
+
+    async def announce(self, text: str) -> None:
+        """Deliver one bounded message to the currently attached session."""
+        async with self._lock:
+            handler = self._handler
+        if handler is None:
+            self._unavailable += 1
+            raise AgentAnnouncementUnavailable("no active voice session")
+        try:
+            await handler(text)
+        except BaseException:
+            self._unavailable += 1
+            raise
+        self._accepted += 1
+
+    def health(self) -> dict[str, bool | int]:
+        """Return content-free attachment and delivery counters."""
+        return {
+            "active_session": self._handler is not None,
+            "accepted": self._accepted,
+            "unavailable": self._unavailable,
+        }
 
 
 class AgentToolBroker:
@@ -182,15 +238,22 @@ class AgentToolBroker:
                 headers=headers,
                 timeout=ClientTimeout(total=timeout),
             ) as response:
-                raw = await response.content.read(MAX_AGENT_RESPONSE_BYTES + 1)
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.content.iter_chunked(8 * 1024):
+                    size += len(chunk)
+                    if size > MAX_AGENT_RESPONSE_BYTES:
+                        raise AgentToolUnavailable(
+                            "agent response exceeded the size limit"
+                        )
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
                 if response.status < 200 or response.status >= 300:
                     raise AgentToolUnavailable(
                         f"agent returned HTTP status {response.status}"
                     )
         except (TimeoutError, ClientError) as err:
             raise AgentToolUnavailable("agent request failed or timed out") from err
-        if len(raw) > MAX_AGENT_RESPONSE_BYTES:
-            raise AgentToolUnavailable("agent response exceeded the size limit")
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as err:
