@@ -1102,6 +1102,7 @@ def _fake_realtime_support(
     full_duplex: bool | None = None,
     prewarm_result: bool = True,
     wake_probability_cutoff: float | None = 0.85,
+    personalized_wake_config_path: str | None = None,
     wake_phrase: str = "okay computer",
     realtime_only: bool = False,
     aec_sink_volume_ceiling_percent: int = 60,
@@ -1118,6 +1119,7 @@ def _fake_realtime_support(
         if full_duplex is None
         else full_duplex,
         wake_probability_cutoff=wake_probability_cutoff,
+        personalized_wake_config_path=personalized_wake_config_path,
         realtime_only=realtime_only,
         aec_sink_volume_ceiling_percent=aec_sink_volume_ceiling_percent,
         playback_volume_percent=playback_volume_percent,
@@ -2403,6 +2405,87 @@ def test_realtime_init_prioritizes_and_tunes_only_configured_detector(
         "okay_nabu",
         "hey_jarvis",
     ]
+
+
+def test_personalized_wake_replaces_one_detector_without_running_both(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support(
+        personalized_wake_config_path="/data/conf/codex-wakewords/custom.json"
+    )
+    _protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    closed: list[str] = []
+    existing = SimpleNamespace(
+        id="okay_computer",
+        wake_word="Okay Computer",
+        probability_cutoff=0.97,
+        close=lambda: closed.append("vendor"),
+    )
+    other = SimpleNamespace(
+        id="okay_nabu",
+        wake_word="Okay Nabu",
+        probability_cutoff=0.85,
+    )
+    personalized = SimpleNamespace(
+        id="custom_model",
+        wake_word="Okay Computer",
+        probability_cutoff=0.81,
+        close=lambda: closed.append("personalized"),
+    )
+    state = SimpleNamespace(wake_words={"okay_nabu": other, "okay_computer": existing})
+    monkeypatch.setattr(
+        module,
+        "_load_personalized_wake",
+        lambda path: personalized,
+    )
+
+    module._install_personalized_wake(state)
+    module._install_realtime_wake_order(state)
+
+    assert state.wake_words["okay_computer"] is personalized
+    assert personalized.id == "okay_computer"
+    assert len(state.wake_words) == 2
+    assert closed == ["vendor"]
+    assert [wake.id for wake in state.wake_words.values()] == [
+        "okay_computer",
+        "okay_nabu",
+    ]
+
+
+def test_personalized_wake_rejects_a_mismatched_phrase_and_closes_model(
+    load_overlay: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support = _fake_realtime_support(
+        personalized_wake_config_path="/data/conf/codex-wakewords/custom.json"
+    )
+    _protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    closed: list[str] = []
+    personalized = SimpleNamespace(
+        id="wrong",
+        wake_word="Hey Jarvis",
+        close=lambda: closed.append("personalized"),
+    )
+    state = SimpleNamespace(
+        wake_words={
+            "okay_computer": SimpleNamespace(
+                id="okay_computer",
+                wake_word="Okay Computer",
+            )
+        }
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_personalized_wake",
+        lambda path: personalized,
+    )
+
+    with pytest.raises(RuntimeError, match="phrase does not match"):
+        module._install_personalized_wake(state)
+
+    assert state.wake_words["okay_computer"] is not personalized
+    assert closed == ["personalized"]
 
 
 def test_realtime_init_installs_order_before_vendor_publication_and_late_add(

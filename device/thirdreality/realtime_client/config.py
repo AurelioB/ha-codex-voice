@@ -63,6 +63,7 @@ _ALLOWED_KEYS = frozenset(
         "wake_phrase",
         "realtime_only",
         "wake_probability_cutoff",
+        "personalized_wake_config_path",
         "voice",
         "prompt",
         "connect_timeout_seconds",
@@ -118,6 +119,21 @@ class ConfigError(ValueError):
     """Raised when realtime configuration is unsafe or invalid."""
 
 
+def _validated_personalized_wake_config_path(candidate: object) -> str | None:
+    if candidate is None:
+        return None
+    if (
+        not isinstance(candidate, str)
+        or not candidate
+        or len(candidate) > 1_024
+        or not Path(candidate).is_absolute()
+        or Path(candidate).suffix != ".json"
+        or any(not character.isprintable() for character in candidate)
+    ):
+        raise ConfigError("personalized_wake_config_path must be an absolute JSON path")
+    return candidate
+
+
 @dataclass(frozen=True, slots=True)
 class RealtimeConfig:
     """Validated, bounded settings for one fresh realtime session."""
@@ -143,6 +159,7 @@ class RealtimeConfig:
     barge_in_mode: str = field(default=ROLLOVER_BARGE_IN_MODE, kw_only=True)
     realtime_only: bool = field(default=False, kw_only=True)
     wake_probability_cutoff: float | None = field(default=None, kw_only=True)
+    personalized_wake_config_path: str | None = field(default=None, kw_only=True)
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
     pulse_aec_source: str | None = None
@@ -231,6 +248,13 @@ class RealtimeConfig:
                     "wake_probability_cutoff must be a number from 0.5 through 0.99"
                 )
             object.__setattr__(self, "wake_probability_cutoff", float(cutoff))
+        object.__setattr__(
+            self,
+            "personalized_wake_config_path",
+            _validated_personalized_wake_config_path(
+                self.personalized_wake_config_path
+            ),
+        )
 
         legacy_volume_percent = self.aec_test_volume_percent
         if (
@@ -419,6 +443,7 @@ def load_config(
         minimum=0.5,
         maximum=0.99,
     )
+    personalized_wake_config_path = _optional_personalized_wake_config_path(decoded)
 
     input_queue_bytes = _bounded_int(
         decoded,
@@ -613,6 +638,7 @@ def load_config(
         direct_capture_gain_db=direct_capture_gain_db,
         realtime_only=realtime_only,
         wake_probability_cutoff=wake_probability_cutoff,
+        personalized_wake_config_path=personalized_wake_config_path,
         voice=voice,
         prompt=prompt,
         pulse_aec_source=pulse_aec_source,
@@ -716,6 +742,14 @@ def _optional_prompt(value: dict[str, Any]) -> str | None:
     if any(not character.isprintable() for character in candidate):
         raise ConfigError("prompt must not contain control characters")
     return candidate
+
+
+def _optional_personalized_wake_config_path(value: dict[str, Any]) -> str | None:
+    if "personalized_wake_config_path" not in value:
+        return None
+    return _validated_personalized_wake_config_path(
+        value.get("personalized_wake_config_path")
+    )
 
 
 def _optional_pulse_name(value: dict[str, Any], key: str) -> str | None:

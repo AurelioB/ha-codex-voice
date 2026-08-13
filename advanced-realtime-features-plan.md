@@ -128,6 +128,9 @@ does not change wake-to-ready p95 by more than 10 ms and cannot block capture.
 
 ### M2 — personalized wake model
 
+Status: compatible one-model activation path implemented; training and physical
+qualification pending.
+
 - Train on the Compose host from owner positives, room-specific negatives, and
   augmentation for distance, noise, reverberation, and speaker playback.
 - Split by recording session, not random clip, so evaluation cannot leak nearly
@@ -138,6 +141,11 @@ does not change wake-to-ready p95 by more than 10 ms and cannot block capture.
   music, assistant playback, television, and unrelated Spanish/English speech.
 - Run a short explicit shadow canary only during testing. Promote one detector
   atomically and remove the shadow evaluator afterward.
+- Activate a qualified artifact through `personalized_wake_config_path`. The
+  pinned firmware's `pymicro_wakeword.MicroWakeWord.from_config` loader accepts
+  the same ESPHome microWakeWord JSON/TFLite format already used by Okay Nabu.
+  The overlay requires the custom phrase to match the configured phrase, keeps
+  the vendor detector's stable ID, and replaces rather than adds a detector.
 - Failed attempts improve the next trained version; they never mutate the live
   model online.
 

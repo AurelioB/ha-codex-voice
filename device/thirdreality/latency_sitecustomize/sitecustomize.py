@@ -449,6 +449,65 @@ def _install_realtime_wake_order(state: Any) -> None:
         state.wake_words = _RealtimeFirstWakeWords(wake_words)
 
 
+def _load_personalized_wake(config_path: str) -> Any:
+    """Load one microWakeWord config only when explicitly selected."""
+    module = importlib.import_module("pymicro_wakeword")
+    return module.MicroWakeWord.from_config(config_path)
+
+
+def _validated_personalized_wake_id(personalized: Any, existing: Any) -> str:
+    phrase = getattr(personalized, "wake_word", "")
+    if (
+        not isinstance(phrase, str)
+        or _REALTIME_SUPPORT.normalize_wake_phrase(phrase)
+        != _REALTIME_CONFIG.wake_phrase
+    ):
+        raise RuntimeError(
+            "personalized wake phrase does not match the configured wake phrase"
+        )
+    existing_id = getattr(existing, "id", None)
+    if not isinstance(existing_id, str) or not existing_id:
+        raise RuntimeError("vendor wake detector has no stable ID")
+    return existing_id
+
+
+def _install_personalized_wake(state: Any) -> None:
+    """Replace the configured vendor detector without adding inference work."""
+    config_path = getattr(_REALTIME_CONFIG, "personalized_wake_config_path", None)
+    if config_path is None:
+        return
+    wake_words = getattr(state, "wake_words", None)
+    if not isinstance(wake_words, dict):
+        raise TypeError("personalized wake requires the vendor wake-word mapping")
+    matching_keys = [
+        key
+        for key, detector in wake_words.items()
+        if _REALTIME_SUPPORT.normalize_wake_phrase(getattr(detector, "wake_word", ""))
+        == _REALTIME_CONFIG.wake_phrase
+    ]
+    if len(matching_keys) != 1:
+        raise RuntimeError(
+            "personalized wake must replace exactly one configured vendor detector"
+        )
+    key = matching_keys[0]
+    existing = wake_words[key]
+    personalized = _load_personalized_wake(config_path)
+    try:
+        personalized.id = _validated_personalized_wake_id(personalized, existing)
+        wake_words[key] = personalized
+    except BaseException:
+        with suppress(Exception):
+            personalized.close()
+        raise
+    with suppress(Exception):
+        existing.close()
+    with suppress(Exception):
+        syslog.syslog(
+            syslog.LOG_INFO,
+            "codex-voice personalized_wake status=active detectors=1",
+        )
+
+
 def _fast_thirdreality_init(instance: Any, state: Any = None) -> None:
     """Install deterministic wake arbitration before publishing the protocol."""
     if state is None:
@@ -456,10 +515,12 @@ def _fast_thirdreality_init(instance: Any, state: Any = None) -> None:
         # The guarded appliance constructor always supplies state and therefore
         # takes the pre-publication branch below.
         _VENDOR_TR_INIT(instance)
+        _install_personalized_wake(instance.state)
         _install_realtime_wake_order(instance.state)
         setattr(instance, _REALTIME_ANCHOR_DIRTY_ATTRIBUTE, False)
         _remember_sound_config_signature(instance)
         return
+    _install_personalized_wake(state)
     _install_realtime_wake_order(state)
     _VENDOR_TR_INIT(instance, state)
     setattr(instance, _REALTIME_ANCHOR_DIRTY_ATTRIBUTE, False)

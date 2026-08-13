@@ -725,6 +725,20 @@ selects direct v2 and no Assist detector is active. In a later split deployment,
 the guarded ordering can prioritize a distinct Okay Computer realtime detector
 when several active models become ready in the same recorder block.
 
+`personalized_wake_config_path` is an optional absolute path to an ESPHome
+microWakeWord-compatible JSON file and is intentionally absent by default. The
+pinned firmware already loads its stock Okay Nabu model through
+`pymicro_wakeword.MicroWakeWord.from_config`, so a qualified custom JSON/TFLite
+pair can use the same runtime. At protocol initialization the overlay requires
+the custom model's normalized `wake_word` to equal the configured
+`wake_phrase`, preserves the replaced detector's stable ID, closes that stock
+detector, and installs the custom detector in the same mapping slot. It never
+runs both models in production, so the number of wake inferences is unchanged.
+An invalid path, model, phrase, or missing matching stock detector fails startup
+closed instead of silently reverting to another wake model. Leave this setting
+absent until the artifact has passed the offline and physical gates in
+[`advanced-realtime-features-plan.md`](../../advanced-realtime-features-plan.md).
+
 For a reversible realtime-only trial, set `wake_phrase` to `okay nabu`, set
 `realtime_only` to `true`, and leave only `okay_nabu` active in
 `/data/conf/sound.json`. This intentionally replaces the normal Assist wake

@@ -7,6 +7,12 @@ and releases use semantic versioning.
 
 ### Added
 
+- Add an on-demand realtime session reporter plus a dependency-free private
+  voice lab for consented wake and speaker-enrollment WAV samples. Dataset
+  commands are never imported by the bridge or speaker runtime. The optional
+  ThirdReality personalized-wake setting loads one microWakeWord-compatible
+  JSON/TFLite artifact at startup and replaces exactly one matching vendor
+  detector, preserving one-model inference and fail-closed rollback.
 - Add desktop-compatible same-peer native interruption. The speaker's
   AEC-qualified cut sends exact `provider_barge`; the bridge sends
   `response.cancel` followed by `output_audio_buffer.clear` on the active

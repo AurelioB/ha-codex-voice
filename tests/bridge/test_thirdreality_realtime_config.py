@@ -62,6 +62,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.wake_phrase == "okay computer"
     assert config.realtime_only is False
     assert config.wake_probability_cutoff is None
+    assert config.personalized_wake_config_path is None
     assert config.voice is None
     assert config.prompt is None
     assert config.full_duplex is False
@@ -112,6 +113,33 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert config.prompt == private_prompt
     assert config.wake_probability_cutoff == 0.85
     assert private_prompt not in repr(config)
+
+
+def test_config_accepts_only_an_absolute_personalized_wake_json_path(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    wake_config = tmp_path / "personalized-nabu.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "personalized_wake_config_path": str(wake_config),
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.personalized_wake_config_path == str(wake_config)
+
+    for invalid in ("relative.json", str(tmp_path / "model.tflite"), ""):
+        _write_config(
+            path,
+            {**_valid_config(), "personalized_wake_config_path": invalid},
+        )
+        with pytest.raises(ConfigError, match="absolute JSON path"):
+            load_config(path, expected_uid=os.getuid())
 
 
 @pytest.mark.parametrize(
