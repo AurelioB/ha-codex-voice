@@ -219,7 +219,9 @@ void PrintUsage(const char* program) {
         "  --out DIR                 WAV output directory\n"
         "  --duration SECONDS        capture duration (1..300; default 15)\n"
         "  --device ALSA_DEVICE      default hw:0,4\n"
-        "  --mic-channel INDEX       default 0\n"
+        "  --mic-channel INDEX       primary microphone, default 0\n"
+        "  --secondary-mic-channel INDEX|-1\n"
+        "                            coherent secondary, default 1; -1 disables\n"
         "  --reference-a INDEX       default 2\n"
         "  --reference-b INDEX       default 3; -1 uses one reference\n"
         "  --startup-timeout-ms MS   first-frame timeout (default 1000)\n"
@@ -283,6 +285,11 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                 return false;
             }
             options->capture.mic_channel = static_cast<unsigned>(parsed);
+        } else if (argument == "--secondary-mic-channel") {
+            if (!ParseInteger(value, -1, 31, &parsed)) {
+                return false;
+            }
+            options->capture.secondary_mic_channel = static_cast<int>(parsed);
         } else if (argument == "--reference-a") {
             if (!ParseInteger(value, 0, 31, &parsed)) {
                 return false;
@@ -363,14 +370,17 @@ int main(int argc, char** argv) {
     const auto stats = engine.GetStats();
     std::printf(
         "summary captured=%llu delivered=%llu dropped=%llu recoveries=%llu "
-        "short_reads=%llu processing_failures=%llu resets=%llu\n",
+        "short_reads=%llu processing_failures=%llu resets=%llu "
+        "coherent_mic_frames=%llu primary_only_mic_frames=%llu\n",
         static_cast<unsigned long long>(stats.captured_frames),
         static_cast<unsigned long long>(stats.delivered_frames),
         static_cast<unsigned long long>(stats.dropped_frames),
         static_cast<unsigned long long>(stats.recoveries),
         static_cast<unsigned long long>(stats.short_reads),
         static_cast<unsigned long long>(stats.processing_failures),
-        static_cast<unsigned long long>(stats.resets));
+        static_cast<unsigned long long>(stats.resets),
+        static_cast<unsigned long long>(stats.coherent_mic_frames),
+        static_cast<unsigned long long>(stats.primary_only_mic_frames));
 
     if (observer.failed()) {
         std::fprintf(stderr, "WAV output failed\n");

@@ -12,6 +12,7 @@ pkg_check_modules(WEBRTC_APM REQUIRED IMPORTED_TARGET webrtc-audio-processing-1)
 
 add_library(codex_aec3_core OBJECT
     src/capture_engine.cpp
+    src/coherent_microphone_combiner.cpp
 )
 set_target_properties(codex_aec3_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON

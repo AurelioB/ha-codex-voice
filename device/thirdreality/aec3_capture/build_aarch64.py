@@ -314,6 +314,7 @@ def _write_manifest(
             "sample_rate": 16_000,
             "channels": 4,
             "mic_channel": 0,
+            "secondary_mic_channel": 1,
             "reference_channels": [2, 3],
             "period_frames": 160,
             "stream_delay_ms": 0,

@@ -28,9 +28,10 @@ the idle LED. A later accepted wake creates a fresh WebSocket, peer, and
 realtime thread.
 
 The active configuration is strict-v2 `bridge_pcm`, native mode, full duplex,
-native AEC3 with a 10 dB baseline, noise-limited adaptive digital gain, a
-limiter, and moderate noise suppression, 0 dB transport gain, and a fixed 100%
-sink/playback anchor. The stream itself stays at 100% relative volume and one
+native AEC3 with conservative coherent use of both physical microphones, a
+10 dB baseline, noise-limited adaptive digital gain, a limiter, moderate noise
+suppression, 18 dB post-wake transport gain, and a fixed 100% sink/playback
+anchor. The stream itself stays at 100% relative volume and one
 non-amplifying software stage gives the physical buttons their full 0–100%
 range. During provider
 speech, two-frame qualified near-end detection cuts local `paplay` immediately

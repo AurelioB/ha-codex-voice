@@ -56,6 +56,8 @@ class _FakeStream:
             short_reads=2,
             processing_failures=0,
             resets=3,
+            coherent_mic_frames=800,
+            primary_only_mic_frames=800,
         )
 
     def stop(self) -> None:
@@ -105,6 +107,7 @@ def test_enabled_environment_uses_exact_hardware_defaults() -> None:
     assert settings.alsa_device == "hw:0,4"
     assert settings.channels == 4
     assert settings.mic_channel == 0
+    assert settings.secondary_mic_channel == 1
     assert (
         settings.reference_channel_a,
         settings.reference_channel_b,
@@ -128,6 +131,13 @@ def test_enabled_environment_uses_exact_hardware_defaults() -> None:
                 "CODEX_AEC3_MIC_CHANNEL": "2",
             },
             "must be distinct",
+        ),
+        (
+            {
+                "CODEX_AEC3_CAPTURE": "1",
+                "CODEX_AEC3_SECONDARY_MIC_CHANNEL": "0",
+            },
+            "primary and secondary",
         ),
         (
             {
@@ -214,6 +224,27 @@ def test_recorder_aggregates_partial_native_reads_without_padding() -> None:
     assert stream.closed
 
 
+def test_recorder_emits_bounded_content_free_dual_mic_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _FakeStream([100] * 160)
+    microphone = recorder.Aec3Microphone(_settings(), _FakeLibrary(stream))
+    logged: list[tuple[int, str]] = []
+    monkeypatch.setattr(recorder.syslog, "syslog", lambda *value: logged.append(value))
+
+    with microphone.recorder(
+        samplerate=16_000,
+        channels=1,
+        blocksize=160,
+    ) as capture:
+        capture._next_stats_log_at = 0.0
+        capture.record()
+
+    assert len(logged) == 1
+    assert "coherent_mic_frames=800" in logged[0][1]
+    assert "primary_only_mic_frames=800" in logged[0][1]
+
+
 def test_recorder_closes_stream_when_native_start_fails() -> None:
     failure = recorder.CaptureRuntimeError("playback DMA is not running")
     stream = _FakeStream(start_error=failure)
@@ -268,8 +299,9 @@ def test_enabled_missing_library_does_not_patch_soundcard(tmp_path: Path) -> Non
 
 
 def test_c_struct_layout_matches_aarch64_abi() -> None:
-    assert ctypes.sizeof(recorder._CConfig) == 48
-    assert ctypes.sizeof(recorder._CStats) == 64
+    assert recorder._ABI_VERSION == 2
+    assert ctypes.sizeof(recorder._CConfig) == 56
+    assert ctypes.sizeof(recorder._CStats) == 80
 
 
 def test_release_archive_contains_native_aec3_sources() -> None:
@@ -295,3 +327,19 @@ def test_native_processor_conditions_capture_before_vendor_wake_and_realtime() -
     )
     assert "processing_config.noise_suppression.enabled = true;" in source
     assert "NoiseSuppression::kModerate" in source
+
+
+def test_native_processor_conservatively_combines_both_microphones() -> None:
+    root = Path(__file__).parents[2]
+    source = (
+        root / "device/thirdreality/aec3_capture/src/coherent_microphone_combiner.cpp"
+    ).read_text()
+    engine = (
+        root / "device/thirdreality/aec3_capture/src/capture_engine.cpp"
+    ).read_text()
+
+    assert "kMinimumAbsoluteCorrelation = 0.60" in source
+    assert "kMinimumEnergyRatio = 0.50" in source
+    assert "kMaximumLagSamples = 4" in source
+    assert "coherent ? kBlendStep : -kBlendStep" in source
+    assert "microphone_combiner_.Process(" in engine

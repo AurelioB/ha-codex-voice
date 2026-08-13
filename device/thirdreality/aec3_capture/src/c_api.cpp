@@ -45,6 +45,7 @@ void codex_aec3_default_config(codex_aec3_config* config) {
     config->sample_rate = codex::aec3::kAec3SampleRate;
     config->channels = 4;
     config->mic_channel = 0;
+    config->secondary_mic_channel = 1;
     config->reference_channel_a = 2;
     config->reference_channel_b = 3;
     config->period_frames = codex::aec3::kAec3FrameSamples;
@@ -62,6 +63,7 @@ codex_aec3_handle* codex_aec3_create(const codex_aec3_config* config) {
         native.sample_rate = config->sample_rate;
         native.channels = config->channels;
         native.mic_channel = config->mic_channel;
+        native.secondary_mic_channel = config->secondary_mic_channel;
         native.reference_channel_a = config->reference_channel_a;
         native.reference_channel_b = config->reference_channel_b;
         native.period_frames = config->period_frames;
@@ -120,6 +122,8 @@ int32_t codex_aec3_get_stats(
     stats->short_reads = native.short_reads;
     stats->processing_failures = native.processing_failures;
     stats->resets = native.resets;
+    stats->coherent_mic_frames = native.coherent_mic_frames;
+    stats->primary_only_mic_frames = native.primary_only_mic_frames;
     return CODEX_AEC3_OK;
 }
 

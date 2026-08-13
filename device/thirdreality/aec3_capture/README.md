@@ -13,7 +13,7 @@ capture:
 | Wire format | interleaved `S16_LE` |
 | Rate/layout | 16 kHz, 4 channels |
 | AEC frame | 160 frames / 10 ms |
-| Microphone | zero-based channel 0 |
+| Microphones | primary channel 0; coherent secondary channel 1 |
 | Render reference | mono average of channels 2 and 3 |
 | AEC ordering | reverse reference, delay 0 ms, capture |
 | Output | 16 kHz mono PCM16, aggregated to the vendor's requested block |
@@ -159,7 +159,16 @@ vendor's `record(1024)` request. The Python facade returns float32 shape
 `(1024, 1)`, preserving the existing 64 ms callback, wake-word processing,
 384 ms pre-roll, official Home Assistant path, and direct WebRTC reframer.
 
-The production profile extends ThirdReality's newer native audio processor:
+The production profile extends ThirdReality's newer native audio processor.
+Before APM, it gradually adds channel 1 only while both physical microphones
+contain strongly correlated, similarly sized audio; otherwise channel 0 passes
+unchanged. It automatically aligns up to four 16-kHz samples of acoustic
+arrival-time difference and corrects inverted polarity. This avoids phase
+cancellation or a noisy/broken secondary channel while gaining up to 3 dB of
+rejection for uncorrelated room noise. The mode can be disabled diagnostically
+with `CODEX_AEC3_SECONDARY_MIC_CHANNEL=-1`.
+
+The remaining processing chain is:
 AEC3 and its required high-pass filter, a 10 dB fixed baseline followed by
 AGC2 adaptive digital gain, its limiter, and moderate WebRTC noise suppression.
 AGC2 may raise distant speech further but caps the amplified output noise floor

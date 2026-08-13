@@ -47,6 +47,11 @@ and releases use semantic versioning.
 - Add one content-free bridge-capture summary per realtime session with raw and
   provider peak/RMS maxima, suppressed packet count, and saturation count. This
   makes distance-gain tuning evidence-based without retaining microphone audio.
+- Add conservative dual-microphone conditioning before native AEC3. Channel 1
+  enters through a click-free ramp only when it is strongly correlated and
+  level-compatible with channel 0; otherwise the proven channel-0 path passes
+  unchanged. Content-free native counters expose coherent versus fallback
+  frames without retaining microphone audio.
 - Add a reversible ThirdReality `realtime_only` wake policy. It permits Okay
   Nabu to replace the normal Assist wake, ignores every non-matching detector,
   disables buffered v2 Assist fallback, and fails closed if guarded realtime

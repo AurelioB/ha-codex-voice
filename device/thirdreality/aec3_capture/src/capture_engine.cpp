@@ -53,6 +53,18 @@ bool CaptureEngine::ValidateConfig(std::string* error) const {
         *error = "microphone channel is outside the capture layout";
         return false;
     }
+    if (config_.secondary_mic_channel < -1 ||
+        (config_.secondary_mic_channel >= 0 &&
+         static_cast<unsigned>(config_.secondary_mic_channel) >=
+             config_.channels)) {
+        *error = "secondary microphone channel is outside the capture layout";
+        return false;
+    }
+    if (config_.secondary_mic_channel ==
+        static_cast<int>(config_.mic_channel)) {
+        *error = "primary and secondary microphone channels must be distinct";
+        return false;
+    }
     if (config_.reference_channel_a < 0 ||
         static_cast<unsigned>(config_.reference_channel_a) >= config_.channels) {
         *error = "first reference channel is outside the capture layout";
@@ -75,6 +87,11 @@ bool CaptureEngine::ValidateConfig(std::string* error) const {
     if (config_.reference_channel_b ==
         static_cast<int>(config_.mic_channel)) {
         *error = "microphone and reference channels must be distinct";
+        return false;
+    }
+    if (config_.secondary_mic_channel == config_.reference_channel_a ||
+        config_.secondary_mic_channel == config_.reference_channel_b) {
+        *error = "secondary microphone and reference channels must be distinct";
         return false;
     }
     if (config_.reference_channel_b == config_.reference_channel_a) {
@@ -218,6 +235,7 @@ bool CaptureEngine::ResetProcessor(std::string* error) {
     if (!BuildProcessor(error)) {
         return false;
     }
+    microphone_combiner_.Reset();
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.resets;
     return true;
@@ -265,6 +283,7 @@ int CaptureEngine::Start() {
         last_error_ = error;
         return CODEX_AEC3_PROCESSING_ERROR;
     }
+    microphone_combiner_.Reset();
 
     stop_requested_.store(false, std::memory_order_release);
     reset_requested_.store(false, std::memory_order_release);
@@ -445,6 +464,8 @@ void CaptureEngine::WorkerLoop() {
 void CaptureEngine::WorkerLoopImpl() {
     const std::size_t period = config_.period_frames;
     std::vector<std::int16_t> interleaved(period * config_.channels);
+    std::vector<std::int16_t> primary_mic(period);
+    std::vector<std::int16_t> secondary_mic(period);
     std::vector<std::int16_t> raw_mic(period);
     std::vector<std::int16_t> raw_reference(period);
     std::vector<std::int16_t> apm_reference(period);
@@ -507,7 +528,10 @@ void CaptureEngine::WorkerLoopImpl() {
         for (std::size_t frame = 0; frame < period; ++frame) {
             const std::int16_t* row =
                 interleaved.data() + frame * config_.channels;
-            raw_mic[frame] = row[config_.mic_channel];
+            primary_mic[frame] = row[config_.mic_channel];
+            if (config_.secondary_mic_channel >= 0) {
+                secondary_mic[frame] = row[config_.secondary_mic_channel];
+            }
             if (config_.reference_channel_b < 0) {
                 raw_reference[frame] = row[config_.reference_channel_a];
             } else {
@@ -516,6 +540,22 @@ void CaptureEngine::WorkerLoopImpl() {
                     static_cast<std::int32_t>(row[config_.reference_channel_b]);
                 raw_reference[frame] = static_cast<std::int16_t>(mixed / 2);
             }
+        }
+
+        if (config_.secondary_mic_channel >= 0) {
+            const auto combined = microphone_combiner_.Process(
+                primary_mic.data(), secondary_mic.data(), raw_mic.data(),
+                period);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (combined.coherent) {
+                stats_.coherent_mic_frames += period;
+            } else {
+                stats_.primary_only_mic_frames += period;
+            }
+        } else {
+            raw_mic = primary_mic;
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.primary_only_mic_frames += period;
         }
 
         apm_reference = raw_reference;

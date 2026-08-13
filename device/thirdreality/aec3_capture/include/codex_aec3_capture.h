@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define CODEX_AEC3_ABI_VERSION 1u
+#define CODEX_AEC3_ABI_VERSION 2u
 
 typedef struct codex_aec3_handle codex_aec3_handle;
 
@@ -44,6 +44,7 @@ typedef struct codex_aec3_config {
     uint32_t sample_rate;
     uint32_t channels;
     uint32_t mic_channel;
+    int32_t secondary_mic_channel;
     int32_t reference_channel_a;
     int32_t reference_channel_b;
     uint32_t period_frames;
@@ -61,6 +62,8 @@ typedef struct codex_aec3_stats {
     uint64_t short_reads;
     uint64_t processing_failures;
     uint64_t resets;
+    uint64_t coherent_mic_frames;
+    uint64_t primary_only_mic_frames;
 } codex_aec3_stats;
 
 CODEX_AEC3_EXPORT uint32_t codex_aec3_abi_version(void);

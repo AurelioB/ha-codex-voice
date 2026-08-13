@@ -263,7 +263,8 @@ echo/double-talk canary diagnosable without retaining audio.
 
 The native hardware-loopback AEC3 capture slice is disabled by default. Its
 normal selector is `capture_backend: "native_aec3"` in the enabled root-owned
-mode-0600 `/data/conf/codex-realtime.json` for `device_webrtc`;
+mode-0600 `/data/conf/codex-realtime.json` for full-duplex `bridge_pcm` or the
+dormant `device_webrtc` route;
 `CODEX_AEC3_CAPTURE=1` is only an explicit diagnostic override. The early
 fail-closed hook sets `CODEX_AEC3_ACTIVE=1` internally after the recorder patch
 succeeds; session preflight consumes it to prove that config and capture agree.
@@ -885,9 +886,11 @@ needs its own physical double-talk and echo-rejection canaries. Native AEC3 is s
 `capture_backend: "native_aec3"` in the secure realtime configuration; the
 environment flag is only an explicit diagnostic override. The active reference
 configuration uses a 10 dB native baseline, noise-limited adaptive microphone
-gain, moderate noise suppression, 0 dB transport gain, and a 100% sink/playback
-anchor. Its saved starting output may be 80%, implemented as non-amplifying
-software attenuation below that anchor.
+gain, moderate noise suppression, 18 dB post-wake transport gain, and a 100%
+sink/playback anchor. Before APM, channel 1 enters a click-free mix only for
+strongly correlated, level-compatible frames; otherwise channel 0 passes
+unchanged. Its saved starting output is implemented as non-amplifying software
+attenuation below the physical 100% anchor.
 
 ### Finished speaking detection
 

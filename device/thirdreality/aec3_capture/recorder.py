@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import importlib
 import os
+import syslog
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -12,13 +13,15 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, Self
 
-_ABI_VERSION = 1
+_ABI_VERSION = 2
 _SAMPLE_RATE = 16_000
 _PERIOD_FRAMES = 160
 _DEFAULT_LIBRARY = Path(
     "/data/conf/codex-python/aec3_capture/lib/libcodex_aec3_capture.so"
 )
 _MAX_NATIVE_ERROR_BYTES = 4_096
+_FIRST_STATS_LOG_SECONDS = 5.0
+_STATS_LOG_INTERVAL_SECONDS = 60.0
 
 _STATUS_NAMES = {
     -1: "invalid argument",
@@ -53,6 +56,7 @@ class CaptureSettings:
     alsa_device: str = "hw:0,4"
     channels: int = 4
     mic_channel: int = 0
+    secondary_mic_channel: int = 1
     reference_channel_a: int = 2
     reference_channel_b: int = 3
     ring_frames: int = 4_096
@@ -75,6 +79,9 @@ class CaptureSettings:
             alsa_device=values.get("CODEX_AEC3_DEVICE", "hw:0,4"),
             channels=_parse_int(values, "CODEX_AEC3_CHANNELS", 4),
             mic_channel=_parse_int(values, "CODEX_AEC3_MIC_CHANNEL", 0),
+            secondary_mic_channel=_parse_int(
+                values, "CODEX_AEC3_SECONDARY_MIC_CHANNEL", 1
+            ),
             reference_channel_a=_parse_int(values, "CODEX_AEC3_REFERENCE_CHANNEL_A", 2),
             reference_channel_b=_parse_int(values, "CODEX_AEC3_REFERENCE_CHANNEL_B", 3),
             ring_frames=_parse_int(values, "CODEX_AEC3_RING_FRAMES", 4_096),
@@ -97,6 +104,16 @@ class CaptureSettings:
             raise CaptureConfigurationError("AEC3 channel count must be in 1..32")
         if not 0 <= self.mic_channel < self.channels:
             raise CaptureConfigurationError("AEC3 microphone channel is out of range")
+        if self.secondary_mic_channel != -1 and not (
+            0 <= self.secondary_mic_channel < self.channels
+        ):
+            raise CaptureConfigurationError(
+                "AEC3 secondary microphone channel is out of range"
+            )
+        if self.secondary_mic_channel == self.mic_channel:
+            raise CaptureConfigurationError(
+                "AEC3 primary and secondary microphone channels must be distinct"
+            )
         if not 0 <= self.reference_channel_a < self.channels:
             raise CaptureConfigurationError("AEC3 reference channel A is out of range")
         if self.reference_channel_b != -1 and not (
@@ -110,6 +127,10 @@ class CaptureSettings:
         if self.mic_channel in reference_channels:
             raise CaptureConfigurationError(
                 "AEC3 microphone and reference channels must be distinct"
+            )
+        if self.secondary_mic_channel in reference_channels:
+            raise CaptureConfigurationError(
+                "AEC3 secondary microphone and reference channels must be distinct"
             )
         if len(reference_channels) != (1 if self.reference_channel_b == -1 else 2):
             raise CaptureConfigurationError("AEC3 reference channels must be distinct")
@@ -140,6 +161,8 @@ class CaptureStats:
     short_reads: int
     processing_failures: int
     resets: int
+    coherent_mic_frames: int
+    primary_only_mic_frames: int
 
 
 class _CConfig(ctypes.Structure):
@@ -150,6 +173,7 @@ class _CConfig(ctypes.Structure):
         ("sample_rate", ctypes.c_uint32),
         ("channels", ctypes.c_uint32),
         ("mic_channel", ctypes.c_uint32),
+        ("secondary_mic_channel", ctypes.c_int32),
         ("reference_channel_a", ctypes.c_int32),
         ("reference_channel_b", ctypes.c_int32),
         ("period_frames", ctypes.c_uint32),
@@ -169,6 +193,8 @@ class _CStats(ctypes.Structure):
         ("short_reads", ctypes.c_uint64),
         ("processing_failures", ctypes.c_uint64),
         ("resets", ctypes.c_uint64),
+        ("coherent_mic_frames", ctypes.c_uint64),
+        ("primary_only_mic_frames", ctypes.c_uint64),
     ]
 
 
@@ -262,6 +288,7 @@ class _NativeStream:
         config.alsa_device = device
         config.channels = settings.channels
         config.mic_channel = settings.mic_channel
+        config.secondary_mic_channel = settings.secondary_mic_channel
         config.reference_channel_a = settings.reference_channel_a
         config.reference_channel_b = settings.reference_channel_b
         config.ring_frames = settings.ring_frames
@@ -331,6 +358,8 @@ class _NativeStream:
             short_reads=int(stats.short_reads),
             processing_failures=int(stats.processing_failures),
             resets=int(stats.resets),
+            coherent_mic_frames=int(stats.coherent_mic_frames),
+            primary_only_mic_frames=int(stats.primary_only_mic_frames),
         )
 
     def stop(self) -> None:
@@ -362,6 +391,7 @@ class Aec3Recorder:
         self._stream_factory = stream_factory
         self._blocksize = blocksize
         self._stream: _CaptureStream | None = None
+        self._next_stats_log_at = 0.0
 
     def __enter__(self) -> Self:
         """Open the synchronized hardware capture stream."""
@@ -375,6 +405,7 @@ class Aec3Recorder:
             stream.close()
             raise
         self._stream = stream
+        self._next_stats_log_at = time.monotonic() + _FIRST_STATS_LOG_SECONDS
         return self
 
     def __exit__(
@@ -426,6 +457,20 @@ class Aec3Recorder:
 
         pcm = np.ctypeslib.as_array(buffer).astype(np.float32)
         pcm *= 1.0 / 32_768.0
+        now = time.monotonic()
+        if now >= self._next_stats_log_at:
+            stats = stream.stats()
+            syslog.syslog(
+                syslog.LOG_INFO,
+                "codex-voice aec3_capture "
+                f"captured_frames={stats.captured_frames} "
+                f"coherent_mic_frames={stats.coherent_mic_frames} "
+                f"primary_only_mic_frames={stats.primary_only_mic_frames} "
+                f"dropped_frames={stats.dropped_frames} "
+                f"recoveries={stats.recoveries} "
+                f"processing_failures={stats.processing_failures}",
+            )
+            self._next_stats_log_at = now + _STATS_LOG_INTERVAL_SECONDS
         return pcm.reshape((frames, 1))
 
     @property

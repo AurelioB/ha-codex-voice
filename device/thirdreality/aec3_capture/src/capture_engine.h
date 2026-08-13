@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+#include "coherent_microphone_combiner.h"
+
 namespace webrtc {
 class AudioProcessing;
 class StreamConfig;
@@ -27,6 +29,7 @@ struct CaptureConfig {
     unsigned sample_rate = kAec3SampleRate;
     unsigned channels = 4;
     unsigned mic_channel = 0;
+    int secondary_mic_channel = 1;
     int reference_channel_a = 2;
     int reference_channel_b = 3;
     std::size_t period_frames = kAec3FrameSamples;
@@ -42,6 +45,8 @@ struct CaptureStats {
     std::uint64_t short_reads = 0;
     std::uint64_t processing_failures = 0;
     std::uint64_t resets = 0;
+    std::uint64_t coherent_mic_frames = 0;
+    std::uint64_t primary_only_mic_frames = 0;
 };
 
 class FrameObserver {
@@ -109,6 +114,7 @@ class CaptureEngine {
     snd_pcm_t* pcm_ = nullptr;
     webrtc::AudioProcessing* processor_ = nullptr;
     webrtc::StreamConfig* stream_config_ = nullptr;
+    CoherentMicrophoneCombiner microphone_combiner_;
 };
 
 }  // namespace codex::aec3
