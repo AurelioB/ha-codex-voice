@@ -996,6 +996,20 @@ def test_realtime_device_token_is_optional_and_loaded_from_env(
     assert BridgeConfig.from_env().realtime_device_token == "device-token"
 
 
+def test_realtime_transcript_logging_is_explicit_and_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_REALTIME_LOG_TRANSCRIPTS", raising=False)
+
+    assert BridgeConfig.from_env().realtime_log_transcripts is False
+    monkeypatch.setenv("HA_CODEX_REALTIME_LOG_TRANSCRIPTS", "true")
+    assert BridgeConfig.from_env().realtime_log_transcripts is True
+    monkeypatch.setenv("HA_CODEX_REALTIME_LOG_TRANSCRIPTS", "sometimes")
+    with pytest.raises(ValueError, match="HA_CODEX_REALTIME_LOG_TRANSCRIPTS"):
+        BridgeConfig.from_env()
+
+
 def test_desktop_realtime_model_is_default_and_env_overridable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7182,6 +7196,7 @@ async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
     fake_rpc: FakeRpc,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    bridge_app[bridge_service.STATE_KEY].config.realtime_log_transcripts = True
     client = await aiohttp_client(bridge_app)
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
     await device.send_json(_realtime_v2_start(conversation_mode="native"))
@@ -7254,6 +7269,9 @@ async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
     assert (
         "Realtime native input transcript: fragments=1 fragment_chars=18 "
         "final_chars=18" in caplog.text
+    )
+    assert (
+        "Realtime debug transcript: role=user text='¡Terminar llamada!'" in caplog.text
     )
     await device.close()
 

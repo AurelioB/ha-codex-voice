@@ -5878,6 +5878,20 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         native_user_transcript_fragments = 0
         native_user_transcript_chars = 0
 
+    def log_native_debug_transcript(role: str, value: object) -> None:
+        """Log bounded transcript text only under the explicit debug opt-in."""
+        if (
+            not state.config.realtime_log_transcripts
+            or role not in {"assistant", "input", "output", "user"}
+            or not isinstance(value, str)
+        ):
+            return
+        LOGGER.info(
+            "Realtime debug transcript: role=%s text=%r",
+            role,
+            value[:4_096],
+        )
+
     def observe_native_barge_control(control: RealtimeDataControl) -> None:
         """Record provider data milestones before their handlers mutate output."""
         if not wire_protocol.requests_native_conversation:
@@ -7531,12 +7545,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             elif method == "thread/realtime/transcript/done":
                 if wire_protocol.uses_binary_audio:
                     role = str(params.get("role", "")).lower()
+                    transcript = params.get("text")
+                    log_native_debug_transcript(role, transcript)
                     observe_native_barge_transcript(role, done=True)
                     if (
                         role in {"input", "user"}
                         and wire_protocol.requests_native_conversation
                     ):
-                        transcript = params.get("text")
                         complete_native_user_transcript(transcript)
                         if await resolve_native_terminal_turn(transcript):
                             return

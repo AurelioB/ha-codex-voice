@@ -144,6 +144,12 @@ desktop WebRTC hush pair (`response.cancel`, then
 The bridge explicitly requests `gpt-live-1-codex`; the model is overridable by
 `HA_CODEX_REALTIME_MODEL` for a controlled rollback or canary.
 
+For a temporary debugging installation, set
+`HA_CODEX_REALTIME_LOG_TRANSCRIPTS=true`. Native realtime then writes bounded
+final user and assistant transcript text to the rotated Docker log. It defaults
+to false because these records contain conversation content; disable it and
+rotate/remove the test logs before ordinary household use.
+
 The bridge does not wait for a provider VAD boundary. If same-peer provider
 control is unavailable, `barge_in_mode: "rollover"` retains the conservative
 generation-replacement path: strict stop and a matching

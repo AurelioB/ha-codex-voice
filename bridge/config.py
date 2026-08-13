@@ -62,6 +62,18 @@ DEFAULT_CODEX_COMMAND = (
 )
 
 
+def _parse_boolean_environment(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of 0/1, false/true, no/yes, off/on")
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     """Configuration shared by the HTTP service and Codex child process."""
@@ -83,6 +95,7 @@ class BridgeConfig:
     realtime_model: str = DEFAULT_REALTIME_MODEL
     silence_ms: int = 0
     live_fragment_quiet_seconds: float = 2.0
+    realtime_log_transcripts: bool = False
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -155,5 +168,8 @@ class BridgeConfig:
                     "HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS",
                     "2.0",
                 )
+            ),
+            realtime_log_transcripts=_parse_boolean_environment(
+                "HA_CODEX_REALTIME_LOG_TRANSCRIPTS"
             ),
         )

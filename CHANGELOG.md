@@ -109,6 +109,10 @@ and releases use semantic versioning.
   inconsistent, or low-confidence requests now produce one brief clarification
   in the user's language instead of an invented interpretation. Add bounded,
   content-free input transcript fragment and character counts for diagnosis.
+- Add an explicit `HA_CODEX_REALTIME_LOG_TRANSCRIPTS` testing switch. When
+  enabled, bounded final user and assistant transcripts are written to the
+  rotated bridge log for acoustic debugging; production remains private by
+  default.
 - Condition ThirdReality microphone audio inside native AEC3 using a 10 dB
   vendor baseline followed by AGC2 noise-limited adaptive digital gain, its
   limiter, and moderate noise suppression. Wake detection and realtime capture
