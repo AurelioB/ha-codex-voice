@@ -350,6 +350,7 @@ _REALTIME_TRACE_DATA_EVENT_TYPES = frozenset(
         "invalid",
         "output_audio_buffer.started",
         "output_audio_buffer.stopped",
+        "output_audio_buffer.cleared",
         "output_transcript.added",
         "response.cancelled",
         "response.created",
@@ -5792,6 +5793,91 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     native_terminal_quiet_generation = 0
     native_terminal_quiet_task: asyncio.Task[None] | None = None
     event_trace = _RealtimeEventTrace()
+    native_barge_sequence = 0
+    native_barge_started_at: float | None = None
+    native_barge_source = "none"
+    native_barge_milestones: set[str] = set()
+
+    def native_barge_trace_is_open() -> bool:
+        return native_barge_started_at is not None and "first_output_pcm" not in (
+            native_barge_milestones
+        )
+
+    def begin_native_barge_trace(source: str) -> None:
+        """Start one content-free interruption trace on the active socket."""
+        nonlocal native_barge_sequence, native_barge_source
+        nonlocal native_barge_started_at, native_barge_milestones
+        if native_barge_trace_is_open():
+            LOGGER.info(
+                "Realtime native barge: sequence=%d source=%s milestone=superseded "
+                "elapsed_ms=%d",
+                native_barge_sequence,
+                native_barge_source,
+                round((time.monotonic() - native_barge_started_at) * 1_000),
+            )
+        native_barge_sequence += 1
+        native_barge_source = source
+        native_barge_started_at = time.monotonic()
+        native_barge_milestones = {"started"}
+        LOGGER.info(
+            "Realtime native barge: sequence=%d source=%s milestone=started "
+            "elapsed_ms=0",
+            native_barge_sequence,
+            native_barge_source,
+        )
+
+    def mark_native_barge(milestone: str) -> None:
+        """Log one allowlisted milestone without conversation content."""
+        if native_barge_started_at is None or milestone in native_barge_milestones:
+            return
+        native_barge_milestones.add(milestone)
+        LOGGER.info(
+            "Realtime native barge: sequence=%d source=%s milestone=%s elapsed_ms=%d",
+            native_barge_sequence,
+            native_barge_source,
+            milestone,
+            round((time.monotonic() - native_barge_started_at) * 1_000),
+        )
+
+    def observe_native_barge_transcript(role: str, *, done: bool) -> None:
+        """Record only the timing of an input transcript notification."""
+        if role not in {"input", "user"}:
+            return
+        if not native_barge_trace_is_open() and output_speaking:
+            begin_native_barge_trace("provider_transcript")
+        mark_native_barge("user_transcript_done" if done else "user_transcript_delta")
+
+    def observe_native_barge_control(control: RealtimeDataControl) -> None:
+        """Record provider data milestones before their handlers mutate output."""
+        if not wire_protocol.requests_native_conversation:
+            return
+        event_type = control.event_type
+        if not native_barge_trace_is_open() and output_speaking:
+            if event_type == "output_audio_buffer.cleared":
+                begin_native_barge_trace("provider_output_clear")
+            elif event_type == "input_audio_buffer.speech_started":
+                begin_native_barge_trace("provider_speech")
+            elif control.role == "user" and event_type in {
+                "turn.created",
+                "turn.done",
+            }:
+                begin_native_barge_trace("provider_user_turn")
+        milestones = {
+            "input_audio_buffer.speech_started": "speech_started",
+            "output_audio_buffer.cleared": "output_cleared",
+            "output_audio_buffer.started": "next_response_started",
+            "response.cancelled": "response_cancelled",
+            "response.created": "next_response_started",
+        }
+        milestone = milestones.get(event_type)
+        if milestone is not None:
+            mark_native_barge(milestone)
+        if control.role == "user" and event_type in {"turn.created", "turn.done"}:
+            mark_native_barge(
+                "user_turn_started"
+                if event_type == "turn.created"
+                else "user_turn_done"
+            )
 
     def uses_native_terminal_gate() -> bool:
         return (
@@ -7299,7 +7385,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         "provider_barge requires an exact explicit native realtime "
                         "control"
                     )
+                begin_native_barge_trace("device_control")
                 session.request_response_cancel_and_clear_output()
+                mark_native_barge("cancel_clear_sent")
                 await end_output(after_tail=False)
                 continue
             elif message_type == "stop":
@@ -7385,6 +7473,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             elif method == "thread/realtime/transcript/delta":
                 if wire_protocol.uses_binary_audio:
                     role = str(params.get("role", "")).lower()
+                    observe_native_barge_transcript(role, done=False)
                     if (
                         role in {"input", "user"}
                         and wire_protocol.requests_native_conversation
@@ -7409,6 +7498,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             elif method == "thread/realtime/transcript/done":
                 if wire_protocol.uses_binary_audio:
                     role = str(params.get("role", "")).lower()
+                    observe_native_barge_transcript(role, done=True)
                     if (
                         role in {"input", "user"}
                         and wire_protocol.requests_native_conversation
@@ -7541,6 +7631,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         delivered_output = output_speaking
             if delivered_output:
                 complete_tool_continuation_after_output()
+                mark_native_barge("first_output_pcm")
 
     async def handle_managed_backend_terminal(
         control: RealtimeDataControl, *, cancelled: bool
@@ -7638,6 +7729,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             control = parse_data_control_event(raw_event)
             if control is None or not wire_protocol.uses_binary_audio:
                 continue
+            observe_native_barge_control(control)
             if control.event_type == "session.context.appended":
                 if bridge_managed_realtime and backend_render_generation is not None:
                     backend_render_context_acknowledged = True
@@ -7804,6 +7896,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 stop.set()
     finally:
         stop.set()
+        mark_native_barge("session_closed")
         shutdown_background_owner = tombstone_background_for_shutdown()
         auxiliary_tasks = tuple(output_aux_tasks)
         background_timeouts = tuple(background_watchdog_tasks)

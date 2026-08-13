@@ -8130,7 +8130,7 @@ def test_upstream_barge_keeps_one_provider_until_model_publishes_user_turn(
     connection.feed(
         Message(
             "text",
-            '{"type":"control","event_type":"turn.created","role":"user"}',
+            '{"type":"control","event_type":"output_audio_buffer.cleared"}',
         )
     )
     assert _wait_for(lambda: not session.output_active)

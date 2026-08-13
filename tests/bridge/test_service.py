@@ -6637,7 +6637,9 @@ async def test_realtime_v2_provider_barge_hushes_same_desktop_model_peer(
     aiohttp_client: Any,
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="bridge.service")
     client = await aiohttp_client(bridge_app)
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
     await device.send_json(_realtime_v2_start(conversation_mode="native"))
@@ -6680,6 +6682,16 @@ async def test_realtime_v2_provider_barge_hushes_same_desktop_model_peer(
         "type": "control",
         "event_type": "output_audio_buffer.cleared",
     }
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "delta": "private replacement request",
+            },
+        }
+    )
 
     peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
     assert (await device.receive_json(timeout=1))["event_type"] == (
@@ -6693,6 +6705,33 @@ async def test_realtime_v2_provider_barge_hushes_same_desktop_model_peer(
         "output_epoch": 2,
     }
     assert (await device.receive(timeout=1)).data == second_output
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.cleared"}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 2,
+    }
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "output_audio_buffer.cleared",
+    }
+
+    for milestone in (
+        "started",
+        "cancel_clear_sent",
+        "output_cleared",
+        "user_transcript_delta",
+        "next_response_started",
+        "first_output_pcm",
+    ):
+        assert f"source=device_control milestone={milestone}" in caplog.text
+    assert "sequence=2 source=provider_output_clear milestone=started" in caplog.text
+    assert (
+        "sequence=2 source=provider_output_clear milestone=output_cleared"
+        in caplog.text
+    )
+    assert "private replacement request" not in caplog.text
 
     starts = [
         params for method, params in fake_rpc.calls if method == "thread/realtime/start"
