@@ -156,10 +156,13 @@ An accepted direct wake immediately queues the non-blocking thinking/pulsing
 LED and claims the vendor owner. At most three session attempts share one
 absolute 12-second owner deadline; each session retains its own configured
 10-second signaling-handshake bound inside the remaining owner budget. Process
-prewarm only proves that each isolated `Popen` child is still alive. It does
-not create or validate an SDP offer; the selected child must do that during the
-owned attempt, and construction, preflight, offer, bridge, or transport failure
-can consume an attempt.
+startup and completed conversations keep one strict-v2 server-media session
+warm for five minutes. Before final detector acceptance, an Okay Nabu model
+score of 0.50 creates or refreshes a ten-second speculative slot. The accepted
+wake atomically claims that same WebSocket/thread/server WebRTC peer, while an
+expired or failed slot uses the ordinary bounded cold attempts. No unclaimed
+slot receives microphone PCM. Dormant v3 process prewarm still proves only that
+its isolated `Popen` child is alive; it does not validate an SDP offer.
 
 `RealtimeSession.ready` is set only after the SDP answer is applied, the peer
 is connected, the `oai-events` data channel is ready, the device has sent

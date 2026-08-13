@@ -78,13 +78,15 @@ transcript gate, executor, `appendSpeech` render, or device `aiortc` import.
 Qualified interruption replaces the provider peer on the server while the
 device session stays open.
 
-Native mode does not make cold startup free. Each new direct wake still has to
-acquire the bridge's single speech lane, create a Codex thread and server peer,
-negotiate App Server/WebRTC, play the ready cue, accept post-cue speech, wait for provider
-endpointing/response generation, and begin physical playback. It does not
-capture or catch up microphone audio during cold startup. Compose keeps the
-bridge, App Server process, OAuth state, media stack, and listener warm, but
-does not yet hold a connected provider standby. Report wake to exact
+Native mode does not make cold startup free. The active client now keeps one
+bounded, audio-empty provider session warm for five minutes after voice-process
+startup and after a completed conversation. A probable Okay Nabu score at 0.50
+also creates or refreshes a ten-second speculative slot before final wake
+acceptance. A matching wake atomically claims the same device WebSocket, Codex
+thread, and server-owned WebRTC peer; no second negotiation is started. An
+expired, failed, or incompatible slot is stopped and the existing three-attempt
+cold path remains available. Capture remains closed and no microphone PCM is
+queued while the slot is unclaimed. Report wake to exact
 `started`, `started` to cue EOF/capture-open, capture-open to speech endpoint,
 endpoint to first PCM, and first PCM to audible playback separately. The
 experimental App Server surface provides no
@@ -814,13 +816,14 @@ duplicate speech.
 The released component omits the handoff request, so every STT and TTS operation
 has a new remote context. Direct calls do the same.
 
-## Why remote prewarming is not enabled
+## Bounded provider prewarming
 
 The Compose deployment keeps the bridge listener, Codex App Server process,
-OAuth state, and server media stack warm, but it does not keep an assigned
-provider speech session waiting for a future wake. The ThirdReality client
-starts its explicitly owned session at the wake callback, so remote thread and
-WebRTC negotiation remain measurable startup costs.
+OAuth state, and server media stack warm. The ThirdReality client additionally
+holds at most one authenticated strict-v2 session: five minutes after startup
+or a completed conversation, and ten seconds after a probable wake score. The
+slot occupies the account's single speech lane, while device capture remains
+closed until a real wake claims it and the ready cue reaches EOF.
 
 Always-on remote prewarming would also:
 
@@ -833,16 +836,11 @@ Always-on remote prewarming would also:
 
 The official [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
 provides usage and rate-limit observability, but no idle realtime-session cost
-or lifetime guarantee. Any future *remote* prewarm experiment must therefore be
-explicit, one-shot, short-lived, owner/profile-bound, and measured against a
-no-prewarm control. It must not silently replenish itself. The implemented
-design instead keeps ordinary server processes warm, creates the initial peer
-only after an accepted wake, then creates a replacement only after a qualified
-`barge`. Caching only a local offer would not remove remote
-admission and negotiation. If measurements justify a future connected warm
-slot, it must be a single opt-in server slot with bounded expiry and no device
-audio before assignment. The dormant device-side worker/standby design is
-retained as historical evidence only.
+or lifetime guarantee. The implemented policy is therefore single-slot,
+profile/configuration-bound, TTL-limited, and audio-empty before assignment. It
+uses the exact production session rather than caching only a local offer, which
+would not remove remote admission and negotiation. The dormant device-side
+worker/standby design is retained as historical evidence only.
 
 ## ThirdReality safe performance settings
 

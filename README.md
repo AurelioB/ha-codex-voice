@@ -579,8 +579,11 @@ interface](https://developers.openai.com/api/docs/guides/realtime-webrtc).
 Native mode removes the artificial
 transcript/executor/render sequence, but it cannot eliminate cold Codex thread
 creation, WebRTC negotiation, network, service admission, or provider response
-latency. A first wake may therefore still be slower than an already-open
-ChatGPT voice session.
+latency. The ThirdReality client therefore keeps one bounded, audio-empty
+production session warm for five minutes after startup/completion and starts a
+ten-second speculative session at the first strong pre-wake score. A real wake
+claims it without repeating App Server/WebRTC negotiation; expiry or failure
+uses the unchanged bounded cold path.
 
 ## Performance
 

@@ -14,6 +14,7 @@ import pytest
 
 from device.thirdreality.realtime_client import session as session_module
 from device.thirdreality.realtime_client.config import (
+    BRIDGE_PCM_TRANSPORT,
     DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
     DEFAULT_PLAYBACK_VOLUME_PERCENT,
     DEFAULT_PULSE_AEC_METHOD,
@@ -626,6 +627,134 @@ def test_prewarm_keeps_exactly_one_device_webrtc_worker_ready(
     assert tuple(session_module._PREWARMED_SIDECARS) == created
     assert session_module._take_prewarmed_sidecar() is created[0]
     assert not session_module._PREWARMED_SIDECARS
+
+
+def test_bridge_pcm_prewarm_starts_once_and_transfers_exact_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+
+    class WarmSession:
+        def __init__(self, config: RealtimeConfig) -> None:
+            self.config = config
+            self.started = 0
+            self.stopped = 0
+            self.terminal = False
+            self.prepared = 0
+            self.claimed = 0
+            created.append(self)
+
+        def prepare_for_prewarm(self) -> None:
+            self.prepared += 1
+
+        def claim_prewarm(self) -> None:
+            self.claimed += 1
+
+        def start(self) -> None:
+            self.started += 1
+
+        def stop(self) -> None:
+            self.stopped += 1
+            self.terminal = True
+
+        def join(self, _timeout: float) -> bool:
+            return self.terminal
+
+    monkeypatch.setattr(session_module, "RealtimeSession", WarmSession)
+    monkeypatch.setattr(session_module, "_BRIDGE_PCM_PREWARM_SLOT", None)
+    monkeypatch.setattr(session_module, "_SHUTTING_DOWN", False)
+    config = _duplex_config(media_transport=BRIDGE_PCM_TRANSPORT)
+
+    assert session_module.prewarm_bridge_pcm(config, ttl_seconds=10.0) is True
+    assert session_module.prewarm_bridge_pcm(config, ttl_seconds=10.0) is False
+    assert len(created) == 1
+    assert created[0].started == 1
+    assert created[0].prepared == 1
+
+    claimed = session_module.take_prewarmed_bridge_pcm(config)
+    assert claimed is created[0]
+    assert claimed.claimed == 1
+    assert claimed.stopped == 0
+    assert session_module._BRIDGE_PCM_PREWARM_SLOT is None
+
+
+def test_cached_aec_preflight_runs_static_probes_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[RealtimeConfig] = []
+    monkeypatch.setattr(session_module, "_AEC_PREFLIGHT_KEYS", set())
+    monkeypatch.setattr(
+        session_module,
+        "_verify_pulseaudio_aec",
+        lambda config: calls.append(config),
+    )
+    config = _duplex_config(media_transport=BRIDGE_PCM_TRANSPORT)
+
+    session_module._verify_pulseaudio_aec_cached(config)
+    session_module._verify_pulseaudio_aec_cached(config)
+
+    assert calls == [config]
+
+
+def test_claimed_bridge_prewarm_resets_normal_session_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    _install_fake_loop_io(monkeypatch, player)
+    session = RealtimeSession(
+        _config(idle_timeout_seconds=1.0, ping_interval_seconds=10.0),
+        clock=lambda: now[0],
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+    )
+    session.prepare_for_prewarm()
+    session.start()
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+
+    now[0] = 100.0
+    time.sleep(0.05)
+    assert not session.terminal
+
+    session.claim_prewarm()
+    assert _wait_for(lambda: not session._prewarm_pending.is_set())
+    now[0] = 100.9
+    time.sleep(0.05)
+    assert not session.terminal
+
+    now[0] = 101.1
+    assert _wait_for(lambda: session.terminal)
+
+
+def test_failed_unclaimed_bridge_prewarm_rearms_with_remaining_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _duplex_config(media_transport=BRIDGE_PCM_TRANSPORT)
+    scheduled: list[tuple[RealtimeConfig, float, float]] = []
+    slot = session_module._BridgePcmPrewarmSlot(
+        session_module._bridge_pcm_prewarm_key(config),
+        config,
+        SimpleNamespace(terminal=True),
+        time.monotonic() + 10.0,
+    )
+    monkeypatch.setattr(session_module, "_BRIDGE_PCM_PREWARM_SLOT", slot)
+    monkeypatch.setattr(session_module, "_SHUTTING_DOWN", False)
+    monkeypatch.setattr(
+        session_module,
+        "schedule_bridge_pcm_prewarm",
+        lambda received, *, delay_seconds, ttl_seconds: scheduled.append(
+            (received, delay_seconds, ttl_seconds)
+        ),
+    )
+
+    session_module._expire_bridge_pcm_prewarm(slot)
+
+    assert session_module._BRIDGE_PCM_PREWARM_SLOT is None
+    assert len(scheduled) == 1
+    assert scheduled[0][0] is config
+    assert scheduled[0][1] == session_module._BRIDGE_PCM_RETRY_SECONDS
+    assert 9.0 < scheduled[0][2] <= 10.0
 
 
 def test_global_sidecar_admission_waits_for_actual_process_exit(

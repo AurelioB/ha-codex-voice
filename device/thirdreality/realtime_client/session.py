@@ -1576,6 +1576,30 @@ def _verify_pulseaudio_aec(config: RealtimeConfig) -> None:
     _verify_aec_sink_volume(config)
 
 
+def _verify_pulseaudio_aec_cached(config: RealtimeConfig) -> None:
+    """Prove immutable Pulse topology once per voice process/configuration.
+
+    The appliance forbids runtime module loading and its supervisor reboots the
+    speaker if PulseAudio exits. Per-response sink volume is still verified by
+    the existing volume guard; only the static source/sink/module/process-route
+    probes are removed from subsequent wake hot paths.
+    """
+    key = (
+        config.full_duplex,
+        config.capture_backend,
+        config.pulse_aec_source,
+        config.pulse_aec_sink,
+        config.pulse_aec_method,
+        config.aec_sink_volume_ceiling_percent,
+        os.environ.get("CODEX_AEC3_ACTIVE"),
+    )
+    with _AEC_PREFLIGHT_LOCK:
+        if key in _AEC_PREFLIGHT_KEYS:
+            return
+        _verify_pulseaudio_aec(config)
+        _AEC_PREFLIGHT_KEYS.add(key)
+
+
 def _playback_sink(config: RealtimeConfig) -> str:
     """Resolve the sink that owns rendered PCM after capture is proven active."""
     if (
@@ -1759,6 +1783,8 @@ def _pactl_output(arguments: tuple[str, ...], *, timeout: float) -> str:
 
 _SESSIONS: weakref.WeakSet[RealtimeSession] = weakref.WeakSet()
 _SESSIONS_LOCK = threading.Lock()
+_AEC_PREFLIGHT_LOCK = threading.Lock()
+_AEC_PREFLIGHT_KEYS: set[tuple[Any, ...]] = set()
 _PREWARM_LOCK = threading.Condition()
 _PREWARMED_SIDECAR_COUNT = 1
 _GLOBAL_SIDECAR_PROCESS_CAP = 1
@@ -1767,6 +1793,25 @@ _SIDECAR_SLOT_POLL_SECONDS = 0.02
 _PREWARMED_SIDECARS: deque[WebRtcSidecarClient] = deque()
 _GLOBAL_SIDECAR_PROCESSES: dict[int, WebRtcSidecarClient] = {}
 _SHUTTING_DOWN = False
+
+
+@dataclass(slots=True)
+class _BridgePcmPrewarmSlot:
+    """One server-owned realtime session prepared before wake acceptance."""
+
+    config_key: tuple[Any, ...]
+    config: RealtimeConfig
+    session: RealtimeSession
+    expires_at: float
+
+
+_BRIDGE_PCM_PREWARM_LOCK = threading.Condition()
+_BRIDGE_PCM_PREWARM_SLOT: _BridgePcmPrewarmSlot | None = None
+_BRIDGE_PCM_PREWARM_SCHEDULED = False
+_BRIDGE_PCM_SPECULATIVE_TTL_SECONDS = 10.0
+_BRIDGE_PCM_READY_TTL_SECONDS = 300.0
+_BRIDGE_PCM_RETRY_SECONDS = 0.5
+_BRIDGE_PCM_RETRY_ATTEMPTS = 3
 
 
 def _prune_global_sidecars_locked() -> None:
@@ -1875,7 +1920,7 @@ class RealtimeSession:
         self._clock = clock
         self._connection_factory = connection_factory
         self._popen = popen
-        self._aec_verifier = aec_verifier or _verify_pulseaudio_aec
+        self._aec_verifier = aec_verifier or _verify_pulseaudio_aec_cached
         # Tests and downstream embedders that supply a complete AEC verifier
         # retain a hermetic guard by default. Production uses the cheaper sink
         # check for every new response after the complete startup preflight.
@@ -1935,6 +1980,8 @@ class RealtimeSession:
         self._stop_requested = threading.Event()
         self._interrupt_requested = threading.Event()
         self._live_capture_opened = threading.Event()
+        self._prewarm_pending = threading.Event()
+        self._prewarm_claimed = threading.Event()
         self._interrupt_preserve_session = True
         self._direct_output_fenced = threading.Event()
         self._local_anchor_transition = threading.Event()
@@ -2026,6 +2073,21 @@ class RealtimeSession:
                 self._state = SessionState.FAILED
             self._terminal.set()
             raise
+
+    def prepare_for_prewarm(self) -> None:
+        """Mark a new bridge session as externally TTL-owned before start."""
+        with self._state_lock:
+            if self._state is not SessionState.NEW:
+                raise RuntimeError("realtime prewarm must be configured before start")
+            if self._config.media_transport != BRIDGE_PCM_TRANSPORT:
+                raise RuntimeError("realtime prewarm requires bridge PCM")
+            self._prewarm_pending.set()
+
+    def claim_prewarm(self) -> None:
+        """Transfer an audio-empty warm session to a real wake owner."""
+        if self._prewarm_pending.is_set():
+            self._prewarm_claimed.set()
+            self._wake_network.set()
 
     def notify_live_capture_opened(self) -> None:
         """Permit direct rollover prewarm after the audible ready boundary."""
@@ -3034,15 +3096,22 @@ class RealtimeSession:
 
             while True:
                 now = self._clock()
-                _check_deadlines(
-                    now,
-                    started_at=started_at,
-                    last_activity=last_semantic_activity,
-                    max_session_seconds=self._config.max_session_seconds,
-                    idle_timeout_seconds=self._config.idle_timeout_seconds,
-                    pending_ping=pending_ping,
-                    pong_deadline=pong_deadline,
-                )
+                prewarm_pending = self._prewarm_pending.is_set()
+                if prewarm_pending and self._prewarm_claimed.is_set():
+                    self._prewarm_pending.clear()
+                    prewarm_pending = False
+                    started_at = now
+                    last_semantic_activity = now
+                if not prewarm_pending:
+                    _check_deadlines(
+                        now,
+                        started_at=started_at,
+                        last_activity=last_semantic_activity,
+                        max_session_seconds=self._config.max_session_seconds,
+                        idle_timeout_seconds=self._config.idle_timeout_seconds,
+                        pending_ping=pending_ping,
+                        pong_deadline=pong_deadline,
+                    )
 
                 if self._interrupt_requested.is_set():
                     self._set_local_output_epoch(None)
@@ -3115,20 +3184,30 @@ class RealtimeSession:
                     if pending_ping is None
                     else max(0.0, (pong_deadline or now) - now)
                 )
-                timeout = min(
-                    _NETWORK_TICK_SECONDS,
-                    pacer.delay(now) or _NETWORK_TICK_SECONDS,
-                    ping_wait,
-                    max(
-                        0.0,
-                        started_at + self._config.max_session_seconds - now,
-                    ),
-                    max(
+                semantic_deadline_wait = (
+                    float("inf")
+                    if prewarm_pending
+                    else max(
                         0.0,
                         last_semantic_activity
                         + self._config.idle_timeout_seconds
                         - now,
-                    ),
+                    )
+                )
+                session_deadline_wait = (
+                    float("inf")
+                    if prewarm_pending
+                    else max(
+                        0.0,
+                        started_at + self._config.max_session_seconds - now,
+                    )
+                )
+                timeout = min(
+                    _NETWORK_TICK_SECONDS,
+                    pacer.delay(now) or _NETWORK_TICK_SECONDS,
+                    ping_wait,
+                    session_deadline_wait,
+                    semantic_deadline_wait,
                 )
                 if not _socket_readable(connection, timeout):
                     self._wake_network.clear()
@@ -4739,14 +4818,183 @@ class RealtimeSession:
         raise WebSocketError("unsupported realtime JSON message")
 
 
+def _bridge_pcm_prewarm_key(config: RealtimeConfig) -> tuple[Any, ...]:
+    """Return the exact private configuration identity for a warm claim."""
+    return (config,)
+
+
+def _expire_bridge_pcm_prewarm(slot: _BridgePcmPrewarmSlot) -> None:
+    """Stop one unclaimed warm session at its renewable TTL boundary."""
+    global _BRIDGE_PCM_PREWARM_SLOT  # noqa: PLW0603
+    retry_ttl = 0.0
+    while True:
+        with _BRIDGE_PCM_PREWARM_LOCK:
+            if _BRIDGE_PCM_PREWARM_SLOT is not slot:
+                return
+            if slot.session.terminal:
+                _BRIDGE_PCM_PREWARM_SLOT = None
+                _BRIDGE_PCM_PREWARM_LOCK.notify_all()
+                retry_ttl = max(0.0, slot.expires_at - time.monotonic())
+                break
+            remaining = slot.expires_at - time.monotonic()
+            if remaining > 0:
+                _BRIDGE_PCM_PREWARM_LOCK.wait(timeout=min(remaining, 0.25))
+                continue
+            _BRIDGE_PCM_PREWARM_SLOT = None
+            _BRIDGE_PCM_PREWARM_LOCK.notify_all()
+        slot.session.stop()
+        slot.session.join(2.0)
+        return
+    if retry_ttl > _BRIDGE_PCM_RETRY_SECONDS and not _SHUTTING_DOWN:
+        schedule_bridge_pcm_prewarm(
+            slot.config,
+            delay_seconds=_BRIDGE_PCM_RETRY_SECONDS,
+            ttl_seconds=retry_ttl,
+        )
+
+
+def prewarm_bridge_pcm(
+    config: RealtimeConfig,
+    *,
+    ttl_seconds: float = _BRIDGE_PCM_SPECULATIVE_TTL_SECONDS,
+) -> bool:
+    """Start or refresh one claimable server-media session without blocking.
+
+    The expensive App Server/WebRTC negotiation runs on ``RealtimeSession``'s
+    existing daemon thread. This call performs only local construction and a
+    thread start, so the microphone callback never waits on LAN/provider I/O.
+    """
+    global _BRIDGE_PCM_PREWARM_SLOT  # noqa: PLW0603
+    if (
+        config.media_transport != BRIDGE_PCM_TRANSPORT
+        or not config.full_duplex
+        or ttl_seconds <= 0
+    ):
+        return False
+    key = _bridge_pcm_prewarm_key(config)
+    expires_at = time.monotonic() + ttl_seconds
+    stale: RealtimeSession | None = None
+    with _BRIDGE_PCM_PREWARM_LOCK:
+        if _SHUTTING_DOWN:
+            return False
+        slot = _BRIDGE_PCM_PREWARM_SLOT
+        if slot is not None and slot.config_key == key and not slot.session.terminal:
+            slot.expires_at = max(slot.expires_at, expires_at)
+            _BRIDGE_PCM_PREWARM_LOCK.notify_all()
+            return False
+        if slot is not None:
+            stale = slot.session
+            _BRIDGE_PCM_PREWARM_SLOT = None
+    if stale is not None:
+        stale.stop()
+        stale.join(2.0)
+
+    with _BRIDGE_PCM_PREWARM_LOCK:
+        if _SHUTTING_DOWN:
+            return False
+        # Another trigger may have populated the slot while stale cleanup ran.
+        slot = _BRIDGE_PCM_PREWARM_SLOT
+        if slot is not None and slot.config_key == key and not slot.session.terminal:
+            slot.expires_at = max(slot.expires_at, expires_at)
+            _BRIDGE_PCM_PREWARM_LOCK.notify_all()
+            return False
+        session = RealtimeSession(config)
+        session.prepare_for_prewarm()
+        session.start()
+        slot = _BridgePcmPrewarmSlot(key, config, session, expires_at)
+        _BRIDGE_PCM_PREWARM_SLOT = slot
+        reaper = threading.Thread(
+            target=_expire_bridge_pcm_prewarm,
+            args=(slot,),
+            name="thirdreality-bridge-prewarm-ttl",
+            daemon=True,
+        )
+        reaper.start()
+        return True
+
+
+def take_prewarmed_bridge_pcm(config: RealtimeConfig) -> RealtimeSession | None:
+    """Atomically transfer a compatible warm session to one accepted wake."""
+    global _BRIDGE_PCM_PREWARM_SLOT  # noqa: PLW0603
+    stale: RealtimeSession | None = None
+    with _BRIDGE_PCM_PREWARM_LOCK:
+        slot = _BRIDGE_PCM_PREWARM_SLOT
+        if slot is None:
+            return None
+        compatible = (
+            slot.config_key == _bridge_pcm_prewarm_key(config)
+            and time.monotonic() < slot.expires_at
+            and not slot.session.terminal
+        )
+        _BRIDGE_PCM_PREWARM_SLOT = None
+        _BRIDGE_PCM_PREWARM_LOCK.notify_all()
+        if compatible:
+            slot.session.claim_prewarm()
+            return slot.session
+        stale = slot.session
+    assert stale is not None
+    stale.stop()
+    return None
+
+
+def schedule_bridge_pcm_prewarm(
+    config: RealtimeConfig,
+    *,
+    delay_seconds: float = 0.5,
+    ttl_seconds: float = _BRIDGE_PCM_READY_TTL_SECONDS,
+) -> bool:
+    """Create one delayed warm slot after boot or a completed conversation."""
+    global _BRIDGE_PCM_PREWARM_SCHEDULED  # noqa: PLW0603
+    if config.media_transport != BRIDGE_PCM_TRANSPORT or not config.full_duplex:
+        return False
+    with _BRIDGE_PCM_PREWARM_LOCK:
+        if _SHUTTING_DOWN or _BRIDGE_PCM_PREWARM_SCHEDULED:
+            return False
+        _BRIDGE_PCM_PREWARM_SCHEDULED = True
+
+    def _run() -> None:
+        global _BRIDGE_PCM_PREWARM_SCHEDULED  # noqa: PLW0603
+        try:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            for attempt in range(_BRIDGE_PCM_RETRY_ATTEMPTS):
+                if prewarm_bridge_pcm(config, ttl_seconds=ttl_seconds):
+                    return
+                with _BRIDGE_PCM_PREWARM_LOCK:
+                    slot = _BRIDGE_PCM_PREWARM_SLOT
+                    if (
+                        slot is not None
+                        and slot.config_key == _bridge_pcm_prewarm_key(config)
+                        and not slot.session.terminal
+                    ):
+                        return
+                if attempt + 1 < _BRIDGE_PCM_RETRY_ATTEMPTS:
+                    time.sleep(_BRIDGE_PCM_RETRY_SECONDS)
+        finally:
+            with _BRIDGE_PCM_PREWARM_LOCK:
+                _BRIDGE_PCM_PREWARM_SCHEDULED = False
+                _BRIDGE_PCM_PREWARM_LOCK.notify_all()
+
+    threading.Thread(
+        target=_run,
+        name="thirdreality-bridge-prewarm",
+        daemon=True,
+    ).start()
+    return True
+
+
 def shutdown_all_sessions(timeout: float = 2.0) -> None:
     """Best-effort bounded cleanup for process exit."""
-    global _SHUTTING_DOWN  # noqa: PLW0603
+    global _BRIDGE_PCM_PREWARM_SLOT, _SHUTTING_DOWN  # noqa: PLW0603
     deadline = time.monotonic() + max(0.0, timeout)
     with _PREWARM_LOCK:
         _SHUTTING_DOWN = True
         prewarmed = tuple(_PREWARMED_SIDECARS)
         _PREWARMED_SIDECARS.clear()
+    with _BRIDGE_PCM_PREWARM_LOCK:
+        bridge_prewarmed = _BRIDGE_PCM_PREWARM_SLOT
+        _BRIDGE_PCM_PREWARM_SLOT = None
+        _BRIDGE_PCM_PREWARM_LOCK.notify_all()
     with _SESSIONS_LOCK:
         sessions = list(_SESSIONS)
     # Signal every active media owner before spending any shared deadline on
@@ -4754,6 +5002,8 @@ def shutdown_all_sessions(timeout: float = 2.0) -> None:
     # when an isolated child is wedged during process exit.
     for session in sessions:
         session.stop()
+    if bridge_prewarmed is not None:
+        bridge_prewarmed.session.stop()
     for sidecar in prewarmed:
         with suppress(Exception):
             sidecar.close(timeout=max(0.0, deadline - time.monotonic()))

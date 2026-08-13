@@ -352,11 +352,13 @@ class _FakeProtocol:
                     id="okay_nabu",
                     wake_word="Okay Nabu",
                     probability_cutoff=0.85,
+                    _probabilities=[],
                 ),
                 "okay_computer": SimpleNamespace(
                     id="okay_computer",
                     wake_word="Okay Computer",
                     probability_cutoff=0.97,
+                    _probabilities=[],
                 ),
             },
             "stop_word": SimpleNamespace(id="stop"),
@@ -1222,7 +1224,29 @@ def _fake_realtime_support(
         return prewarm_result
 
     support.prewarm_device_webrtc = prewarm_device_webrtc  # type: ignore[attr-defined]
+    bridge_prewarm_calls: list[object] = []
+    scheduled_bridge_prewarm_calls: list[object] = []
+
+    def prewarm_bridge_pcm(received_config: object) -> bool:
+        assert received_config is config
+        bridge_prewarm_calls.append(received_config)
+        return len(bridge_prewarm_calls) == 1
+
+    def schedule_bridge_pcm_prewarm(received_config: object) -> bool:
+        assert received_config is config
+        scheduled_bridge_prewarm_calls.append(received_config)
+        return True
+
+    support.prewarm_bridge_pcm = prewarm_bridge_pcm  # type: ignore[attr-defined]
+    support.schedule_bridge_pcm_prewarm = (  # type: ignore[attr-defined]
+        schedule_bridge_pcm_prewarm
+    )
+    support.take_prewarmed_bridge_pcm = lambda _config: None  # type: ignore[attr-defined]
     support.prewarm_calls = prewarm_calls  # type: ignore[attr-defined]
+    support.bridge_prewarm_calls = bridge_prewarm_calls  # type: ignore[attr-defined]
+    support.scheduled_bridge_prewarm_calls = (  # type: ignore[attr-defined]
+        scheduled_bridge_prewarm_calls
+    )
     support.sessions = sessions  # type: ignore[attr-defined]
     return support
 
@@ -1245,6 +1269,52 @@ def test_only_direct_webrtc_prewarms_after_guarded_overlay_activation(
 
     assert module._REALTIME_PATCH_ACTIVE
     assert support.prewarm_calls == expected_calls  # type: ignore[attr-defined]
+
+
+def test_bridge_pcm_probable_wake_score_starts_nonblocking_prewarm(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        full_duplex=True,
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    detector = instance.state.wake_words["okay_nabu"]
+
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY - 0.01]
+    instance.handle_audio(_pcm_frame(1))
+    assert support.bridge_prewarm_calls == []  # type: ignore[attr-defined]
+
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY]
+    instance.handle_audio(_pcm_frame(2))
+    assert support.bridge_prewarm_calls == [support.load_config()]  # type: ignore[attr-defined]
+
+
+def test_bridge_pcm_wake_claims_connecting_prewarm_without_second_start(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        full_duplex=True,
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    prewarmed = support.RealtimeSession(support.load_config())  # type: ignore[attr-defined]
+    prewarmed.start()
+    support.take_prewarmed_bridge_pcm = (  # type: ignore[attr-defined]
+        lambda _config: prewarmed
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+
+    _wake(instance, "okay nabu")
+
+    assert instance._codex_realtime_owner.session is prewarmed
+    assert prewarmed.started == 1
+    instance.stop()
 
 
 def test_guarded_direct_overlay_uses_50ms_system_volume_poll(

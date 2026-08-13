@@ -341,14 +341,15 @@ The bundled component omits the private request, so STT and TTS always use
 separate remote contexts. Diagnostic tickets remain bearer secrets and are
 excluded from logs and diagnostics.
 
-The bridge does not prewarm a remote session before a future wake word. A
-custom STT provider has no reliable Home Assistant callback before wake
-detection, an idle peer continues sending paced silent RTP, and a speculative
-session would occupy the single subscription speech lane without a documented
-quota-neutral idle lifetime. Experimental Codex adapter optimization is
-therefore limited to capture overlap and progressive TTS delivery. The
-recommended Wyoming providers do not use those remote adapters. The direct
-device prewarms exactly one reusable local isolated `aiortc` worker. Idle
+The active ThirdReality strict-v2 route keeps at most one audio-empty provider
+session warm. Voice-process startup and completed conversations arm a
+five-minute slot; a 0.50 probable wake score creates or refreshes a ten-second
+slot before final detector acceptance. The real wake claims that exact device
+WebSocket, thread, and server-owned WebRTC peer. Expiry or failure stops it and
+falls back to bounded cold startup. This deliberately occupies the single
+subscription speech lane, but never admits microphone PCM before assignment.
+The recommended Wyoming providers do not use this policy. The dormant direct
+device route prewarms exactly one reusable local isolated `aiortc` worker. Idle
 process prewarm means only that its `Popen` is alive; it does not request,
 drain, or validate an SDP offer. The worker creates its first peer offer only
 inside an accepted wake attempt. After that peer is ready and the confirmation

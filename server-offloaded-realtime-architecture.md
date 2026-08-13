@@ -182,13 +182,13 @@ Compose keeps the bridge, Codex App Server process, OAuth state, Python media
 stack, and route listener warm continuously. That removes device-side imports,
 worker creation, and memory pressure from wake latency.
 
-Milestone 1 still creates the provider thread and WebRTC peer after an accepted
-wake. A permanently connected provider “warm slot” is deferred until metrics
-show that remote negotiation dominates warm wake latency. A connected slot
-consumes a live provider session, needs expiry rotation, and adds assignment
-and cleanup states; caching a local offer without completing the remote
-negotiation would not remove the expensive part. If added later, it must be a
-single opt-in server slot and must never receive device audio before assignment.
+The deployed client keeps one bounded production session warm rather than only
+caching a local offer. Boot and completed conversations arm it for five minutes;
+a probable wake score arms or refreshes it for ten seconds. It already owns the
+authenticated device WebSocket, Codex thread, and server WebRTC peer, but gets
+no microphone PCM until a final wake atomically claims it and cue EOF opens
+capture. Expiry/failure closes the slot and preserves cold startup. The explicit
+single-slot bound acknowledges that this occupies the subscription speech lane.
 
 ## Docker Compose deployment
 

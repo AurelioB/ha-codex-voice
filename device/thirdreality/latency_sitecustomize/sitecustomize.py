@@ -262,6 +262,10 @@ _REALTIME_STARTUP_HEADROOM_BYTES = 32 * 1024
 _DIRECT_STARTUP_MAX_ATTEMPTS = 3
 _DIRECT_STARTUP_DEADLINE_SECONDS = 12.0
 _DIRECT_READY_CUE_TIMEOUT_SECONDS = 2.0
+_DIRECT_READY_CUE_PATH = (
+    "/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav"
+)
+_BRIDGE_PCM_PREWAKE_PROBABILITY = 0.50
 _REALTIME_LOCK_CREATION = threading.Lock()
 _DIRECT_VOLUME_LIVE_SESSION_STATES = frozenset({"CONNECTING", "READY", "INTERRUPTING"})
 _DIRECT_VOLUME_STARTUP_SESSION_STATES = _DIRECT_VOLUME_LIVE_SESSION_STATES | {"NEW"}
@@ -471,6 +475,15 @@ def _uses_device_webrtc() -> bool:
     )
 
 
+def _uses_bridge_pcm() -> bool:
+    """Return whether the speaker is the raw-PCM client of the local bridge."""
+    if _REALTIME_CONFIG is None or _REALTIME_SUPPORT is None:
+        return False
+    return getattr(_REALTIME_CONFIG, "media_transport", None) == getattr(
+        _REALTIME_SUPPORT, "BRIDGE_PCM_TRANSPORT", "bridge_pcm"
+    )
+
+
 def _uses_deterministic_realtime_media() -> bool:
     """Return whether capture starts only after one confirmed live session."""
     if _REALTIME_CONFIG is None or _REALTIME_SUPPORT is None:
@@ -582,6 +595,41 @@ def _discard_realtime_preroll(instance: Any) -> None:
     setattr(instance, _REALTIME_PREROLL_ATTRIBUTE, None)
 
 
+def _maybe_prewarm_probable_realtime_wake(instance: Any) -> None:
+    """Start server media on the first strong pre-activation model score."""
+    if not _uses_bridge_pcm() or not _uses_deterministic_realtime_media():
+        return
+    wake_words = getattr(instance.state, "wake_words", None)
+    if not isinstance(wake_words, dict):
+        return
+    for wake_word in wake_words.values():
+        if not _is_realtime_wake(wake_word):
+            continue
+        probabilities = getattr(wake_word, "_probabilities", ())
+        try:
+            latest = probabilities[-1]
+        except (IndexError, KeyError, TypeError):
+            return
+        if (
+            isinstance(latest, bool)
+            or not isinstance(latest, (int, float))
+            or not math.isfinite(float(latest))
+            or float(latest) < _BRIDGE_PCM_PREWAKE_PROBABILITY
+        ):
+            return
+        try:
+            started = _REALTIME_SUPPORT.prewarm_bridge_pcm(_REALTIME_CONFIG)
+        except Exception:  # noqa: BLE001 - speculation must never affect wake audio
+            return
+        if started:
+            with suppress(Exception):
+                syslog.syslog(
+                    syslog.LOG_INFO,
+                    "codex-voice realtime_prewarm source=wake_probability",
+                )
+        return
+
+
 def _preroll_with_startup_headroom(preroll_audio: list[bytes]) -> list[bytes]:
     """Keep newest PCM without consuming the live cold-start allowance."""
     fallback_capacity = _REALTIME_CONFIG.fallback_buffer_bytes
@@ -631,6 +679,18 @@ def _construct_realtime_session(
     deadline: float | None,
 ) -> tuple[Any | None, int]:
     """Construct one session under a bounded direct-start retry budget."""
+    if _uses_bridge_pcm():
+        try:
+            prewarmed = _REALTIME_SUPPORT.take_prewarmed_bridge_pcm(_REALTIME_CONFIG)
+        except Exception:  # noqa: BLE001 - cold construction remains available
+            prewarmed = None
+        if prewarmed is not None:
+            with suppress(Exception):
+                syslog.syslog(
+                    syslog.LOG_INFO,
+                    "codex-voice realtime_prewarm source=claimed",
+                )
+            return prewarmed, 1
     for attempt in range(1, maximum_attempts + 1):
         if deadline is not None and time.monotonic() >= deadline:
             break
@@ -658,7 +718,13 @@ def _activate_realtime_owner(
     """Start transport ownership and apply the one-time vendor duck."""
     try:
         _initialize_direct_session_volume(instance, owner)
-        owner.session.start()
+        session_state = getattr(getattr(owner.session, "state", None), "name", None)
+        if session_state in {None, "NEW"}:
+            owner.session.start()
+        elif session_state not in {"CONNECTING", "READY"}:
+            raise RuntimeError(  # noqa: TRY301 - handled by startup retry below
+                "prewarmed realtime session is not live"
+            )
         if (
             owner.startup_deadline is not None
             and time.monotonic() >= owner.startup_deadline
@@ -1018,8 +1084,13 @@ def _begin_direct_ready_confirmation(instance: Any, owner: _RealtimeOwner) -> No
         _complete_direct_ready_confirmation(instance, owner)
 
     try:
+        ready_cue = (
+            _DIRECT_READY_CUE_PATH
+            if Path(_DIRECT_READY_CUE_PATH).is_file()
+            else instance.state.wakeup_sound
+        )
         instance.state.tts_player.play(
-            instance.state.wakeup_sound,
+            ready_cue,
             done_callback=_on_ready_cue_finished,
         )
     except Exception:  # noqa: BLE001 - capture must not open without the cue
@@ -1067,6 +1138,9 @@ def _detach_realtime_owner(
             except Exception:  # noqa: BLE001 - owner is already safely released
                 _LOGGER.warning("Failed to stop ThirdReality realtime ready cue")
         _nonblocking_led_fire("idle", to_idle=True)
+        if owner.ready_seen and _uses_bridge_pcm():
+            with suppress(Exception):
+                _REALTIME_SUPPORT.schedule_bridge_pcm_prewarm(_REALTIME_CONFIG)
 
 
 def _reconcile_realtime_owner(instance: Any) -> _RealtimeOwner | None:
@@ -1250,6 +1324,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
                 and instance.state.connected
                 and not instance.state.muted
             ):
+                _maybe_prewarm_probable_realtime_wake(instance)
                 _remember_realtime_preroll(instance, audio_chunk)
             else:
                 _discard_realtime_preroll(instance)
@@ -2278,11 +2353,14 @@ if _observed_hashes == _expected_hashes:
                     )
                 _LOGGER.warning("ThirdReality realtime cleanup is unavailable")
             try:
-                prewarm_ok = (
-                    _REALTIME_SUPPORT.prewarm_device_webrtc()
-                    if _uses_device_webrtc()
-                    else True
-                )
+                if _uses_device_webrtc():
+                    prewarm_ok = _REALTIME_SUPPORT.prewarm_device_webrtc()
+                elif _uses_bridge_pcm():
+                    prewarm_ok = _REALTIME_SUPPORT.schedule_bridge_pcm_prewarm(
+                        _REALTIME_CONFIG
+                    )
+                else:
+                    prewarm_ok = True
             except Exception as exc:  # noqa: BLE001 - optional support boundary
                 if _NATIVE_AEC3_SELECTED:
                     _fatal_aec3_startup(
@@ -2291,10 +2369,12 @@ if _observed_hashes == _expected_hashes:
                     )
                 prewarm_ok = False
             if not prewarm_ok:
-                _LOGGER.warning("ThirdReality direct WebRTC prewarm is unavailable")
+                _LOGGER.warning("ThirdReality realtime prewarm is unavailable")
                 if _NATIVE_AEC3_SELECTED:
                     _fatal_aec3_startup(
                         "ThirdReality native AEC3 requires direct WebRTC prewarm"
+                        if _uses_device_webrtc()
+                        else "ThirdReality native AEC3 requires realtime prewarm"
                     )
         else:
             _LOGGER.warning(

@@ -30,8 +30,11 @@ _SESSION_EXPORTS = frozenset(
         "RealtimeSession",
         "SessionState",
         "SubmitResult",
+        "prewarm_bridge_pcm",
         "prewarm_device_webrtc",
+        "schedule_bridge_pcm_prewarm",
         "shutdown_all_sessions",
+        "take_prewarmed_bridge_pcm",
     }
 )
 
@@ -67,6 +70,9 @@ __all__ = [
     "SubmitResult",
     "load_config",
     "normalize_wake_phrase",
+    "prewarm_bridge_pcm",
     "prewarm_device_webrtc",
+    "schedule_bridge_pcm_prewarm",
     "shutdown_all_sessions",
+    "take_prewarmed_bridge_pcm",
 ]
