@@ -77,8 +77,9 @@ The first WebSocket frame is UTF-8 JSON:
 8,000 through 192,000 Hz; the ThirdReality client uses 16,000 Hz.
 `input_channels` must be `1`. Samples are signed little-endian PCM16.
 `conversation_mode`, when present, must be exactly `native`; `managed`, `null`,
-and other values are rejected. A native request ignores Home Assistant broker
-availability and selects an initial App Server realtime voice thread. Omitting
+and other values are rejected. A native request captures the currently
+registered Home Assistant authority snapshot and selects an initial App Server
+realtime voice thread. Omitting
 the field preserves legacy automatic route selection. V2 rejects unknown start
 fields, device `tools`, model or realtime-version overrides,
 startup-context/handoff overrides, and `initial_items`. The bridge selects
@@ -388,17 +389,17 @@ The following client-to-bridge controls remain JSON:
 The v2 device remains audio/control only. A v2 start containing `tools` or an
 incoming device `tool_result` is rejected. Provider tool calls and Home
 Assistant results are never forwarded to the speaker. An explicit native
-session exposes exactly one bridge-owned empty-input tool,
-`end_conversation`, even if a Home Assistant realtime authority is currently
-registered. Spanish and English terminal instructions require the model to
+session exposes bridge-owned `end_conversation`, the captured Home Assistant
+tools, and optional bridge-owned agent tools. Spanish and English terminal
+instructions require the model to
 call it immediately without a spoken promise. An exact normalized terminal
 transcript such as `Terminar`, `Terminar llamada`, `goodbye`, or `hang up` is a
 narrow fallback. The bridge then sends
 `{"type":"stopped","reason":"end_conversation"}` and closes the owned
-session. Every other provider tool request is rejected internally. Legacy
-auto-selected realtime home control is disabled unless
-exactly one Home Assistant Conversation subentry is explicitly opted in as
-authority. That subentry opens the separate
+session. Every undeclared provider tool request is rejected internally. The
+first Home Assistant Conversation subentry is the default authority; additional
+subentries remain non-authoritative unless selected explicitly. That subentry
+opens the separate
 `/v1/home-assistant/tools` WebSocket with the primary bridge token, registers a
 bounded snapshot of its selected Home Assistant LLM API tools and rendered
 instructions, and executes correlated calls locally. Its locale defaults to

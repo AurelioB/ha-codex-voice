@@ -29,6 +29,7 @@ from typing import Any, cast
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
+from .agent_tools import AgentToolBroker, AgentToolUnavailable
 from .app_server import CodexAppServer
 from .audio import (
     REALTIME_SAMPLE_RATE,
@@ -157,8 +158,8 @@ DIRECT_REALTIME_BASE_INSTRUCTIONS = (
     "detail. Treat incoming speech as potentially noisy. If a request is incomplete, "
     "internally inconsistent, or you are not confident what the user wants, do not "
     "guess or silently supply missing words; ask one short clarification in the "
-    "user's language. Never inspect local files. Your only tool is end_conversation. Invoke "
-    "it only when the user explicitly asks to end, stop, close, or leave this "
+    "user's language. Never inspect local files or use undeclared tools. Invoke "
+    "end_conversation only when the user explicitly asks to end, stop, close, or leave this "
     "conversation, or clearly says goodbye. Spanish requests such as 'terminar', "
     "'terminar llamada', 'terminar la llamada', 'finalizar', 'colgar', and 'adios' "
     "mean to invoke end_conversation with {} immediately. Never say that you will "
@@ -949,6 +950,13 @@ class BridgeState:
             self.rpc = rpc
         self.peer_factory = peer_factory
         self.home_assistant_tools = HomeAssistantToolBroker()
+        self.agent_tools = AgentToolBroker(
+            config.agent_url,
+            token=config.agent_token,
+            room=config.agent_room,
+            recall_timeout=config.agent_recall_timeout,
+            task_timeout=config.agent_task_timeout,
+        )
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
         self._speech_state_lock = asyncio.Lock()
@@ -1390,14 +1398,17 @@ class BridgeState:
             self._conversations.clear()
         finally:
             try:
-                await self.rpc.close()
+                await self.agent_tools.close()
             finally:
-                if self._temporary_cwd is not None:
-                    self._temporary_cwd.cleanup()
-                    self._temporary_cwd = None
-                if self._isolated_runtime is not None:
-                    self._isolated_runtime.cleanup()
-                    self._isolated_runtime = None
+                try:
+                    await self.rpc.close()
+                finally:
+                    if self._temporary_cwd is not None:
+                        self._temporary_cwd.cleanup()
+                        self._temporary_cwd = None
+                    if self._isolated_runtime is not None:
+                        self._isolated_runtime.cleanup()
+                        self._isolated_runtime = None
 
     async def _prune_conversations(self) -> None:
         now = time.monotonic()
@@ -2056,6 +2067,7 @@ async def _health(request: web.Request) -> web.Response:
             "status": "ok" if ready else "unavailable",
             "app_server": health,
             "home_assistant_tools": state.home_assistant_tools.health(),
+            "agent_tools": state.agent_tools.health(),
         },
         status=200 if ready else 503,
     )
@@ -4242,6 +4254,51 @@ async def _realtime(request: web.Request) -> web.WebSocketResponse:
     return await _realtime_admitted(request, state)
 
 
+def _native_realtime_tools(
+    broker_snapshot: ToolBrokerSnapshot | None,
+    agent_tools: AgentToolBroker,
+) -> list[dict[str, Any]]:
+    """Merge bridge, agent, and Home Assistant tools with explicit ownership."""
+    tools: list[dict[str, Any]] = [DIRECT_END_CONVERSATION_TOOL]
+    tools.extend(agent_tools.tools)
+    reserved_names = {
+        DIRECT_END_CONVERSATION_TOOL_NAME,
+        *(tool["name"] for tool in agent_tools.tools),
+    }
+    if broker_snapshot is not None:
+        tools.extend(
+            tool
+            for tool in broker_snapshot.tools
+            if tool.get("name") not in reserved_names
+        )
+    return normalize_dynamic_tools(tools)
+
+
+def _native_realtime_base_instructions(
+    broker_snapshot: ToolBrokerSnapshot | None,
+    agent_tools: AgentToolBroker,
+) -> str:
+    """Build trusted native instructions for one immutable tool snapshot."""
+    instructions = DIRECT_REALTIME_BASE_INSTRUCTIONS
+    if broker_snapshot is not None:
+        instructions += (
+            "\n\nHome Assistant is the authoritative smart-home integration. Use "
+            "its declared tools for entity state and control. Never claim an action "
+            "succeeded until its tool result confirms success, and never retry an "
+            "unknown outcome.\n"
+            f"Language: {broker_snapshot.language}\n"
+            f"{broker_snapshot.instructions}"
+        )
+    if agent_tools.enabled:
+        instructions += (
+            "\n\nAn optional external agent is available through ask_agent and "
+            "recall_memory. Use it for memory, research, cross-application, or deeper "
+            "tasks only. Never use it for Home Assistant entity state or control; use "
+            "the declared Home Assistant tools directly for those requests."
+        )
+    return instructions
+
+
 async def _realtime_admitted(
     request: web.Request, state: BridgeState
 ) -> web.WebSocketResponse:
@@ -4266,14 +4323,11 @@ async def _realtime_admitted(
             )
         broker_snapshot = (
             state.home_assistant_tools.snapshot
-            if (
-                wire_protocol.uses_binary_audio
-                and not wire_protocol.requests_native_conversation
-            )
+            if wire_protocol.uses_binary_audio
             else None
         )
         configured_tools = normalize_dynamic_tools(
-            [DIRECT_END_CONVERSATION_TOOL]
+            _native_realtime_tools(broker_snapshot, state.agent_tools)
             if (
                 wire_protocol.uses_binary_audio
                 and wire_protocol.requests_native_conversation
@@ -5009,6 +5063,7 @@ async def _serve_realtime_session(
             first,
             wire_protocol,
             configured_tools=configured_tools,
+            broker_snapshot=broker_snapshot,
         )
         return
     session: RealtimeSession | None = None
@@ -5252,6 +5307,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
     wire_protocol: RealtimeWireProtocol,
     *,
     configured_tools: list[dict[str, Any]],
+    broker_snapshot: ToolBrokerSnapshot | None,
 ) -> None:
     """Keep native v2 capture live while replacing non-interruptible peers."""
     version = state.config.realtime_version
@@ -5301,7 +5357,10 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                 candidate_thread_id = await state.start_thread(
                     thread_payload,
                     tools=configured_tools,
-                    base_instructions=DIRECT_REALTIME_BASE_INSTRUCTIONS,
+                    base_instructions=_native_realtime_base_instructions(
+                        broker_snapshot,
+                        state.agent_tools,
+                    ),
                 )
                 created_thread = True
                 owned.add(candidate_thread_id)
@@ -5492,7 +5551,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                 websocket,
                 active.session,
                 wire_protocol,
-                broker_snapshot=None,
+                broker_snapshot=broker_snapshot,
                 native_input=continuity,
             )
             if barge is None:
@@ -6466,7 +6525,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         claimed_tool_responses.add(request_id)
         tool_requests = {call_id: request_id}
         LOGGER.info(
-            "Delivering realtime Home Assistant tool result correlation=%s",
+            "Delivering realtime owned tool result correlation=%s",
             correlation,
         )
         require_continuation = not bridge_managed_realtime or (
@@ -6490,37 +6549,56 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             timeout=REALTIME_CONTROL_TIMEOUT_SECONDS,
         )
         LOGGER.info(
-            "Delivered realtime Home Assistant tool result correlation=%s",
+            "Delivered realtime owned tool result correlation=%s",
             correlation,
         )
         delivered_tool_responses.add(request_id)
         if require_continuation:
             arm_pending_tool_continuation_watchdog()
 
-    async def execute_home_assistant_tool_call(
+    async def execute_owned_tool_call(
         request_id: int | str,
         call_id: str,
         name: object,
         arguments: object,
         background_turn_generation: int | None,
     ) -> None:
-        """Execute one provider call through the captured HA authority only."""
+        """Execute one declared Home Assistant or optional-agent tool call."""
         nonlocal tool_authority_failed_closed
         correlation = tool_correlation(request_id, call_id)
         started_at = time.monotonic()
+        agent_owned = state.agent_tools.owns(name)
+        owner = "agent" if agent_owned else "home_assistant"
         LOGGER.info(
-            "Realtime Home Assistant tool call started correlation=%s",
+            "Realtime owned tool call started owner=%s correlation=%s",
+            owner,
             correlation,
         )
         success = False
         result: object = {
-            "error": "home_assistant_tool_unavailable",
+            "error": f"{owner}_tool_unavailable",
             "do_not_retry": True,
         }
-        if (
+        if agent_owned and isinstance(name, str) and isinstance(arguments, Mapping):
+            try:
+                broker_result = await state.agent_tools.call(
+                    name=name,
+                    arguments=arguments,
+                )
+            except (AgentToolUnavailable, ProtocolError):
+                LOGGER.warning(
+                    "Realtime agent tool call failed correlation=%s",
+                    correlation,
+                    exc_info=True,
+                )
+            else:
+                success = broker_result.success
+                result = broker_result.result
+        elif (
             broker_snapshot is not None
             and isinstance(name, str)
             and isinstance(arguments, Mapping)
+            and name in broker_snapshot.tool_names
         ):
             try:
                 broker_result = await state.home_assistant_tools.call(
@@ -6557,10 +6635,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 ):
                     tool_authority_failed_closed = True
         else:
-            tool_authority_failed_closed = True
+            result = {"error": "unowned_realtime_tool", "do_not_retry": True}
         LOGGER.info(
-            "Realtime Home Assistant tool call returned correlation=%s success=%s "
+            "Realtime owned tool call returned owner=%s correlation=%s success=%s "
             "duration_ms=%d",
+            owner,
             correlation,
             success,
             round((time.monotonic() - started_at) * 1_000),
@@ -6573,7 +6652,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             background_turn_generation=background_turn_generation,
         )
 
-    def start_home_assistant_tool_call(event: Mapping[str, Any]) -> None:
+    def start_owned_tool_call(event: Mapping[str, Any]) -> None:
         """Run one bounded, deduplicated call without blocking lifecycle events."""
         request_id = event.get("id")
         params = event.get("params")
@@ -6590,6 +6669,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         cancel_tool_continuation_watchdog()
         name = params.get("tool")
         arguments = params.get("arguments", {})
+        agent_owned = state.agent_tools.owns(name)
         owned_background_generation = (
             active_background_turn_generation if bridge_managed_realtime else None
         )
@@ -6598,7 +6678,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         session_limit_exceeded = (
             len(seen_tool_request_ids) > REALTIME_MAX_TOOL_CALLS_PER_SESSION
         )
-        if tool_authority_failed_closed:
+        if tool_authority_failed_closed and not agent_owned:
             rejection = {
                 "error": "home_assistant_tool_session_unavailable",
                 "do_not_retry": True,
@@ -6632,7 +6712,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         background_turn_generation=owned_background_generation,
                     )
                 else:
-                    await execute_home_assistant_tool_call(
+                    await execute_owned_tool_call(
                         request_id,
                         call_id,
                         name,
@@ -6645,7 +6725,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 if tool_call_failures.empty():
                     tool_call_failures.put_nowait(exc)
 
-        task = asyncio.create_task(run(), name="codex-realtime-home-assistant-tool")
+        task = asyncio.create_task(run(), name="codex-realtime-owned-tool")
         active_tool_calls[request_id] = (call_id, task)
         tool_call_tasks.add(task)
 
@@ -7190,7 +7270,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 await reject_unowned_tool_call(event)
                 return
             active_background_turn_had_tool = True
-            start_home_assistant_tool_call(event)
+            start_owned_tool_call(event)
             return
         if method == "item/agentMessage/delta":
             remember_background_agent_message(params, authoritative=False)
@@ -7479,6 +7559,22 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         )
         delivered_tool_responses.add(request_id)
 
+    async def handle_native_tool_call(
+        event: Mapping[str, Any], params: Mapping[str, Any]
+    ) -> bool:
+        """Dispatch one native tool and return true for terminal intent."""
+        tool_name = params.get("tool")
+        if tool_name == DIRECT_END_CONVERSATION_TOOL_NAME:
+            action = await _handle_direct_provider_tool_call(session, event)
+            return action == "end"
+        if state.agent_tools.owns(tool_name) or (
+            broker_snapshot is not None and tool_name in broker_snapshot.tool_names
+        ):
+            start_owned_tool_call(event)
+            return False
+        await _handle_direct_provider_tool_call(session, event)
+        return False
+
     async def events() -> None:
         while not stop.is_set():
             event = await session.next_event()
@@ -7489,8 +7585,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             if method == "item/tool/call" and "id" in event:
                 if wire_protocol.uses_binary_audio:
                     if wire_protocol.requests_native_conversation:
-                        action = await _handle_direct_provider_tool_call(session, event)
-                        if action == "end":
+                        if await handle_native_tool_call(event, params):
                             LOGGER.info("Direct realtime terminal intent: source=tool")
                             await end_output(after_tail=False)
                             await send(
@@ -7501,7 +7596,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     elif bridge_managed_realtime:
                         await reject_unowned_tool_call(event)
                     else:
-                        start_home_assistant_tool_call(event)
+                        start_owned_tool_call(event)
                     continue
                 call_id = str(params.get("callId", event["id"]))
                 tool_requests[call_id] = event["id"]

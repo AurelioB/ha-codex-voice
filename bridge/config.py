@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 DEFAULT_PERMISSION_PROFILE = "ha-voice-minimal"
 DEFAULT_REALTIME_MODEL = "gpt-live-1-codex"
@@ -96,6 +97,11 @@ class BridgeConfig:
     silence_ms: int = 0
     live_fragment_quiet_seconds: float = 2.0
     realtime_log_transcripts: bool = False
+    agent_url: str | None = None
+    agent_token: str | None = field(default=None, repr=False)
+    agent_room: str = "home"
+    agent_recall_timeout: float = 8.0
+    agent_task_timeout: float = 35.0
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -117,6 +123,22 @@ class BridgeConfig:
             raise ValueError("permission_profile must not be empty")
         if not 0.5 <= self.live_fragment_quiet_seconds <= 2.0:
             raise ValueError("live_fragment_quiet_seconds must be between 0.5 and 2.0")
+        if self.agent_url is not None:
+            parsed_agent_url = urlsplit(self.agent_url)
+            if (
+                parsed_agent_url.scheme not in {"http", "https"}
+                or not parsed_agent_url.netloc
+                or parsed_agent_url.username is not None
+                or parsed_agent_url.password is not None
+                or len(self.agent_url) > 2_048
+            ):
+                raise ValueError("agent_url must be a bounded HTTP(S) URL")
+        if not self.agent_room or len(self.agent_room) > 128:
+            raise ValueError("agent_room must be a non-empty bounded value")
+        if not 0.5 <= self.agent_recall_timeout <= 40.0:
+            raise ValueError("agent_recall_timeout must be between 0.5 and 40 seconds")
+        if not 0.5 <= self.agent_task_timeout <= 40.0:
+            raise ValueError("agent_task_timeout must be between 0.5 and 40 seconds")
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -171,5 +193,14 @@ class BridgeConfig:
             ),
             realtime_log_transcripts=_parse_boolean_environment(
                 "HA_CODEX_REALTIME_LOG_TRANSCRIPTS"
+            ),
+            agent_url=os.environ.get("HA_CODEX_AGENT_URL") or None,
+            agent_token=os.environ.get("HA_CODEX_AGENT_TOKEN") or None,
+            agent_room=os.environ.get("HA_CODEX_AGENT_ROOM", "home"),
+            agent_recall_timeout=float(
+                os.environ.get("HA_CODEX_AGENT_RECALL_TIMEOUT", "8")
+            ),
+            agent_task_timeout=float(
+                os.environ.get("HA_CODEX_AGENT_TASK_TIMEOUT", "35")
             ),
         )

@@ -1025,6 +1025,33 @@ def test_desktop_realtime_model_is_default_and_env_overridable(
     assert BridgeConfig.from_env().realtime_model == "gpt-live-canary"
 
 
+def test_optional_agent_configuration_is_disabled_by_default_and_loaded_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_AGENT_URL", raising=False)
+
+    assert BridgeConfig.from_env().agent_url is None
+
+    monkeypatch.setenv("HA_CODEX_AGENT_URL", "http://agent.local:8090/task")
+    monkeypatch.setenv("HA_CODEX_AGENT_TOKEN", "agent-token")
+    monkeypatch.setenv("HA_CODEX_AGENT_ROOM", "cocina")
+    config = BridgeConfig.from_env()
+
+    assert config.agent_url == "http://agent.local:8090/task"
+    assert config.agent_token == "agent-token"
+    assert config.agent_room == "cocina"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["file:///tmp/agent", "http://user:secret@agent.local/task", "agent.local"],
+)
+def test_optional_agent_url_rejects_unsafe_shapes(url: str) -> None:
+    with pytest.raises(ValueError, match="agent_url"):
+        BridgeConfig(bearer_token="test-token", agent_url=url)
+
+
 def test_config_can_replace_only_the_codex_executable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1776,6 +1803,13 @@ async def test_health_requires_bearer_and_reports_ready(
             "calls_timed_out": 0,
             "calls_transport_failed": 0,
             "calls_cancelled": 0,
+            "last_call_duration_ms": None,
+        },
+        "agent_tools": {
+            "enabled": False,
+            "calls_started": 0,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
             "last_call_duration_ms": None,
         },
     }
@@ -6533,6 +6567,49 @@ def test_realtime_v2_bounds_composed_device_preferences() -> None:
     assert len(prompt) == bridge_service.REALTIME_FRONTEND_PROMPT_MAX_CHARS
 
 
+def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
+    snapshot = bridge_service.ToolBrokerSnapshot(
+        generation="generation",
+        authority_id="authority",
+        language="es-MX",
+        instructions="",
+        tools=(
+            {
+                "type": "function",
+                "name": "ask_agent",
+                "description": "HA compatibility adapter",
+                "inputSchema": {"type": "object"},
+            },
+            {
+                "type": "function",
+                "name": "HassTurnOn",
+                "description": "Home Assistant",
+                "inputSchema": {"type": "object"},
+            },
+        ),
+        tool_names=frozenset({"ask_agent", "HassTurnOn"}),
+    )
+    agent = bridge_service.AgentToolBroker(
+        "http://agent.local/task",
+        token=None,
+        room="home",
+        recall_timeout=1,
+        task_timeout=1,
+    )
+
+    tools = bridge_service._native_realtime_tools(snapshot, agent)
+
+    assert [tool["name"] for tool in tools] == [
+        "end_conversation",
+        "ask_agent",
+        "recall_memory",
+        "HassTurnOn",
+    ]
+    assert next(tool for tool in tools if tool["name"] == "ask_agent")[
+        "description"
+    ].startswith("Ask the optional external agent")
+
+
 @pytest.mark.asyncio
 async def test_realtime_v2_preserves_native_frontend_without_tool_authority(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
@@ -6556,7 +6633,7 @@ async def test_realtime_v2_preserves_native_frontend_without_tool_authority(
 
 
 @pytest.mark.asyncio
-async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
+async def test_realtime_v2_explicit_native_uses_connected_tool_authority(
     aiohttp_client: Any,
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
@@ -6580,11 +6657,21 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
         ]
         assert len(thread_starts) == 1
         assert thread_starts[0]["dynamicTools"] == [
-            bridge_service.DIRECT_END_CONVERSATION_TOOL
+            bridge_service.DIRECT_END_CONVERSATION_TOOL,
+            {
+                "type": "function",
+                "name": "HassTurnOn",
+                "description": "Enciende una entidad expuesta",
+                "inputSchema": {"type": "object"},
+            },
         ]
-        assert "Home Assistant" not in thread_starts[0]["baseInstructions"]
         assert (
-            "Your only tool is end_conversation" in thread_starts[0]["baseInstructions"]
+            "Home Assistant is the authoritative"
+            in thread_starts[0]["baseInstructions"]
+        )
+        assert (
+            "Controla solo las entidades expuestas."
+            in thread_starts[0]["baseInstructions"]
         )
         assert (
             "do not guess or silently supply missing words"
@@ -6605,6 +6692,38 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
             "Realtime conversation route selected: route=native selection=explicit"
             in caplog.text
         )
+
+        await fake_rpc.broadcast(
+            {
+                "id": "native-ha-request",
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": started["thread_id"],
+                    "callId": "native-ha-call",
+                    "tool": "HassTurnOn",
+                    "arguments": {"name": "Cocina"},
+                },
+            }
+        )
+        tool_call = await authority.receive_json(timeout=1)
+        assert tool_call["type"] == "tool_call"
+        assert tool_call["name"] == "HassTurnOn"
+        assert tool_call["arguments"] == {"name": "Cocina"}
+        await authority.send_json(
+            {
+                "type": "tool_result",
+                "generation": tool_call["generation"],
+                "call_id": tool_call["call_id"],
+                "success": True,
+                "result": {"speech": "Encendí la cocina"},
+            }
+        )
+        async with asyncio.timeout(1):
+            while not any(
+                request_id == "native-ha-request"
+                for request_id, _ in fake_rpc.responses
+            ):
+                await asyncio.sleep(0)
 
         streamed_audio = b"\x00\x02" * 48
         peer = fake_rpc.peers[-1]
@@ -6648,6 +6767,78 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
             await device.send_json({"type": "stop"})
             await device.close()
         await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_explicit_native_executes_optional_agent_tool(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    received: list[dict[str, Any]] = []
+
+    async def agent_handler(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        return web.json_response({"answer": "Resultado del agente"})
+
+    agent_app = web.Application()
+    agent_app.router.add_post("/task", agent_handler)
+    agent_server = await aiohttp_server(agent_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            agent_url=str(agent_server.make_url("/task")),
+            agent_room="cocina",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "ask_agent",
+        "recall_memory",
+    ]
+    assert "optional external agent" in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "native-agent-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "native-agent-call",
+                "tool": "ask_agent",
+                "arguments": {"question": "Investiga el clima"},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "native-agent-request" for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    assert received == [{"question": "Investiga el clima", "room": "cocina"}]
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "native-agent-request"
+    )
+    assert response["success"] is True
+    assert json.loads(response["contentItems"][0]["text"]) == {
+        "answer": "Resultado del agente"
+    }
+
+    await device.send_json({"type": "stop"})
+    await device.close()
 
 
 @pytest.mark.asyncio

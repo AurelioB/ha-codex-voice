@@ -51,9 +51,10 @@ native realtime and sets `realtime_only: true`:
              -> Docker/host bridge + App Server/OAuth
              -> one active bridge-owned WebRTC provider generation
 
-Home Assistant Assist/Hermes and entity tools are deferred for this trial. No
-Home Assistant broker snapshot, transcript executor, or appendSpeech render
-handoff participates in the direct session.
+Home Assistant's exposed-entity tool snapshot is captured before provider
+startup. Its Assist conversation/STT/TTS flow, transcript executor, and
+appendSpeech render handoff do not participate in the direct session. An
+external memory/deep-task agent is optional.
 ```
 
 The device is the aarch64 Buildroot Linux speaker, not Android, and remains an
@@ -68,10 +69,10 @@ outgoing bridge PCM uses 0 dB transport gain.
 The always-running server owns the authenticated v2 socket, the managed Codex
 login, the App Server realtime provider generation, its paced WebRTC peer,
 response lifecycle, interruption replacement, and cleanup. The active provider
-generation exposes exactly one dynamic empty-input tool, `end_conversation`;
-a narrow normalized Spanish/English terminal-phrase fallback handles explicit
-end requests that are acknowledged without a tool call. No Home Assistant
-entity tool or broker authority is available.
+generation exposes Home Assistant's captured entity tools, bridge-owned
+`end_conversation`, and optional agent tools. A narrow normalized
+Spanish/English terminal-phrase fallback handles explicit end requests that are
+acknowledged without a tool call.
 
 The direct wake boundary is deterministic. An accepted Okay Nabu detection
 immediately claims the vendor owner and queues the non-blocking
@@ -388,8 +389,8 @@ software-volume stage that implements the physical 0/1–100% range.
 Local AEC-qualified speech cuts output immediately while its samples continue
 on the same device socket. The bridge replaces the non-interruptible provider
 generation and replays the retained utterance once at normal media pace. The
-server exposes only `end_conversation`, and realtime-only failure returns idle
-without an Assist/Hermes fallback.
+server exposes the captured Home Assistant tools plus `end_conversation`, and
+realtime-only failure returns idle without an Assist/Hermes fallback.
 
 ### Dormant device-owned v3 experiment (historical)
 
@@ -594,8 +595,8 @@ full physical v3 acceptance matrix remains installation-specific.
 
 The active `media_transport: "bridge_pcm"` route uses v2 binary input,
 bridge-owned WebRTC media, bridge-side speaking epochs, and a 2,250 ms live
-input cap. Native/realtime-only startup discards pre-ready PCM and exposes only
-`end_conversation`; it does not enter Assist or the managed compatibility
+input cap. Native/realtime-only startup discards pre-ready PCM and exposes Home
+Assistant tools plus `end_conversation`; it does not enter Assist or the managed compatibility
 route. Older v2 clients may omit `conversation_mode` and retain the legacy
 two-thread policy. Those compatibility semantics never apply to explicit
 native mode or a v3 socket.

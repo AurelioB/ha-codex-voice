@@ -103,10 +103,9 @@ def _default_subentries() -> list[ConfigSubentryData]:
                 CONF_SERVICE_TIER: DEFAULT_CONVERSATION_SERVICE_TIER,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
-                # Realtime control is a distinct, privileged execution path.
-                # Keep it disabled until the user explicitly enables one
-                # Conversation subentry in its options flow.
-                CONF_REALTIME_AUTHORITY: False,
+                # Home Assistant is the default smart-home authority for the
+                # independent realtime route. Additional agents remain opt-in.
+                CONF_REALTIME_AUTHORITY: True,
                 CONF_REALTIME_LANGUAGE: DEFAULT_REALTIME_LANGUAGE,
             },
         },
@@ -147,7 +146,7 @@ class CodexVoiceConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Codex Voice config flow."""
 
     VERSION = 1
-    MINOR_VERSION = 2
+    MINOR_VERSION = 3
 
     @override
     async def async_step_user(

@@ -6,8 +6,9 @@ media server for the ThirdReality speaker: strict-v2 PCM arrives over the LAN,
 and the bridge keeps one provider generation active behind the stable device
 WebSocket. A qualified interruption replaces that generation without making
 the speaker reconnect.
-Home Assistant integration routes remain available but are deferred from the
-active Okay Nabu path. The child uses the machine's existing file-backed
+Home Assistant exposed-entity tools are the default smart-home authority on the
+active Okay Nabu path; an external memory/deep-task agent is optional. The child
+uses the machine's existing file-backed
 Codex/ChatGPT login through a private temporary Codex home; no OAuth token is
 copied into Home Assistant or onto the speaker.
 
@@ -118,8 +119,9 @@ requires the primary Home Assistant bridge token.
   not expose transcripts, provider payloads, tool calls, or tool results to the
   device.
   The active strict-v2 route requires `conversation_mode: "native"`; an
-  accepted value is echoed in `started`. Native v2 declares only the
-  empty-input `end_conversation` tool and ignores Home Assistant broker state.
+  accepted value is echoed in `started`. Native v2 declares bridge-owned
+  `end_conversation`, the immutable Home Assistant authority snapshot captured
+  at startup, and optional external-agent tools.
   A v2 `text` control is a bounded user message; its role must be omitted or
   exactly `user`. See the [active v2
   contract](../protocol/realtime-wire-v2.md) and dormant [v3 direct-media
@@ -160,12 +162,13 @@ late output from the retired generation cannot cross the fence.
 
 The bridge sends `started` only after the App Server thread, SDP exchange,
 WebRTC transport, and provider session are ready. That is the device's
-cue-gated capture boundary. Native v2 has no completed-transcript gate,
-executor, `appendSpeech` render handoff, or Home Assistant authority. It
-declares exactly one empty-input tool, `end_conversation`; a valid call or the
-narrow bilingual terminal-phrase fallback emits terminal `stopped` and closes
-the owned session. Device-declared tools and every other provider tool call
-fail closed.
+cue-gated capture boundary. Native v2 has no completed-transcript executor or
+`appendSpeech` render handoff. It exposes bridge-owned `end_conversation`, Home
+Assistant tools from the generation snapshot captured before `thread/start`,
+and—only when configured—`ask_agent` and `recall_memory`. Calls execute
+asynchronously so PCM forwarding continues. The narrow bilingual
+terminal-phrase fallback still emits terminal `stopped`; undeclared and
+device-declared tools fail closed.
 
 The Compose service keeps the bridge, App Server, OAuth state, media stack, and
 listener warm. It still creates the provider thread and peer at wake; a

@@ -80,9 +80,9 @@ historical.
   generation behind the stable device WebSocket. No firmware flash or
   separately supervised device daemon is required.
 - The route-scoped device token cannot open the Home Assistant broker. Active
-  native v2 ignores every broker snapshot, rejects device-declared tools, and
-  exposes only the server-owned empty-input `end_conversation` tool. Home
-  Assistant compatibility code remains dormant.
+  native v2 captures the broker's immutable exposed-entity snapshot before
+  startup, rejects device-declared tools, and adds bridge-owned
+  `end_conversation`. Optional agent tools are advertised only when configured.
 - The active reference configuration uses `native_aec3` with a 10 dB native
   baseline, noise-limited adaptive digital gain, a limiter, and moderate noise
   suppression, plus 0 dB transport gain, a fixed 100% AEC/playback anchor, a 100%-relative
@@ -283,9 +283,10 @@ Codex OAuth credential. Deployment and rollback must preserve TCP ADB port
 not restart or kill PulseAudio during those iterations.
 
 The realtime client always requests `conversation_mode: "native"` and requires
-the bridge to echo it in `started`. The bridge ignores any Home Assistant tool
-snapshot and exposes only `end_conversation`. Optional `voice` and `prompt`
-settings select `cove` and Mexican Spanish in the reference deployment.
+the bridge to echo it in `started`. The bridge exposes the current Home
+Assistant tool snapshot plus `end_conversation`; optional `ask_agent` and
+`recall_memory` tools are absent unless configured. Optional `voice` and
+`prompt` settings select `cove` and Mexican Spanish in the reference deployment.
 
 ## Home Assistant controls
 
@@ -295,14 +296,14 @@ are returned to the integration, executed inside Home Assistant, and sent back
 to the same Codex turn. The bridge does not need a Home Assistant long-lived
 access token.
 
-The current Okay Nabu realtime-only route does not use this authority. It
-requests one native server-owned WebRTC voice thread and exposes only
-`end_conversation`. Home Assistant control is deferred until the conversation
-experience passes its physical acceptance matrix.
+The current Okay Nabu realtime-only route captures this authority before its
+native server-owned WebRTC thread starts. Home Assistant remains the sole
+smart-home owner; `end_conversation` is bridge-owned and optional agent tools
+handle only memory or deeper non-entity work.
 
-For compatibility with older strict-v2 clients that omit `conversation_mode`,
-direct realtime can use the same authority only after a second, explicit
-opt-in on exactly one Conversation subentry. Home Assistant captures that subentry's
+Exactly one Conversation subentry owns the realtime authority; the default
+entry is selected automatically and additional entries remain opt-in. Home
+Assistant captures that subentry's
 rendered instructions, `es-MX`-by-default realtime locale, and selected LLM API
 tool schemas, then registers a bounded generation over
 `/v1/home-assistant/tools` with the primary bridge token. Each legacy-auto
@@ -407,10 +408,10 @@ controls regress. There is no transcript executor or synthesized turn handoff.
 
 Strict-v2 `started` is the session-readiness boundary. The speaker plays its
 pinned cue only after that message and opens capture only at cue EOF. The
-server declares only the empty-input `end_conversation` tool, plus a narrow
-normalized Spanish/English terminal-phrase fallback. A successful end emits a
-terminal `stopped` event and normal cleanup restores idle. Device-declared
-tools and Home Assistant broker state are rejected or ignored.
+server declares bridge-owned `end_conversation`, the captured Home Assistant
+tools, and optional agent tools, plus a narrow normalized Spanish/English
+terminal-phrase fallback. A successful end emits a terminal `stopped` event and
+normal cleanup restores idle. Device-declared and undeclared tools are rejected.
 
 See the [active v2 wire contract](protocol/realtime-wire-v2.md) and the
 [server-offloaded architecture](server-offloaded-realtime-architecture.md).
@@ -545,7 +546,8 @@ The active `media_transport: "bridge_pcm"` route negotiates strict v2,
 streams binary 16 kHz mono PCM16 to the bridge, and receives binary 24 kHz mono
 PCM16 between speaking epochs. The active native/realtime-only configuration
 discards pre-ready audio, has no Assist fallback, uses one server-owned peer,
-and exposes only `end_conversation`. Omitted-mode managed behavior remains
+and exposes Home Assistant tools plus `end_conversation`. Optional agent tools
+are configuration-gated. Omitted-mode managed behavior remains
 legacy compatibility only. See the complete [v2 wire
 contract](protocol/realtime-wire-v2.md), dormant [v3 wire
 contract](protocol/realtime-wire-v3.md), and [device deployment
@@ -717,10 +719,11 @@ opt-in and must never print OAuth tokens or recorded audio.
   every device and room at full output.
 - Active v2 is fail-closed rather than failover: startup or runtime failure
   clears Okay Nabu audio and returns idle without invoking Home Assistant.
-- Okay Nabu is currently an untrusted, native audio/control endpoint and
-  cannot control Home Assistant. Exactly one tool, `end_conversation`, is
-  available. Home Assistant/Hermes and entity tools are deferred; omitted-mode
-  managed v2 remains compatibility code only.
+- Okay Nabu is an untrusted native audio/control endpoint. It never receives
+  Home Assistant credentials, schemas, arguments, or results; the server model
+  can control only entities in Home Assistant's captured exposed-entity tool
+  snapshot. `end_conversation` is bridge-owned and external-agent tools are
+  optional.
 - ThirdReality firmware 1.01.07 normally withholds microphone audio until its
   wake confirmation sound finishes, then may block the microphone thread for
   up to two seconds while updating the LED. The optional pinned overlay uses an

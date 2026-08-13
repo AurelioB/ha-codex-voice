@@ -83,7 +83,7 @@ async def test_user_flow_creates_stable_provider_subentries(
     assert result["subentries"][0]["data"][CONF_SERVICE_TIER] == (
         DEFAULT_CONVERSATION_SERVICE_TIER
     )
-    assert result["subentries"][0]["data"][CONF_REALTIME_AUTHORITY] is False
+    assert result["subentries"][0]["data"][CONF_REALTIME_AUTHORITY] is True
     assert (
         result["subentries"][0]["data"][CONF_REALTIME_LANGUAGE]
         == DEFAULT_REALTIME_LANGUAGE

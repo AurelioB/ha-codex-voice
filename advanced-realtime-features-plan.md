@@ -2,13 +2,15 @@
 
 ## Decision
 
-Extend the server-offloaded realtime assistant with three independent features:
+Extend the server-offloaded realtime assistant with four independent features:
 
-1. personalized wake-word training and correction;
-2. optional speaker identification; and
-3. server-side automation tools exposed to the native realtime conversation.
+1. Home Assistant tools exposed to native realtime conversations by default;
+2. an optional external agent for memory and deeper tasks;
+3. personalized wake-word training and correction; and
+4. optional speaker identification.
 
-Home Assistant Conversation, STT, and TTS entities are explicitly excluded.
+Home Assistant Conversation, STT, and TTS packaging is explicitly excluded.
+Home Assistant participates only as the authenticated smart-home tool authority.
 The realtime session remains the product: the ThirdReality speaker is a small
 audio appliance and the Docker Compose host owns training, identity, tool
 authority, model artifacts, and diagnostics.
@@ -26,7 +28,8 @@ flowchart LR
     provider["Subscription realtime provider"]
     lab["Private voice lab\nsamples + labels + models"]
     identity["Speaker identity worker"]
-    tools["Hermes / Home Assistant tool authority"]
+    ha["Home Assistant\nexposed-entity tool authority"]
+    agent["Optional agent\nmemory + deep tasks"]
 
     speaker <-->|"strict-v2 PCM + lifecycle"| bridge
     bridge <-->|"WebRTC + App Server"| provider
@@ -34,7 +37,8 @@ flowchart LR
     lab -->|"signed/versioned wake model"| speaker
     bridge -. "bounded utterance copy" .-> identity
     identity -->|"advisory identity"| bridge
-    tools <-->|"bounded tool calls"| bridge
+    ha <-->|"bounded tool calls"| bridge
+    agent -.->|"optional bounded calls"| bridge
 ```
 
 ## Performance invariants
@@ -50,8 +54,11 @@ flowchart LR
 - Speaker identification never gates wake acknowledgement, provider readiness,
   capture opening, interruption, or the first response. Its result may annotate
   later context only if it arrives in time.
-- Tool discovery is generation-scoped and complete before `thread/start`.
-  Tool execution is asynchronous and cannot block PCM forwarding.
+- Home Assistant tool discovery is generation-scoped and complete before
+  `thread/start`. The broker adds no audio-loop work.
+- Tool execution is asynchronous and cannot block PCM forwarding.
+- The optional agent is absent from prompts and network traffic unless
+  configured. It never owns Home Assistant entity control.
 - The existing per-session report remains an on-demand CLI and adds zero runtime
   work.
 
@@ -110,7 +117,54 @@ Status: implemented.
 Exit gate: focused tests prove validation, permissions, duplicate handling,
 verification, deletion, and no import from either runtime.
 
-### M1 — explicit sample capture and labeling
+### M1 — default Home Assistant tool authority
+
+Status: implemented; physical entity-control canary pending.
+
+- Reuse the authenticated Home Assistant LLM API broker and its selected
+  exposed-entity policy. Do not add another Home Assistant token or a second
+  entity allowlist to the bridge.
+- Make the first/default Conversation subentry the realtime tool authority on
+  new installations and migrate existing entries to one deterministic authority.
+- Capture one immutable authority snapshot before every native `thread/start`,
+  merge it with bridge-owned `end_conversation`, and preserve it through
+  provider rollover.
+- Execute calls asynchronously through Home Assistant-owned tool objects, with
+  bounded schemas, timeouts, deduplication, exactly-once results, and
+  fail-closed unknown outcomes.
+- Keep tool schemas and results off the device PCM socket.
+
+Exit gate: native voice can read and control exposed entities during a long
+session and after interruption while audio keeps flowing during tool calls;
+authority loss fails closed and no ambiguous action is retried.
+
+### M2 — optional external agent interactivity
+
+Status: synchronous recall/deep-task adapter implemented; asynchronous
+report-back is deferred to its explicitly authenticated delivery slice.
+
+Follow the useful split in
+[`voicepe-realtime`](https://github.com/TristanBrotherton/voicepe-realtime):
+Home Assistant remains the built-in smart-home integration, while an external
+agent is optional and handles memory or deeper cross-application work.
+
+- Add disabled-by-default `ask_agent` and `recall_memory` tools using a bounded
+  HTTP adapter compatible with the reference project's `question`/`room` and
+  `recall` request shapes.
+- Agent-owned names take precedence over colliding Home Assistant tool names,
+  but the system prompt directs all entity control to Home Assistant.
+- Require an explicit URL; support an optional bearer token; bound request and
+  response sizes and keep timeouts below App Server's tool deadline.
+- Do not grant the agent shell, OAuth, Home Assistant credentials, or an
+  implicit route to execute smart-home actions.
+- Add asynchronous report-back/announcement later through its own authenticated
+  bounded channel; it must not reopen a closed session unexpectedly.
+
+Exit gate: no agent configuration means no advertised tools or runtime work;
+when configured, recall and deep-task calls return exactly once without delaying
+PCM or shadowing Home Assistant control.
+
+### M3 — explicit sample capture and labeling
 
 - Add a disabled-by-default speaker-to-host sample channel separate from the
   realtime media socket.
@@ -126,7 +180,7 @@ verification, deletion, and no import from either runtime.
 Exit gate: collection disabled has no measurable callback cost; enabled capture
 does not change wake-to-ready p95 by more than 10 ms and cannot block capture.
 
-### M2 — personalized wake model
+### M4 — personalized wake model
 
 Status: compatible one-model activation path implemented; training and physical
 qualification pending.
@@ -153,7 +207,7 @@ Exit gate: 20/20 intended wakes at 1.5 m in the target room, no false activation
 in a two-hour playback/noise test, and wake callback CPU no worse than the
 qualified vendor detector.
 
-### M3 — speaker enrollment and identification
+### M5 — speaker enrollment and identification
 
 - Enroll each person from several sessions and distances, not one phrase.
 - Compute embeddings on the Compose host from AEC-cleaned user speech after wake.
@@ -170,24 +224,7 @@ Exit gate: target household validation meets the documented false-accept bound,
 unknown speakers remain unknown, and identification work causes no audio queue
 growth or response-start regression.
 
-### M4 — native realtime automation tools
-
-- Reuse the existing generation-scoped Home Assistant tool broker or add a
-  Hermes authority adapter behind the same bounded broker interface.
-- Keep `end_conversation` bridge-owned and always available.
-- Add automation tools only when an authenticated authority snapshot is present
-  before `thread/start`; otherwise start conversation-only mode.
-- Merge names without collisions, apply strict JSON schema/size/count limits,
-  deduplicate call IDs, and return every result exactly once.
-- Keep tool execution independent of Home Assistant's Conversation, STT, and TTS
-  entities. Home Assistant or Hermes is only an automation/tool backend.
-- Expose a config switch that defaults off during acoustic qualification.
-
-Exit gate: lights and read-only state work during a long native session;
-interruption and PCM continue during tool execution; authority loss fails closed;
-no action is retried after an unknown outcome.
-
-### M5 — deployment and burn-in
+### M6 — deployment and burn-in
 
 - Package the voice lab and future trainer/identity worker in Docker Compose
   profiles so the ordinary bridge image stays small.
@@ -216,7 +253,10 @@ common failure modes, not every theoretical interleaving.
 ## Explicit non-goals
 
 - Repackaging the subscription backend as Home Assistant Conversation, STT, or
-  TTS entities.
+  TTS entities. Home Assistant tool exposure is intentionally independent of
+  those Assist pipeline entities.
+- Letting the optional external agent replace or bypass Home Assistant's
+  exposed-entity policy.
 - Treating voice identity as secure biometric authentication.
 - Continuous recording or passive household surveillance.
 - Unattended online wake-model mutation.

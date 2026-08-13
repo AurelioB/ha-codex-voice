@@ -19,17 +19,17 @@ sides of a narrow bridge API.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
 - The current ThirdReality strict-v2 client explicitly requests
-  `conversation_mode: "native"`. The bridge ignores any Home Assistant broker
-  snapshot for that session and keeps exactly one active native App Server
-  realtime provider generation behind a stable device WebSocket. Every
-  generation has exactly one dynamic tool, `end_conversation`. The tool has
-  an empty-object input schema and only terminates this voice session; the bridge
-  rejects every other provider tool request with `do_not_retry` and ends the
-  session. The bridge accepts bounded binary v2 PCM but never exposes raw
+  `conversation_mode: "native"`. The bridge captures the current immutable Home
+  Assistant broker snapshot and keeps one active native App Server realtime
+  provider generation behind a stable device WebSocket. Every generation adds
+  bridge-owned `end_conversation`; optional agent tools appear only when an
+  endpoint is configured and cannot replace colliding Home Assistant tools.
+  The bridge rejects every undeclared provider tool with `do_not_retry`. It
+  accepts bounded binary v2 PCM but never exposes raw
   provider data-channel events to the speaker. In the current controlled
   deployment, Okay Nabu selects
-  this direct route with `realtime_only: true`; Home Assistant Assist/Hermes and
-  entity tools are deferred, so it has no Home Assistant control authority.
+  this direct route with `realtime_only: true`; Home Assistant entity tools are
+  the built-in authority without involving the Assist conversation/STT/TTS flow.
 - The bridge echoes an accepted explicit mode in `started`; the reference
   client requires `conversation_mode: "native"` and fails closed if the echo is
   absent or different. Native audio never crosses the legacy completed-
@@ -114,7 +114,8 @@ sides of a narrow bridge API.
   consumer closes, and provider/thread cleanup remains tracked and shielded
   from request-handler cancellation.
 - Okay Nabu selects explicit native v2 in the current `realtime_only` trial and
-  gains no Home Assistant authority. Once a direct session owns the device,
+  gains only the server-captured Home Assistant exposed-entity authority. The
+  speaker itself receives no authority or credentials. Once a direct session owns the device,
   later detector hits are ignored; interruption and follow-up are driven only
   by bounded live audio and local AEC-qualified barge-in. A later split
   deployment may restore Assist and a distinct direct phrase, but that authority

@@ -69,11 +69,12 @@ turn the standard Assist pipeline into a full-duplex or barge-in session.
 ## Direct realtime path
 
 The current controlled ThirdReality deployment selects this path with Okay
-Nabu and `realtime_only: true`; Home Assistant Assist/Hermes and entity control
-are deferred. The client requests `conversation_mode: "native"`; the bridge
-echoes it, ignores Home Assistant broker state, and keeps one active App Server
-realtime provider generation behind the device's WebSocket. Exactly one
-empty-input tool, `end_conversation`, can terminate it. There is no finite
+Nabu and `realtime_only: true`. The client requests
+`conversation_mode: "native"`; the bridge echoes it, captures Home Assistant's
+current exposed-entity tool snapshot, and keeps one active App Server realtime
+provider generation behind the device's WebSocket. Bridge-owned
+`end_conversation` terminates it, and optional agent tools are configuration
+gated. There is no finite
 transcript gate, executor, `appendSpeech` render, or device `aiortc` import.
 Qualified interruption replaces the provider peer on the server while the
 device session stays open.
@@ -420,8 +421,9 @@ prompt and the causal words must be replayed exactly once to the replacement
 provider without a second sentence, reconnect, or another wake. Also verify the
 10 dB baseline plus noise-limited adaptive APM profile and limiter behavior,
 normal-distance recognition, single-stage volume, absence of persistent
-crackle, sole-tool Spanish/English termination, bounded memory/player cleanup,
-no Home Assistant authority or fallback, and unchanged TCP ADB port 5555.
+crackle, Spanish/English termination, Home Assistant tool execution during
+audio, bounded memory/player cleanup, no Assist fallback, and unchanged TCP ADB
+port 5555.
 
 ### Physical quick-command regression canary
 

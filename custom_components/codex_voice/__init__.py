@@ -96,10 +96,10 @@ async def async_migrate_entry(
     hass: HomeAssistant,
     entry: CodexVoiceConfigEntry,
 ) -> bool:
-    """Add opt-in realtime authority fields and Mexican Spanish language."""
+    """Select one default realtime authority and Mexican Spanish language."""
     if entry.version != 1:
         return False
-    if entry.minor_version >= 2:
+    if entry.minor_version >= 3:
         return True
 
     conversations = [
@@ -107,15 +107,19 @@ async def async_migrate_entry(
         for subentry in entry.subentries.values()
         if subentry.subentry_type == SUBENTRY_TYPE_CONVERSATION
     ]
-    for subentry in conversations:
+    already_selected = any(
+        subentry.data.get(CONF_REALTIME_AUTHORITY) is True for subentry in conversations
+    )
+    for index, subentry in enumerate(conversations):
         data = dict(subentry.data)
-        # Existing installations were explicitly chat-only on the device path.
-        # Migration must not silently grant a new Home Assistant control surface.
-        data.setdefault(CONF_REALTIME_AUTHORITY, False)
+        if not already_selected:
+            data[CONF_REALTIME_AUTHORITY] = index == 0
+        else:
+            data.setdefault(CONF_REALTIME_AUTHORITY, False)
         data.setdefault(CONF_REALTIME_LANGUAGE, DEFAULT_REALTIME_LANGUAGE)
         hass.config_entries.async_update_subentry(entry, subentry, data=data)
 
-    hass.config_entries.async_update_entry(entry, minor_version=2)
+    hass.config_entries.async_update_entry(entry, minor_version=3)
     return True
 
 

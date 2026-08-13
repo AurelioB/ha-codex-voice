@@ -155,10 +155,10 @@ async def test_realtime_tool_snapshot_starts_immediately_after_boot(
     cancel()
 
 
-async def test_migrate_requires_explicit_authority_opt_in_and_adds_language(
+async def test_migrate_selects_first_authority_and_adds_language(
     hass: HomeAssistant,
 ) -> None:
-    """Legacy profiles do not silently gain a Home Assistant control surface."""
+    """Legacy profiles gain one deterministic Home Assistant authority."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         version=1,
@@ -195,8 +195,8 @@ async def test_migrate_requires_explicit_authority_opt_in_and_adds_language(
         if item.subentry_type == "conversation"
     ]
     assert [item.data[CONF_REALTIME_AUTHORITY] for item in conversations] == [
-        False,
+        True,
         False,
     ]
     assert all(item.data[CONF_REALTIME_LANGUAGE] == "es-MX" for item in conversations)
-    assert entry.minor_version == 2
+    assert entry.minor_version == 3
