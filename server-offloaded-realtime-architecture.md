@@ -166,8 +166,9 @@ does not depend on provider `speech_started`.
 
 ## Ending a conversation
 
-The native thread exposes bridge-owned `end_conversation`, the current Home
-Assistant exposed-entity tools, and optional agent recall/deep-task tools. Its
+The native thread exposes bridge-owned `end_conversation` and `search_web`, the
+current Home Assistant exposed-entity tools, and optional agent
+recall/deep-task tools. Its
 Spanish and English instructions say to call the terminal tool when the user
 clearly asks to end the conversation, including “terminar” and “terminar llamada”. The
 server accepts only that tool name and an empty object, emits a terminal
@@ -177,6 +178,7 @@ An exact, normalized bilingual transcript allowlist is a narrow reliability
 fallback for provider runs that acknowledge the phrase without calling the
 tool. It is not a general intent parser. Home Assistant remains the
 authoritative smart-home tool owner; the optional agent does not replace it.
+Public-web results are untrusted evidence and cannot replace it either.
 
 ## Server warming policy
 

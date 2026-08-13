@@ -25,7 +25,12 @@ services:
       HA_CODEX_BRIDGE_PORT: "${HA_CODEX_BRIDGE_PORT:-8787}"
       HA_CODEX_REALTIME_LOG_TRANSCRIPTS: "${HA_CODEX_REALTIME_LOG_TRANSCRIPTS:-false}"
       HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS: "${HA_CODEX_TRANSCRIBE_LIVE_FRAGMENT_QUIET_SECONDS:-0.5}"
+      HA_CODEX_WEB_SEARCH_TIMEOUT: "${HA_CODEX_WEB_SEARCH_TIMEOUT:-10}"
+      HA_CODEX_WEB_SEARCH_URL: "http://127.0.0.1:${HA_CODEX_SEARCH_PORT:-8888}/search"
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    depends_on:
+      search:
+        condition: service_healthy
     volumes:
       - type: bind
         source: "${HA_CODEX_AUTH_FILE_HOST:?Set HA_CODEX_AUTH_FILE_HOST to the absolute auth.json path}"
@@ -50,3 +55,41 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+
+  search:
+    image: "docker.io/searxng/searxng@sha256:c7ca5516d881de86f34ea65fcb4231eb1b2d0837f95abe6cd035764e051eb575"
+    init: true
+    user: "977:977"
+    read_only: true
+    restart: unless-stopped
+    environment:
+      FORCE_OWNERSHIP: "false"
+      GRANIAN_HOST: "0.0.0.0"
+      SEARXNG_BASE_URL: "http://127.0.0.1:${HA_CODEX_SEARCH_PORT:-8888}/"
+      SEARXNG_SECRET: "${HA_CODEX_SEARCH_SECRET:-local-loopback-search-cookie-secret}"
+    ports:
+      - "127.0.0.1:${HA_CODEX_SEARCH_PORT:-8888}:8080"
+    volumes:
+      - type: bind
+        source: "./deploy/searxng/settings.yml"
+        target: /etc/searxng/settings.yml
+        read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+      - /var/cache/searxng:rw,nosuid,nodev,noexec,size=64m,mode=0750,uid=977,gid=977
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

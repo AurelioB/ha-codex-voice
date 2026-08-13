@@ -139,6 +139,8 @@ class BridgeConfig:
     speaker_identity_url: str | None = None
     speaker_identity_token: str | None = field(default=None, repr=False)
     speaker_identity_timeout: float = 4.0
+    web_search_url: str | None = None
+    web_search_timeout: float = 10.0
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -201,6 +203,18 @@ class BridgeConfig:
             ):
                 raise ValueError("voice_sample_root must be a bounded absolute path")
         _validate_speaker_identity_config(self)
+        if self.web_search_url is not None:
+            parsed_search_url = urlsplit(self.web_search_url)
+            if (
+                parsed_search_url.scheme not in {"http", "https"}
+                or not parsed_search_url.netloc
+                or parsed_search_url.username is not None
+                or parsed_search_url.password is not None
+                or len(self.web_search_url) > 2_048
+            ):
+                raise ValueError("web_search_url must be a bounded HTTP(S) URL")
+        if not 0.5 <= self.web_search_timeout <= 20.0:
+            raise ValueError("web_search_timeout must be between 0.5 and 20 seconds")
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -280,5 +294,9 @@ class BridgeConfig:
             ),
             speaker_identity_timeout=float(
                 os.environ.get("HA_CODEX_SPEAKER_IDENTITY_TIMEOUT", "4")
+            ),
+            web_search_url=os.environ.get("HA_CODEX_WEB_SEARCH_URL") or None,
+            web_search_timeout=float(
+                os.environ.get("HA_CODEX_WEB_SEARCH_TIMEOUT", "10")
             ),
         )

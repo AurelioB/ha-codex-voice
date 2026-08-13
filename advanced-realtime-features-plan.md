@@ -2,18 +2,19 @@
 
 ## Decision
 
-Extend the server-offloaded realtime assistant with four independent features:
+Extend the server-offloaded realtime assistant with five independent features:
 
 1. Home Assistant tools exposed to native realtime conversations by default;
 2. an optional external agent for memory and deeper tasks;
-3. personalized wake-word training and correction; and
-4. optional speaker identification.
+3. personalized wake-word training and correction;
+4. optional speaker identification; and
+5. default public-web search without an OpenAI API key.
 
 Home Assistant Conversation, STT, and TTS packaging is explicitly excluded.
 Home Assistant participates only as the authenticated smart-home tool authority.
 The realtime session remains the product: the ThirdReality speaker is a small
 audio appliance and the Docker Compose host owns training, identity, tool
-authority, model artifacts, and diagnostics.
+authority, web metasearch, model artifacts, and diagnostics.
 
 No feature in this plan may make the current conversation path slower merely by
 being installed. Collection and training are disabled by default. Wake inference
@@ -30,6 +31,7 @@ flowchart LR
     identity["Speaker identity worker"]
     ha["Home Assistant\nexposed-entity tool authority"]
     agent["Optional agent\nmemory + deep tasks"]
+    search["Loopback SearXNG\npublic-web metasearch"]
 
     speaker <-->|"strict-v2 PCM + lifecycle"| bridge
     bridge <-->|"WebRTC + App Server"| provider
@@ -39,6 +41,7 @@ flowchart LR
     identity -->|"advisory identity"| bridge
     ha <-->|"bounded tool calls"| bridge
     agent -.->|"optional bounded calls"| bridge
+    search <-->|"bounded untrusted results"| bridge
 ```
 
 ## Performance invariants
@@ -57,6 +60,8 @@ flowchart LR
 - Home Assistant tool discovery is generation-scoped and complete before
   `thread/start`. The broker adds no audio-loop work.
 - Tool execution is asynchronous and cannot block PCM forwarding.
+- Public-web search is one bounded asynchronous bridge call and never grants a
+  browser, shell, arbitrary URL fetch, or Home Assistant authority.
 - The optional agent is absent from prompts and network traffic unless
   configured. It never owns Home Assistant entity control.
 - The existing per-session report remains an on-demand CLI and adds zero runtime
@@ -163,6 +168,26 @@ agent is optional and handles memory or deeper cross-application work.
 Exit gate: no agent configuration means no advertised tools or runtime work;
 when configured, recall and deep-task calls return exactly once without delaying
 PCM or shadowing Home Assistant control.
+
+### M2b — default public-web search
+
+Status: implemented and live canary passed.
+
+- Run digest-pinned SearXNG in the default Compose stack, published only on
+  host loopback with JSON as its sole search response format.
+- Advertise one bridge-owned `search_web` tool in every native realtime session
+  when the local endpoint is configured; reserve its name ahead of Home
+  Assistant tools.
+- Accept one printable bounded query and return at most six bounded titles,
+  public HTTP(S) URLs, excerpts, and optional publication dates.
+- Treat returned content as untrusted evidence, compare useful sources, and
+  never use search results as smart-home state, authorization, or instructions.
+- Keep Codex App Server's shell, built-in web search, and generic network access
+  disabled; this path requires no OpenAI API key and does not alter PCM flow.
+
+Exit gate: a live native tool call returns current results while audio remains
+available, unavailable search fails only that call, and health contains no query
+or result content.
 
 ### M3 — explicit sample capture and labeling
 

@@ -38,7 +38,7 @@ general tools, or call Home Assistant. Native AEC3 remains on the speaker so
 capture and the physical render reference stay sample-aligned. The bridge owns
 Codex App Server, OAuth, WebRTC, provider lifecycle, bridge-owned
 `end_conversation`, the default Home Assistant exposed-entity tool snapshot,
-and optional external-agent tools.
+default public-web search, and optional external-agent tools.
 
 An accepted wake pulses the LED and claims the microphone, but does not admit
 speech. The bridge completes the initial provider session, returns strict-v2
@@ -85,7 +85,8 @@ historical.
 - The route-scoped device token cannot open the Home Assistant broker. Active
   native v2 captures the broker's immutable exposed-entity snapshot before
   startup, rejects device-declared tools, and adds bridge-owned
-  `end_conversation`. Optional agent tools are advertised only when configured.
+  `end_conversation` plus default `search_web`. Optional agent tools are
+  advertised only when configured.
 - The active reference configuration uses `native_aec3` with a 10 dB native
   baseline, noise-limited adaptive digital gain, a limiter, and moderate noise
   suppression, plus 0 dB transport gain, a fixed 100% AEC/playback anchor, a 100%-relative
@@ -164,6 +165,13 @@ start it with:
 ```bash
 docker compose --env-file .codex-voice/compose.env up --detach --build
 ```
+
+The default Compose stack also runs a digest-pinned SearXNG metasearch service
+bound only to host loopback. Native conversations receive a bounded
+`search_web` tool, so current-information questions do not require an OpenAI
+API key or the optional external agent. Queries leave the host for the public
+search engines selected by SearXNG; returned titles, URLs, and excerpts are
+untrusted evidence and cannot authorize Home Assistant actions.
 
 The Compose service uses host networking for reliable server-owned WebRTC, so
 apply a host firewall rule for port 8787. See the
@@ -427,10 +435,11 @@ controls regress. There is no transcript executor or synthesized turn handoff.
 
 Strict-v2 `started` is the session-readiness boundary. The speaker plays its
 pinned cue only after that message and opens capture only at cue EOF. The
-server declares bridge-owned `end_conversation`, the captured Home Assistant
-tools, and optional agent tools, plus a narrow normalized Spanish/English
-terminal-phrase fallback. A successful end emits a terminal `stopped` event and
-normal cleanup restores idle. Device-declared and undeclared tools are rejected.
+server declares bridge-owned `end_conversation` and `search_web`, the captured
+Home Assistant tools, and optional agent tools, plus a narrow normalized
+Spanish/English terminal-phrase fallback. A successful end emits a terminal
+`stopped` event and normal cleanup restores idle. Device-declared and undeclared
+tools are rejected.
 
 See the [active v2 wire contract](protocol/realtime-wire-v2.md) and the
 [server-offloaded architecture](server-offloaded-realtime-architecture.md).

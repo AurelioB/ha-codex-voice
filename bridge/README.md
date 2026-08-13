@@ -125,8 +125,8 @@ requires the primary Home Assistant bridge token.
   device.
   The active strict-v2 route requires `conversation_mode: "native"`; an
   accepted value is echoed in `started`. Native v2 declares bridge-owned
-  `end_conversation`, the immutable Home Assistant authority snapshot captured
-  at startup, and optional external-agent tools.
+  `end_conversation` and `search_web`, the immutable Home Assistant authority
+  snapshot captured at startup, and optional external-agent tools.
   A v2 `text` control is a bounded user message; its role must be omitted or
   exactly `user`. See the [active v2
   contract](../protocol/realtime-wire-v2.md) and dormant [v3 direct-media
@@ -174,6 +174,23 @@ and—only when configured—`ask_agent` and `recall_memory`. Calls execute
 asynchronously so PCM forwarding continues. The narrow bilingual
 terminal-phrase fallback still emits terminal `stopped`; undeclared and
 device-declared tools fail closed.
+
+### Default public-web search
+
+The normal Compose stack starts a digest-pinned SearXNG service whose published
+port is restricted to `127.0.0.1`. The bridge advertises `search_web` whenever
+`HA_CODEX_WEB_SEARCH_URL` is configured (Compose supplies it automatically).
+Each call accepts one bounded query and returns at most six bounded public HTTP
+or HTTPS results with title, URL, excerpt, and optional publication date. It
+does not expose a general browser, arbitrary fetch endpoint, host network tool,
+or OpenAI API key.
+
+Search is independent of PCM forwarding and Home Assistant authority. Results
+are explicitly untrusted and may contain inaccurate or adversarial text; the
+model is instructed to compare sources and never treat web content as
+authorization or smart-home state. Set a different local SearXNG endpoint with
+`HA_CODEX_WEB_SEARCH_URL`, or omit that variable when running the bridge
+without Compose to advertise no web tool.
 
 An optional agent may report a completed background task to the currently
 active session through `/v1/agent/announce`. This path has a separate bearer,

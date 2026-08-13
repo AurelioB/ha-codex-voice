@@ -389,8 +389,9 @@ The following client-to-bridge controls remain JSON:
 The v2 device remains audio/control only. A v2 start containing `tools` or an
 incoming device `tool_result` is rejected. Provider tool calls and Home
 Assistant results are never forwarded to the speaker. An explicit native
-session exposes bridge-owned `end_conversation`, the captured Home Assistant
-tools, and optional bridge-owned agent tools. Spanish and English terminal
+session exposes bridge-owned `end_conversation` and configured `search_web`,
+the captured Home Assistant tools, and optional bridge-owned agent tools.
+Spanish and English terminal
 instructions require the model to
 call it immediately without a spoken promise. An exact normalized terminal
 transcript such as `Terminar`, `Terminar llamada`, `goodbye`, or `hang up` is a

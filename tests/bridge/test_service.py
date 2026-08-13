@@ -1045,6 +1045,30 @@ def test_optional_agent_configuration_is_disabled_by_default_and_loaded_from_env
     assert config.agent_room == "cocina"
 
 
+def test_web_search_configuration_is_optional_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_WEB_SEARCH_URL", raising=False)
+    monkeypatch.delenv("HA_CODEX_WEB_SEARCH_TIMEOUT", raising=False)
+    assert BridgeConfig.from_env().web_search_url is None
+
+    monkeypatch.setenv(
+        "HA_CODEX_WEB_SEARCH_URL",
+        "http://127.0.0.1:8888/search",
+    )
+    monkeypatch.setenv("HA_CODEX_WEB_SEARCH_TIMEOUT", "7")
+    config = BridgeConfig.from_env()
+    assert config.web_search_url == "http://127.0.0.1:8888/search"
+    assert config.web_search_timeout == 7
+
+    with pytest.raises(ValueError, match="bounded HTTP"):
+        BridgeConfig(
+            bearer_token="test-token",
+            web_search_url="file:///etc/passwd",
+        )
+
+
 def test_voice_sample_collection_requires_explicit_root_and_consent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1900,6 +1924,13 @@ async def test_health_requires_bearer_and_reports_ready(
             "matches": 0,
             "unknown": 0,
             "last_duration_ms": None,
+        },
+        "web_search": {
+            "enabled": False,
+            "calls_started": 0,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
+            "last_call_duration_ms": None,
         },
     }
 
@@ -6665,6 +6696,12 @@ def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
         tools=(
             {
                 "type": "function",
+                "name": "search_web",
+                "description": "HA search compatibility adapter",
+                "inputSchema": {"type": "object"},
+            },
+            {
+                "type": "function",
                 "name": "ask_agent",
                 "description": "HA compatibility adapter",
                 "inputSchema": {"type": "object"},
@@ -6676,7 +6713,7 @@ def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
                 "inputSchema": {"type": "object"},
             },
         ),
-        tool_names=frozenset({"ask_agent", "HassTurnOn"}),
+        tool_names=frozenset({"search_web", "ask_agent", "HassTurnOn"}),
     )
     agent = bridge_service.AgentToolBroker(
         "http://agent.local/task",
@@ -6690,10 +6727,12 @@ def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
         snapshot,
         agent,
         bridge_service.VoiceSampleInbox(None),
+        bridge_service.WebSearchBroker("http://search.local/search", timeout=1),
     )
 
     assert [tool["name"] for tool in tools] == [
         "end_conversation",
+        "search_web",
         "ask_agent",
         "recall_memory",
         "HassTurnOn",
@@ -6929,6 +6968,91 @@ async def test_realtime_v2_explicit_native_executes_optional_agent_tool(
     assert json.loads(response["contentItems"][0]["text"]) == {
         "answer": "Resultado del agente"
     }
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_executes_default_web_search_tool(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    received: list[dict[str, str]] = []
+
+    async def search_handler(request: web.Request) -> web.Response:
+        received.append(dict(request.query))
+        return web.json_response(
+            {
+                "results": [
+                    {
+                        "title": "Fuente actual",
+                        "url": "https://example.com/actual",
+                        "content": "Información obtenida de internet.",
+                    }
+                ]
+            }
+        )
+
+    search_app = web.Application()
+    search_app.router.add_get("/search", search_handler)
+    search_server = await aiohttp_server(search_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            web_search_url=str(search_server.make_url("/search")),
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "search_web",
+    ]
+    assert "untrusted excerpts" in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "native-search-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "native-search-call",
+                "tool": "search_web",
+                "arguments": {"query": "noticias actuales"},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "native-search-request"
+            for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    assert received[0]["q"] == "noticias actuales"
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "native-search-request"
+    )
+    assert response["success"] is True
+    assert json.loads(response["contentItems"][0]["text"])["results"] == [
+        {
+            "title": "Fuente actual",
+            "url": "https://example.com/actual",
+            "snippet": "Información obtenida de internet.",
+        }
+    ]
 
     await device.send_json({"type": "stop"})
     await device.close()

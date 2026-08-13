@@ -18,6 +18,12 @@ sides of a narrow bridge API.
 - The bridge never receives a Home Assistant long-lived access token.
 - Home Assistant prepares the selected LLM tools, validates tool arguments,
   executes the calls, and sends only their results back to the bridge.
+- Default Compose web search uses a digest-pinned SearXNG container published
+  only on host loopback. The bridge sends one bounded query and accepts at most
+  six bounded public HTTP(S) result excerpts. Queries leave the host for
+  SearXNG's selected public engines. Result text is untrusted, cannot grant
+  permissions, and cannot replace Home Assistant state or control tools. App
+  Server shell, native web search, and general network access remain disabled.
 - Optional agent calls use an explicitly configured endpoint and optional
   outbound bearer. Agent report-back uses a different bearer accepted only by
   `/v1/agent/announce`; it cannot access health, media, Home Assistant tools, or
@@ -40,8 +46,9 @@ sides of a narrow bridge API.
   `conversation_mode: "native"`. The bridge captures the current immutable Home
   Assistant broker snapshot and keeps one active native App Server realtime
   provider generation behind a stable device WebSocket. Every generation adds
-  bridge-owned `end_conversation`; optional agent tools appear only when an
-  endpoint is configured and cannot replace colliding Home Assistant tools.
+  bridge-owned `end_conversation` and configured local `search_web`; optional
+  agent tools appear only when an endpoint is configured. Bridge tools cannot
+  be replaced by colliding Home Assistant tools.
   The bridge rejects every undeclared provider tool with `do_not_retry`. It
   accepts bounded binary v2 PCM but never exposes raw
   provider data-channel events to the speaker. In the current controlled
