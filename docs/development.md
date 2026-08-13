@@ -60,6 +60,28 @@ Use `--json` for machine-readable output. For an offline report, supply
 the bridge's explicit testing switch `HA_CODEX_REALTIME_LOG_TRANSCRIPTS=true`
 was active; the reporter itself never enables logging or records audio.
 
+## Private voice lab
+
+The voice lab is a separate, dependency-free CLI for explicitly consented wake
+and speaker-enrollment recordings. It is not imported by the bridge or device,
+so installing it adds no media-path work. Initialize a private dataset outside
+the repository, or use the ignored `.voice-lab/` path for local experiments:
+
+```bash
+uv run python scripts/voice_lab.py --root .voice-lab init
+uv run python scripts/voice_lab.py --root .voice-lab add sample.wav \
+  --kind wake-positive --phrase "Okay Nabu" --outcome miss \
+  --speaker-id owner --provenance physical-test --consent
+uv run python scripts/voice_lab.py --root .voice-lab verify
+uv run python scripts/voice_lab.py --root .voice-lab list
+```
+
+Imports must be mono PCM16 WAV at 16 kHz. The CLI canonicalizes the file,
+deduplicates by PCM SHA-256, measures duration/peak/RMS, and keeps the dataset
+directory at mode `0700` with files at `0600`. Use `remove SAMPLE_ID` to delete
+an imported recording. Do not place real recordings, embeddings, or trained
+models in Git.
+
 ## Inner loop: local Home Assistant
 
 The standard-library helper needs Docker but no Python packages from this

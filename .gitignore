@@ -17,6 +17,7 @@ htmlcov/
 # Bridge runtime state and credentials must never be committed.
 .bridge-token
 .codex-voice/
+.voice-lab/
 
 # Host-specific local speech service settings.
 deploy/systemd/*.local
