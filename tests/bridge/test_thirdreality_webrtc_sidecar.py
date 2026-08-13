@@ -136,7 +136,7 @@ def test_ipc_round_trips_fieldless_capture_barrier(message_type: str) -> None:
         encode_control(message_type, sample_end=320)
 
 
-@pytest.mark.parametrize("gain_db", [0.0, 6.25, 12.0])
+@pytest.mark.parametrize("gain_db", [0.0, 6.25, 18.0])
 def test_ipc_round_trips_strict_capture_gain(gain_db: float) -> None:
     assert decode_packet(
         encode_control("create_offer", direct_capture_gain_db=gain_db)
@@ -185,7 +185,7 @@ def test_ipc_requires_epoch_on_every_tagged_standby_control(
 
 @pytest.mark.parametrize(
     "gain_db",
-    [True, float("nan"), float("inf"), -0.01, 12.01, 10**400],
+    [True, float("nan"), float("inf"), -0.01, 18.01, 10**400],
 )
 def test_ipc_rejects_invalid_capture_gain(gain_db: object) -> None:
     with pytest.raises(ProtocolError, match="capture gain"):

@@ -282,6 +282,34 @@ class _AudioPacket:
 
 
 @dataclass(slots=True)
+class _BridgeCaptureDiagnostics:
+    """Content-free level summary for the server-media microphone path."""
+
+    packets: int = 0
+    suppressed_packets: int = 0
+    source_max_peak: int = 0
+    source_max_rms: int = 0
+    provider_max_peak: int = 0
+    provider_max_rms: int = 0
+    saturated_samples: int = 0
+
+    def observe(self, source: bytes, provider: bytes, *, suppressed: bool) -> None:
+        """Aggregate levels without retaining capture bytes or metadata."""
+        source_peak, source_rms = _pcm_peak_and_rms(source)
+        provider_peak, provider_rms = _pcm_peak_and_rms(provider)
+        self.packets += 1
+        self.suppressed_packets += int(suppressed)
+        self.source_max_peak = max(self.source_max_peak, source_peak)
+        self.source_max_rms = max(self.source_max_rms, source_rms)
+        self.provider_max_peak = max(self.provider_max_peak, provider_peak)
+        self.provider_max_rms = max(self.provider_max_rms, provider_rms)
+        self.saturated_samples += sum(
+            sample in {-32_768, 32_767}
+            for (sample,) in struct.iter_unpack("<h", provider)
+        )
+
+
+@dataclass(slots=True)
 class _DirectStandby:
     """One offer-warm logical peer inside the active sidecar process."""
 
@@ -2010,6 +2038,7 @@ class RealtimeSession:
         self._thread: threading.Thread | None = None
         self._ever_ready = False
         self._direct_diagnostics: _DirectSessionDiagnostics | None = None
+        self._bridge_capture_diagnostics = _BridgeCaptureDiagnostics()
         self._direct_render_observation_tail = b""
 
     @property
@@ -3034,6 +3063,11 @@ class RealtimeSession:
                     self._config.direct_capture_gain_db,
                 )
             )
+            self._bridge_capture_diagnostics.observe(
+                packet.data,
+                provider_pcm,
+                suppressed=packet.suppress_bridge,
+            )
             connection.send_binary(provider_pcm)
             self._sent_capture_watermark = packet.capture_watermark
             return packet, remaining_packets
@@ -3260,6 +3294,21 @@ class RealtimeSession:
             _LOGGER.warning("ThirdReality realtime session failed", exc_info=False)
         finally:
             try:
+                diagnostics = self._bridge_capture_diagnostics
+                with suppress(Exception):
+                    syslog.syslog(
+                        syslog.LOG_INFO,
+                        "codex-voice bridge_capture "
+                        f"packets={min(diagnostics.packets, 99_999_999)} "
+                        "suppressed_packets="
+                        f"{min(diagnostics.suppressed_packets, 99_999_999)} "
+                        f"source_peak={min(diagnostics.source_max_peak, 32_768)} "
+                        f"source_rms={min(diagnostics.source_max_rms, 32_768)} "
+                        f"provider_peak={min(diagnostics.provider_max_peak, 32_768)} "
+                        f"provider_rms={min(diagnostics.provider_max_rms, 32_768)} "
+                        "saturated_samples="
+                        f"{min(diagnostics.saturated_samples, 99_999_999)}",
+                    )
                 self._set_local_output_epoch(None)
                 self._audio.clear()
                 with suppress(Exception):

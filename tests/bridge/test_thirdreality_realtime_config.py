@@ -332,7 +332,7 @@ def test_config_accepts_device_webrtc_capture_gain_boundaries(
         (float("inf"), "outside its supported range"),
         (float("-inf"), "outside its supported range"),
         (-0.01, "outside its supported range"),
-        (12.01, "outside its supported range"),
+        (18.01, "outside its supported range"),
     ],
 )
 def test_config_rejects_invalid_device_webrtc_capture_gain(

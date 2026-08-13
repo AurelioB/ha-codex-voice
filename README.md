@@ -254,7 +254,7 @@ The active root-owned mode-0600 configuration uses these values:
   "pulse_aec_method": "adrian",
   "aec_sink_volume_ceiling_percent": 100,
   "playback_volume_percent": 100,
-  "direct_capture_gain_db": 0
+  "direct_capture_gain_db": 18
 }
 ```
 

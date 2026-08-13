@@ -7489,6 +7489,12 @@ def test_bridge_native_capture_gain_is_applied_once_with_pcm16_saturation() -> N
     assert [value for value, _sent_at in connection.binary_sent] == [
         struct.pack("<6h", 1_995, -1_995, 32_767, -32_768, 32_767, -32_768)
     ]
+    diagnostics = session._bridge_capture_diagnostics
+    assert diagnostics.packets == 1
+    assert diagnostics.suppressed_packets == 0
+    assert diagnostics.source_max_peak == 32_768
+    assert diagnostics.provider_max_peak == 32_768
+    assert diagnostics.saturated_samples == 4
 
 
 @pytest.mark.parametrize(

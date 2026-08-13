@@ -41,9 +41,12 @@ and releases use semantic versioning.
   arrives before the completed transcript, and user `turn.done` can no longer
   truncate an active assistant response.
 - Add explicit `direct_capture_gain_db` tuning for realtime microphone egress,
-  defaulting to 0 dB and bounded to 0–12 dB. Gain uses saturating PCM16, leaves
+  defaulting to 0 dB and bounded to 0–18 dB. Gain uses saturating PCM16, leaves
   wake/Assist/local-barge audio unchanged, and is applied exactly once before
   bridge PCM or device-WebRTC provider egress.
+- Add one content-free bridge-capture summary per realtime session with raw and
+  provider peak/RMS maxima, suppressed packet count, and saturation count. This
+  makes distance-gain tuning evidence-based without retaining microphone audio.
 - Add a reversible ThirdReality `realtime_only` wake policy. It permits Okay
   Nabu to replace the normal Assist wake, ignores every non-matching detector,
   disables buffered v2 Assist fallback, and fails closed if guarded realtime
@@ -100,8 +103,8 @@ and releases use semantic versioning.
 - Condition ThirdReality microphone audio inside native AEC3 using a 10 dB
   vendor baseline followed by AGC2 noise-limited adaptive digital gain, its
   limiter, and moderate noise suppression. Wake detection and realtime capture
-  now receive the same distance-adaptive samples. Reduce post-APM transport
-  gain from 12 dB to 0 dB so there is no second stage after the limiter.
+  now receive the same distance-adaptive samples. Use an 18 dB outbound stage
+  only after wake so short commands are immediately usable at room distance.
 - Keep one bounded, audio-empty strict-v2 provider session warm on the
   ThirdReality appliance: five minutes after startup or a completed
   conversation, and ten seconds after a probable 0.50 wake-model score. A real
@@ -110,7 +113,7 @@ and releases use semantic versioning.
   Pulse/AEC topology proof for the voice-process lifetime; retain per-response
   sink-volume verification and the unchanged bounded cold/retry path.
 - Route the current controlled Okay Nabu deployment to full-duplex
-  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 0`, a fixed 100%
+  `bridge_pcm` with native AEC3, `direct_capture_gain_db: 18`, a fixed 100%
   playback anchor, and `realtime_only: true`; defer Home Assistant
   Assist/Hermes and entity tools. The device-owned v3 implementation remains
   available in source as a dormant rollback experiment.

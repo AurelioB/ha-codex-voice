@@ -164,8 +164,10 @@ AEC3 and its required high-pass filter, a 10 dB fixed baseline followed by
 AGC2 adaptive digital gain, its limiter, and moderate WebRTC noise suppression.
 AGC2 may raise distant speech further but caps the amplified output noise floor
 at -50 dBFS. Conditioning happens inside APM, so the vendor wake detector and
-realtime path receive the same cleaned samples. The active deployment keeps
-transport gain at 0 dB to avoid a second gain stage after the limiter.
+realtime path receive the same cleaned samples. The active server-media route
+adds 18 dB only at provider egress so the first short command is usable before
+adaptive gain ramps; wake-word audio remains unchanged, and PCM16 saturation
+bounds that post-wake stage.
 
 ## What needs a reboot
 

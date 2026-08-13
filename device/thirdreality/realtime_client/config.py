@@ -47,7 +47,7 @@ DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
 MAX_REALTIME_VOLUME_PERCENT = 100
 DEFAULT_DIRECT_CAPTURE_GAIN_DB = 0.0
-MAX_DIRECT_CAPTURE_GAIN_DB = 12.0
+MAX_DIRECT_CAPTURE_GAIN_DB = 18.0
 # Retained for source compatibility. JSON configurations may also keep using
 # ``aec_test_volume_percent`` as an unambiguous legacy alias for both new
 # settings.
