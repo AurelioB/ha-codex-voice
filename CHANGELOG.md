@@ -105,6 +105,10 @@ and releases use semantic versioning.
 
 ### Changed
 
+- Make native realtime recover gracefully from uncertain noisy input: incomplete,
+  inconsistent, or low-confidence requests now produce one brief clarification
+  in the user's language instead of an invented interpretation. Add bounded,
+  content-free input transcript fragment and character counts for diagnosis.
 - Condition ThirdReality microphone audio inside native AEC3 using a 10 dB
   vendor baseline followed by AGC2 noise-limited adaptive digital gain, its
   limiter, and moderate noise suppression. Wake detection and realtime capture

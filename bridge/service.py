@@ -154,7 +154,10 @@ DIRECT_END_CONVERSATION_TOOL = {
 DIRECT_REALTIME_BASE_INSTRUCTIONS = (
     "Act as a natural realtime voice conversation partner. Respond directly in "
     "conversational spoken language. Keep answers concise unless the user asks for "
-    "detail. Never inspect local files. Your only tool is end_conversation. Invoke "
+    "detail. Treat incoming speech as potentially noisy. If a request is incomplete, "
+    "internally inconsistent, or you are not confident what the user wants, do not "
+    "guess or silently supply missing words; ask one short clarification in the "
+    "user's language. Never inspect local files. Your only tool is end_conversation. Invoke "
     "it only when the user explicitly asks to end, stop, close, or leave this "
     "conversation, or clearly says goodbye. Spanish requests such as 'terminar', "
     "'terminar llamada', 'terminar la llamada', 'finalizar', 'colgar', and 'adios' "
@@ -5792,6 +5795,8 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     native_terminal_fragment_chars = 0
     native_terminal_quiet_generation = 0
     native_terminal_quiet_task: asyncio.Task[None] | None = None
+    native_user_transcript_fragments = 0
+    native_user_transcript_chars = 0
     event_trace = _RealtimeEventTrace()
     native_barge_sequence = 0
     native_barge_started_at: float | None = None
@@ -5846,6 +5851,32 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         if not native_barge_trace_is_open() and output_speaking:
             begin_native_barge_trace("provider_transcript")
         mark_native_barge("user_transcript_done" if done else "user_transcript_delta")
+
+    def observe_native_user_transcript_fragment(value: object) -> None:
+        """Count provider transcript shape without retaining its content."""
+        nonlocal native_user_transcript_fragments, native_user_transcript_chars
+        if not isinstance(value, str) or not value:
+            return
+        native_user_transcript_fragments = min(
+            native_user_transcript_fragments + 1, 65_535
+        )
+        native_user_transcript_chars = min(
+            native_user_transcript_chars + len(value), 65_535
+        )
+
+    def complete_native_user_transcript(value: object) -> None:
+        """Publish one bounded content-free transcript completeness record."""
+        nonlocal native_user_transcript_fragments, native_user_transcript_chars
+        final_chars = min(len(value), 65_535) if isinstance(value, str) else 0
+        LOGGER.info(
+            "Realtime native input transcript: fragments=%d fragment_chars=%d "
+            "final_chars=%d",
+            native_user_transcript_fragments,
+            native_user_transcript_chars,
+            final_chars,
+        )
+        native_user_transcript_fragments = 0
+        native_user_transcript_chars = 0
 
     def observe_native_barge_control(control: RealtimeDataControl) -> None:
         """Record provider data milestones before their handlers mutate output."""
@@ -7478,7 +7509,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         role in {"input", "user"}
                         and wire_protocol.requests_native_conversation
                     ):
-                        await observe_native_terminal_fragment(params.get("delta"))
+                        fragment = params.get("delta")
+                        observe_native_user_transcript_fragment(fragment)
+                        await observe_native_terminal_fragment(fragment)
                         continue
                     if (
                         role in {"assistant", "output"}
@@ -7503,7 +7536,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                         role in {"input", "user"}
                         and wire_protocol.requests_native_conversation
                     ):
-                        if await resolve_native_terminal_turn(params.get("text")):
+                        transcript = params.get("text")
+                        complete_native_user_transcript(transcript)
+                        if await resolve_native_terminal_turn(transcript):
                             return
                         continue
                     if role == "user" and bridge_managed_realtime:

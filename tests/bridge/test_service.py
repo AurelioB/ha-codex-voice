@@ -6572,6 +6572,10 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
         assert (
             "Your only tool is end_conversation" in thread_starts[0]["baseInstructions"]
         )
+        assert (
+            "do not guess or silently supply missing words"
+            in thread_starts[0]["baseInstructions"]
+        )
         realtime_starts = [
             params
             for method, params in fake_rpc.calls
@@ -7176,6 +7180,7 @@ async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
     aiohttp_client: Any,
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = await aiohttp_client(bridge_app)
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
@@ -7194,6 +7199,7 @@ async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
     assert await device.receive_json(timeout=1) == {
         "type": "control",
         "event_type": "turn.created",
+        "role": "user",
     }
     await fake_rpc.broadcast(
         {
@@ -7229,22 +7235,26 @@ async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
         "event_type": "turn.done",
     }
 
-    await fake_rpc.broadcast(
-        {
-            "method": "thread/realtime/transcript/done",
-            "params": {
-                "threadId": started["thread_id"],
-                "role": "user",
-                "text": "¡Terminar llamada!",
-            },
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await fake_rpc.broadcast(
+            {
+                "method": "thread/realtime/transcript/done",
+                "params": {
+                    "threadId": started["thread_id"],
+                    "role": "user",
+                    "text": "¡Terminar llamada!",
+                },
+            }
+        )
+        assert await device.receive_json(timeout=1) == {
+            "type": "stopped",
+            "reason": "end_conversation",
         }
-    )
-
-    assert await device.receive_json(timeout=1) == {
-        "type": "stopped",
-        "reason": "end_conversation",
-    }
     assert fake_rpc.responses == []
+    assert (
+        "Realtime native input transcript: fragments=1 fragment_chars=18 "
+        "final_chars=18" in caplog.text
+    )
     await device.close()
 
 
