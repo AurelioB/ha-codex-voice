@@ -43,6 +43,23 @@ Do not delete behavior coverage merely to shorten the edit loop; select less of
 it until a release candidate exists. Pytest remains the fastest automated loop
 because it avoids container startup and onboarding entirely.
 
+## On-demand realtime session report
+
+The diagnostic reporter is a separate process and adds no work to the bridge,
+speaker capture callback, or media path. It reads existing rotated Docker and
+device syslog records only when invoked:
+
+```bash
+UV_CACHE_DIR=/tmp/codex-uv-cache uv run python \
+  scripts/report_realtime_session.py \
+  --live --adb-serial 192.168.8.42:5555 --since 4h --latest 3
+```
+
+Use `--json` for machine-readable output. For an offline report, supply
+`--bridge-log PATH --device-log PATH`. Exact transcript text appears only when
+the bridge's explicit testing switch `HA_CODEX_REALTIME_LOG_TRANSCRIPTS=true`
+was active; the reporter itself never enables logging or records audio.
+
 ## Inner loop: local Home Assistant
 
 The standard-library helper needs Docker but no Python packages from this
