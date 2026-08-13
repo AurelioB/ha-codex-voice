@@ -7,6 +7,11 @@ and releases use semantic versioning.
 
 ### Added
 
+- Add trusted local context to native realtime sessions. Compose configures
+  `America/Mexico_City` and `Mexico City, Mexico` by default; every new thread
+  receives a fresh provider-start timestamp and a bridge-owned
+  `get_current_time` tool returns the exact local date, time, UTC offset,
+  timezone, and location without a network request.
 - Add default subscription-backed public web search through the Codex OAuth
   search endpoint, with the digest-pinned loopback-only SearXNG Compose service
   retained as an automatic fallback. The bridge-owned `search_web` tool returns

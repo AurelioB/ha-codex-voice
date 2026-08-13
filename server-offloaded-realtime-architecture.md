@@ -166,8 +166,9 @@ does not depend on provider `speech_started`.
 
 ## Ending a conversation
 
-The native thread exposes bridge-owned `end_conversation` and `search_web`, the
-current Home Assistant exposed-entity tools, and optional agent
+The native thread exposes bridge-owned `end_conversation`, configured
+`get_current_time`, and `search_web`, the current Home Assistant exposed-entity
+tools, and optional agent
 recall/deep-task tools. Its
 Spanish and English instructions say to call the terminal tool when the user
 clearly asks to end the conversation, including “terminar” and “terminar llamada”. The

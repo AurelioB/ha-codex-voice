@@ -125,7 +125,8 @@ requires the primary Home Assistant bridge token.
   device.
   The active strict-v2 route requires `conversation_mode: "native"`; an
   accepted value is echoed in `started`. Native v2 declares bridge-owned
-  `end_conversation` and `search_web`, the immutable Home Assistant authority
+  `end_conversation`, configured `get_current_time`, and `search_web`, the
+  immutable Home Assistant authority
   snapshot captured at startup, and optional external-agent tools.
   A v2 `text` control is a bounded user message; its role must be omitted or
   exactly `user`. See the [active v2
@@ -170,8 +171,10 @@ WebRTC transport, and provider session are ready. That is the device's
 cue-gated capture boundary. Native v2 has no completed-transcript executor or
 `appendSpeech` render handoff. It exposes bridge-owned `end_conversation`, Home
 Assistant tools from the generation snapshot captured before `thread/start`,
-and—only when configured—`ask_agent` and `recall_memory`. Calls execute
-asynchronously so PCM forwarding continues. The narrow bilingual
+and—only when configured—`get_current_time`, `ask_agent`, and `recall_memory`.
+Trusted local context includes a provider-start timestamp; the clock tool
+returns a fresh value for exact date/time requests without web access. Calls
+execute asynchronously so PCM forwarding continues. The narrow bilingual
 terminal-phrase fallback still emits terminal `stopped`; undeclared and
 device-declared tools fail closed.
 

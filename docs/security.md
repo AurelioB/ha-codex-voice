@@ -48,8 +48,9 @@ sides of a narrow bridge API.
   `conversation_mode: "native"`. The bridge captures the current immutable Home
   Assistant broker snapshot and keeps one active native App Server realtime
   provider generation behind a stable device WebSocket. Every generation adds
-  bridge-owned `end_conversation` and subscription-first `search_web`; optional
-  agent tools appear only when an endpoint is configured. Bridge tools cannot
+  bridge-owned `end_conversation`, configured local `get_current_time`, and
+  subscription-first `search_web`; optional agent tools appear only when an
+  endpoint is configured. Bridge tools cannot
   be replaced by colliding Home Assistant tools.
   The bridge rejects every undeclared provider tool with `do_not_retry`. It
   accepts bounded binary v2 PCM but never exposes raw

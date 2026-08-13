@@ -10,9 +10,11 @@ import wave
 from array import array
 from collections import Counter
 from collections.abc import Mapping
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from aiohttp import WSCloseCode, WSMsgType, WSServerHandshakeError, web
@@ -1067,6 +1069,21 @@ def test_web_search_configuration_is_optional_and_bounded(
             bearer_token="test-token",
             web_search_url="file:///etc/passwd",
         )
+
+
+def test_assistant_local_context_configuration_is_optional_and_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.setenv("HA_CODEX_ASSISTANT_TIMEZONE", "America/Mexico_City")
+    monkeypatch.setenv("HA_CODEX_ASSISTANT_LOCATION", "Mexico City, Mexico")
+
+    config = BridgeConfig.from_env()
+
+    assert config.assistant_timezone == "America/Mexico_City"
+    assert config.assistant_location == "Mexico City, Mexico"
+    with pytest.raises(ValueError, match="valid IANA timezone"):
+        BridgeConfig(bearer_token="test-token", assistant_timezone="Mars/Olympus")
 
 
 def test_voice_sample_collection_requires_explicit_root_and_consent(
@@ -7053,6 +7070,71 @@ async def test_realtime_v2_executes_default_web_search_tool(
             "snippet": "Información obtenida de internet.",
         }
     ]
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_exposes_and_executes_fresh_local_context(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            assistant_timezone="America/Mexico_City",
+            assistant_location="Mexico City, Mexico",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "get_current_time",
+    ]
+    assert "Location: Mexico City, Mexico" in thread_start["baseInstructions"]
+    assert "Time zone: America/Mexico_City" in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "native-time-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "native-time-call",
+                "tool": "get_current_time",
+                "arguments": {},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "native-time-request" for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "native-time-request"
+    )
+    assert response["success"] is True
+    result = json.loads(response["contentItems"][0]["text"])
+    assert (
+        result["local_date"]
+        == datetime.now(ZoneInfo("America/Mexico_City")).date().isoformat()
+    )
+    assert result["timezone"] == "America/Mexico_City"
+    assert result["location"] == "Mexico City, Mexico"
 
     await device.send_json({"type": "stop"})
     await device.close()

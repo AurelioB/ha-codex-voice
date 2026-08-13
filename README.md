@@ -40,6 +40,9 @@ Codex App Server, OAuth, WebRTC, provider lifecycle, bridge-owned
 `end_conversation`, the default Home Assistant exposed-entity tool snapshot,
 default public-web search, and optional external-agent tools.
 
+The reference deployment also supplies trusted Mexico City location/timezone
+context and an exact local `get_current_time` tool.
+
 An accepted wake pulses the LED and claims the microphone, but does not admit
 speech. The bridge completes the initial provider session, returns strict-v2
 `started`, and only then does the speaker play the acknowledgement cue. Cue EOF
@@ -85,8 +88,8 @@ historical.
 - The route-scoped device token cannot open the Home Assistant broker. Active
   native v2 captures the broker's immutable exposed-entity snapshot before
   startup, rejects device-declared tools, and adds bridge-owned
-  `end_conversation` plus default `search_web`. Optional agent tools are
-  advertised only when configured.
+  `end_conversation`, configured `get_current_time`, plus default `search_web`.
+  Optional agent tools are advertised only when configured.
 - The active reference configuration uses `native_aec3` with a 10 dB native
   baseline, noise-limited adaptive digital gain, a limiter, and moderate noise
   suppression, plus 0 dB transport gain, a fixed 100% AEC/playback anchor, a 100%-relative
@@ -173,6 +176,13 @@ stack also runs a digest-pinned SearXNG service bound only to host loopback and
 uses it automatically if subscription search is unavailable. Returned titles,
 URLs, and excerpts are untrusted evidence and cannot authorize Home Assistant
 actions.
+
+The reference Compose deployment sets `HA_CODEX_ASSISTANT_TIMEZONE` to
+`America/Mexico_City` and `HA_CODEX_ASSISTANT_LOCATION` to
+`Mexico City, Mexico`. These values enter trusted startup instructions, and
+`get_current_time` reads the local clock again whenever exact date or time is
+needed. Override either value for another installation; the timezone must be a
+valid IANA name.
 
 The Compose service uses host networking for reliable server-owned WebRTC, so
 apply a host firewall rule for port 8787. See the
@@ -436,7 +446,8 @@ controls regress. There is no transcript executor or synthesized turn handoff.
 
 Strict-v2 `started` is the session-readiness boundary. The speaker plays its
 pinned cue only after that message and opens capture only at cue EOF. The
-server declares bridge-owned `end_conversation` and `search_web`, the captured
+server declares bridge-owned `end_conversation`, `get_current_time`, and
+`search_web`, the captured
 Home Assistant tools, and optional agent tools, plus a narrow normalized
 Spanish/English terminal-phrase fallback. A successful end emits a terminal
 `stopped` event and normal cleanup restores idle. Device-declared and undeclared

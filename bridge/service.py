@@ -36,6 +36,7 @@ from .agent_tools import (
     AgentToolUnavailable,
 )
 from .app_server import CodexAppServer
+from .assistant_context import AssistantContext
 from .audio import (
     REALTIME_SAMPLE_RATE,
     Pcm16Mono24KhzResampler,
@@ -988,6 +989,10 @@ class BridgeState:
             config.web_search_url,
             timeout=config.web_search_timeout,
             subscription_auth_file=config.codex_auth_file,
+        )
+        self.assistant_context = AssistantContext(
+            config.assistant_timezone,
+            config.assistant_location,
         )
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
         self._conversation_lock = asyncio.Lock()
@@ -4381,14 +4386,18 @@ def _native_realtime_tools(
     agent_tools: AgentToolBroker,
     voice_samples: VoiceSampleInbox,
     web_search: WebSearchBroker,
+    assistant_context: AssistantContext | None = None,
 ) -> list[dict[str, Any]]:
     """Merge bridge, agent, and Home Assistant tools with explicit ownership."""
     tools: list[dict[str, Any]] = [DIRECT_END_CONVERSATION_TOOL]
+    context_tools = assistant_context.tools if assistant_context is not None else ()
+    tools.extend(context_tools)
     tools.extend(web_search.tools)
     tools.extend(voice_samples.tools)
     tools.extend(agent_tools.tools)
     reserved_names = {
         DIRECT_END_CONVERSATION_TOOL_NAME,
+        *(tool["name"] for tool in context_tools),
         *(tool["name"] for tool in web_search.tools),
         *(tool["name"] for tool in voice_samples.tools),
         *(tool["name"] for tool in agent_tools.tools),
@@ -4408,9 +4417,12 @@ def _native_realtime_base_instructions(
     voice_samples: VoiceSampleInbox,
     speaker_identity: SpeakerIdentityBroker,
     web_search: WebSearchBroker,
+    assistant_context: AssistantContext | None = None,
 ) -> str:
     """Build trusted native instructions for one immutable tool snapshot."""
     instructions = DIRECT_REALTIME_BASE_INSTRUCTIONS
+    if assistant_context is not None:
+        instructions += assistant_context.instructions()
     if broker_snapshot is not None:
         instructions += (
             "\n\nHome Assistant is the authoritative smart-home integration. Use "
@@ -4484,6 +4496,7 @@ async def _realtime_admitted(
                 state.agent_tools,
                 state.voice_samples,
                 state.web_search,
+                state.assistant_context,
             )
             if (
                 wire_protocol.uses_binary_audio
@@ -5528,6 +5541,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                         state.voice_samples,
                         state.speaker_identity,
                         state.web_search,
+                        state.assistant_context,
                     ),
                 )
                 created_thread = True
@@ -6774,10 +6788,13 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         started_at = time.monotonic()
         sample_owned = state.voice_samples.owns(name)
         web_owned = state.web_search.owns(name)
+        context_owned = state.assistant_context.owns(name)
         agent_owned = state.agent_tools.owns(name)
         owner = (
             "voice_samples"
             if sample_owned
+            else "assistant_context"
+            if context_owned
             else "web_search"
             if web_owned
             else "agent"
@@ -6794,7 +6811,21 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             "error": f"{owner}_tool_unavailable",
             "do_not_retry": True,
         }
-        if sample_owned and isinstance(arguments, Mapping):
+        if context_owned and isinstance(name, str):
+            try:
+                result = state.assistant_context.call(
+                    name=name,
+                    arguments=arguments,
+                )
+            except ProtocolError:
+                LOGGER.warning(
+                    "Realtime assistant-context tool call failed correlation=%s",
+                    correlation,
+                    exc_info=True,
+                )
+            else:
+                success = True
+        elif sample_owned and isinstance(arguments, Mapping):
             if arguments:
                 result = {
                     "error": "mark_false_wake_requires_empty_arguments",
@@ -6917,7 +6948,11 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         cancel_tool_continuation_watchdog()
         name = params.get("tool")
         arguments = params.get("arguments", {})
-        bridge_owned = state.voice_samples.owns(name) or state.web_search.owns(name)
+        bridge_owned = (
+            state.voice_samples.owns(name)
+            or state.web_search.owns(name)
+            or state.assistant_context.owns(name)
+        )
         agent_owned = state.agent_tools.owns(name)
         owned_background_generation = (
             active_background_turn_generation if bridge_managed_realtime else None
@@ -7819,6 +7854,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         if (
             state.voice_samples.owns(tool_name)
             or state.web_search.owns(tool_name)
+            or state.assistant_context.owns(tool_name)
             or state.agent_tools.owns(tool_name)
             or (broker_snapshot is not None and tool_name in broker_snapshot.tool_names)
         ):

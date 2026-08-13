@@ -7,6 +7,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_PERMISSION_PROFILE = "ha-voice-minimal"
 DEFAULT_REALTIME_MODEL = "gpt-live-1-codex"
@@ -106,6 +107,21 @@ def _validate_speaker_identity_config(config: BridgeConfig) -> None:
         raise ValueError("speaker_identity_timeout must be between 0.5 and 15 seconds")
 
 
+def _validate_assistant_context_config(config: BridgeConfig) -> None:
+    try:
+        ZoneInfo(config.assistant_timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("assistant_timezone must be a valid IANA timezone") from exc
+    if config.assistant_location is not None and (
+        not config.assistant_location.strip()
+        or len(config.assistant_location) > 256
+        or any(not character.isprintable() for character in config.assistant_location)
+    ):
+        raise ValueError(
+            "assistant_location must be a non-empty bounded printable value"
+        )
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     """Configuration shared by the HTTP service and Codex child process."""
@@ -141,6 +157,8 @@ class BridgeConfig:
     speaker_identity_timeout: float = 4.0
     web_search_url: str | None = None
     web_search_timeout: float = 10.0
+    assistant_timezone: str = "UTC"
+    assistant_location: str | None = None
 
     def __post_init__(self) -> None:
         if not self.bearer_token:
@@ -215,6 +233,7 @@ class BridgeConfig:
                 raise ValueError("web_search_url must be a bounded HTTP(S) URL")
         if not 0.5 <= self.web_search_timeout <= 20.0:
             raise ValueError("web_search_timeout must be between 0.5 and 20 seconds")
+        _validate_assistant_context_config(self)
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -299,4 +318,6 @@ class BridgeConfig:
             web_search_timeout=float(
                 os.environ.get("HA_CODEX_WEB_SEARCH_TIMEOUT", "10")
             ),
+            assistant_timezone=os.environ.get("HA_CODEX_ASSISTANT_TIMEZONE", "UTC"),
+            assistant_location=os.environ.get("HA_CODEX_ASSISTANT_LOCATION") or None,
         )
