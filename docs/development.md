@@ -112,22 +112,12 @@ printf '%s  %s\n' \
   .speaker-identity/models/nemo_en_titanet_large.onnx | sha256sum --check
 ```
 
-Import explicitly consented natural speech as `speaker-enrollment`, then build
-one private centroid from at least five usable three-second chunks spanning
-several recordings, distances, and sessions:
+The recommended enrollment path is the admin-only Home Assistant **Codex
+Voice** panel. First build/start the worker and bridge:
 
 ```bash
 docker build -f deploy/docker/SpeakerIdentity.Dockerfile \
-  -t ha-codex-speaker-identity:1.13.4 .
-docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/.speaker-identity/models:/models:ro" \
-  -v "$PWD/.speaker-identity/profiles:/profiles" \
-  -v "$PWD/private-enrollment-recordings:/recordings:ro" \
-  ha-codex-speaker-identity:1.13.4 \
-  --model /models/nemo_en_titanet_large.onnx \
-  --model-sha256 d51abcf31717ef28162f26acb9d44dd4127c3d44c9b8624f699f3425daca8e77 \
-  enroll owner /recordings/recording-1.wav /recordings/recording-2.wav \
-  /recordings/recording-3.wav --profiles /profiles
+  -t ha-codex-speaker-identity:1.14.0 .
 ```
 
 Set `HA_CODEX_SPEAKER_IDENTITY_TOKEN` to a distinct long random value and set
@@ -141,12 +131,33 @@ docker compose --env-file .codex-voice/compose.env \
   up --detach --build
 ```
 
+Open **Codex Voice** in the Home Assistant sidebar as an administrator. Start
+an enrollment only after the named person explicitly consents. Optionally link
+the profile to an existing Home Assistant Person and user. The next five
+separate voice sessions each contribute at most one silence-stripped,
+normalized embedding from the bounded post-wake window. Raw audio is not
+written to the profile directory. Complete the enrollment after all five
+samples are accepted; the resulting profile remains inactive.
+
+Arm held-out tests from the same panel at different distances and with an
+unknown household member or visitor. Adjust match/separation thresholds toward
+`unknown` rather than a false match, then explicitly activate the profile. The
+panel also supports relinking, renaming, deactivation, deletion, and restarting
+enrollment. Person/user links do not inherit that user's permissions and must
+never be used as biometric authentication.
+
+For offline experiments only, the image still exposes the `enroll` CLI. Mount
+explicitly consented WAV recordings read-only and build a centroid from at
+least five usable three-second chunks spanning multiple sessions and distances.
+Do not mix those enrollment recordings into held-out validation.
+
 The worker binds only to host loopback. The bridge copies one bounded
 five-second post-wake window, never blocks PCM on inference, and appends only a
-confident match as advisory context. Calibrate thresholds with held-out
-household and visitor recordings before relying on personalization. A match is
-not biometric authentication and must not authorize locks, alarms, purchases,
-or account changes.
+confident session-level match as advisory context. Calibrate thresholds with
+held-out household and visitor speech before relying on personalization. This
+release does not attempt per-utterance diarization when speakers change during
+one open conversation. A match is not biometric authentication and must not
+authorize locks, alarms, purchases, or account changes.
 
 ## Inner loop: local Home Assistant
 

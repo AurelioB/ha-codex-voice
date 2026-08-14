@@ -239,9 +239,10 @@ qualified vendor detector.
 ### M5 — speaker enrollment and identification
 
 Status: private centroid builder, pinned optional Compose worker, asynchronous
-five-second bridge probe, conservative unknown fallback, and advisory context
-injection implemented; household enrollment and physical threshold calibration
-remain pending.
+five-second bridge probe, conservative unknown fallback, advisory context
+injection, consented enrollment state, held-out validation, Home Assistant
+Person/user links, and an admin management panel are implemented; household
+enrollment and physical threshold calibration remain pending.
 
 - Enroll each person from several sessions and distances, not one phrase.
 - Compute embeddings on the Compose host from AEC-cleaned user speech after wake.
@@ -253,8 +254,14 @@ remain pending.
   result per device session.
 - Inject an advisory identity context update only after a confident result. Do
   not restart the provider or delay its first response.
-- Add an explicit profile delete/re-enroll workflow and threshold evaluation for
-  household members, visitors, playback, and recordings.
+- Use the Home Assistant **Codex Voice** panel to enroll, test, activate,
+  relink, delete, and re-enroll profiles and to tune the persisted score/margin
+  thresholds. Profiles remain inactive until an administrator explicitly
+  enables them after held-out testing.
+- Keep the first release session-level: one dominant identity result may be
+  published per device session. Per-utterance speaker changes require a later
+  segmentation/diarization milestone and are not inferred from arbitrary
+  rolling windows.
 
 Exit gate: target household validation meets the documented false-accept bound,
 unknown speakers remain unknown, and identification work causes no audio queue

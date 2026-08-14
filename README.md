@@ -191,8 +191,8 @@ apply a host firewall rule for port 8787. See the
 for setup, security, lifecycle, rollout, and physical acceptance details.
 
 Optional local speaker identification is a separate image and never enlarges
-the normal bridge container. After enrolling private profiles and downloading
-the exact documented TitaNet model, enable it explicitly with:
+the normal bridge container. After downloading the exact documented TitaNet
+model, enable it explicitly with:
 
 ```bash
 docker compose --env-file .codex-voice/compose.env \
@@ -200,10 +200,15 @@ docker compose --env-file .codex-voice/compose.env \
   up --detach --build
 ```
 
-The worker receives one bounded post-wake PCM window over loopback, returns
-`unknown` unless score and margin both pass, and can only add advisory
-personalization context. It is never an authentication factor. See
-[development](docs/development.md#optional-speaker-identification).
+The Home Assistant integration then adds an admin-only **Codex Voice** panel.
+It provides consented enrollment, held-out tests, activation, deletion,
+threshold tuning, and optional links from each local voice profile to a Home
+Assistant Person and user. Enrollment keeps normalized embeddings and source
+audio hashes only; it does not retain raw audio. The worker receives one
+bounded post-wake PCM window over loopback, returns `unknown` unless score and
+margin both pass, and can only add advisory personalization context. A match is
+never an authentication factor and never changes Home Assistant permissions.
+See [development](docs/development.md#optional-speaker-identification).
 
 ### 3. Add reliable local STT
 

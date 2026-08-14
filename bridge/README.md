@@ -252,13 +252,17 @@ docker compose --env-file .codex-voice/compose.env \
   up -d --build
 ```
 
-The bridge captures at most one five-second post-wake PCM window and submits it
-asynchronously over loopback. The worker strips silence and requires both a
-calibrated cosine threshold and separation margin. A confident match is
-appended later as advisory developer context; `unknown`, timeout, worker
-failure, or an absent profile changes nothing. Identity never delays readiness,
-capture, interruption, or the first response and never authorizes a sensitive
-Home Assistant action. Enrollment and threshold evaluation are documented in
+The Home Assistant integration exposes the worker through an admin-only panel
+and primary-token management API. It supports explicit-consent enrollment,
+held-out validation, activation, deletion, threshold tuning, and optional
+links to live Home Assistant Person and user records. The bridge captures at
+most one five-second post-wake PCM window and submits it asynchronously over
+loopback. The worker strips silence and requires both a calibrated cosine
+threshold and separation margin. A confident match is appended later as
+advisory developer context; `unknown`, timeout, worker failure, or an absent
+profile changes nothing. Identity never delays readiness, capture,
+interruption, or the first response and never authorizes a sensitive Home
+Assistant action. Enrollment and threshold evaluation are documented in
 [`docs/development.md`](../docs/development.md#optional-speaker-identification).
 
 The Compose service keeps the bridge, App Server, OAuth state, media stack, and

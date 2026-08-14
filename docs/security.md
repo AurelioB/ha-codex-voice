@@ -43,12 +43,16 @@ sides of a narrow bridge API.
 - Speaker identification is absent from the standard bridge image and runtime.
   The optional Compose worker binds to loopback, receives a distinct bearer and
   one bounded five-second PCM window per enabled session, verifies the exact
-  TitaNet model hash, and reads owner-managed profiles through a read-only
-  mount. A timeout, malformed result, insufficient voiced audio, low score, or
-  insufficient margin returns `unknown` without affecting voice availability.
-  Only a confident profile ID may be appended as advisory personalization
-  context; it never authenticates the caller or expands Home Assistant tool
-  authority.
+  TitaNet model hash, and writes only normalized embeddings, bounded metadata,
+  and source-audio hashes to an owner-only profile mount. Raw enrollment audio
+  is never retained. Management requires the primary bridge bearer and an
+  authenticated Home Assistant administrator; the route-scoped speaker token
+  cannot reach it. A timeout, malformed result, insufficient voiced audio, low
+  score, or insufficient margin returns `unknown` without affecting voice
+  availability. Optional Home Assistant Person/user links are advisory
+  metadata: only a confident profile may be appended as personalization
+  context, and it never authenticates the caller, impersonates the linked HA
+  user, or expands Home Assistant tool authority.
 - The current ThirdReality strict-v2 client explicitly requests
   `conversation_mode: "native"`. The bridge captures the current immutable Home
   Assistant broker snapshot and keeps one active native App Server realtime

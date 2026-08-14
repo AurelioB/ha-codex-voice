@@ -25,6 +25,8 @@ async def test_disabled_broker_allocates_no_probe_or_client() -> None:
         "matches": 0,
         "unknown": 0,
         "last_duration_ms": None,
+        "enrollment_active": False,
+        "test_armed": False,
     }
     await broker.close()
 
@@ -45,6 +47,8 @@ async def test_probe_submits_one_bounded_window_and_returns_advisory_context(
         return {
             "status": "match",
             "speaker_id": "owner",
+            "display_name": "Aurelio",
+            "ha_person_id": "person.aurelio",
             "score": 0.81,
             "margin": 0.29,
         }
@@ -63,7 +67,10 @@ async def test_probe_submits_one_bounded_window_and_returns_advisory_context(
     assert len(observed[0]) == CAPTURE_BYTES
     assert result.status == "match"
     assert result.speaker_id == "owner"
+    assert result.display_name == "Aurelio"
+    assert result.ha_person_id == "person.aurelio"
     assert result.context is not None
+    assert "Home Assistant person Aurelio" in result.context
     assert "not authentication" in result.context
     assert broker.health()["matches"] == 1
     await broker.close()

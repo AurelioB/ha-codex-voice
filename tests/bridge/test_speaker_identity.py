@@ -12,8 +12,10 @@ from scripts.speaker_identity import (
     CHUNK_BYTES,
     SAMPLE_RATE,
     SpeakerIdentityError,
+    SpeakerIdentityStore,
     build_profile,
     identify,
+    load_profile_documents,
     load_profiles,
 )
 
@@ -134,3 +136,133 @@ def test_invalid_profile_dimension_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(SpeakerIdentityError, match="invalid dimension"):
         load_profiles(profiles, model_sha256="a" * 64)
+
+
+def test_consented_enrollment_builds_disabled_linked_profile_without_raw_audio(
+    tmp_path: Path,
+) -> None:
+    embedder = FakeEmbedder([1.0, 0.0])
+    store = SpeakerIdentityStore(
+        tmp_path / "profiles",
+        embedder=embedder,
+        match_threshold=0.55,
+        margin_threshold=0.08,
+    )
+
+    enrollment = store.start_enrollment(
+        {
+            "speaker_id": "owner",
+            "display_name": "Aurelio",
+            "ha_person_id": "person.aurelio",
+            "ha_user_id": "ha-user-id",
+            "consent": True,
+        }
+    )
+    assert enrollment["sample_count"] == 0
+    for index in range(5):
+        sample = store.add_enrollment_sample("owner", _pcm(5, amplitude=1_000 + index))
+        assert sample["accepted"] is True
+        assert sample["sample_count"] == index + 1
+
+    profile = store.complete_enrollment("owner")
+    assert profile == {
+        "speaker_id": "owner",
+        "display_name": "Aurelio",
+        "ha_person_id": "person.aurelio",
+        "ha_user_id": "ha-user-id",
+        "enabled": False,
+        "chunks": 5,
+        "created_at": profile["created_at"],
+        "updated_at": profile["updated_at"],
+    }
+    assert store.status()["raw_audio_retained"] is False
+    assert not list((tmp_path / "profiles" / ".enrollments").glob("*.json"))
+    serialized = (tmp_path / "profiles" / "owner.json").read_text()
+    assert "RIFF" not in serialized
+    assert "centroid" in serialized
+
+    # Disabled profiles are excluded from ordinary recognition but available
+    # for explicit held-out testing until the administrator activates them.
+    assert store.identify_audio(_pcm(5))["status"] == "unknown"
+    held_out = store.identify_audio(_pcm(5), include_disabled=True)
+    assert held_out["speaker_id"] == "owner"
+    assert held_out["display_name"] == "Aurelio"
+    store.update_profile("owner", {"enabled": True})
+    assert store.identify_audio(_pcm(5))["speaker_id"] == "owner"
+
+
+def test_enrollment_requires_consent_is_single_active_and_deduplicates(
+    tmp_path: Path,
+) -> None:
+    store = SpeakerIdentityStore(
+        tmp_path / "profiles",
+        embedder=FakeEmbedder([1.0, 0.0]),
+        match_threshold=0.55,
+        margin_threshold=0.08,
+    )
+    payload = {
+        "speaker_id": "owner",
+        "display_name": "Owner",
+        "ha_person_id": None,
+        "ha_user_id": None,
+        "consent": False,
+    }
+    with pytest.raises(SpeakerIdentityError, match="explicit consent"):
+        store.start_enrollment(payload)
+    payload["consent"] = True
+    store.start_enrollment(payload)
+    duplicate = store.add_enrollment_sample("owner", _pcm(5))
+    assert duplicate["accepted"] is True
+    duplicate = store.add_enrollment_sample("owner", _pcm(5))
+    assert duplicate["accepted"] is False
+    assert duplicate["reason"] == "duplicate"
+    assert duplicate["sample_count"] == 1
+    with pytest.raises(SpeakerIdentityError, match="active speaker enrollment"):
+        store.start_enrollment(
+            {
+                **payload,
+                "speaker_id": "other",
+                "display_name": "Other",
+            }
+        )
+
+
+def test_profile_schema_one_migrates_in_memory_and_settings_persist(
+    tmp_path: Path,
+) -> None:
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "owner.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "speaker_id": "owner",
+                "model_sha256": "a" * 64,
+                "centroid": [1.0, 0.0],
+            }
+        )
+    )
+    documents = load_profile_documents(profiles, model_sha256="a" * 64)
+    assert documents["owner"]["display_name"] == "owner"
+    assert documents["owner"]["enabled"] is True
+
+    store = SpeakerIdentityStore(
+        profiles,
+        embedder=FakeEmbedder([1.0, 0.0]),
+        match_threshold=0.55,
+        margin_threshold=0.08,
+    )
+    assert store.update_settings(
+        {"match_threshold": 0.7, "margin_threshold": 0.12}
+    ) == {"match_threshold": 0.7, "margin_threshold": 0.12}
+    reloaded = SpeakerIdentityStore(
+        profiles,
+        embedder=FakeEmbedder([1.0, 0.0]),
+        match_threshold=0.1,
+        margin_threshold=0.01,
+    )
+    assert reloaded.settings() == {
+        "match_threshold": 0.7,
+        "margin_threshold": 0.12,
+    }
+    assert [profile["speaker_id"] for profile in reloaded.list_profiles()] == ["owner"]

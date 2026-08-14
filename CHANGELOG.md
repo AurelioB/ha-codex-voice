@@ -33,6 +33,11 @@ and releases use semantic versioning.
   verifies an exact TitaNet model and private enrolled centroids, and only a
   confident score-plus-margin match becomes advisory context. Unknown or failed
   identity never delays or terminates realtime audio.
+- Add admin-managed local voice profiles. The Home Assistant **Codex Voice**
+  panel handles explicit-consent enrollment, progress, held-out testing,
+  activation, deletion, threshold tuning, and optional links to Home Assistant
+  Person/user records. Profiles use a versioned migration, retain embeddings
+  and source hashes rather than raw audio, and remain personalization-only.
 - Add desktop-compatible same-peer native interruption. The speaker's
   AEC-qualified cut sends exact `provider_barge`; the bridge sends
   `response.cancel` followed by `output_audio_buffer.clear` on the active

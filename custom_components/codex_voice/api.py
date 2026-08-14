@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Final, NoReturn
+from urllib.parse import quote
 
 from aiohttp import (
     ClientError,
@@ -281,6 +282,88 @@ class BridgeClient:
         if payload.get("status") not in (None, "ok", "ready"):
             raise BridgeConnectionError("The Codex bridge is not ready")
         return payload
+
+    async def async_speaker_identity_status(self) -> JsonObject:
+        """Return profiles, enrollment progress, tests, and runtime settings."""
+        return await self._async_speaker_identity_request("GET", "")
+
+    async def async_start_speaker_enrollment(
+        self, payload: Mapping[str, Any]
+    ) -> JsonObject:
+        """Start one explicitly consented speaker enrollment."""
+        return await self._async_speaker_identity_request(
+            "POST", "/enrollments", payload
+        )
+
+    async def async_complete_speaker_enrollment(self, speaker_id: str) -> JsonObject:
+        """Build one disabled profile after enough independent samples."""
+        return await self._async_speaker_identity_request(
+            "POST", f"/enrollments/{quote(speaker_id, safe='')}/complete", {}
+        )
+
+    async def async_cancel_speaker_enrollment(self, speaker_id: str) -> JsonObject:
+        """Delete a pending enrollment and its private embeddings."""
+        return await self._async_speaker_identity_request(
+            "DELETE", f"/enrollments/{quote(speaker_id, safe='')}"
+        )
+
+    async def async_update_speaker_profile(
+        self, speaker_id: str, payload: Mapping[str, Any]
+    ) -> JsonObject:
+        """Update links, display name, or activation for one profile."""
+        return await self._async_speaker_identity_request(
+            "PATCH", f"/profiles/{quote(speaker_id, safe='')}", payload
+        )
+
+    async def async_delete_speaker_profile(self, speaker_id: str) -> JsonObject:
+        """Delete one private speaker profile."""
+        return await self._async_speaker_identity_request(
+            "DELETE", f"/profiles/{quote(speaker_id, safe='')}"
+        )
+
+    async def async_arm_speaker_identity_test(
+        self, expected_speaker_id: str | None
+    ) -> JsonObject:
+        """Apply the next post-wake probe only to held-out validation."""
+        return await self._async_speaker_identity_request(
+            "POST", "/tests", {"expected_speaker_id": expected_speaker_id}
+        )
+
+    async def async_update_speaker_identity_settings(
+        self, *, match_threshold: float, margin_threshold: float
+    ) -> JsonObject:
+        """Persist conservative live identity thresholds on the worker."""
+        return await self._async_speaker_identity_request(
+            "PATCH",
+            "/settings",
+            {
+                "match_threshold": match_threshold,
+                "margin_threshold": margin_threshold,
+            },
+        )
+
+    async def _async_speaker_identity_request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> JsonObject:
+        try:
+            async with self._session.request(
+                method,
+                self._url(f"/v1/speaker-identity{path}"),
+                headers=self._headers,
+                json=dict(payload) if payload is not None else None,
+                timeout=ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as response:
+                await self._raise_for_status(response)
+                return await self._read_json(response)
+        except BridgeError:
+            raise
+        except (TimeoutError, ClientError) as err:
+            raise BridgeConnectionError(
+                "Unable to manage speaker identity through the Codex bridge"
+            ) from err
 
     async def async_converse(
         self,

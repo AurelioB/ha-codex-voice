@@ -1918,6 +1918,7 @@ async def test_health_requires_bearer_and_reports_ready(
             "connected": False,
             "language": None,
             "tool_count": 0,
+            "local_context_available": False,
             "pending_calls": 0,
             "calls_started": 0,
             "calls_succeeded": 0,
@@ -1953,12 +1954,18 @@ async def test_health_requires_bearer_and_reports_ready(
             "matches": 0,
             "unknown": 0,
             "last_duration_ms": None,
+            "enrollment_active": False,
+            "test_armed": False,
         },
         "web_search": {
             "enabled": False,
+            "primary_backend": None,
+            "local_fallback": False,
             "calls_started": 0,
             "calls_succeeded": 0,
             "calls_failed": 0,
+            "subscription_calls": 0,
+            "fallback_calls": 0,
             "last_call_duration_ms": None,
         },
     }
@@ -7219,6 +7226,115 @@ async def test_realtime_v2_optional_identity_appends_late_advisory_context(
     assert await device.receive_json(timeout=1) == {"type": "pong"}
     await device.send_json({"type": "stop"})
     await device.close()
+
+
+@pytest.mark.asyncio
+async def test_speaker_identity_management_is_primary_auth_and_worker_backed(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    observed: list[tuple[str, str, object]] = []
+
+    async def worker(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == (
+            "Bearer speaker-specific-token-123456"
+        )
+        payload = await request.json() if request.can_read_body else None
+        observed.append((request.method, request.path, payload))
+        if request.path == "/status":
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "profiles": [],
+                    "enrollments": [],
+                    "settings": {
+                        "match_threshold": 0.55,
+                        "margin_threshold": 0.08,
+                    },
+                    "required_samples": 5,
+                    "raw_audio_retained": False,
+                }
+            )
+        if request.path == "/enrollments":
+            return web.json_response({"speaker_id": payload["speaker_id"]})
+        if request.path.endswith("/complete"):
+            return web.json_response(
+                {"speaker_id": "owner", "enabled": False, "chunks": 5}
+            )
+        if request.path == "/profiles/owner":
+            return web.json_response({"speaker_id": "owner", **(payload or {})})
+        if request.path == "/settings":
+            return web.json_response(payload)
+        return web.json_response({"deleted": True})
+
+    worker_app = web.Application()
+    worker_app.router.add_route("*", "/{tail:.*}", worker)
+    identity_server = await aiohttp_server(worker_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            realtime_device_token="device-token-distinct",
+            speaker_identity_url=str(identity_server.make_url("/identify")),
+            speaker_identity_token="speaker-specific-token-123456",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    assert (await client.get("/v1/speaker-identity")).status == 401
+    assert (
+        await client.get(
+            "/v1/speaker-identity",
+            headers={"Authorization": "Bearer device-token-distinct"},
+        )
+    ).status == 401
+
+    status = await client.get("/v1/speaker-identity", headers=AUTH)
+    assert status.status == 200
+    assert (await status.json())["raw_audio_retained"] is False
+    enrollment = await client.post(
+        "/v1/speaker-identity/enrollments",
+        headers=AUTH,
+        json={
+            "speaker_id": "owner",
+            "display_name": "Aurelio",
+            "ha_person_id": "person.aurelio",
+            "ha_user_id": "user-id",
+            "consent": True,
+        },
+    )
+    assert enrollment.status == 200
+    assert (await enrollment.json())["speaker_id"] == "owner"
+    completed = await client.post(
+        "/v1/speaker-identity/enrollments/owner/complete", headers=AUTH
+    )
+    assert completed.status == 200
+    updated = await client.patch(
+        "/v1/speaker-identity/profiles/owner",
+        headers=AUTH,
+        json={"enabled": True},
+    )
+    assert (await updated.json())["enabled"] is True
+    settings = await client.patch(
+        "/v1/speaker-identity/settings",
+        headers=AUTH,
+        json={"match_threshold": 0.7, "margin_threshold": 0.12},
+    )
+    assert await settings.json() == {
+        "match_threshold": 0.7,
+        "margin_threshold": 0.12,
+    }
+    armed = await client.post(
+        "/v1/speaker-identity/tests",
+        headers=AUTH,
+        json={"expected_speaker_id": "owner"},
+    )
+    assert await armed.json() == {"armed": True, "expected_speaker_id": "owner"}
+    assert ("GET", "/status", None) in observed
+    assert any(
+        method == "POST" and path == "/enrollments" for method, path, _ in observed
+    )
 
 
 @pytest.mark.asyncio

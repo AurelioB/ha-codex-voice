@@ -8,7 +8,7 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/SpeakerIdentity.Dockerfile
-    image: "ha-codex-speaker-identity:${HA_CODEX_SPEAKER_IDENTITY_IMAGE_TAG:-1.13.4}"
+    image: "ha-codex-speaker-identity:${HA_CODEX_SPEAKER_IDENTITY_IMAGE_TAG:-1.14.0}"
     init: true
     user: "${HA_CODEX_UID:-1000}:${HA_CODEX_GID:-1000}"
     read_only: true
@@ -42,7 +42,6 @@ services:
       - type: bind
         source: "${HA_CODEX_SPEAKER_PROFILES_HOST:?Set an owner-only profile directory}"
         target: /profiles
-        read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     cap_drop:

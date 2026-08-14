@@ -33,6 +33,7 @@ from .const import (
     PLATFORMS,
     SUBENTRY_TYPE_CONVERSATION,
 )
+from .identity_management import async_setup_identity_management
 from .realtime_tools import async_start_realtime_tool_broker
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ async def async_setup_entry(
         raise ConfigEntryError(str(err)) from err
 
     entry.runtime_data = client
+    await async_setup_identity_management(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(
         _async_start_realtime_tool_broker_at_started(hass, entry, session)

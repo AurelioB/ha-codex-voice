@@ -64,8 +64,13 @@ async def test_setup_owns_handoff_release_tasks_until_unload() -> None:
         patch(
             "custom_components.codex_voice.async_start_realtime_tool_broker"
         ) as start_broker,
+        patch(
+            "custom_components.codex_voice.async_setup_identity_management",
+            new_callable=AsyncMock,
+        ) as setup_identity_management,
     ):
         assert await async_setup_entry(cast("Any", hass), cast("Any", entry))
+        setup_identity_management.assert_awaited_once_with(hass)
         start_broker.assert_not_called()
         assert len(startup_callbacks) == 1
         startup_callbacks[0](hass)

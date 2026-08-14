@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import math
+import re
 import secrets
 import sys
 import tempfile
@@ -68,7 +69,11 @@ from .realtime_wire import (
     validate_direct_webrtc_rollover_ready,
 )
 from .runtime import IsolatedCodexRuntime, codex_child_environment
-from .speaker_identity import SpeakerIdentityBroker, SpeakerIdentityProbe
+from .speaker_identity import (
+    SpeakerIdentityBroker,
+    SpeakerIdentityProbe,
+    SpeakerIdentityUnavailable,
+)
 from .tool_broker import (
     MAX_TOOL_BROKER_MESSAGE_BYTES,
     HomeAssistantToolBroker,
@@ -238,6 +243,8 @@ REALTIME_MAX_PENDING_TOOL_CALLS = 16
 REALTIME_MAX_TOOL_CALLS_PER_SESSION = 1_024
 REALTIME_TOOL_CONTINUATION_TIMEOUT_SECONDS = 20.0
 REALTIME_PROVIDER_TOOL_REQUEST_TIMEOUT_SECONDS = 45.0
+SPEAKER_IDENTITY_MANAGEMENT_MAX_BYTES = 16 * 1024
+SPEAKER_IDENTITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 REALTIME_FRONTEND_PROMPT_MAX_CHARS = 4_096
 REALTIME_FRONTEND_PROMPT = (
     "You are a speech frontend controlled by the client. Never answer a user "
@@ -1981,6 +1988,30 @@ def create_app(
     app.router.add_post("/v1/speech-session/release", _release_speech_session)
     app.router.add_post("/v1/agent/announce", _agent_announce)
     app.router.add_post("/v1/voice-lab/wake-sample", _voice_lab_wake_sample)
+    app.router.add_get("/v1/speaker-identity", _speaker_identity_status)
+    app.router.add_post(
+        "/v1/speaker-identity/enrollments", _speaker_identity_start_enrollment
+    )
+    app.router.add_post(
+        "/v1/speaker-identity/enrollments/{speaker_id}/complete",
+        _speaker_identity_complete_enrollment,
+    )
+    app.router.add_delete(
+        "/v1/speaker-identity/enrollments/{speaker_id}",
+        _speaker_identity_cancel_enrollment,
+    )
+    app.router.add_patch(
+        "/v1/speaker-identity/profiles/{speaker_id}",
+        _speaker_identity_update_profile,
+    )
+    app.router.add_delete(
+        "/v1/speaker-identity/profiles/{speaker_id}",
+        _speaker_identity_delete_profile,
+    )
+    app.router.add_post("/v1/speaker-identity/tests", _speaker_identity_arm_test)
+    app.router.add_patch(
+        "/v1/speaker-identity/settings", _speaker_identity_update_settings
+    )
     app.router.add_get("/v1/home-assistant/tools", _home_assistant_tools)
     app.router.add_get("/v1/realtime", _realtime)
     app.on_shutdown.append(_close_active_websockets)
@@ -2101,6 +2132,8 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.StreamRes
         return web.json_response({"error": str(exc)}, status=503)
     except VoiceSampleUnavailable as exc:
         return web.json_response({"error": str(exc)}, status=503)
+    except SpeakerIdentityUnavailable as exc:
+        return web.json_response({"error": str(exc)}, status=503)
     except BridgeError as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -2139,6 +2172,91 @@ async def _health(request: web.Request) -> web.Response:
         },
         status=200 if ready else 503,
     )
+
+
+def _speaker_identity_id(request: web.Request) -> str:
+    speaker_id = request.match_info.get("speaker_id", "")
+    if SPEAKER_IDENTITY_ID.fullmatch(speaker_id) is None:
+        raise ProtocolError("speaker ID contains unsupported characters")
+    return speaker_id
+
+
+async def _speaker_identity_management_json(request: web.Request) -> dict[str, Any]:
+    if (
+        request.content_length is not None
+        and request.content_length > SPEAKER_IDENTITY_MANAGEMENT_MAX_BYTES
+    ):
+        raise ProtocolError("speaker identity request exceeded its size limit")
+    payload = await _read_json(request)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode()
+    if len(encoded) > SPEAKER_IDENTITY_MANAGEMENT_MAX_BYTES:
+        raise ProtocolError("speaker identity request exceeded its size limit")
+    return payload
+
+
+async def _speaker_identity_status(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    return web.json_response(await state.speaker_identity.management_status())
+
+
+async def _speaker_identity_start_enrollment(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    payload = await _speaker_identity_management_json(request)
+    return web.json_response(await state.speaker_identity.start_enrollment(payload))
+
+
+async def _speaker_identity_complete_enrollment(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    return web.json_response(
+        await state.speaker_identity.complete_enrollment(_speaker_identity_id(request))
+    )
+
+
+async def _speaker_identity_cancel_enrollment(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    await state.speaker_identity.cancel_enrollment(_speaker_identity_id(request))
+    return web.json_response({"deleted": True})
+
+
+async def _speaker_identity_update_profile(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    payload = await _speaker_identity_management_json(request)
+    return web.json_response(
+        await state.speaker_identity.update_profile(
+            _speaker_identity_id(request), payload
+        )
+    )
+
+
+async def _speaker_identity_delete_profile(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    await state.speaker_identity.delete_profile(_speaker_identity_id(request))
+    return web.json_response({"deleted": True})
+
+
+async def _speaker_identity_arm_test(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    payload = await _speaker_identity_management_json(request)
+    if set(payload) != {"expected_speaker_id"}:
+        raise ProtocolError("identity test requires exactly expected_speaker_id")
+    expected = payload["expected_speaker_id"]
+    if expected is not None and (
+        not isinstance(expected, str) or SPEAKER_IDENTITY_ID.fullmatch(expected) is None
+    ):
+        raise ProtocolError("expected speaker ID is invalid")
+    state.speaker_identity.arm_test(expected)
+    return web.json_response({"armed": True, "expected_speaker_id": expected})
+
+
+async def _speaker_identity_update_settings(request: web.Request) -> web.Response:
+    state: BridgeState = request.app[STATE_KEY]
+    payload = await _speaker_identity_management_json(request)
+    return web.json_response(await state.speaker_identity.update_settings(payload))
 
 
 async def _agent_announce(request: web.Request) -> web.Response:
