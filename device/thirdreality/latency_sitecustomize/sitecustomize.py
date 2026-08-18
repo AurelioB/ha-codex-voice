@@ -263,6 +263,15 @@ _VOICE_SAMPLE_PREROLL_MAX_BYTES = 96 * 1024
 _REALTIME_STARTUP_HEADROOM_BYTES = 32 * 1024
 _DIRECT_STARTUP_MAX_ATTEMPTS = 3
 _DIRECT_STARTUP_DEADLINE_SECONDS = 12.0
+_LIVE_RECONNECT_MAX_ATTEMPTS = 3
+_LIVE_RECONNECT_DEADLINE_SECONDS = 15.0
+_NON_RECONNECTABLE_LIVE_FAILURE_REASONS = frozenset(
+    {
+        "idle_deadline",
+        "invalid_media_or_protocol",
+        "session_deadline",
+    }
+)
 _DIRECT_READY_CUE_TIMEOUT_SECONDS = 2.0
 _DIRECT_READY_CUE_PATH = (
     "/usr/lib/python3.11/site-packages/sounds/wake_word_triggered_old.wav"
@@ -344,6 +353,7 @@ class _RealtimeOwner:
         "ready_confirmation_deadline",
         "ready_confirmation_pending",
         "ready_seen",
+        "reconnect_attempt",
         "released",
         "session",
         "startup_attempt",
@@ -372,6 +382,7 @@ class _RealtimeOwner:
         self.ready_confirmation_deadline: float | None = None
         self.ready_confirmation_pending = False
         self.ready_seen = False
+        self.reconnect_attempt = 0
         self.released = False
         self.startup_attempt = 1
         self.startup_deadline: float | None = None
@@ -1052,6 +1063,63 @@ def _retry_direct_realtime_startup(
     return False
 
 
+def _retry_live_realtime_connection(
+    instance: Any,
+    owner: _RealtimeOwner,
+    *,
+    start_watcher: bool = True,
+) -> bool:
+    """Reconnect a failed live transport without releasing speaker ownership."""
+    if (
+        not _uses_deterministic_realtime_media()
+        or not owner.capture_open
+        or owner.stop_requested
+        or owner.released
+        or owner.reconnect_attempt >= _LIVE_RECONNECT_MAX_ATTEMPTS
+        or getattr(instance, _REALTIME_OWNER_ATTRIBUTE, None) is not owner
+    ):
+        return False
+    try:
+        state_name = owner.session.state.name
+    except Exception:  # noqa: BLE001 - malformed optional state is not recoverable
+        return False
+    if state_name != "FAILED":
+        return False
+    if (
+        getattr(owner.session, "terminal_reason", None)
+        in _NON_RECONNECTABLE_LIVE_FAILURE_REASONS
+    ):
+        return False
+
+    with suppress(Exception):
+        owner.session.stop()
+    while owner.reconnect_attempt < _LIVE_RECONNECT_MAX_ATTEMPTS:
+        owner.reconnect_attempt += 1
+        try:
+            replacement = _REALTIME_SUPPORT.RealtimeSession(_REALTIME_CONFIG)
+            owner.session = replacement
+            owner.ready_seen = False
+            owner.ready_confirmation_pending = False
+            owner.ready_confirmation_deadline = None
+            owner.startup_deadline = time.monotonic() + _LIVE_RECONNECT_DEADLINE_SECONDS
+            _initialize_direct_session_volume(instance, owner)
+            replacement.start()
+        except Exception:  # noqa: BLE001 - exhaust the bounded reconnect policy
+            with suppress(Exception):
+                owner.session.stop()
+            continue
+        with suppress(Exception):
+            syslog.syslog(
+                syslog.LOG_INFO,
+                "codex-voice realtime_reconnect "
+                f"attempt={owner.reconnect_attempt}/{_LIVE_RECONNECT_MAX_ATTEMPTS}",
+            )
+        if start_watcher and not _start_direct_lifecycle_watcher(instance, owner):
+            return False
+        return True
+    return False
+
+
 def _start_direct_lifecycle_watcher(
     instance: Any,
     owner: _RealtimeOwner,
@@ -1096,6 +1164,8 @@ def _watch_direct_lifecycle(
             startup_deadline = owner.startup_deadline
             if owner.ready_seen:
                 if watched_session.terminal:
+                    if _retry_live_realtime_connection(instance, owner):
+                        return
                     _detach_realtime_owner(instance, owner, unduck=owner.ducked)
                     return
                 cue_deadline = owner.ready_confirmation_deadline
@@ -1130,17 +1200,28 @@ def _watch_direct_lifecycle(
                     return
                 owner.ready_seen = True
                 owner.startup_deadline = None
+                owner.reconnect_attempt = 0
                 _begin_direct_ready_confirmation(instance, owner)
                 continue
             if startup_deadline is not None and time.monotonic() >= startup_deadline:
+                if owner.capture_open and _retry_live_realtime_connection(
+                    instance, owner
+                ):
+                    return
                 _LOGGER.warning("ThirdReality realtime startup deadline expired")
                 _fallback_realtime_to_ha(instance, owner)
                 return
             if watched_session.failed_before_ready:
+                if owner.capture_open:
+                    if not _retry_live_realtime_connection(instance, owner):
+                        _detach_realtime_owner(instance, owner, unduck=owner.ducked)
+                    return
                 if not _retry_direct_realtime_startup(instance, owner):
                     _fallback_realtime_to_ha(instance, owner)
                 return
             if watched_session.terminal:
+                if _retry_live_realtime_connection(instance, owner):
+                    return
                 _detach_realtime_owner(instance, owner, unduck=owner.ducked)
                 return
 
@@ -1455,6 +1536,8 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
             _fallback_realtime_to_ha(instance, owner, audio_chunk)
             return
         if owner.session.terminal:
+            if _retry_live_realtime_connection(instance, owner):
+                return
             _detach_realtime_owner(instance, owner, unduck=owner.ducked)
             return
 
@@ -1466,7 +1549,7 @@ def _realtime_handle_audio(instance: Any, audio_chunk: bytes) -> None:
                     return
                 owner.fallback_audio.append(audio_chunk)
                 owner.fallback_bytes += len(audio_chunk)
-        elif not owner.ready_seen:
+        elif not owner.ready_seen and owner.session.ready:
             owner.ready_seen = True
             owner.fallback_audio.clear()
             owner.fallback_bytes = 0

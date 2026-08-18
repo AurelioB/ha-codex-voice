@@ -104,6 +104,15 @@ class CodexVoicePanel extends HTMLElement {
     ].join("");
   }
 
+  _valueOptions(values, selected) {
+    return (values || [])
+      .map(
+        (value) =>
+          `<option value="${esc(value)}" ${value === selected ? "selected" : ""}>${esc(value)}</option>`,
+      )
+      .join("");
+  }
+
   _renderEnrollment() {
     const enrollment = (this._status?.enrollments || [])[0];
     if (enrollment) {
@@ -193,11 +202,25 @@ class CodexVoicePanel extends HTMLElement {
       </section>`;
   }
 
+  _renderAssistantSettings() {
+    const settings = this._status?.assistant_settings || {};
+    return `
+      <section class="card important">
+        <div class="section-title"><h2>Realtime assistant</h2><a href="${esc(this._status?.integration_url || "/config/integrations")}">Advanced Conversation and tool settings</a></div>
+        <p>These defaults apply when the next conversation starts. An active conversation keeps its current voice and language.</p>
+        <form id="assistant-settings-form" class="grid-form two">
+          <label>Voice<select name="voice">${this._valueOptions(settings.voices, settings.voice)}</select></label>
+          <label>Default language<select name="language">${this._valueOptions(settings.languages, settings.language)}</select></label>
+          <div class="actions"><button class="primary" type="submit">Save assistant settings</button></div>
+        </form>
+      </section>`;
+  }
+
   _renderSettings() {
     const settings = this._status?.settings || {};
     return `
       <section class="card">
-        <div class="section-title"><h2>Assistant settings</h2><a href="${esc(this._status?.integration_url || "/config/integrations")}">Conversation, language, voice and Home Assistant tools</a></div>
+        <h2>Speaker identity matching</h2>
         <p>Identity thresholds apply immediately and persist in the private worker directory. Raise them to prefer “unknown” over a false match.</p>
         <form id="settings-form" class="grid-form two">
           <label>Match threshold<input name="match_threshold" type="number" min="-1" max="1" step="0.01" value="${esc(settings.match_threshold ?? 0.55)}"></label>
@@ -256,7 +279,7 @@ class CodexVoicePanel extends HTMLElement {
         </header>
         ${this._error ? `<div class="error">${esc(this._error)}</div>` : ""}
         ${!this._entries.length ? '<section class="card"><p>Add and load the Codex Voice integration first.</p></section>' : ""}
-        ${this._status ? `${this._renderEnrollment()}${this._renderTest()}${this._renderProfiles()}${this._renderSettings()}` : this._entries.length ? '<section class="card spinner"><p>Loading identity worker…</p></section>' : ""}
+        ${this._status ? `${this._renderAssistantSettings()}${this._renderEnrollment()}${this._renderTest()}${this._renderProfiles()}${this._renderSettings()}` : this._entries.length ? '<section class="card spinner"><p>Loading settings…</p></section>' : ""}
       </main>`;
     this._bind();
   }
@@ -289,6 +312,17 @@ class CodexVoicePanel extends HTMLElement {
           entry_id: this._entryId,
           match_threshold: Number(form.get("match_threshold")),
           margin_threshold: Number(form.get("margin_threshold")),
+        }),
+      );
+    });
+    root.querySelector("#assistant-settings-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      this._run(() =>
+        this._call("codex_voice/assistant/settings/update", {
+          entry_id: this._entryId,
+          voice: form.get("voice"),
+          language: form.get("language"),
         }),
       );
     });

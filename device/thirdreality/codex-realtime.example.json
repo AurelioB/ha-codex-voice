@@ -12,6 +12,7 @@
   "idle_timeout_seconds": 120,
   "max_session_seconds": 900,
   "max_message_bytes": 65536,
+  "output_queue_bytes": 98304,
   "media_transport": "bridge_pcm",
   "capture_backend": "native_aec3",
   "barge_in_mode": "provider_control",

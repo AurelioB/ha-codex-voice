@@ -7,6 +7,10 @@ and releases use semantic versioning.
 
 ### Added
 
+- Add administrator-selectable realtime voice and default language settings to
+  the Home Assistant **Codex Voice** panel. The authoritative Conversation
+  profile supplies both values to each new server-owned realtime session;
+  active sessions keep their immutable voice until the next wake.
 - Add trusted local context to native realtime sessions. A connected Home
   Assistant authority supplies its configured location name, coordinates, and
   IANA timezone; Compose-configured values remain the disconnected fallback.
@@ -278,6 +282,16 @@ and releases use semantic versioning.
 
 ### Fixed
 
+- Reconnect unexpected live speaker transport and local playback failures up
+  to three times without releasing the LED/microphone owner or replaying the
+  ready cue. Explicit stop, mute, end-conversation, idle expiry, and the hard
+  session limit remain terminal. Add content-free terminal reason telemetry so
+  subsequent physical failures distinguish network, playback, protocol, and
+  policy exits.
+- Double the default speaker output queue capacity to 96 KiB without adding a
+  playback prebuffer. This leaves immediate audio onset unchanged while giving
+  a released one-second terminal-output quarantine enough burst headroom to
+  avoid a queue-full skip and mid-reply socket teardown.
 - Keep server-PCM replies from cancelling themselves after a genuine
   interruption. The active bridge route now classifies capture against the
   exact PCM accepted by the speaker, gives every speaking epoch its existing

@@ -183,11 +183,14 @@ EOF switches the LED to listening and opens live capture. The cue has a
 absolute deadline, or attempt exhaustion fails closed and returns idle without
 starting Home Assistant.
 
-The default device output queue is 48 KiB, about 1.024 seconds at 24 kHz mono
-PCM16. V3 also bounds every child IPC packet and fails rather than dropping a
-capture or playback packet under pressure. The bridge's 2,250 ms live-input cap
-applies only to v2; v3 media never enters that bridge queue. These are safety
-bounds, not a latency promise.
+The default device output queue is 96 KiB, about 2.048 seconds at 24 kHz mono
+PCM16. It is capacity rather than a playback prebuffer, so normal audio still
+starts immediately; the extra headroom absorbs the bounded burst released by
+terminal-intent quarantine instead of ending the socket mid-response. V3 also
+bounds every child IPC packet and fails rather than dropping a capture or
+playback packet under pressure. The bridge's 2,250 ms live-input cap applies
+only to v2; v3 media never enters that bridge queue. These are safety bounds,
+not a latency promise.
 
 `device_webrtc` requires `full_duplex: true`, explicit safe
 `pulse_aec_source` and `pulse_aec_sink` names, and one allowlisted
@@ -831,8 +834,10 @@ engine. The shipped disabled configuration example intentionally names the
 complete v3 route so its requirements are reviewable, but `enabled: false`
 keeps it inactive until the runtime and AEC qualification are complete.
 
-Optional `voice` and `prompt` settings are sent in either native v2 or v3 start
-message.
+Optional device `voice` and `prompt` settings are sent in either native v2 or
+v3 start message. On the active server-owned v2 route, a connected Home
+Assistant realtime authority supplies the administrator-selected voice for new
+sessions and the device value remains the disconnected fallback.
 Voice names start with an ASCII letter, contain 1–64 ASCII letters, digits,
 `_`, or `-`, and are normalized to lowercase. Prompts are printable, non-empty
 text up to 1,024 characters. Their

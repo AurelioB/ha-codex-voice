@@ -20,6 +20,7 @@ from custom_components.codex_voice.const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DOMAIN,
 )
 
@@ -204,4 +205,5 @@ async def test_migrate_selects_first_authority_and_adds_language(
         False,
     ]
     assert all(item.data[CONF_REALTIME_LANGUAGE] == "es-MX" for item in conversations)
-    assert entry.minor_version == 3
+    assert all(item.data[CONF_REALTIME_VOICE] == "cove" for item in conversations)
+    assert entry.minor_version == 4

@@ -38,7 +38,9 @@ from .const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DEFAULT_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_VOICE,
     DOMAIN,
     MAX_REALTIME_TOOL_ARGUMENT_BYTES,
     MAX_REALTIME_TOOL_MESSAGE_BYTES,
@@ -50,6 +52,7 @@ from .const import (
     REALTIME_TOOL_PROTOCOL_VERSION,
     SUBENTRY_TYPE_CONVERSATION,
     SUPPORTED_LANGUAGES,
+    SUPPORTED_VOICES,
 )
 from .llm_tools import serialize_llm_tools
 
@@ -284,6 +287,11 @@ class RealtimeToolBroker:
             raise RealtimeToolBrokerError(
                 f"Unsupported realtime authority language: {language!r}"
             )
+        voice = self._authority.data.get(CONF_REALTIME_VOICE, DEFAULT_REALTIME_VOICE)
+        if voice not in SUPPORTED_VOICES:
+            raise RealtimeToolBrokerError(
+                f"Unsupported realtime authority voice: {voice!r}"
+            )
 
         api_ids = self._authority.data.get(CONF_LLM_HASS_API)
         if not api_ids:
@@ -369,6 +377,7 @@ class RealtimeToolBroker:
             "protocol_version": REALTIME_TOOL_PROTOCOL_VERSION,
             "authority_id": authority_id,
             "language": language,
+            "voice": voice,
             "timezone": _bounded_string(
                 self._hass.config.time_zone,
                 "timezone",

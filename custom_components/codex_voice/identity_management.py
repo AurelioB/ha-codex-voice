@@ -10,11 +10,21 @@ from typing import Any, Final
 import voluptuous as vol
 from homeassistant.components import panel_custom, websocket_api
 from homeassistant.components.http import StaticPathConfig
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant
 
 from .api import BridgeClient, BridgeError
-from .const import DOMAIN
+from .const import (
+    CONF_REALTIME_AUTHORITY,
+    CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
+    DEFAULT_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_VOICE,
+    DOMAIN,
+    SUBENTRY_TYPE_CONVERSATION,
+    SUPPORTED_LANGUAGES,
+    SUPPORTED_VOICES,
+)
 
 _DATA_SETUP: Final = f"{DOMAIN}_identity_management_setup"
 _PANEL_URL: Final = "codex-voice"
@@ -42,6 +52,19 @@ def _profile_id(value: object) -> str:
     if not isinstance(value, str) or _PROFILE_ID.fullmatch(value) is None:
         raise ValueError("Profile ID may contain letters, digits, _, -, and .")
     return value
+
+
+def _realtime_authority(entry: ConfigEntry[BridgeClient]) -> ConfigSubentry:
+    """Return the sole Conversation subentry that owns realtime preferences."""
+    authorities = [
+        subentry
+        for subentry in entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_TYPE_CONVERSATION
+        and subentry.data.get(CONF_REALTIME_AUTHORITY) is True
+    ]
+    if len(authorities) != 1:
+        raise ValueError("Configure exactly one realtime Conversation authority")
+    return authorities[0]
 
 
 def _display_name(value: object) -> str:
@@ -140,6 +163,7 @@ async def websocket_status(
     """Return identity state and Home Assistant link candidates."""
     try:
         entry = _entry(hass, msg["entry_id"])
+        authority = _realtime_authority(entry)
         status = await entry.runtime_data.async_speaker_identity_status()
         people, users = await _people_and_users(hass)
     except (BridgeError, ValueError) as err:
@@ -151,6 +175,16 @@ async def websocket_status(
             **status,
             "people": people,
             "users": users,
+            "assistant_settings": {
+                "language": authority.data.get(
+                    CONF_REALTIME_LANGUAGE, DEFAULT_REALTIME_LANGUAGE
+                ),
+                "voice": authority.data.get(
+                    CONF_REALTIME_VOICE, DEFAULT_REALTIME_VOICE
+                ),
+                "languages": list(SUPPORTED_LANGUAGES),
+                "voices": list(SUPPORTED_VOICES),
+            },
             "integration_url": f"/config/integrations/integration/{DOMAIN}",
         },
     )
@@ -373,6 +407,38 @@ async def websocket_update_settings(
     )
 
 
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/assistant/settings/update",
+        vol.Required("entry_id"): str,
+        vol.Required("language"): vol.In(SUPPORTED_LANGUAGES),
+        vol.Required("voice"): vol.In(SUPPORTED_VOICES),
+    }
+)
+@websocket_api.async_response
+async def websocket_update_assistant_settings(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Persist default language and voice for subsequent realtime sessions."""
+    try:
+        entry = _entry(hass, msg["entry_id"])
+        authority = _realtime_authority(entry)
+    except ValueError as err:
+        connection.send_error(msg["id"], "assistant_settings_error", str(err))
+        return
+    data = dict(authority.data)
+    data[CONF_REALTIME_LANGUAGE] = msg["language"]
+    data[CONF_REALTIME_VOICE] = msg["voice"]
+    hass.config_entries.async_update_subentry(entry, authority, data=data)
+    connection.send_result(
+        msg["id"],
+        {"language": msg["language"], "voice": msg["voice"]},
+    )
+
+
 _COMMANDS: tuple[_Handler, ...] = (
     websocket_entries,
     websocket_status,
@@ -383,6 +449,7 @@ _COMMANDS: tuple[_Handler, ...] = (
     websocket_delete_profile,
     websocket_arm_test,
     websocket_update_settings,
+    websocket_update_assistant_settings,
 )
 
 
@@ -409,7 +476,7 @@ async def async_setup_identity_management(hass: HomeAssistant) -> None:
         webcomponent_name="codex-voice-panel",
         sidebar_title="Codex Voice",
         sidebar_icon="mdi:account-voice",
-        module_url=f"{_STATIC_URL}/codex-voice-panel.js?v=1",
+        module_url=f"{_STATIC_URL}/codex-voice-panel.js?v=2",
         require_admin=True,
         config_panel_domain=DOMAIN,
     )

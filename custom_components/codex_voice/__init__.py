@@ -28,7 +28,9 @@ from .const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DEFAULT_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_VOICE,
     MIN_HA_VERSION,
     PLATFORMS,
     SUBENTRY_TYPE_CONVERSATION,
@@ -101,7 +103,7 @@ async def async_migrate_entry(
     """Select one default realtime authority and Mexican Spanish language."""
     if entry.version != 1:
         return False
-    if entry.minor_version >= 3:
+    if entry.minor_version >= 4:
         return True
 
     conversations = [
@@ -119,9 +121,10 @@ async def async_migrate_entry(
         else:
             data.setdefault(CONF_REALTIME_AUTHORITY, False)
         data.setdefault(CONF_REALTIME_LANGUAGE, DEFAULT_REALTIME_LANGUAGE)
+        data.setdefault(CONF_REALTIME_VOICE, DEFAULT_REALTIME_VOICE)
         hass.config_entries.async_update_subentry(entry, subentry, data=data)
 
-    hass.config_entries.async_update_entry(entry, minor_version=3)
+    hass.config_entries.async_update_entry(entry, minor_version=4)
     return True
 
 

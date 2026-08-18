@@ -260,12 +260,15 @@ trusted response-language context. The component leaves Home Assistant's
 global interface language unchanged.
 
 Conversation profiles also expose **Provide Home Assistant tools to realtime
-voice** and **Realtime voice language**. Tool authority is off by default and
-may be enabled on exactly one Conversation subentry. Its realtime language
-defaults to `es-MX`. Only the Home Assistant LLM APIs selected on that subentry
-are registered; enabling it does not give the speaker a Home Assistant token.
-This authority supports the compatibility auto/managed wire route. It does not
-override `conversation_mode: "native"` from the current ThirdReality client.
+voice**, **Realtime voice language**, and **Realtime voice**. Tool authority is
+off by default and may be enabled on exactly one Conversation subentry. Its
+realtime language defaults to `es-MX` and its voice defaults to `cove`. The
+same two defaults are available in the administrator-only **Codex Voice** panel
+and apply to the next conversation because a provider voice is immutable once
+that session starts. Only the Home Assistant LLM APIs selected on that
+subentry are registered; enabling it does not give the speaker a Home
+Assistant token. The authority supplies language, voice, and tools to both the
+compatibility route and the active `conversation_mode: "native"` route.
 
 For the lowest latency on ordinary device-control commands, enable **Prefer
 handling commands locally** on that pipeline. Home Assistant will handle

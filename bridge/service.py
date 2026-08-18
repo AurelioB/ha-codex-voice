@@ -5514,6 +5514,13 @@ async def _serve_realtime_session(
                     REALTIME_DEVICE_INPUT_BUFFER_MILLISECONDS
                 )
             voice = first.get("voice")
+            normalized_voice = (
+                broker_snapshot.voice
+                if broker_snapshot is not None
+                else voice.lower()
+                if isinstance(voice, str) and voice
+                else None
+            )
             device_prompt = (
                 first.get("prompt") if isinstance(first.get("prompt"), str) else None
             )
@@ -5530,7 +5537,7 @@ async def _serve_realtime_session(
                     if isinstance(first.get("model"), str)
                     else None
                 ),
-                voice=voice.lower() if isinstance(voice, str) and voice else None,
+                voice=normalized_voice,
                 include_startup_context=(
                     False
                     if (
@@ -5629,7 +5636,13 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
     thread_payload = dict(first)
     thread_payload.pop("model", None)
     voice = first.get("voice")
-    normalized_voice = voice.lower() if isinstance(voice, str) and voice else None
+    normalized_voice = (
+        broker_snapshot.voice
+        if broker_snapshot is not None
+        else voice.lower()
+        if isinstance(voice, str) and voice
+        else None
+    )
     device_prompt = first.get("prompt")
     normalized_prompt = device_prompt if isinstance(device_prompt, str) else None
     active: _NativeV2Provider | None = None

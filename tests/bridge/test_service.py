@@ -101,6 +101,7 @@ async def _register_test_realtime_tool_authority(
     client: Any,
     *,
     include_location: bool = False,
+    voice: str = "cove",
 ) -> tuple[Any, str]:
     authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
     registration = {
@@ -108,6 +109,7 @@ async def _register_test_realtime_tool_authority(
         "protocol_version": 1,
         "authority_id": "conversation-profile",
         "language": "es-MX",
+        "voice": voice,
         "instructions": "Controla solo las entidades expuestas.",
         "tools": [
             {
@@ -5476,20 +5478,25 @@ async def test_realtime_v2_composes_server_routing_with_device_preferences(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
     client = await aiohttp_client(bridge_app)
-    authority, _ = await _register_test_realtime_tool_authority(client)
+    authority, _ = await _register_test_realtime_tool_authority(client, voice="ember")
+    assert (
+        bridge_app[bridge_service.STATE_KEY].home_assistant_tools.snapshot.voice
+        == "ember"
+    )
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
     preference = "Responde en español de México con un acento natural y estable."
 
-    await device.send_json(_realtime_v2_start(prompt=preference))
+    await device.send_json(_realtime_v2_start(voice="cove", prompt=preference))
     assert (await device.receive_json(timeout=1))["type"] == "started"
-    realtime_start = next(
+    realtime_start = [
         params for method, params in fake_rpc.calls if method == "thread/realtime/start"
-    )
+    ][-1]
 
     provider_prompt = realtime_start["prompt"]
     assert provider_prompt.startswith(bridge_service.REALTIME_FRONTEND_PROMPT)
     assert realtime_start["includeStartupContext"] is False
     assert realtime_start["clientManagedHandoffs"] is True
+    assert realtime_start["voice"] == "ember"
     assert realtime_start["delegationAckFiller"] is False
     assert "Never answer a user request" in provider_prompt
     assert "Default response language and locale: es-MX." in provider_prompt
@@ -6728,6 +6735,7 @@ def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
         generation="generation",
         authority_id="authority",
         language="es-MX",
+        voice="cove",
         instructions="",
         tools=(
             {
@@ -6808,12 +6816,17 @@ async def test_realtime_v2_explicit_native_uses_connected_tool_authority(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = await aiohttp_client(bridge_app)
-    authority, _ = await _register_test_realtime_tool_authority(client)
+    authority, _ = await _register_test_realtime_tool_authority(client, voice="ember")
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
 
     try:
         with caplog.at_level(logging.INFO, logger="bridge.service"):
-            await device.send_json(_realtime_v2_start(conversation_mode="native"))
+            await device.send_json(
+                _realtime_v2_start(
+                    conversation_mode="native",
+                    voice="cove",
+                )
+            )
             started = await device.receive_json(timeout=1)
 
         assert started["type"] == "started"
@@ -6855,6 +6868,7 @@ async def test_realtime_v2_explicit_native_uses_connected_tool_authority(
         assert realtime_start["threadId"] == started["thread_id"]
         assert realtime_start["includeStartupContext"] is False
         assert realtime_start["clientManagedHandoffs"] is False
+        assert realtime_start["voice"] == "ember"
         assert "delegationAckFiller" not in realtime_start
         assert (
             "Realtime conversation route selected: route=native selection=explicit"
@@ -11609,6 +11623,7 @@ async def test_realtime_v2_executes_only_captured_home_assistant_tools(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {
@@ -11719,6 +11734,7 @@ async def test_pending_home_assistant_tool_does_not_block_provider_close(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {
@@ -11812,6 +11828,7 @@ async def test_realtime_home_assistant_tools_deduplicate_provider_call_ids(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {
@@ -11898,6 +11915,7 @@ async def test_realtime_home_assistant_tool_burst_is_bounded(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {

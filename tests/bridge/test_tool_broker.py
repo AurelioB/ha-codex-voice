@@ -45,6 +45,7 @@ def _registration(**overrides: Any) -> dict[str, Any]:
         "protocol_version": 1,
         "authority_id": "entry:conversation",
         "language": "es-MX",
+        "voice": "cove",
         "timezone": "America/Mexico_City",
         "location": "Casa",
         "latitude": 19.4326,
@@ -77,6 +78,7 @@ async def test_registration_and_correlated_tool_result() -> None:
         "generation": snapshot.generation,
     }
     assert snapshot.language == "es-MX"
+    assert snapshot.voice == "cove"
     assert snapshot.timezone == "America/Mexico_City"
     assert snapshot.location == "Casa"
     assert snapshot.latitude == 19.4326
@@ -106,6 +108,7 @@ async def test_registration_and_correlated_tool_result() -> None:
     assert result.result == {"speech": "Encendí la luz"}
     health = broker.health()
     assert health["connected"] is True
+    assert health["voice"] == "cove"
     assert health["local_context_available"] is True
     assert health["tool_count"] == 1
     assert health["pending_calls"] == 0

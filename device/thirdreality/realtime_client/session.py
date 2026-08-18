@@ -2003,6 +2003,7 @@ class RealtimeSession:
         self._state_lock = threading.Lock()
         self._ready = threading.Event()
         self._terminal = threading.Event()
+        self._terminal_reason: str | None = None
         self._ready_at: float | None = None
         self._wake_network = threading.Event()
         self._stop_requested = threading.Event()
@@ -2072,6 +2073,12 @@ class RealtimeSession:
     def terminal(self) -> bool:
         """Return whether the session thread has completed cleanup."""
         return self._terminal.is_set()
+
+    @property
+    def terminal_reason(self) -> str | None:
+        """Return one content-free terminal classification for recovery policy."""
+        with self._state_lock:
+            return self._terminal_reason
 
     @property
     def context_loss_rollovers(self) -> int:
@@ -3088,6 +3095,7 @@ class RealtimeSession:
                 popen=self._popen,
             )
         failed = False
+        terminal_reason = "unknown"
         try:
             started_at = self._clock()
             if self._config.full_duplex:
@@ -3159,12 +3167,14 @@ class RealtimeSession:
                         interrupt_sent = True
                         interrupt_deadline = now + self._config.io_timeout_seconds
                     elif interrupt_deadline is not None and now >= interrupt_deadline:
+                        terminal_reason = "interrupt_timeout"
                         return
                 elif self._stop_requested.is_set():
                     self._set_local_output_epoch(None)
                     self._abort_player(player)
                     self._audio.clear()
                     connection.send_json({"type": "stop"})
+                    terminal_reason = "local_stop"
                     return
                 else:
                     output_epoch, barge_watermark = self._flush_local_barge_in(
@@ -3265,8 +3275,10 @@ class RealtimeSession:
                 if semantic:
                     last_semantic_activity = self._clock()
                 if action == "stop":
+                    terminal_reason = "remote_stop"
                     return
                 if interrupt_sent and action == "interrupted":
+                    terminal_reason = "remote_interrupt"
                     return
                 if interrupt_sent and action == "interrupt_resumed":
                     self._set_local_output_epoch(None)
@@ -3278,20 +3290,35 @@ class RealtimeSession:
                                 self._state = SessionState.READY
                     if not preserve_session:
                         connection.send_json({"type": "stop"})
+                        terminal_reason = "local_interrupt"
                         return
                     interrupt_sent = False
                     interrupt_deadline = None
                     self._suppressed_output_epoch = None
                     last_semantic_activity = self._clock()
-        except (OSError, TimeoutError, ValueError, WebSocketError):
+        except (OSError, TimeoutError, ValueError, WebSocketError) as err:
             failed = not (
                 self._stop_requested.is_set() or self._interrupt_requested.is_set()
             )
+            terminal_reason = (
+                _bridge_failure_reason(err)
+                if failed
+                else "local_interrupt"
+                if self._interrupt_requested.is_set()
+                else "local_stop"
+            )
             if failed:
-                _LOGGER.warning("ThirdReality realtime session failed")
+                _LOGGER.warning(
+                    "ThirdReality realtime session failed: %s", terminal_reason
+                )
         except Exception:  # noqa: BLE001 - never escape the vendor daemon thread
             failed = True
-            _LOGGER.warning("ThirdReality realtime session failed", exc_info=False)
+            terminal_reason = "internal_error"
+            _LOGGER.warning(
+                "ThirdReality realtime session failed: %s",
+                terminal_reason,
+                exc_info=False,
+            )
         finally:
             try:
                 diagnostics = self._bridge_capture_diagnostics
@@ -3309,6 +3336,13 @@ class RealtimeSession:
                         "saturated_samples="
                         f"{min(diagnostics.saturated_samples, 99_999_999)}",
                     )
+                with suppress(Exception):
+                    syslog.syslog(
+                        syslog.LOG_INFO,
+                        "codex-voice bridge_terminal "
+                        f"outcome={'failed' if failed else 'stopped'} "
+                        f"reason={terminal_reason}",
+                    )
                 self._set_local_output_epoch(None)
                 self._audio.clear()
                 with suppress(Exception):
@@ -3323,6 +3357,7 @@ class RealtimeSession:
                     self._state = (
                         SessionState.FAILED if failed else SessionState.STOPPED
                     )
+                    self._terminal_reason = terminal_reason
                 self._terminal.set()
                 with _SESSIONS_LOCK:
                     _SESSIONS.discard(self)
@@ -5290,6 +5325,33 @@ def _output_epoch(value: dict[str, Any]) -> int:
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
         raise WebSocketError("output_epoch must be a positive integer")
     return epoch
+
+
+def _bridge_failure_reason(error: BaseException) -> str:
+    """Classify one local/server-media failure without logging private data."""
+    message = str(error)
+    fixed_reasons = {
+        "playback queue exceeded its bound": "playback_queue_full",
+        "paplay rejected output": "playback_pipe_failed",
+        "paplay exited before consuming output": "playback_process_failed",
+        "peer closed WebSocket": "transport_closed",
+        "WebSocket transport reached EOF": "transport_closed",
+        "realtime session exceeded its hard limit": "session_deadline",
+        "realtime session exceeded its idle limit": "idle_deadline",
+        "realtime pong timed out": "pong_timeout",
+    }
+    fixed = fixed_reasons.get(message)
+    if fixed is not None:
+        return fixed
+    if isinstance(error, TimeoutError):
+        return "transport_timeout"
+    if isinstance(error, WebSocketError):
+        return "protocol_or_transport_error"
+    if isinstance(error, OSError):
+        return "network_or_playback_os_error"
+    if isinstance(error, ValueError):
+        return "invalid_media_or_protocol"
+    return "internal_error"
 
 
 def _check_deadlines(

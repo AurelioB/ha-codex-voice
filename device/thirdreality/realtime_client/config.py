@@ -643,8 +643,10 @@ def load_config(
         output_queue_bytes=_bounded_int(
             decoded,
             "output_queue_bytes",
-            # 1.024 seconds of 24 kHz mono PCM16.
-            default=48 * 1024,
+            # Two seconds of 24 kHz mono PCM16. This is capacity, not a
+            # prebuffer: normal audio still starts immediately, while a short
+            # scheduler/network burst cannot tear down the conversation.
+            default=96 * 1024,
             minimum=48 * 1024,
             maximum=192 * 1024,
         ),

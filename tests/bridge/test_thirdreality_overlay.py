@@ -1165,6 +1165,7 @@ def _fake_realtime_support(
             self.ready_at = None
             self.failed_before_ready = False
             self.terminal = False
+            self.terminal_reason = None
             self.state = _FakeSessionState.NEW
             self.submit_result = SubmitResult.ACCEPTED
             self.started = 0
@@ -3151,6 +3152,85 @@ def test_direct_lifecycle_watcher_closes_live_owner_without_mic_callback(
     assert instance.events.count("unduck") == 1
     assert not instance._pipeline_active
     assert not instance._is_streaming_audio
+
+
+def test_failed_live_socket_reconnects_without_releasing_owner_or_replaying_cue(
+    load_overlay: Any,
+) -> None:
+    """An unexpected live transport failure keeps LED/capture ownership alive."""
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        capture_backend="pulseaudio_aec",
+        full_duplex=True,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    first = support.sessions[0]  # type: ignore[attr-defined]
+    _mark_direct_ready(instance, first)
+    instance.state.tts_player.callbacks.pop()()
+    owner = instance._codex_realtime_owner
+
+    first.state = _FakeSessionState.FAILED
+    first.terminal_reason = "transport_closed"
+    first.terminal = True
+    for _ in range(100):
+        if len(support.sessions) == 2:  # type: ignore[attr-defined]
+            break
+        time.sleep(0.002)
+
+    replacement = support.sessions[1]  # type: ignore[attr-defined]
+    assert instance._codex_realtime_owner is owner
+    assert owner.session is replacement
+    assert owner.capture_open
+    assert instance.events == ["duck", "cue"]
+
+    retained = _pcm_frame(12)
+    instance.handle_audio(retained)
+    assert replacement.audio == [retained]
+    assert not owner.ready_seen
+
+    replacement.ready_at = time.monotonic()
+    replacement.ready = True
+    replacement.state = _FakeSessionState.READY
+    for _ in range(100):
+        if owner.ready_seen:
+            break
+        time.sleep(0.002)
+    assert owner.ready_seen
+    assert owner.reconnect_attempt == 0
+    assert instance.state.tts_player.callbacks == []
+
+    instance.stop()
+
+
+def test_live_policy_deadline_does_not_reconnect(
+    load_overlay: Any,
+) -> None:
+    """An intentional idle limit releases ownership instead of reopening it."""
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        capture_backend="pulseaudio_aec",
+        full_duplex=True,
+    )
+    protocol, _module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    _wake(instance, "okay computer")
+    session = support.sessions[0]  # type: ignore[attr-defined]
+    _mark_direct_ready(instance, session)
+    instance.state.tts_player.callbacks.pop()()
+
+    session.state = _FakeSessionState.FAILED
+    session.terminal_reason = "idle_deadline"
+    session.terminal = True
+    for _ in range(100):
+        if instance._codex_realtime_owner is None:
+            break
+        time.sleep(0.002)
+
+    assert len(support.sessions) == 1  # type: ignore[attr-defined]
+    assert instance._codex_realtime_owner is None
+    assert instance.events.count("unduck") == 1
 
 
 def test_direct_webrtc_real_input_queue_full_fails_closed(

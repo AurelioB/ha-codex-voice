@@ -22,6 +22,7 @@ from .errors import BridgeBusyError, BridgeError, ProtocolError
 TOOL_BROKER_PROTOCOL_VERSION = 1
 MAX_AUTHORITY_ID_CHARS = 256
 MAX_LANGUAGE_CHARS = 35
+MAX_VOICE_CHARS = 64
 MAX_LOCATION_CHARS = 256
 MAX_TIMEZONE_CHARS = 128
 MAX_INSTRUCTIONS_CHARS = 64 * 1024
@@ -35,6 +36,7 @@ MAX_PENDING_TOOL_CALLS = 16
 MAX_RETIRED_TOOL_CALLS = 128
 DEFAULT_TOOL_TIMEOUT_SECONDS = 35.0
 _TOOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,255}\Z")
+_VOICE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 
 
 class ToolBrokerUnavailable(BridgeError):
@@ -48,6 +50,7 @@ class ToolBrokerSnapshot:
     generation: str
     authority_id: str
     language: str
+    voice: str
     instructions: str
     tools: tuple[dict[str, Any], ...]
     tool_names: frozenset[str]
@@ -106,6 +109,7 @@ class HomeAssistantToolBroker:
                 snapshot is not None and websocket is not None and not websocket.closed
             ),
             "language": snapshot.language if snapshot is not None else None,
+            "voice": snapshot.voice if snapshot is not None else None,
             "tool_count": len(snapshot.tools) if snapshot is not None else 0,
             "local_context_available": bool(
                 snapshot is not None
@@ -144,6 +148,7 @@ class HomeAssistantToolBroker:
                 generation=generation,
                 authority_id=snapshot.authority_id,
                 language=snapshot.language,
+                voice=snapshot.voice,
                 instructions=snapshot.instructions,
                 tools=snapshot.tools,
                 tool_names=snapshot.tool_names,
@@ -353,6 +358,9 @@ def _validated_registration(value: Mapping[str, Any]) -> ToolBrokerSnapshot:
     )
     language = _bounded_text(value.get("language"), MAX_LANGUAGE_CHARS, "language")
     language = _canonical_language(language)
+    voice = _bounded_text(value.get("voice"), MAX_VOICE_CHARS, "voice").lower()
+    if _VOICE_NAME.fullmatch(voice) is None:
+        raise ProtocolError("Home Assistant broker voice is invalid")
     timezone = _optional_bounded_text(
         value.get("timezone"), MAX_TIMEZONE_CHARS, "timezone"
     )
@@ -418,6 +426,7 @@ def _validated_registration(value: Mapping[str, Any]) -> ToolBrokerSnapshot:
         generation="",
         authority_id=authority_id,
         language=language,
+        voice=voice,
         instructions=instructions,
         tools=tuple(tools),
         tool_names=frozenset(names),

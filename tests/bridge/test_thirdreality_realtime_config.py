@@ -85,7 +85,7 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.io_timeout_seconds == 1.0
     assert config.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_SECONDS
     assert config.max_session_seconds == DEFAULT_MAX_SESSION_SECONDS
-    assert config.output_queue_bytes == 48 * 1024
+    assert config.output_queue_bytes == 96 * 1024
     assert "0123456789abcdef" not in repr(config)
 
 

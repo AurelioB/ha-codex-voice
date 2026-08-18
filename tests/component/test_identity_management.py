@@ -15,6 +15,9 @@ from custom_components.codex_voice.api import BridgeClient
 from custom_components.codex_voice.const import (
     CONF_ACCESS_TOKEN,
     CONF_BRIDGE_URL,
+    CONF_REALTIME_AUTHORITY,
+    CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DOMAIN,
 )
 from custom_components.codex_voice.identity_management import (
@@ -47,6 +50,18 @@ async def _setup(
         domain=DOMAIN,
         title="Codex Voice",
         data={CONF_BRIDGE_URL: client.base_url, CONF_ACCESS_TOKEN: "bridge-token"},
+        subentries_data=[
+            {
+                "data": {
+                    CONF_REALTIME_AUTHORITY: True,
+                    CONF_REALTIME_LANGUAGE: "es-MX",
+                    CONF_REALTIME_VOICE: "cove",
+                },
+                "subentry_type": "conversation",
+                "title": "Conversation",
+                "unique_id": None,
+            }
+        ],
     )
     entry.runtime_data = client
     entry.add_to_hass(hass)
@@ -90,8 +105,39 @@ async def test_status_includes_home_assistant_people_and_users(
             "user_id": owner.id,
         }
     ]
+    assert response["result"]["assistant_settings"]["language"] == "es-MX"
+    assert response["result"]["assistant_settings"]["voice"] == "cove"
     assert any(user["id"] == owner.id for user in response["result"]["users"])
     client.async_speaker_identity_status.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+async def test_admin_updates_realtime_voice_and_language(
+    hass: HomeAssistant,
+    hass_ws_client: Any,
+) -> None:
+    """The panel persists next-session preferences on the authority subentry."""
+    websocket, _client, entry = await _setup(hass, hass_ws_client)
+
+    await websocket.send_json(
+        {
+            "id": 9,
+            "type": "codex_voice/assistant/settings/update",
+            "entry_id": entry.entry_id,
+            "language": "en-US",
+            "voice": "ember",
+        }
+    )
+    response = await websocket.receive_json()
+
+    assert response == {
+        "id": 9,
+        "type": "result",
+        "success": True,
+        "result": {"language": "en-US", "voice": "ember"},
+    }
+    authority = next(iter(entry.subentries.values()))
+    assert authority.data[CONF_REALTIME_LANGUAGE] == "en-US"
+    assert authority.data[CONF_REALTIME_VOICE] == "ember"
 
 
 async def test_enrollment_requires_admin_selected_live_person_and_consent(

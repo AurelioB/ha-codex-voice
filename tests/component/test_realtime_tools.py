@@ -21,6 +21,7 @@ from custom_components.codex_voice.const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DOMAIN,
     MAX_REALTIME_TOOL_ARGUMENT_BYTES,
     MAX_REALTIME_TOOL_RESULT_BYTES,
@@ -130,6 +131,7 @@ def _entry(
     *,
     authorities: tuple[bool, ...] = (True,),
     language: str = "es-MX",
+    voice: str = "cove",
     prompt: str = "You are the assistant for {{ ha_name }}.",
 ) -> MockConfigEntry:
     """Create an entry with the requested Conversation authority layout."""
@@ -144,6 +146,7 @@ def _entry(
                     "prompt": prompt,
                     CONF_REALTIME_AUTHORITY: authority,
                     CONF_REALTIME_LANGUAGE: language,
+                    CONF_REALTIME_VOICE: voice,
                 },
                 "subentry_type": "conversation",
                 "title": f"Conversation {index}",
@@ -263,6 +266,7 @@ async def test_authenticated_registration_and_generation_scoped_calls(
     assert registration["protocol_version"] == 1
     assert registration["authority_id"] == authority.subentry_id
     assert registration["language"] == "es-MX"
+    assert registration["voice"] == "cove"
     assert registration["timezone"] == hass.config.time_zone
     assert registration["location"] == hass.config.location_name
     assert registration["latitude"] == hass.config.latitude

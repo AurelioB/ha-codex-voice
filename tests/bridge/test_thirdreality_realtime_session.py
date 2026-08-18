@@ -8330,7 +8330,9 @@ def test_network_thread_startup_failure_is_terminal_before_ready(
     assert session.failed_before_ready
     assert session.terminal
     assert session.ready is False
-    assert caplog.messages == ["ThirdReality realtime session failed"]
+    assert caplog.messages == [
+        "ThirdReality realtime session failed: network_or_playback_os_error"
+    ]
     assert "secret-token" not in caplog.text
 
 
