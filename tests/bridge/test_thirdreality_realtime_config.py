@@ -8,14 +8,25 @@ from pathlib import Path
 import pytest
 
 from device.thirdreality.realtime_client.config import (
+    BRIDGE_PCM_TRANSPORT,
     DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT,
     DEFAULT_AEC_TEST_VOLUME_PERCENT,
+    DEFAULT_DIRECT_CAPTURE_GAIN_DB,
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_MAX_SESSION_SECONDS,
     DEFAULT_PLAYBACK_VOLUME_PERCENT,
     DEFAULT_PULSE_AEC_METHOD,
     DEFAULT_PULSE_AEC_SINK,
     DEFAULT_PULSE_AEC_SOURCE,
+    DEVICE_WEBRTC_TRANSPORT,
+    MAX_DIRECT_CAPTURE_GAIN_DB,
     MAX_REALTIME_VOLUME_PERCENT,
+    NATIVE_AEC3_CAPTURE,
     NATIVE_CONVERSATION_MODE,
+    PROVIDER_CONTROL_BARGE_IN_MODE,
+    PULSEAUDIO_AEC_CAPTURE,
+    ROLLOVER_BARGE_IN_MODE,
+    UPSTREAM_BARGE_IN_MODE,
     ConfigError,
     RealtimeConfig,
     load_config,
@@ -49,9 +60,17 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert isinstance(config, RealtimeConfig)
     assert config.connect_address == "192.0.2.10"
     assert config.wake_phrase == "okay computer"
+    assert config.realtime_only is False
+    assert config.wake_probability_cutoff is None
+    assert config.personalized_wake_config_path is None
+    assert config.voice_sample_collection_enabled is False
     assert config.voice is None
     assert config.prompt is None
     assert config.full_duplex is False
+    assert config.media_transport == BRIDGE_PCM_TRANSPORT
+    assert config.capture_backend == PULSEAUDIO_AEC_CAPTURE
+    assert config.barge_in_mode == ROLLOVER_BARGE_IN_MODE
+    assert config.direct_capture_gain_db == DEFAULT_DIRECT_CAPTURE_GAIN_DB
     assert config.pulse_aec_source is None
     assert config.pulse_aec_sink is None
     assert config.pulse_aec_method is None
@@ -64,7 +83,9 @@ def test_secure_config_loads_bounded_defaults_without_exposing_token(
     assert config.input_queue_bytes == 64 * 1024
     assert config.fallback_buffer_bytes == 64 * 1024
     assert config.io_timeout_seconds == 1.0
-    assert config.output_queue_bytes == 48 * 1024
+    assert config.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_SECONDS
+    assert config.max_session_seconds == DEFAULT_MAX_SESSION_SECONDS
+    assert config.output_queue_bytes == 96 * 1024
     assert "0123456789abcdef" not in repr(config)
 
 
@@ -82,6 +103,7 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
             "voice": "Cove",
             "prompt": private_prompt,
             "max_message_bytes": 2_048,
+            "wake_probability_cutoff": 0.85,
         },
     )
 
@@ -90,7 +112,117 @@ def test_config_loads_bounded_mexican_spanish_session_preferences_without_leak(
     assert config is not None
     assert config.voice == "cove"
     assert config.prompt == private_prompt
+    assert config.wake_probability_cutoff == 0.85
     assert private_prompt not in repr(config)
+
+
+def test_config_accepts_only_an_absolute_personalized_wake_json_path(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    wake_config = tmp_path / "personalized-nabu.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "personalized_wake_config_path": str(wake_config),
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.personalized_wake_config_path == str(wake_config)
+
+    for invalid in ("relative.json", str(tmp_path / "model.tflite"), ""):
+        _write_config(
+            path,
+            {**_valid_config(), "personalized_wake_config_path": invalid},
+        )
+        with pytest.raises(ConfigError, match="absolute JSON path"):
+            load_config(path, expected_uid=os.getuid())
+
+
+def test_config_requires_an_explicit_boolean_for_voice_sample_collection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {**_valid_config(), "voice_sample_collection_enabled": True},
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.voice_sample_collection_enabled is True
+
+    _write_config(
+        path,
+        {**_valid_config(), "voice_sample_collection_enabled": "true"},
+    )
+    with pytest.raises(ConfigError, match="must be a boolean"):
+        load_config(path, expected_uid=os.getuid())
+
+
+@pytest.mark.parametrize(
+    "barge_in_mode",
+    [PROVIDER_CONTROL_BARGE_IN_MODE, UPSTREAM_BARGE_IN_MODE],
+)
+def test_config_allows_continuous_peer_barge_modes_only_for_native_full_duplex_bridge(
+    tmp_path: Path,
+    barge_in_mode: str,
+) -> None:
+    path = tmp_path / "realtime.json"
+    base = {
+        **_valid_config(),
+        "full_duplex": True,
+        "capture_backend": NATIVE_AEC3_CAPTURE,
+        "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+        "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        "barge_in_mode": barge_in_mode,
+    }
+    _write_config(path, base)
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.barge_in_mode == barge_in_mode
+
+    for incompatible, error in (
+        ({**base, "full_duplex": False}, "native_aec3 capture requires"),
+        (
+            {**base, "capture_backend": PULSEAUDIO_AEC_CAPTURE},
+            rf"{barge_in_mode} barge_in_mode requires",
+        ),
+        (
+            {**base, "media_transport": DEVICE_WEBRTC_TRANSPORT},
+            rf"{barge_in_mode} barge_in_mode requires",
+        ),
+    ):
+        _write_config(path, incompatible)
+        with pytest.raises(ConfigError, match=error):
+            load_config(path, expected_uid=os.getuid())
+
+
+def test_config_allows_normal_wake_phrase_only_for_realtime_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "wake_phrase": " Okay   Nabu ",
+            "realtime_only": True,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.wake_phrase == "okay nabu"
+    assert config.realtime_only is True
 
 
 def test_realtime_start_message_hardcodes_native_conversation_mode(
@@ -104,6 +236,208 @@ def test_realtime_start_message_hardcodes_native_conversation_mode(
     assert realtime_start_message(config)["conversation_mode"] == (
         NATIVE_CONVERSATION_MODE
     )
+
+
+def test_device_webrtc_start_carries_only_direct_offer_and_preferences(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "voice": "Cove",
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+    assert realtime_start_message(config, webrtc_sdp=offer) == {
+        "type": "start",
+        "protocol_version": 3,
+        "conversation_mode": NATIVE_CONVERSATION_MODE,
+        "transport": {"type": "webrtc", "sdp": offer},
+        "voice": "cove",
+    }
+
+
+def test_device_webrtc_requires_full_duplex_and_an_offer(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {**_valid_config(), "media_transport": DEVICE_WEBRTC_TRANSPORT},
+    )
+    with pytest.raises(ConfigError, match="requires full_duplex"):
+        load_config(path, expected_uid=os.getuid())
+
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        },
+    )
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+    with pytest.raises(ConfigError, match="requires an SDP offer"):
+        realtime_start_message(config)
+
+
+def test_config_loads_normalized_device_webrtc_capture_gain(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": 6,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.direct_capture_gain_db == 6.0
+    assert isinstance(config.direct_capture_gain_db, float)
+
+
+@pytest.mark.parametrize(
+    "media_transport",
+    [DEVICE_WEBRTC_TRANSPORT, BRIDGE_PCM_TRANSPORT],
+)
+def test_config_loads_native_aec3_for_full_duplex_transports(
+    tmp_path: Path,
+    media_transport: str,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": media_transport,
+            "capture_backend": NATIVE_AEC3_CAPTURE,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.capture_backend == NATIVE_AEC3_CAPTURE
+
+    _write_config(
+        path,
+        {**_valid_config(), "capture_backend": NATIVE_AEC3_CAPTURE},
+    )
+    with pytest.raises(ConfigError, match="requires full_duplex"):
+        load_config(path, expected_uid=os.getuid())
+
+
+@pytest.mark.parametrize(
+    "gain_db",
+    [DEFAULT_DIRECT_CAPTURE_GAIN_DB, MAX_DIRECT_CAPTURE_GAIN_DB],
+)
+def test_config_accepts_device_webrtc_capture_gain_boundaries(
+    tmp_path: Path,
+    gain_db: float,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": gain_db,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.direct_capture_gain_db == gain_db
+
+
+@pytest.mark.parametrize(
+    ("gain_db", "message"),
+    [
+        (True, "must be a number"),
+        ("6", "must be a number"),
+        (float("nan"), "outside its supported range"),
+        (float("inf"), "outside its supported range"),
+        (float("-inf"), "outside its supported range"),
+        (-0.01, "outside its supported range"),
+        (18.01, "outside its supported range"),
+    ],
+)
+def test_config_rejects_invalid_device_webrtc_capture_gain(
+    tmp_path: Path,
+    gain_db: object,
+    message: str,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": DEVICE_WEBRTC_TRANSPORT,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": gain_db,
+        },
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(path, expected_uid=os.getuid())
+
+
+def test_config_loads_bridge_pcm_native_aec3_capture_gain(tmp_path: Path) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(
+        path,
+        {
+            **_valid_config(),
+            "full_duplex": True,
+            "media_transport": BRIDGE_PCM_TRANSPORT,
+            "capture_backend": NATIVE_AEC3_CAPTURE,
+            "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
+            "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
+            "direct_capture_gain_db": 6,
+        },
+    )
+
+    config = load_config(path, expected_uid=os.getuid())
+
+    assert config is not None
+    assert config.capture_backend == NATIVE_AEC3_CAPTURE
+    assert config.direct_capture_gain_db == 6.0
+
+
+def test_config_rejects_nonzero_capture_gain_for_pulse_bridge_pcm(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, {**_valid_config(), "direct_capture_gain_db": 6})
+
+    with pytest.raises(ConfigError, match="requires device_webrtc or native_aec3"):
+        load_config(path, expected_uid=os.getuid())
 
 
 def test_conversation_mode_is_not_a_user_configurable_setting(tmp_path: Path) -> None:
@@ -167,9 +501,12 @@ def test_config_migrates_legacy_bounded_aec_volume_to_both_controls(
     assert config.aec_test_volume_percent == 12
 
 
-def test_config_accepts_explicit_sixty_percent_aec_and_playback(
+@pytest.mark.parametrize("volume_percent", [80, 100])
+def test_config_accepts_supported_high_volume_aec_and_playback(
     tmp_path: Path,
+    volume_percent: int,
 ) -> None:
+    assert MAX_REALTIME_VOLUME_PERCENT == 100
     path = tmp_path / "realtime.json"
     _write_config(
         path,
@@ -178,16 +515,16 @@ def test_config_accepts_explicit_sixty_percent_aec_and_playback(
             "full_duplex": True,
             "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
             "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
-            "aec_sink_volume_ceiling_percent": MAX_REALTIME_VOLUME_PERCENT,
-            "playback_volume_percent": MAX_REALTIME_VOLUME_PERCENT,
+            "aec_sink_volume_ceiling_percent": volume_percent,
+            "playback_volume_percent": volume_percent,
         },
     )
 
     config = load_config(path, expected_uid=os.getuid())
 
     assert config is not None
-    assert config.aec_sink_volume_ceiling_percent == 60
-    assert config.playback_volume_percent == 60
+    assert config.aec_sink_volume_ceiling_percent == volume_percent
+    assert config.playback_volume_percent == volume_percent
 
 
 def test_config_accepts_playback_below_aec_sink_ceiling(tmp_path: Path) -> None:
@@ -199,17 +536,17 @@ def test_config_accepts_playback_below_aec_sink_ceiling(tmp_path: Path) -> None:
             "full_duplex": True,
             "pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE,
             "pulse_aec_sink": DEFAULT_PULSE_AEC_SINK,
-            "aec_sink_volume_ceiling_percent": 60,
-            "playback_volume_percent": 40,
+            "aec_sink_volume_ceiling_percent": 80,
+            "playback_volume_percent": 60,
         },
     )
 
     config = load_config(path, expected_uid=os.getuid())
 
     assert config is not None
-    assert config.aec_sink_volume_ceiling_percent == 60
-    assert config.playback_volume_percent == 40
-    assert config.aec_test_volume_percent == 40
+    assert config.aec_sink_volume_ceiling_percent == 80
+    assert config.playback_volume_percent == 60
+    assert config.aec_test_volume_percent == 60
 
 
 def test_config_rejects_playback_above_aec_sink_ceiling(tmp_path: Path) -> None:
@@ -242,14 +579,74 @@ def test_legacy_direct_constructor_argument_still_couples_both_controls(
     assert legacy_config.aec_test_volume_percent == 60
 
 
-def test_direct_config_rejects_volume_above_sixty_percent(tmp_path: Path) -> None:
+def test_direct_config_rejects_volume_above_full_scale(tmp_path: Path) -> None:
     path = tmp_path / "realtime.json"
     _write_config(path, _valid_config())
     config = load_config(path, expected_uid=os.getuid())
     assert config is not None
 
-    with pytest.raises(ConfigError, match=r"playback_volume_percent.*1 through 60"):
-        replace(config, playback_volume_percent=61)
+    with pytest.raises(ConfigError, match=r"playback_volume_percent.*1 through 100"):
+        replace(config, playback_volume_percent=101)
+
+
+def test_direct_config_rejects_invalid_wake_probability_cutoff(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+
+    with pytest.raises(ConfigError, match=r"wake_probability_cutoff.*0.5 through 0.99"):
+        replace(config, wake_probability_cutoff=True)
+
+
+def test_direct_config_validates_realtime_only_and_normal_phrase(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "realtime.json"
+    _write_config(path, _valid_config())
+    config = load_config(path, expected_uid=os.getuid())
+    assert config is not None
+
+    with pytest.raises(ConfigError, match=r"realtime_only.*boolean"):
+        replace(config, realtime_only=1)
+    with pytest.raises(ConfigError, match=r"wake_phrase.*normal wake phrase"):
+        replace(config, wake_phrase="Okay Nabu")
+
+    realtime_only = replace(
+        config,
+        wake_phrase=" Okay   Nabu ",
+        realtime_only=True,
+    )
+    assert realtime_only.realtime_only is True
+
+
+def test_wake_probability_cutoff_preserves_existing_positional_arguments() -> None:
+    config = RealtimeConfig(
+        "ws://192.0.2.10:8787/v1/realtime",
+        "192.0.2.10",
+        "token",
+        "okay computer",
+        1.0,
+        2.0,
+        1.0,
+        10.0,
+        30.0,
+        5.0,
+        2.0,
+        64 * 1024,
+        64 * 1024,
+        48 * 1024,
+        64 * 1024,
+        False,
+        BRIDGE_PCM_TRANSPORT,
+        "cove",
+    )
+
+    assert config.voice == "cove"
+    assert config.realtime_only is False
+    assert config.wake_probability_cutoff is None
 
 
 def test_full_duplex_defaults_to_existing_webrtc_aec_contract(tmp_path: Path) -> None:
@@ -270,12 +667,12 @@ def test_full_duplex_defaults_to_existing_webrtc_aec_contract(tmp_path: Path) ->
     assert config.pulse_aec_method == DEFAULT_PULSE_AEC_METHOD
 
 
-@pytest.mark.parametrize("mode", [0o604, 0o640, 0o666])
-def test_config_rejects_group_or_other_access(tmp_path: Path, mode: int) -> None:
+@pytest.mark.parametrize("mode", [0o400, 0o604, 0o640, 0o666, 0o700])
+def test_config_requires_exact_private_mode(tmp_path: Path, mode: int) -> None:
     path = tmp_path / "realtime.json"
     _write_config(path, _valid_config(), mode=mode)
 
-    with pytest.raises(ConfigError, match="group or other"):
+    with pytest.raises(ConfigError, match="mode 0600"):
         load_config(path, expected_uid=os.getuid())
 
 
@@ -305,6 +702,10 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"prompt": "line\nbreak"}, "control characters"),
         ({"prompt": "x" * 1_025}, "up to 1024"),
         ({"wake_phrase": "okay nabu"}, "distinct"),
+        ({"realtime_only": 1}, "must be a boolean"),
+        ({"wake_probability_cutoff": True}, "must be a number"),
+        ({"wake_probability_cutoff": 0.49}, "outside its supported range"),
+        ({"wake_probability_cutoff": 1.0}, "outside its supported range"),
         ({"connect_address": "bridge.local"}, "numeric IP"),
         ({"max_message_bytes": 2_047}, "outside its supported range"),
         ({"max_message_bytes": 65_535}, "PCM16 aligned"),
@@ -315,6 +716,7 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ({"input_queue_bytes": 64 * 1024 + 2}, "outside its supported range"),
         ({"io_timeout_seconds": 3.1}, "outside its supported range"),
         ({"full_duplex": 1}, "boolean"),
+        ({"media_transport": "rtp"}, "media_transport must be"),
         ({"full_duplex": True}, "requires explicit"),
         ({"pulse_aec_source": DEFAULT_PULSE_AEC_SOURCE}, "requires full_duplex"),
         ({"pulse_aec_method": "speex"}, "requires full_duplex"),
@@ -332,12 +734,12 @@ def test_config_rejects_symlink(tmp_path: Path) -> None:
         ),
         ({"aec_test_volume_percent": True}, "must be an integer"),
         ({"aec_test_volume_percent": 0}, "outside its supported range"),
-        ({"aec_test_volume_percent": 61}, "outside its supported range"),
+        ({"aec_test_volume_percent": 101}, "outside its supported range"),
         ({"playback_volume_percent": True}, "must be an integer"),
         ({"playback_volume_percent": 0}, "outside its supported range"),
-        ({"playback_volume_percent": 61}, "outside its supported range"),
+        ({"playback_volume_percent": 101}, "outside its supported range"),
         (
-            {"aec_sink_volume_ceiling_percent": 61},
+            {"aec_sink_volume_ceiling_percent": 101},
             "outside its supported range",
         ),
         (

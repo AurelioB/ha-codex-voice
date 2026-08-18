@@ -20,11 +20,13 @@ from custom_components.codex_voice.const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     CONF_REASONING_EFFORT,
     CONF_SERVICE_TIER,
     DEFAULT_CONVERSATION_REASONING_EFFORT,
     DEFAULT_CONVERSATION_SERVICE_TIER,
     DEFAULT_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_VOICE,
     DOMAIN,
 )
 
@@ -83,10 +85,13 @@ async def test_user_flow_creates_stable_provider_subentries(
     assert result["subentries"][0]["data"][CONF_SERVICE_TIER] == (
         DEFAULT_CONVERSATION_SERVICE_TIER
     )
-    assert result["subentries"][0]["data"][CONF_REALTIME_AUTHORITY] is False
+    assert result["subentries"][0]["data"][CONF_REALTIME_AUTHORITY] is True
     assert (
         result["subentries"][0]["data"][CONF_REALTIME_LANGUAGE]
         == DEFAULT_REALTIME_LANGUAGE
+    )
+    assert (
+        result["subentries"][0]["data"][CONF_REALTIME_VOICE] == DEFAULT_REALTIME_VOICE
     )
 
 
@@ -116,6 +121,7 @@ async def test_added_conversation_defaults_to_non_authoritative_mexican_spanish(
     }
     assert suggestions[CONF_REALTIME_AUTHORITY] is False
     assert suggestions[CONF_REALTIME_LANGUAGE] == "es-MX"
+    assert suggestions[CONF_REALTIME_VOICE] == DEFAULT_REALTIME_VOICE
 
 
 async def test_second_realtime_authority_is_rejected(
@@ -154,6 +160,7 @@ async def test_second_realtime_authority_is_rejected(
             CONF_SERVICE_TIER: "standard",
             CONF_REALTIME_AUTHORITY: True,
             CONF_REALTIME_LANGUAGE: "es-MX",
+            CONF_REALTIME_VOICE: DEFAULT_REALTIME_VOICE,
         },
     )
 

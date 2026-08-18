@@ -1,0 +1,10 @@
+services:
+  bridge:
+    environment:
+      HA_CODEX_VOICE_SAMPLE_CONSENT: "true"
+      HA_CODEX_VOICE_SAMPLE_ROOT: /var/lib/ha-codex-voice/voice-samples
+    volumes:
+      - type: bind
+        source: "${HA_CODEX_VOICE_SAMPLE_ROOT_HOST:?Set HA_CODEX_VOICE_SAMPLE_ROOT_HOST to an absolute private directory}"
+        target: /var/lib/ha-codex-voice/voice-samples
+        read_only: false

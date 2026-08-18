@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Coroutine
+from types import SimpleNamespace
 from typing import Any, Self
 
 import pytest
+from aiohttp import WSMsgType
 
 from scripts import smoke_realtime, smoke_realtime_v2
 
@@ -27,6 +30,8 @@ def _started_event(*, protocol_version: int) -> dict[str, Any]:
             "local_flush": True,
             "remote_cancel": False,
             "same_session_interrupt_ack": True,
+            "server_owned_media": True,
+            "native_end_conversation": True,
         },
     }
 
@@ -87,6 +92,24 @@ class _FakeClientSession:
 
     def ws_connect(self, _url: str) -> _HeartbeatWebSocket:
         return self._websocket
+
+
+class _TerminalWebSocket(_HeartbeatWebSocket):
+    """Return one exact silent terminal event after successful startup."""
+
+    def __init__(self, started: dict[str, Any]) -> None:
+        super().__init__(started)
+        self.sent_json: list[dict[str, Any]] = []
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        self.sent_json.append(payload)
+
+    async def receive(self, timeout: float | None = None) -> Any:
+        self.receive_timeouts.append(timeout)
+        return SimpleNamespace(
+            type=WSMsgType.TEXT,
+            data=json.dumps({"type": "stopped", "reason": "end_conversation"}),
+        )
 
 
 def _install_fake_session(
@@ -198,3 +221,26 @@ async def test_output_deadline_is_not_extended_by_heartbeats(
     assert websocket.receive_json_timeouts == [None]
     assert websocket.receive_timeouts == [None]
     assert websocket.heartbeat_count > 1
+
+
+async def test_v2_end_smoke_accepts_only_silent_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = _TerminalWebSocket(_started_event(protocol_version=2))
+    _install_fake_session(monkeypatch, smoke_realtime_v2, websocket)
+
+    result = await smoke_realtime_v2.run_smoke(
+        "http://bridge.test",
+        "test-token",
+        "End conversation",
+        expect_end=True,
+    )
+
+    assert result["terminal_reason"] == "end_conversation"
+    assert result["audio_bytes"] == 0
+    assert websocket.sent_json[-1] == {
+        "type": "text",
+        "role": "user",
+        "text": "End conversation",
+    }
+    assert {"type": "stop"} not in websocket.sent_json

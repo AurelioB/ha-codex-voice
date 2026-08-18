@@ -24,9 +24,30 @@ DEFAULT_PULSE_AEC_SINK = "codex_echo_cancel_sink"
 DEFAULT_PULSE_AEC_METHOD = "webrtc"
 SUPPORTED_PULSE_AEC_METHODS = frozenset({"adrian", "speex", "webrtc"})
 NATIVE_CONVERSATION_MODE = "native"
+BRIDGE_PCM_TRANSPORT = "bridge_pcm"
+DEVICE_WEBRTC_TRANSPORT = "device_webrtc"
+SUPPORTED_MEDIA_TRANSPORTS = frozenset({BRIDGE_PCM_TRANSPORT, DEVICE_WEBRTC_TRANSPORT})
+PULSEAUDIO_AEC_CAPTURE = "pulseaudio_aec"
+NATIVE_AEC3_CAPTURE = "native_aec3"
+SUPPORTED_CAPTURE_BACKENDS = frozenset({PULSEAUDIO_AEC_CAPTURE, NATIVE_AEC3_CAPTURE})
+ROLLOVER_BARGE_IN_MODE = "rollover"
+UPSTREAM_BARGE_IN_MODE = "upstream"
+PROVIDER_CONTROL_BARGE_IN_MODE = "provider_control"
+SUPPORTED_BARGE_IN_MODES = frozenset(
+    {
+        ROLLOVER_BARGE_IN_MODE,
+        UPSTREAM_BARGE_IN_MODE,
+        PROVIDER_CONTROL_BARGE_IN_MODE,
+    }
+)
+DEFAULT_IDLE_TIMEOUT_SECONDS = 120.0
+DEFAULT_MAX_SESSION_SECONDS = 900.0
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 DEFAULT_AEC_SINK_VOLUME_CEILING_PERCENT = 25
 DEFAULT_PLAYBACK_VOLUME_PERCENT = 25
-MAX_REALTIME_VOLUME_PERCENT = 60
+MAX_REALTIME_VOLUME_PERCENT = 100
+DEFAULT_DIRECT_CAPTURE_GAIN_DB = 0.0
+MAX_DIRECT_CAPTURE_GAIN_DB = 18.0
 # Retained for source compatibility. JSON configurations may also keep using
 # ``aec_test_volume_percent`` as an unambiguous legacy alias for both new
 # settings.
@@ -40,6 +61,10 @@ _ALLOWED_KEYS = frozenset(
         "connect_address",
         "token",
         "wake_phrase",
+        "realtime_only",
+        "wake_probability_cutoff",
+        "personalized_wake_config_path",
+        "voice_sample_collection_enabled",
         "voice",
         "prompt",
         "connect_timeout_seconds",
@@ -54,18 +79,65 @@ _ALLOWED_KEYS = frozenset(
         "output_queue_bytes",
         "max_message_bytes",
         "full_duplex",
+        "media_transport",
+        "capture_backend",
+        "barge_in_mode",
         "pulse_aec_source",
         "pulse_aec_sink",
         "pulse_aec_method",
         "aec_test_volume_percent",
         "aec_sink_volume_ceiling_percent",
         "playback_volume_percent",
+        "direct_capture_gain_db",
     }
 )
 
 
+def _validated_barge_in_mode(
+    candidate: object,
+    *,
+    full_duplex: bool,
+    media_transport: str,
+    capture_backend: str,
+) -> str:
+    if not isinstance(candidate, str) or candidate not in SUPPORTED_BARGE_IN_MODES:
+        raise ConfigError(
+            "barge_in_mode must be 'rollover', 'provider_control', or 'upstream'"
+        )
+    if candidate in {PROVIDER_CONTROL_BARGE_IN_MODE, UPSTREAM_BARGE_IN_MODE} and not (
+        full_duplex
+        and media_transport == BRIDGE_PCM_TRANSPORT
+        and capture_backend == NATIVE_AEC3_CAPTURE
+    ):
+        raise ConfigError(
+            f"{candidate} barge_in_mode requires full-duplex bridge_pcm with "
+            "native_aec3 capture"
+        )
+    return candidate
+
+
 class ConfigError(ValueError):
     """Raised when realtime configuration is unsafe or invalid."""
+
+
+def _validated_personalized_wake_config_path(candidate: object) -> str | None:
+    if candidate is None:
+        return None
+    if (
+        not isinstance(candidate, str)
+        or not candidate
+        or len(candidate) > 1_024
+        or not Path(candidate).is_absolute()
+        or Path(candidate).suffix != ".json"
+        or any(not character.isprintable() for character in candidate)
+    ):
+        raise ConfigError("personalized_wake_config_path must be an absolute JSON path")
+    return candidate
+
+
+def _require_boolean(candidate: object, name: str) -> None:
+    if not isinstance(candidate, bool):
+        raise ConfigError(f"{name} must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +160,13 @@ class RealtimeConfig:
     output_queue_bytes: int
     max_message_bytes: int
     full_duplex: bool
+    media_transport: str = BRIDGE_PCM_TRANSPORT
+    capture_backend: str = field(default=PULSEAUDIO_AEC_CAPTURE, kw_only=True)
+    barge_in_mode: str = field(default=ROLLOVER_BARGE_IN_MODE, kw_only=True)
+    realtime_only: bool = field(default=False, kw_only=True)
+    wake_probability_cutoff: float | None = field(default=None, kw_only=True)
+    personalized_wake_config_path: str | None = field(default=None, kw_only=True)
+    voice_sample_collection_enabled: bool = field(default=False, kw_only=True)
     voice: str | None = None
     prompt: str | None = field(default=None, repr=False)
     pulse_aec_source: str | None = None
@@ -99,11 +178,94 @@ class RealtimeConfig:
     aec_test_volume_percent: int = DEFAULT_AEC_TEST_VOLUME_PERCENT
     aec_sink_volume_ceiling_percent: int = field(default=cast(int, _VOLUME_UNSET))
     playback_volume_percent: int = field(default=cast(int, _VOLUME_UNSET))
+    direct_capture_gain_db: float = field(
+        default=DEFAULT_DIRECT_CAPTURE_GAIN_DB,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         """Keep direct construction as strict as the root-only JSON loader."""
         if not isinstance(self.full_duplex, bool):
             raise ConfigError("full_duplex must be a boolean")
+        if not isinstance(self.realtime_only, bool):
+            raise ConfigError("realtime_only must be a boolean")
+        _require_boolean(
+            self.voice_sample_collection_enabled,
+            "voice_sample_collection_enabled",
+        )
+        if (
+            not self.realtime_only
+            and isinstance(self.wake_phrase, str)
+            and normalize_wake_phrase(self.wake_phrase) == _NORMAL_WAKE_PHRASE
+        ):
+            raise ConfigError(
+                "wake_phrase must be distinct from the normal wake phrase unless "
+                "realtime_only is true"
+            )
+        if (
+            not isinstance(self.media_transport, str)
+            or self.media_transport not in SUPPORTED_MEDIA_TRANSPORTS
+        ):
+            raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
+        if self.media_transport == DEVICE_WEBRTC_TRANSPORT and not self.full_duplex:
+            raise ConfigError("device_webrtc media transport requires full_duplex")
+        if (
+            not isinstance(self.capture_backend, str)
+            or self.capture_backend not in SUPPORTED_CAPTURE_BACKENDS
+        ):
+            raise ConfigError(
+                "capture_backend must be 'pulseaudio_aec' or 'native_aec3'"
+            )
+        if self.capture_backend == NATIVE_AEC3_CAPTURE and not self.full_duplex:
+            raise ConfigError("native_aec3 capture requires full_duplex")
+        _validated_barge_in_mode(
+            self.barge_in_mode,
+            full_duplex=self.full_duplex,
+            media_transport=self.media_transport,
+            capture_backend=self.capture_backend,
+        )
+        capture_gain = self.direct_capture_gain_db
+        if (
+            isinstance(capture_gain, bool)
+            or not isinstance(capture_gain, (int, float))
+            or not 0.0 <= float(capture_gain) <= MAX_DIRECT_CAPTURE_GAIN_DB
+        ):
+            raise ConfigError(
+                "direct_capture_gain_db must be a number from 0 through "
+                f"{MAX_DIRECT_CAPTURE_GAIN_DB:g}"
+            )
+        normalized_capture_gain = float(capture_gain)
+        if (
+            self.media_transport != DEVICE_WEBRTC_TRANSPORT
+            and self.capture_backend != NATIVE_AEC3_CAPTURE
+            and normalized_capture_gain != DEFAULT_DIRECT_CAPTURE_GAIN_DB
+        ):
+            raise ConfigError(
+                "direct_capture_gain_db requires device_webrtc or native_aec3 capture"
+            )
+        object.__setattr__(
+            self,
+            "direct_capture_gain_db",
+            normalized_capture_gain,
+        )
+        if self.wake_probability_cutoff is not None:
+            cutoff = self.wake_probability_cutoff
+            if (
+                isinstance(cutoff, bool)
+                or not isinstance(cutoff, (int, float))
+                or not 0.5 <= float(cutoff) <= 0.99
+            ):
+                raise ConfigError(
+                    "wake_probability_cutoff must be a number from 0.5 through 0.99"
+                )
+            object.__setattr__(self, "wake_probability_cutoff", float(cutoff))
+        object.__setattr__(
+            self,
+            "personalized_wake_config_path",
+            _validated_personalized_wake_config_path(
+                self.personalized_wake_config_path
+            ),
+        )
 
         legacy_volume_percent = self.aec_test_volume_percent
         if (
@@ -201,16 +363,30 @@ def normalize_wake_phrase(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def realtime_start_message(config: RealtimeConfig) -> dict[str, Any]:
-    """Build the strict v2 start object, omitting unset session preferences."""
-    value: dict[str, Any] = {
-        "type": "start",
-        "protocol_version": 2,
-        "conversation_mode": NATIVE_CONVERSATION_MODE,
-        "audio_transport": "binary",
-        "input_sample_rate": 16_000,
-        "input_channels": 1,
-    }
+def realtime_start_message(
+    config: RealtimeConfig, *, webrtc_sdp: str | None = None
+) -> dict[str, Any]:
+    """Build one strict native start object, omitting unset preferences."""
+    if config.media_transport == DEVICE_WEBRTC_TRANSPORT:
+        if not isinstance(webrtc_sdp, str) or not webrtc_sdp:
+            raise ConfigError("device_webrtc start requires an SDP offer")
+        if "\x00" in webrtc_sdp:
+            raise ConfigError("device_webrtc SDP offer contains NUL")
+        value: dict[str, Any] = {
+            "type": "start",
+            "protocol_version": 3,
+            "conversation_mode": NATIVE_CONVERSATION_MODE,
+            "transport": {"type": "webrtc", "sdp": webrtc_sdp},
+        }
+    else:
+        value = {
+            "type": "start",
+            "protocol_version": 2,
+            "conversation_mode": NATIVE_CONVERSATION_MODE,
+            "audio_transport": "binary",
+            "input_sample_rate": 16_000,
+            "input_channels": 1,
+        }
     if config.voice is not None:
         value["voice"] = config.voice
     if config.prompt is not None:
@@ -241,6 +417,10 @@ def load_config(
     if not enabled:
         return None
 
+    realtime_only = decoded.get("realtime_only", False)
+    if not isinstance(realtime_only, bool):
+        raise ConfigError("realtime_only must be a boolean")
+
     parsed = _validated_url(_required_text(decoded, "url", maximum=2_048))
     connect_address = decoded.get("connect_address", parsed.hostname)
     if not isinstance(connect_address, str) or not connect_address:
@@ -261,10 +441,27 @@ def load_config(
     wake_phrase = normalize_wake_phrase(
         _required_text(decoded, "wake_phrase", maximum=64)
     )
-    if not wake_phrase or wake_phrase == _NORMAL_WAKE_PHRASE:
-        raise ConfigError("wake_phrase must be distinct from the normal wake phrase")
+    if not wake_phrase or (wake_phrase == _NORMAL_WAKE_PHRASE and not realtime_only):
+        raise ConfigError(
+            "wake_phrase must be distinct from the normal wake phrase unless "
+            "realtime_only is true"
+        )
     if any(not character.isprintable() for character in wake_phrase):
         raise ConfigError("wake_phrase must contain only printable characters")
+    wake_probability_cutoff = _optional_bounded_float(
+        decoded,
+        "wake_probability_cutoff",
+        minimum=0.5,
+        maximum=0.99,
+    )
+    personalized_wake_config_path = _optional_personalized_wake_config_path(decoded)
+    voice_sample_collection_enabled = decoded.get(
+        "voice_sample_collection_enabled", False
+    )
+    _require_boolean(
+        voice_sample_collection_enabled,
+        "voice_sample_collection_enabled",
+    )
 
     input_queue_bytes = _bounded_int(
         decoded,
@@ -303,6 +500,36 @@ def load_config(
     full_duplex = decoded.get("full_duplex", False)
     if not isinstance(full_duplex, bool):
         raise ConfigError("full_duplex must be a boolean")
+    media_transport = decoded.get("media_transport", BRIDGE_PCM_TRANSPORT)
+    if (
+        not isinstance(media_transport, str)
+        or media_transport not in SUPPORTED_MEDIA_TRANSPORTS
+    ):
+        raise ConfigError("media_transport must be 'bridge_pcm' or 'device_webrtc'")
+    if media_transport == DEVICE_WEBRTC_TRANSPORT and not full_duplex:
+        raise ConfigError("device_webrtc media transport requires full_duplex")
+    capture_backend = _capture_backend(decoded, full_duplex=full_duplex)
+    barge_in_mode = _validated_barge_in_mode(
+        decoded.get("barge_in_mode", ROLLOVER_BARGE_IN_MODE),
+        full_duplex=full_duplex,
+        media_transport=media_transport,
+        capture_backend=capture_backend,
+    )
+    direct_capture_gain_db = _bounded_float(
+        decoded,
+        "direct_capture_gain_db",
+        default=DEFAULT_DIRECT_CAPTURE_GAIN_DB,
+        minimum=0.0,
+        maximum=MAX_DIRECT_CAPTURE_GAIN_DB,
+    )
+    if (
+        media_transport != DEVICE_WEBRTC_TRANSPORT
+        and capture_backend != NATIVE_AEC3_CAPTURE
+        and direct_capture_gain_db != DEFAULT_DIRECT_CAPTURE_GAIN_DB
+    ):
+        raise ConfigError(
+            "direct_capture_gain_db requires device_webrtc or native_aec3 capture"
+        )
     pulse_aec_source = _optional_pulse_name(decoded, "pulse_aec_source")
     pulse_aec_sink = _optional_pulse_name(decoded, "pulse_aec_sink")
     pulse_aec_method = _optional_pulse_aec_method(decoded)
@@ -372,7 +599,7 @@ def load_config(
         handshake_timeout_seconds=_bounded_float(
             decoded,
             "handshake_timeout_seconds",
-            default=20.0,
+            default=DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
             minimum=1.0,
             maximum=30.0,
         ),
@@ -386,14 +613,14 @@ def load_config(
         idle_timeout_seconds=_bounded_float(
             decoded,
             "idle_timeout_seconds",
-            default=45.0,
+            default=DEFAULT_IDLE_TIMEOUT_SECONDS,
             minimum=5.0,
             maximum=120.0,
         ),
         max_session_seconds=_bounded_float(
             decoded,
             "max_session_seconds",
-            default=300.0,
+            default=DEFAULT_MAX_SESSION_SECONDS,
             minimum=15.0,
             maximum=900.0,
         ),
@@ -416,13 +643,23 @@ def load_config(
         output_queue_bytes=_bounded_int(
             decoded,
             "output_queue_bytes",
-            # 1.024 seconds of 24 kHz mono PCM16.
-            default=48 * 1024,
+            # Two seconds of 24 kHz mono PCM16. This is capacity, not a
+            # prebuffer: normal audio still starts immediately, while a short
+            # scheduler/network burst cannot tear down the conversation.
+            default=96 * 1024,
             minimum=48 * 1024,
             maximum=192 * 1024,
         ),
         max_message_bytes=max_message_bytes,
         full_duplex=full_duplex,
+        media_transport=media_transport,
+        capture_backend=capture_backend,
+        barge_in_mode=barge_in_mode,
+        direct_capture_gain_db=direct_capture_gain_db,
+        realtime_only=realtime_only,
+        wake_probability_cutoff=wake_probability_cutoff,
+        personalized_wake_config_path=personalized_wake_config_path,
+        voice_sample_collection_enabled=voice_sample_collection_enabled,
         voice=voice,
         prompt=prompt,
         pulse_aec_source=pulse_aec_source,
@@ -451,10 +688,8 @@ def _read_secure_file(path: Path, *, expected_uid: int) -> bytes:
             raise ConfigError("realtime config must be a regular file")
         if metadata.st_uid != expected_uid:
             raise ConfigError("realtime config must be owned by root")
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise ConfigError(
-                "realtime config must not be accessible by group or other"
-            )
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise ConfigError("realtime config must have mode 0600")
         if metadata.st_size > _MAX_CONFIG_BYTES:
             raise ConfigError("realtime config is too large")
         chunks: list[bytes] = []
@@ -530,6 +765,14 @@ def _optional_prompt(value: dict[str, Any]) -> str | None:
     return candidate
 
 
+def _optional_personalized_wake_config_path(value: dict[str, Any]) -> str | None:
+    if "personalized_wake_config_path" not in value:
+        return None
+    return _validated_personalized_wake_config_path(
+        value.get("personalized_wake_config_path")
+    )
+
+
 def _optional_pulse_name(value: dict[str, Any], key: str) -> str | None:
     if key not in value:
         return None
@@ -548,12 +791,31 @@ def _optional_pulse_aec_method(value: dict[str, Any]) -> str | None:
     return candidate
 
 
+def _capture_backend(value: dict[str, Any], *, full_duplex: bool) -> str:
+    candidate = value.get("capture_backend", PULSEAUDIO_AEC_CAPTURE)
+    if not isinstance(candidate, str) or candidate not in SUPPORTED_CAPTURE_BACKENDS:
+        raise ConfigError("capture_backend must be 'pulseaudio_aec' or 'native_aec3'")
+    if candidate == NATIVE_AEC3_CAPTURE and not full_duplex:
+        raise ConfigError("native_aec3 capture requires full_duplex")
+    return candidate
+
+
 def _validate_start_message_size(config: RealtimeConfig) -> None:
     # Keep this encoding identical to WebSocketConnection.send_json. The prompt
     # character bound also keeps the worst-case ensure_ascii expansion below
     # that transport's fixed 16 KiB text ceiling.
+    # Reserve enough room for the measured aiortc offer while retaining the
+    # embedded client's fixed 16 KiB JSON ceiling. The exact runtime offer is
+    # checked again by WebSocketConnection.send_json.
+    offer = (
+        "v=0\r\n" + "a=x:" + ("0" * 4_090)
+        if config.media_transport == DEVICE_WEBRTC_TRANSPORT
+        else None
+    )
     encoded = json.dumps(
-        realtime_start_message(config), separators=(",", ":"), ensure_ascii=True
+        realtime_start_message(config, webrtc_sdp=offer),
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode()
     if len(encoded) > config.max_message_bytes:
         raise ConfigError("voice and prompt do not fit within max_message_bytes")
@@ -568,6 +830,24 @@ def _bounded_float(
     maximum: float,
 ) -> float:
     candidate = value.get(key, default)
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise ConfigError(f"{key} must be a number")
+    result = float(candidate)
+    if not minimum <= result <= maximum:
+        raise ConfigError(f"{key} is outside its supported range")
+    return result
+
+
+def _optional_bounded_float(
+    value: dict[str, Any],
+    key: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float | None:
+    if key not in value:
+        return None
+    candidate = value.get(key)
     if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
         raise ConfigError(f"{key} must be a number")
     result = float(candidate)

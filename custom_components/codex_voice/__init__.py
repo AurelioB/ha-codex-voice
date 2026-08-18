@@ -28,11 +28,14 @@ from .const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DEFAULT_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_VOICE,
     MIN_HA_VERSION,
     PLATFORMS,
     SUBENTRY_TYPE_CONVERSATION,
 )
+from .identity_management import async_setup_identity_management
 from .realtime_tools import async_start_realtime_tool_broker
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +87,7 @@ async def async_setup_entry(
         raise ConfigEntryError(str(err)) from err
 
     entry.runtime_data = client
+    await async_setup_identity_management(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(
         _async_start_realtime_tool_broker_at_started(hass, entry, session)
@@ -96,10 +100,10 @@ async def async_migrate_entry(
     hass: HomeAssistant,
     entry: CodexVoiceConfigEntry,
 ) -> bool:
-    """Add opt-in realtime authority fields and Mexican Spanish language."""
+    """Select one default realtime authority and Mexican Spanish language."""
     if entry.version != 1:
         return False
-    if entry.minor_version >= 2:
+    if entry.minor_version >= 4:
         return True
 
     conversations = [
@@ -107,15 +111,20 @@ async def async_migrate_entry(
         for subentry in entry.subentries.values()
         if subentry.subentry_type == SUBENTRY_TYPE_CONVERSATION
     ]
-    for subentry in conversations:
+    already_selected = any(
+        subentry.data.get(CONF_REALTIME_AUTHORITY) is True for subentry in conversations
+    )
+    for index, subentry in enumerate(conversations):
         data = dict(subentry.data)
-        # Existing installations were explicitly chat-only on the device path.
-        # Migration must not silently grant a new Home Assistant control surface.
-        data.setdefault(CONF_REALTIME_AUTHORITY, False)
+        if not already_selected:
+            data[CONF_REALTIME_AUTHORITY] = index == 0
+        else:
+            data.setdefault(CONF_REALTIME_AUTHORITY, False)
         data.setdefault(CONF_REALTIME_LANGUAGE, DEFAULT_REALTIME_LANGUAGE)
+        data.setdefault(CONF_REALTIME_VOICE, DEFAULT_REALTIME_VOICE)
         hass.config_entries.async_update_subentry(entry, subentry, data=data)
 
-    hass.config_entries.async_update_entry(entry, minor_version=2)
+    hass.config_entries.async_update_entry(entry, minor_version=4)
     return True
 
 

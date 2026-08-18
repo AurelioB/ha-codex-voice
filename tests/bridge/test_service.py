@@ -8,17 +8,20 @@ import re
 import time
 import wave
 from array import array
+from collections import Counter
 from collections.abc import Mapping
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from aiohttp import WSCloseCode, WSMsgType, WSServerHandshakeError, web
 
 from bridge import __main__ as bridge_main
 from bridge import service as bridge_service
-from bridge.config import DEFAULT_CODEX_COMMAND, BridgeConfig
+from bridge.config import DEFAULT_CODEX_COMMAND, DEFAULT_REALTIME_MODEL, BridgeConfig
 from bridge.errors import AppServerExited, BridgeBusyError, ProtocolError
 from bridge.runtime import IsolatedCodexRuntime
 from bridge.service import BridgeState, _codex_child_environment, create_app
@@ -61,24 +64,71 @@ def _realtime_v2_start(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-async def _register_test_realtime_tool_authority(client: Any) -> tuple[Any, str]:
+_TEST_WEBRTC_SDP = (
+    "v=0\r\n"
+    "o=- 1 2 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+)
+
+
+def _realtime_v3_start(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "start",
+        "protocol_version": 3,
+        "conversation_mode": "native",
+        "transport": {"type": "webrtc", "sdp": _TEST_WEBRTC_SDP},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _realtime_v3_rollover(epoch: int) -> dict[str, Any]:
+    return {
+        "type": "rollover",
+        "protocol_version": 3,
+        "epoch": epoch,
+        "transport": {
+            "type": "webrtc",
+            "sdp": _TEST_WEBRTC_SDP.replace("o=- 1", f"o=- {epoch + 1}"),
+        },
+    }
+
+
+async def _register_test_realtime_tool_authority(
+    client: Any,
+    *,
+    include_location: bool = False,
+    voice: str = "cove",
+) -> tuple[Any, str]:
     authority = await client.ws_connect("/v1/home-assistant/tools", headers=AUTH)
-    await authority.send_json(
-        {
-            "type": "register",
-            "protocol_version": 1,
-            "authority_id": "conversation-profile",
-            "language": "es-MX",
-            "instructions": "Controla solo las entidades expuestas.",
-            "tools": [
-                {
-                    "name": "HassTurnOn",
-                    "description": "Enciende una entidad expuesta",
-                    "parameters": {"type": "object"},
-                }
-            ],
-        }
-    )
+    registration = {
+        "type": "register",
+        "protocol_version": 1,
+        "authority_id": "conversation-profile",
+        "language": "es-MX",
+        "voice": voice,
+        "instructions": "Controla solo las entidades expuestas.",
+        "tools": [
+            {
+                "name": "HassTurnOn",
+                "description": "Enciende una entidad expuesta",
+                "parameters": {"type": "object"},
+            }
+        ],
+    }
+    if include_location:
+        registration.update(
+            {
+                "timezone": "America/Cancun",
+                "location": "Casa HA",
+                "latitude": 21.1619,
+                "longitude": -86.8515,
+            }
+        )
+    await authority.send_json(registration)
     registered = await authority.receive_json(timeout=1)
     assert registered["type"] == "registered"
     return authority, registered["generation"]
@@ -219,6 +269,20 @@ async def _assert_busy(response: Any) -> None:
         "error": "another speech session is already active",
         "code": "busy",
     }
+
+
+async def _wait_for_no_active_websockets(app: web.Application) -> None:
+    async with asyncio.timeout(1):
+        while app[bridge_service.ACTIVE_WEBSOCKETS_KEY]:
+            await asyncio.sleep(0)
+
+
+def _thread_call_counts(fake_rpc: FakeRpc, method: str) -> Counter[str]:
+    return Counter(
+        params["threadId"]
+        for candidate, params in fake_rpc.calls
+        if candidate == method
+    )
 
 
 class FakeSubscription:
@@ -405,6 +469,7 @@ class FakeRpc:
         self.turn_interrupt_gate: asyncio.Event | None = None
         self.turn_interrupt_started = asyncio.Event()
         self.thread_delete_error: Exception | None = None
+        self.thread_delete_gate: asyncio.Event | None = None
         self.turn_gate: asyncio.Event | None = None
         self.input_drain_gate: asyncio.Event | None = None
         self.input_drain_started = asyncio.Event()
@@ -413,7 +478,12 @@ class FakeRpc:
         self.realtime_start_gate: asyncio.Event | None = None
         self.realtime_start_started = asyncio.Event()
         self.realtime_stop_gate: asyncio.Event | None = None
+        self.realtime_stop_gates: dict[str, asyncio.Event] = {}
+        self.realtime_stop_error: Exception | None = None
         self.realtime_stop_started = asyncio.Event()
+        self.realtime_active_threads: set[str] = set()
+        self.realtime_same_thread_overlaps: list[str] = []
+        self.realtime_lifecycle: list[tuple[str, str]] = []
         self.synthesis_append_gate: asyncio.Event | None = None
         self.synthesis_append_started = asyncio.Event()
         self.synthesis_result_gates: list[asyncio.Event] = []
@@ -466,8 +536,8 @@ class FakeRpc:
         del timeout
         values = dict(params or {})
         self.calls.append((method, values))
-        if method == "thread/delete" and self.thread_delete_error is not None:
-            raise self.thread_delete_error
+        if method == "thread/delete":
+            return await self._delete_thread(values["threadId"])
         if method == "permissionProfile/list":
             return {
                 "data": [
@@ -550,9 +620,14 @@ class FakeRpc:
             if self.realtime_start_gate is not None:
                 await self.realtime_start_gate.wait()
             thread_id = values["threadId"]
-            peer = self.peers[-1]
-            peer.thread_id = thread_id
-            peer.managed_realtime = values.get("delegationAckFiller") is False
+            if thread_id in self.realtime_active_threads:
+                self.realtime_same_thread_overlaps.append(thread_id)
+            self.realtime_active_threads.add(thread_id)
+            self.realtime_lifecycle.append(("start", thread_id))
+            peer = self.peers[-1] if self.peers else None
+            if peer is not None:
+                peer.thread_id = thread_id
+                peer.managed_realtime = values.get("delegationAckFiller") is False
             await self.broadcast(
                 {
                     "method": "thread/realtime/started",
@@ -566,17 +641,21 @@ class FakeRpc:
             await self.broadcast(
                 {
                     "method": "thread/realtime/sdp",
-                    "params": {"threadId": thread_id, "sdp": "v=0\r\nfake-answer\r\n"},
+                    "params": {
+                        "threadId": thread_id,
+                        "sdp": (
+                            "v=0\r\nfake-answer\r\n"
+                            if peer is not None
+                            else _TEST_WEBRTC_SDP.replace("o=- 1", "o=- 2")
+                        ),
+                    },
                 }
             )
-            if values.get("delegationAckFiller") is False:
+            if peer is not None and values.get("delegationAckFiller") is False:
                 peer.data.put_nowait(json.dumps({"type": "session.started"}))
             return {}
         if method == "thread/realtime/stop":
-            self.realtime_stop_started.set()
-            if self.realtime_stop_gate is not None:
-                await self.realtime_stop_gate.wait()
-            return {}
+            return await self._stop_realtime(values["threadId"])
         is_synthesis_append = method == "thread/realtime/appendText" and str(
             values.get("text", "")
         ).startswith("Vocalize only")
@@ -615,6 +694,35 @@ class FakeRpc:
             else:
                 await self._emit_synthesis_result(peer, values["threadId"])
             return {}
+        return {}
+
+    async def _delete_thread(self, thread_id: str) -> dict[str, Any]:
+        if self.thread_delete_gate is not None:
+            await self.thread_delete_gate.wait()
+        if self.thread_delete_error is not None:
+            raise self.thread_delete_error
+        self.realtime_active_threads.discard(thread_id)
+        self.realtime_lifecycle.append(("delete", thread_id))
+        return {}
+
+    async def _stop_realtime(self, thread_id: str) -> dict[str, Any]:
+        self.realtime_stop_started.set()
+        self.realtime_lifecycle.append(("stop", thread_id))
+        stop_gate = self.realtime_stop_gates.get(thread_id, self.realtime_stop_gate)
+        if stop_gate is not None:
+            await stop_gate.wait()
+        stop_error = self.realtime_stop_error
+        self.realtime_stop_error = None
+        if stop_error is not None:
+            raise stop_error
+        await self.broadcast(
+            {
+                "method": "thread/realtime/closed",
+                "params": {"threadId": thread_id},
+            }
+        )
+        self.realtime_active_threads.discard(thread_id)
+        self.realtime_lifecycle.append(("closed", thread_id))
         return {}
 
     async def _emit_synthesis_result(
@@ -902,6 +1010,170 @@ def test_realtime_device_token_is_optional_and_loaded_from_env(
 
     monkeypatch.setenv("HA_CODEX_REALTIME_DEVICE_TOKEN", "device-token")
     assert BridgeConfig.from_env().realtime_device_token == "device-token"
+
+
+def test_realtime_transcript_logging_is_explicit_and_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_REALTIME_LOG_TRANSCRIPTS", raising=False)
+
+    assert BridgeConfig.from_env().realtime_log_transcripts is False
+    monkeypatch.setenv("HA_CODEX_REALTIME_LOG_TRANSCRIPTS", "true")
+    assert BridgeConfig.from_env().realtime_log_transcripts is True
+    monkeypatch.setenv("HA_CODEX_REALTIME_LOG_TRANSCRIPTS", "sometimes")
+    with pytest.raises(ValueError, match="HA_CODEX_REALTIME_LOG_TRANSCRIPTS"):
+        BridgeConfig.from_env()
+
+
+def test_desktop_realtime_model_is_default_and_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_REALTIME_MODEL", raising=False)
+
+    assert BridgeConfig.from_env().realtime_model == "gpt-live-1-codex"
+    assert BridgeConfig(bearer_token="test-token").realtime_model == (
+        DEFAULT_REALTIME_MODEL
+    )
+
+    monkeypatch.setenv("HA_CODEX_REALTIME_MODEL", "gpt-live-canary")
+    assert BridgeConfig.from_env().realtime_model == "gpt-live-canary"
+
+
+def test_optional_agent_configuration_is_disabled_by_default_and_loaded_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_AGENT_URL", raising=False)
+
+    assert BridgeConfig.from_env().agent_url is None
+
+    monkeypatch.setenv("HA_CODEX_AGENT_URL", "http://agent.local:8090/task")
+    monkeypatch.setenv("HA_CODEX_AGENT_TOKEN", "agent-token")
+    monkeypatch.setenv("HA_CODEX_AGENT_ANNOUNCE_TOKEN", "announce-token")
+    monkeypatch.setenv("HA_CODEX_AGENT_ROOM", "cocina")
+    config = BridgeConfig.from_env()
+
+    assert config.agent_url == "http://agent.local:8090/task"
+    assert config.agent_token == "agent-token"
+    assert config.agent_announce_token == "announce-token"
+    assert config.agent_room == "cocina"
+
+
+def test_web_search_configuration_is_optional_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_WEB_SEARCH_URL", raising=False)
+    monkeypatch.delenv("HA_CODEX_WEB_SEARCH_TIMEOUT", raising=False)
+    assert BridgeConfig.from_env().web_search_url is None
+
+    monkeypatch.setenv(
+        "HA_CODEX_WEB_SEARCH_URL",
+        "http://127.0.0.1:8888/search",
+    )
+    monkeypatch.setenv("HA_CODEX_WEB_SEARCH_TIMEOUT", "7")
+    config = BridgeConfig.from_env()
+    assert config.web_search_url == "http://127.0.0.1:8888/search"
+    assert config.web_search_timeout == 7
+
+    with pytest.raises(ValueError, match="bounded HTTP"):
+        BridgeConfig(
+            bearer_token="test-token",
+            web_search_url="file:///etc/passwd",
+        )
+
+
+def test_assistant_local_context_configuration_is_optional_and_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.setenv("HA_CODEX_ASSISTANT_TIMEZONE", "America/Mexico_City")
+    monkeypatch.setenv("HA_CODEX_ASSISTANT_LOCATION", "Mexico City, Mexico")
+
+    config = BridgeConfig.from_env()
+
+    assert config.assistant_timezone == "America/Mexico_City"
+    assert config.assistant_location == "Mexico City, Mexico"
+    with pytest.raises(ValueError, match="valid IANA timezone"):
+        BridgeConfig(bearer_token="test-token", assistant_timezone="Mars/Olympus")
+
+
+def test_voice_sample_collection_requires_explicit_root_and_consent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "test-token")
+    monkeypatch.delenv("HA_CODEX_VOICE_SAMPLE_ROOT", raising=False)
+    monkeypatch.delenv("HA_CODEX_VOICE_SAMPLE_CONSENT", raising=False)
+    assert BridgeConfig.from_env().voice_sample_root is None
+    assert BridgeConfig.from_env().voice_sample_consent is False
+
+    root = tmp_path / "voice-samples"
+    monkeypatch.setenv("HA_CODEX_VOICE_SAMPLE_ROOT", str(root))
+    with pytest.raises(ValueError, match="requires both"):
+        BridgeConfig.from_env()
+
+    monkeypatch.setenv("HA_CODEX_VOICE_SAMPLE_CONSENT", "true")
+    config = BridgeConfig.from_env()
+    assert config.voice_sample_root == str(root)
+    assert config.voice_sample_consent is True
+
+    with pytest.raises(ValueError, match="requires both"):
+        BridgeConfig(
+            bearer_token="test-token",
+            voice_sample_consent=True,
+        )
+
+
+def test_speaker_identity_is_optional_and_requires_a_distinct_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HA_CODEX_BRIDGE_TOKEN", "bridge-token")
+    monkeypatch.delenv("HA_CODEX_SPEAKER_IDENTITY_URL", raising=False)
+    monkeypatch.delenv("HA_CODEX_SPEAKER_IDENTITY_TOKEN", raising=False)
+    assert BridgeConfig.from_env().speaker_identity_url is None
+
+    monkeypatch.setenv(
+        "HA_CODEX_SPEAKER_IDENTITY_URL",
+        "http://127.0.0.1:8790/identify",
+    )
+    with pytest.raises(ValueError, match="requires both"):
+        BridgeConfig.from_env()
+
+    monkeypatch.setenv(
+        "HA_CODEX_SPEAKER_IDENTITY_TOKEN",
+        "speaker-specific-token-123456",
+    )
+    config = BridgeConfig.from_env()
+    assert config.speaker_identity_url == "http://127.0.0.1:8790/identify"
+    assert config.speaker_identity_token == "speaker-specific-token-123456"
+    assert config.speaker_identity_timeout == 4.0
+
+    with pytest.raises(ValueError, match="must differ"):
+        BridgeConfig(
+            bearer_token="speaker-specific-token-123456",
+            speaker_identity_url="http://127.0.0.1:8790/identify",
+            speaker_identity_token="speaker-specific-token-123456",
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["file:///tmp/agent", "http://user:secret@agent.local/task", "agent.local"],
+)
+def test_optional_agent_url_rejects_unsafe_shapes(url: str) -> None:
+    with pytest.raises(ValueError, match="agent_url"):
+        BridgeConfig(bearer_token="test-token", agent_url=url)
+
+
+def test_agent_announcement_token_must_be_route_specific() -> None:
+    with pytest.raises(ValueError, match="must differ"):
+        BridgeConfig(
+            bearer_token="same-token",
+            agent_announce_token="same-token",
+        )
 
 
 def test_config_can_replace_only_the_codex_executable(
@@ -1648,6 +1920,7 @@ async def test_health_requires_bearer_and_reports_ready(
             "connected": False,
             "language": None,
             "tool_count": 0,
+            "local_context_available": False,
             "pending_calls": 0,
             "calls_started": 0,
             "calls_succeeded": 0,
@@ -1655,6 +1928,46 @@ async def test_health_requires_bearer_and_reports_ready(
             "calls_timed_out": 0,
             "calls_transport_failed": 0,
             "calls_cancelled": 0,
+            "last_call_duration_ms": None,
+        },
+        "agent_tools": {
+            "enabled": False,
+            "calls_started": 0,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
+            "last_call_duration_ms": None,
+        },
+        "agent_announcements": {
+            "active_session": False,
+            "accepted": 0,
+            "unavailable": 0,
+        },
+        "voice_samples": {
+            "enabled": False,
+            "samples_stored": 0,
+            "false_wakes_labeled": 0,
+            "failures": 0,
+        },
+        "speaker_identity": {
+            "enabled": False,
+            "requests_started": 0,
+            "requests_succeeded": 0,
+            "requests_failed": 0,
+            "matches": 0,
+            "unknown": 0,
+            "last_duration_ms": None,
+            "enrollment_active": False,
+            "test_armed": False,
+        },
+        "web_search": {
+            "enabled": False,
+            "primary_backend": None,
+            "local_fallback": False,
+            "calls_started": 0,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
+            "subscription_calls": 0,
+            "fallback_calls": 0,
             "last_call_duration_ms": None,
         },
     }
@@ -1691,7 +2004,7 @@ async def test_primary_bearer_remains_valid_for_all_realtime_protocols(
 
 
 @pytest.mark.asyncio
-async def test_realtime_device_token_is_route_scoped_and_v2_only(
+async def test_realtime_device_token_is_route_scoped_and_media_protocol_only(
     aiohttp_client: Any,
     fake_rpc: FakeRpc,
 ) -> None:
@@ -1725,10 +2038,32 @@ async def test_realtime_device_token_is_route_scoped_and_v2_only(
     await legacy.send_json({"type": "start"})
     assert await legacy.receive_json(timeout=1) == {
         "type": "error",
-        "error": "realtime device authentication requires protocol_version 2",
+        "error": "realtime device authentication requires protocol_version 2 or 3",
     }
+    await legacy.receive(timeout=1)
     await legacy.close()
     assert not any(method == "thread/start" for method, _ in fake_rpc.calls)
+
+    direct = await client.ws_connect(
+        "/v1/realtime",
+        headers={"Authorization": "Bearer device-token"},
+    )
+    await direct.send_json(_realtime_v3_start())
+    assert (await direct.receive_json(timeout=1))["type"] == "answer"
+    await direct.send_json({"type": "transport_ready", "protocol_version": 3})
+    started = await direct.receive_json(timeout=1)
+    assert started == {
+        "type": "started",
+        "version": "v3",
+        "protocol_version": 3,
+        "conversation_mode": "native",
+        "transport": "webrtc",
+        "audio_over_bridge": False,
+        "sideband_control": True,
+    }
+    await direct.send_json({"type": "stop"})
+    await direct.receive(timeout=1)
+    await direct.close()
 
     websocket = await client.ws_connect(
         "/v1/realtime",
@@ -1737,7 +2072,9 @@ async def test_realtime_device_token_is_route_scoped_and_v2_only(
     await websocket.send_json(_realtime_v2_start())
     assert (await websocket.receive_json(timeout=1))["type"] == "started"
     await websocket.send_json({"type": "stop"})
+    await websocket.receive(timeout=1)
     await websocket.close()
+    await _wait_for_no_active_websockets(app)
 
 
 @pytest.mark.asyncio
@@ -5141,20 +5478,25 @@ async def test_realtime_v2_composes_server_routing_with_device_preferences(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
 ) -> None:
     client = await aiohttp_client(bridge_app)
-    authority, _ = await _register_test_realtime_tool_authority(client)
+    authority, _ = await _register_test_realtime_tool_authority(client, voice="ember")
+    assert (
+        bridge_app[bridge_service.STATE_KEY].home_assistant_tools.snapshot.voice
+        == "ember"
+    )
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
     preference = "Responde en español de México con un acento natural y estable."
 
-    await device.send_json(_realtime_v2_start(prompt=preference))
+    await device.send_json(_realtime_v2_start(voice="cove", prompt=preference))
     assert (await device.receive_json(timeout=1))["type"] == "started"
-    realtime_start = next(
+    realtime_start = [
         params for method, params in fake_rpc.calls if method == "thread/realtime/start"
-    )
+    ][-1]
 
     provider_prompt = realtime_start["prompt"]
     assert provider_prompt.startswith(bridge_service.REALTIME_FRONTEND_PROMPT)
     assert realtime_start["includeStartupContext"] is False
     assert realtime_start["clientManagedHandoffs"] is True
+    assert realtime_start["voice"] == "ember"
     assert realtime_start["delegationAckFiller"] is False
     assert "Never answer a user request" in provider_prompt
     assert "Default response language and locale: es-MX." in provider_prompt
@@ -5165,6 +5507,1203 @@ async def test_realtime_v2_composes_server_routing_with_device_preferences(
     await device.send_json({"type": "stop"})
     await device.close()
     await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_relays_device_sdp_without_constructing_bridge_peer(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(
+        _realtime_v3_start(
+            voice="Cove",
+            prompt="Responde en español de México.",
+        )
+    )
+    answer = await device.receive_json(timeout=1)
+
+    assert answer == {
+        "type": "answer",
+        "protocol_version": 3,
+        "transport": {
+            "type": "webrtc",
+            "sdp": _TEST_WEBRTC_SDP.replace("o=- 1", "o=- 2"),
+        },
+    }
+    assert fake_rpc.peers == []
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert thread_start["dynamicTools"] == [bridge_service.DIRECT_END_CONVERSATION_TOOL]
+    realtime_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    )
+    assert realtime_start == {
+        "threadId": "thread-1",
+        "outputModality": "audio",
+        "includeStartupContext": False,
+        "clientManagedHandoffs": False,
+        "transport": {"type": "webrtc", "sdp": _TEST_WEBRTC_SDP},
+        "version": "v3",
+        "prompt": "Responde en español de México.",
+        "voice": "cove",
+    }
+
+    started_receive = asyncio.create_task(device.receive_json(timeout=1))
+    await asyncio.sleep(0)
+    assert not started_receive.done()
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    started = await started_receive
+    assert started["type"] == "started"
+    assert started["version"] == "v3"
+    assert started["protocol_version"] == 3
+    assert started["transport"] == "webrtc"
+    assert started["audio_over_bridge"] is False
+    assert started["sideband_control"] is True
+    assert "sdp" not in started
+    assert "thread_id" not in started
+    assert "realtime_session_id" not in started
+    assert "conversation_id" not in started
+
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_direct_webrtc_uses_configured_provider_v1(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(bearer_token="test-token", realtime_version="v1"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    realtime_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    )
+    assert realtime_start["version"] == "v1"
+
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    started = await device.receive_json(timeout=1)
+    assert started["type"] == "started"
+    assert started["version"] == "v3"
+    assert started["protocol_version"] == 3
+
+    await device.send_json(_realtime_v3_rollover(2))
+    rollover_answer = await device.receive_json(timeout=1)
+    assert rollover_answer["type"] == "rollover_answer"
+    realtime_starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert [params["version"] for params in realtime_starts] == ["v1", "v1"]
+    assert realtime_starts[-1]["includeStartupContext"] is True
+    await device.send_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "rollover_started",
+        "protocol_version": 3,
+        "epoch": 2,
+        "context_retained": True,
+    }
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rollover_reuses_thread_in_strict_epoch_order(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+    old_subscription = next(iter(fake_rpc.subscriptions))
+
+    for epoch in (2, 3):
+        await device.send_json(_realtime_v3_rollover(epoch))
+        assert await device.receive_json(timeout=1) == {
+            "type": "rollover_answer",
+            "protocol_version": 3,
+            "epoch": epoch,
+            "transport": {
+                "type": "webrtc",
+                "sdp": _TEST_WEBRTC_SDP.replace("o=- 1", "o=- 2"),
+            },
+        }
+        if epoch == 2:
+            # The retired subscription is no longer monitored by the active
+            # epoch, even if an already-queued event arrives on that object.
+            old_subscription.queue.put_nowait(
+                {
+                    "method": "thread/realtime/closed",
+                    "params": {"threadId": "thread-1"},
+                }
+            )
+        await device.send_json(
+            {
+                "type": "rollover_transport_ready",
+                "protocol_version": 3,
+                "epoch": epoch,
+            }
+        )
+        assert await device.receive_json(timeout=1) == {
+            "type": "rollover_started",
+            "protocol_version": 3,
+            "epoch": epoch,
+            "context_retained": True,
+        }
+        await device.send_json({"type": "ping"})
+        assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    lifecycle = [
+        (method, params)
+        for method, params in fake_rpc.calls
+        if method in {"thread/realtime/start", "thread/realtime/stop"}
+    ]
+    assert [method for method, _ in lifecycle] == [
+        "thread/realtime/start",
+        "thread/realtime/stop",
+        "thread/realtime/start",
+        "thread/realtime/stop",
+        "thread/realtime/start",
+    ]
+    starts = [params for method, params in lifecycle if method.endswith("/start")]
+    assert [params["threadId"] for params in starts] == [
+        "thread-1",
+        "thread-1",
+        "thread-1",
+    ]
+    assert [params["includeStartupContext"] for params in starts] == [
+        False,
+        True,
+        True,
+    ]
+    assert fake_rpc.thread_count == 1
+    assert fake_rpc.realtime_lifecycle == [
+        ("start", "thread-1"),
+        ("stop", "thread-1"),
+        ("closed", "thread-1"),
+        ("start", "thread-1"),
+        ("stop", "thread-1"),
+        ("closed", "thread-1"),
+        ("start", "thread-1"),
+    ]
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while sum(method == "thread/delete" for method, _ in fake_rpc.calls) < 1:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 3}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter({"thread-1": 1})
+    assert fake_rpc.realtime_active_threads == set()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rollover_stop_error_uses_unblocked_isolated_thread(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    fake_rpc.realtime_stop_error = RuntimeError("ambiguous provider stop")
+    fake_rpc.thread_delete_gate = asyncio.Event()
+    await device.send_json(_realtime_v3_rollover(2))
+    # Old thread deletion is deliberately blocked. Negotiation must continue on
+    # a different thread instead of waiting for that bounded cleanup.
+    answer = await device.receive_json(timeout=1)
+    assert answer["type"] == "rollover_answer"
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert [params["threadId"] for params in starts] == ["thread-1", "thread-2"]
+    assert [params["includeStartupContext"] for params in starts] == [False, False]
+    thread_starts = [
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    ]
+    assert len(thread_starts) == 2
+    assert all(
+        params["dynamicTools"] == [bridge_service.DIRECT_END_CONVERSATION_TOOL]
+        for params in thread_starts
+    )
+    assert all(
+        "Your only tool is end_conversation" in params["baseInstructions"]
+        for params in thread_starts
+    )
+
+    await device.send_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "rollover_started",
+        "protocol_version": 3,
+        "epoch": 2,
+        "context_retained": False,
+    }
+    fake_rpc.thread_delete_gate.set()
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while sum(method == "thread/delete" for method, _ in fake_rpc.calls) < 2:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rollover_stop_grace_expiry_uses_fresh_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        0.01,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    state = bridge_app[bridge_service.STATE_KEY]
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    await device.send_json(_realtime_v3_rollover(2))
+    assert (await device.receive_json(timeout=1))["type"] == "rollover_answer"
+    assert fake_rpc.realtime_stop_started.is_set()
+    assert not fake_rpc.realtime_stop_gate.is_set()
+    assert len(state._realtime_provider_cleanup_tasks) == 1
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter()
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert [params["threadId"] for params in starts] == ["thread-1", "thread-2"]
+    assert [params["includeStartupContext"] for params in starts] == [False, False]
+    assert fake_rpc.realtime_active_threads == {"thread-1", "thread-2"}
+    assert fake_rpc.realtime_same_thread_overlaps == []
+    assert fake_rpc.realtime_lifecycle[:3] == [
+        ("start", "thread-1"),
+        ("stop", "thread-1"),
+        ("start", "thread-2"),
+    ]
+
+    await device.send_json(
+        {
+            "type": "rollover_transport_ready",
+            "protocol_version": 3,
+            "epoch": 2,
+        }
+    )
+    assert (await device.receive_json(timeout=1))["context_retained"] is False
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    fake_rpc.realtime_stop_gate.set()
+    async with asyncio.timeout(1):
+        while (
+            _thread_call_counts(fake_rpc, "thread/delete")["thread-1"] != 1
+            or state._realtime_provider_cleanup_tasks
+        ):
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter({"thread-1": 1})
+    assert fake_rpc.realtime_active_threads == {"thread-2"}
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+    async with asyncio.timeout(1):
+        while state._realtime_provider_cleanup_tasks or fake_rpc.subscriptions:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert fake_rpc.realtime_active_threads == set()
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_stop_during_blocked_rollover_stops_without_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    state = bridge_app[bridge_service.STATE_KEY]
+    await device.send_json(_realtime_v3_rollover(2))
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    await device.send_json({"type": "stop"})
+    async with asyncio.timeout(1):
+        while not state._realtime_provider_cleanup_tasks:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter()
+    fake_rpc.realtime_stop_gate.set()
+    await device.receive(timeout=1)
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter({"thread-1": 1})
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_disconnect_during_rollover_grace_cleans_once(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    state = bridge_app[bridge_service.STATE_KEY]
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    await device.send_json(_realtime_v3_rollover(2))
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    disconnect = asyncio.create_task(device.close())
+    async with asyncio.timeout(1):
+        while not state._realtime_provider_cleanup_tasks:
+            await asyncio.sleep(0)
+
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter()
+
+    fake_rpc.realtime_stop_gate.set()
+    await asyncio.wait_for(disconnect, timeout=1)
+    await _wait_for_no_active_websockets(bridge_app)
+    async with asyncio.timeout(1):
+        while state._realtime_provider_cleanup_tasks or fake_rpc.subscriptions:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter({"thread-1": 1})
+    assert fake_rpc.realtime_active_threads == set()
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_stop_during_replacement_negotiation_closes_cleanly(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    fake_rpc.realtime_start_gate = asyncio.Event()
+    fake_rpc.realtime_start_started = asyncio.Event()
+    await device.send_json(_realtime_v3_rollover(2))
+    await asyncio.wait_for(fake_rpc.realtime_start_started.wait(), timeout=1)
+    await device.send_json({"type": "stop"})
+
+    message = await device.receive(timeout=1)
+    assert message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING}
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_stop_during_replacement_readiness_closes_cleanly(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await device.send_json(_realtime_v3_rollover(2))
+    assert (await device.receive_json(timeout=1))["type"] == "rollover_answer"
+    await device.send_json({"type": "stop"})
+
+    message = await device.receive(timeout=1)
+    assert message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING}
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_concurrent_rollover_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    state = bridge_app[bridge_service.STATE_KEY]
+    await device.send_json(_realtime_v3_rollover(2))
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    await device.send_json(_realtime_v3_rollover(3))
+    async with asyncio.timeout(1):
+        while not state._realtime_provider_cleanup_tasks:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    fake_rpc.realtime_stop_gate.set()
+    error = await device.receive_json(timeout=1)
+
+    assert error["type"] == "error"
+    assert "already in progress" in error["error"]
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter({"thread-1": 1})
+    assert fake_rpc.realtime_active_threads == set()
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_app_server_exit_during_strict_stop_never_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    async def app_server_exits(_thread_id: str) -> dict[str, Any]:
+        await fake_rpc.broadcast(
+            {"method": "bridge/appServerExited", "params": {"returncode": 29}}
+        )
+        return {}
+
+    fake_rpc._stop_realtime = app_server_exits  # type: ignore[method-assign]
+    await device.send_json(_realtime_v3_rollover(2))
+    error = await device.receive_json(timeout=1)
+
+    assert error["type"] == "error"
+    assert "status 29" in error["error"]
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1}
+    )
+    assert sum(method == "thread/start" for method, _ in fake_rpc.calls) == 1
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter({"thread-1": 1})
+    assert fake_rpc.realtime_active_threads == set()
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_app_server_exit_after_grace_closes_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        0.01,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    state = bridge_app[bridge_service.STATE_KEY]
+    old_stop_gate = asyncio.Event()
+    fake_rpc.realtime_stop_gates["thread-1"] = old_stop_gate
+    await device.send_json(_realtime_v3_rollover(2))
+    answer = await device.receive_json(timeout=1)
+    assert answer["type"] == "rollover_answer"
+    assert len(state._realtime_provider_cleanup_tasks) == 1
+    assert fake_rpc.realtime_active_threads == {"thread-1", "thread-2"}
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+    await fake_rpc.broadcast(
+        {"method": "bridge/appServerExited", "params": {"returncode": 31}}
+    )
+    old_stop_gate.set()
+    error = await device.receive_json(timeout=1)
+
+    assert error["type"] == "error"
+    assert "status 31" in error["error"]
+    assert not any(
+        message.get("type") == "rollover_started" for message in (answer, error)
+    )
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+    async with asyncio.timeout(1):
+        while state._realtime_provider_cleanup_tasks or fake_rpc.subscriptions:
+            await asyncio.sleep(0)
+    assert _thread_call_counts(fake_rpc, "thread/realtime/start") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/realtime/stop") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert _thread_call_counts(fake_rpc, "thread/delete") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert fake_rpc.realtime_active_threads == set()
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("epoch", [1, 3])
+async def test_realtime_v3_rollover_rejects_stale_or_skipped_epoch(
+    epoch: int,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await device.send_json(_realtime_v3_rollover(epoch))
+    error = await device.receive_json(timeout=1)
+    assert error["type"] == "error"
+    assert "epoch must be 2" in error["error"]
+    assert not any(message.get("type") == "rollover_started" for message in [error])
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rejects_binary_media_and_never_sends_started(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await device.send_bytes(b"\x00\x00")
+    error = await device.receive_json(timeout=1)
+
+    assert error["type"] == "error"
+    assert "binary" in error["error"]
+    assert fake_rpc.peers == []
+    await device.receive(timeout=1)
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_disconnect_after_answer_cleans_remote_once(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await device.close()
+
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    assert sum(method == "thread/realtime/stop" for method, _ in fake_rpc.calls) == 1
+    assert sum(method == "thread/delete" for method, _ in fake_rpc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_cleanup_ownership_is_tracked_before_stop_await(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    fake_rpc.realtime_stop_gate = asyncio.Event()
+    app = create_app(
+        BridgeConfig(bearer_token="test-token"),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await device.send_json({"type": "stop"})
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    state = app[bridge_service.STATE_KEY]
+    assert len(state._realtime_provider_cleanup_tasks) == 1
+    assert ("thread/delete", {"threadId": "thread-1"}) not in fake_rpc.calls
+
+    close_task = asyncio.create_task(state.close())
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(close_task), timeout=0.02)
+
+    fake_rpc.realtime_stop_gate.set()
+    await asyncio.wait_for(close_task, timeout=1)
+    assert ("thread/delete", {"threadId": "thread-1"}) in fake_rpc.calls
+    assert not state._realtime_provider_cleanup_tasks
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_sanitizes_provider_error_during_device_handshake(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/error",
+            "params": {
+                "threadId": "thread-1",
+                "message": "private upstream credential oauth-secret-value",
+            },
+        }
+    )
+    error = await device.receive_json(timeout=1)
+
+    assert error == {"type": "error", "error": "realtime provider error"}
+    assert "secret" not in json.dumps(error)
+    await device.receive(timeout=1)
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", [3.0, True])
+async def test_realtime_v3_transport_ready_requires_exact_integer_version(
+    protocol_version: object,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await device.send_json(
+        {"type": "transport_ready", "protocol_version": protocol_version}
+    )
+    error = await device.receive_json(timeout=1)
+
+    assert error["type"] == "error"
+    assert "transport_ready" in error["error"]
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rejects_tool_call_while_waiting_for_transport_ready(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-request-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "callId": "call-1",
+                "tool": "must_not_run",
+                "arguments": {"private": "never forward"},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+    assert fake_rpc.responses == [
+        (
+            "provider-request-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": (
+                            '{"error":"direct_voice_tool_not_allowed",'
+                            '"do_not_retry":true}'
+                        ),
+                    }
+                ],
+                "success": False,
+            },
+        )
+    ]
+
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+    await device.send_json({"type": "stop"})
+    await device.close()
+    async with asyncio.timeout(1):
+        while not any(method == "thread/delete" for method, _ in fake_rpc.calls):
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_provider_close_during_rollover_handshake_fails_closed(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await device.send_json(_realtime_v3_rollover(2))
+    assert (await device.receive_json(timeout=1))["type"] == "rollover_answer"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/closed",
+            "params": {"threadId": "thread-1"},
+        }
+    )
+    error = await device.receive_json(timeout=1)
+
+    assert error == {
+        "type": "error",
+        "error": "realtime provider closed during device handshake",
+    }
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_provider_close_during_runtime_stops_active_epoch(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/closed",
+            "params": {"threadId": "thread-1"},
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "remote_closed",
+    }
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_rejected_runtime_tool_call_stops_active_epoch(
+    aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-request-runtime-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "callId": "call-runtime-1",
+                "tool": "must_not_run",
+                "arguments": {"private": "never forward"},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "provider_tool_rejected",
+    }
+    assert fake_rpc.responses == [
+        (
+            "provider-request-runtime-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": (
+                            '{"error":"direct_voice_tool_not_allowed",'
+                            '"do_not_retry":true}'
+                        ),
+                    }
+                ],
+                "success": False,
+            },
+        )
+    ]
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_end_conversation_tool_stops_active_epoch(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-end-request-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "callId": "end-call-1",
+                "tool": "end_conversation",
+                "arguments": {},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    assert fake_rpc.responses == [
+        (
+            "provider-end-request-1",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": '{"status":"conversation_ended"}',
+                    }
+                ],
+                "success": True,
+            },
+        )
+    ]
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("Terminar", True),
+        ("¡Terminar llamada!", True),
+        ("TERMINAR LA LLAMADA", True),
+        ("Adiós.", True),
+        ("Terminar terminar", True),
+        ("Terminar llamada finalizar", True),
+        ("Quiero terminar la llamada", False),
+        ("Terminar la música", False),
+        ("Terminar terminar la música", False),
+        ("Terminarx", False),
+        ("Continuar", False),
+    ],
+)
+def test_direct_terminal_transcript_matches_only_exact_phrases(
+    phrase: str,
+    expected: bool,
+) -> None:
+    event = {
+        "method": "thread/realtime/transcript/done",
+        "params": {"role": "user", "text": phrase},
+    }
+
+    assert bridge_service._direct_provider_transcript_requests_end(event) is expected
+    event["params"]["role"] = "assistant"
+    assert not bridge_service._direct_provider_transcript_requests_end(event)
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("Term", True),
+        ("terminar llama", True),
+        ("terminar term", True),
+        ("terminar terminar llama", True),
+        ("¡", True),
+        ("terminar terminar la música", False),
+        ("terminarx", False),
+        ("What", False),
+        ("Stop the kitchen timer", False),
+    ],
+)
+def test_direct_terminal_transcript_prefix_gate(
+    phrase: str,
+    expected: bool,
+) -> None:
+    assert bridge_service._direct_terminal_transcript_is_possible_prefix(phrase) is (
+        expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_exact_spanish_end_transcript_stops_active_epoch(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v3_start())
+    assert (await device.receive_json(timeout=1))["type"] == "answer"
+    await device.send_json({"type": "transport_ready", "protocol_version": 3})
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "text": "¡Terminar llamada!",
+            },
+        }
+    )
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    assert fake_rpc.responses == []
+    await device.close()
+    await _wait_for_no_active_websockets(bridge_app)
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_provider_failure_wins_simultaneous_device_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def receive_ready(_websocket: Any, *, allow_binary: bool) -> dict[str, Any]:
+        assert allow_binary is False
+        await release.wait()
+        return {"type": "transport_ready", "protocol_version": 3}
+
+    class FailedSession:
+        async def next_event(self, timeout: float | None = None) -> dict[str, Any]:
+            assert timeout is not None
+            await release.wait()
+            return {
+                "method": "thread/realtime/error",
+                "params": {"message": "provider unavailable"},
+            }
+
+    monkeypatch.setattr(
+        bridge_service,
+        "_receive_realtime_message",
+        receive_ready,
+    )
+    waiting = asyncio.create_task(
+        bridge_service._wait_for_direct_transport_ready(object(), FailedSession())
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(ProtocolError, match="realtime provider error"):
+        await waiting
+
+
+@pytest.mark.asyncio
+async def test_realtime_v3_provider_failure_wins_simultaneous_rollover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    sent: list[dict[str, Any]] = []
+
+    async def receive_rollover(
+        _websocket: Any, *, allow_binary: bool
+    ) -> dict[str, Any]:
+        assert allow_binary is False
+        await release.wait()
+        return _realtime_v3_rollover(2)
+
+    async def capture_send(
+        _websocket: Any,
+        value: Mapping[str, Any],
+        *,
+        send_lock: asyncio.Lock | None = None,
+    ) -> None:
+        assert send_lock is None
+        sent.append(dict(value))
+
+    class FailedSession:
+        async def next_event(self, timeout: float | None = None) -> dict[str, Any]:
+            assert timeout is None
+            await release.wait()
+            return {
+                "method": "thread/realtime/error",
+                "params": {"threadId": "thread-1"},
+            }
+
+    monkeypatch.setattr(bridge_service, "_receive_realtime_message", receive_rollover)
+    monkeypatch.setattr(bridge_service, "_send_realtime_json", capture_send)
+    running = asyncio.create_task(
+        bridge_service._run_direct_realtime_socket(
+            object(), FailedSession(), expected_epoch=2
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await running is None
+    assert sent == [{"type": "error", "error": "realtime provider error"}]
 
 
 @pytest.mark.asyncio
@@ -5191,6 +6730,62 @@ def test_realtime_v2_bounds_composed_device_preferences() -> None:
     assert len(prompt) == bridge_service.REALTIME_FRONTEND_PROMPT_MAX_CHARS
 
 
+def test_native_agent_tools_override_colliding_home_assistant_names() -> None:
+    snapshot = bridge_service.ToolBrokerSnapshot(
+        generation="generation",
+        authority_id="authority",
+        language="es-MX",
+        voice="cove",
+        instructions="",
+        tools=(
+            {
+                "type": "function",
+                "name": "search_web",
+                "description": "HA search compatibility adapter",
+                "inputSchema": {"type": "object"},
+            },
+            {
+                "type": "function",
+                "name": "ask_agent",
+                "description": "HA compatibility adapter",
+                "inputSchema": {"type": "object"},
+            },
+            {
+                "type": "function",
+                "name": "HassTurnOn",
+                "description": "Home Assistant",
+                "inputSchema": {"type": "object"},
+            },
+        ),
+        tool_names=frozenset({"search_web", "ask_agent", "HassTurnOn"}),
+    )
+    agent = bridge_service.AgentToolBroker(
+        "http://agent.local/task",
+        token=None,
+        room="home",
+        recall_timeout=1,
+        task_timeout=1,
+    )
+
+    tools = bridge_service._native_realtime_tools(
+        snapshot,
+        agent,
+        bridge_service.VoiceSampleInbox(None),
+        bridge_service.WebSearchBroker("http://search.local/search", timeout=1),
+    )
+
+    assert [tool["name"] for tool in tools] == [
+        "end_conversation",
+        "search_web",
+        "ask_agent",
+        "recall_memory",
+        "HassTurnOn",
+    ]
+    assert next(tool for tool in tools if tool["name"] == "ask_agent")[
+        "description"
+    ].startswith("Ask the optional external agent")
+
+
 @pytest.mark.asyncio
 async def test_realtime_v2_preserves_native_frontend_without_tool_authority(
     aiohttp_client: Any, bridge_app: web.Application, fake_rpc: FakeRpc
@@ -5214,29 +6809,55 @@ async def test_realtime_v2_preserves_native_frontend_without_tool_authority(
 
 
 @pytest.mark.asyncio
-async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
+async def test_realtime_v2_explicit_native_uses_connected_tool_authority(
     aiohttp_client: Any,
     bridge_app: web.Application,
     fake_rpc: FakeRpc,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = await aiohttp_client(bridge_app)
-    authority, _ = await _register_test_realtime_tool_authority(client)
+    authority, _ = await _register_test_realtime_tool_authority(client, voice="ember")
     device = await client.ws_connect("/v1/realtime", headers=AUTH)
 
     try:
         with caplog.at_level(logging.INFO, logger="bridge.service"):
-            await device.send_json(_realtime_v2_start(conversation_mode="native"))
+            await device.send_json(
+                _realtime_v2_start(
+                    conversation_mode="native",
+                    voice="cove",
+                )
+            )
             started = await device.receive_json(timeout=1)
 
         assert started["type"] == "started"
         assert started["conversation_mode"] == "native"
+        assert started["capabilities"]["server_owned_media"] is True
+        assert started["capabilities"]["native_end_conversation"] is True
         thread_starts = [
             params for method, params in fake_rpc.calls if method == "thread/start"
         ]
         assert len(thread_starts) == 1
-        assert "dynamicTools" not in thread_starts[0]
-        assert "Home Assistant" not in thread_starts[0]["baseInstructions"]
+        assert thread_starts[0]["dynamicTools"] == [
+            bridge_service.DIRECT_END_CONVERSATION_TOOL,
+            {
+                "type": "function",
+                "name": "HassTurnOn",
+                "description": "Enciende una entidad expuesta",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        assert (
+            "Home Assistant is the authoritative"
+            in thread_starts[0]["baseInstructions"]
+        )
+        assert (
+            "Controla solo las entidades expuestas."
+            in thread_starts[0]["baseInstructions"]
+        )
+        assert (
+            "do not guess or silently supply missing words"
+            in thread_starts[0]["baseInstructions"]
+        )
         realtime_starts = [
             params
             for method, params in fake_rpc.calls
@@ -5247,11 +6868,44 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
         assert realtime_start["threadId"] == started["thread_id"]
         assert realtime_start["includeStartupContext"] is False
         assert realtime_start["clientManagedHandoffs"] is False
+        assert realtime_start["voice"] == "ember"
         assert "delegationAckFiller" not in realtime_start
         assert (
             "Realtime conversation route selected: route=native selection=explicit"
             in caplog.text
         )
+
+        await fake_rpc.broadcast(
+            {
+                "id": "native-ha-request",
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": started["thread_id"],
+                    "callId": "native-ha-call",
+                    "tool": "HassTurnOn",
+                    "arguments": {"name": "Cocina"},
+                },
+            }
+        )
+        tool_call = await authority.receive_json(timeout=1)
+        assert tool_call["type"] == "tool_call"
+        assert tool_call["name"] == "HassTurnOn"
+        assert tool_call["arguments"] == {"name": "Cocina"}
+        await authority.send_json(
+            {
+                "type": "tool_result",
+                "generation": tool_call["generation"],
+                "call_id": tool_call["call_id"],
+                "success": True,
+                "result": {"speech": "Encendí la cocina"},
+            }
+        )
+        async with asyncio.timeout(1):
+            while not any(
+                request_id == "native-ha-request"
+                for request_id, _ in fake_rpc.responses
+            ):
+                await asyncio.sleep(0)
 
         streamed_audio = b"\x00\x02" * 48
         peer = fake_rpc.peers[-1]
@@ -5295,6 +6949,1515 @@ async def test_realtime_v2_explicit_native_ignores_connected_tool_authority(
             await device.send_json({"type": "stop"})
             await device.close()
         await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_explicit_native_executes_optional_agent_tool(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    received: list[dict[str, Any]] = []
+
+    async def agent_handler(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        return web.json_response({"answer": "Resultado del agente"})
+
+    agent_app = web.Application()
+    agent_app.router.add_post("/task", agent_handler)
+    agent_server = await aiohttp_server(agent_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            agent_url=str(agent_server.make_url("/task")),
+            agent_room="cocina",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "ask_agent",
+        "recall_memory",
+    ]
+    assert "optional external agent" in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "native-agent-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "native-agent-call",
+                "tool": "ask_agent",
+                "arguments": {"question": "Investiga el clima"},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "native-agent-request" for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    assert received == [{"question": "Investiga el clima", "room": "cocina"}]
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "native-agent-request"
+    )
+    assert response["success"] is True
+    assert json.loads(response["contentItems"][0]["text"]) == {
+        "answer": "Resultado del agente"
+    }
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_executes_default_web_search_tool(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    received: list[dict[str, str]] = []
+
+    async def search_handler(request: web.Request) -> web.Response:
+        received.append(dict(request.query))
+        return web.json_response(
+            {
+                "results": [
+                    {
+                        "title": "Fuente actual",
+                        "url": "https://example.com/actual",
+                        "content": "Información obtenida de internet.",
+                    }
+                ]
+            }
+        )
+
+    search_app = web.Application()
+    search_app.router.add_get("/search", search_handler)
+    search_server = await aiohttp_server(search_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            web_search_url=str(search_server.make_url("/search")),
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "search_web",
+    ]
+    assert "untrusted excerpts" in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "native-search-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "native-search-call",
+                "tool": "search_web",
+                "arguments": {"query": "noticias actuales"},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "native-search-request"
+            for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    assert received[0]["q"] == "noticias actuales"
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "native-search-request"
+    )
+    assert response["success"] is True
+    assert json.loads(response["contentItems"][0]["text"])["results"] == [
+        {
+            "title": "Fuente actual",
+            "url": "https://example.com/actual",
+            "snippet": "Información obtenida de internet.",
+        }
+    ]
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_exposes_and_executes_fresh_local_context(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            assistant_timezone="America/Mexico_City",
+            assistant_location="Mexico City, Mexico",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    authority, _ = await _register_test_realtime_tool_authority(
+        client,
+        include_location=True,
+    )
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "get_current_time",
+        "HassTurnOn",
+    ]
+    assert "Location: Casa HA" in thread_start["baseInstructions"]
+    assert "Coordinates: 21.1619, -86.8515" in thread_start["baseInstructions"]
+    assert "Time zone: America/Cancun" in thread_start["baseInstructions"]
+    assert "Context source: home_assistant" in thread_start["baseInstructions"]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "native-time-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "native-time-call",
+                "tool": "get_current_time",
+                "arguments": {},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "native-time-request" for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "native-time-request"
+    )
+    assert response["success"] is True
+    result = json.loads(response["contentItems"][0]["text"])
+    assert (
+        result["local_date"]
+        == datetime.now(ZoneInfo("America/Cancun")).date().isoformat()
+    )
+    assert result["timezone"] == "America/Cancun"
+    assert result["location"] == "Casa HA"
+    assert result["latitude"] == 21.1619
+    assert result["longitude"] == -86.8515
+    assert result["source"] == "home_assistant"
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+    await authority.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_optional_identity_appends_late_advisory_context(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    observed: list[bytes] = []
+
+    async def identify_handler(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == (
+            "Bearer speaker-specific-token-123456"
+        )
+        observed.append(await request.read())
+        return web.json_response(
+            {
+                "status": "match",
+                "speaker_id": "owner",
+                "score": 0.81,
+                "margin": 0.29,
+            }
+        )
+
+    identity_app = web.Application()
+    identity_app.router.add_post("/identify", identify_handler)
+    identity_server = await aiohttp_server(identity_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            speaker_identity_url=str(identity_server.make_url("/identify")),
+            speaker_identity_token="speaker-specific-token-123456",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    for _ in range(5):
+        await device.send_bytes(b"\x01\x00" * 16_000)
+    async with asyncio.timeout(1):
+        while not any(
+            method == "thread/realtime/appendText"
+            and params.get("role") == "developer"
+            and "[local speaker identity]" in str(params.get("text"))
+            for method, params in fake_rpc.calls
+        ):
+            await asyncio.sleep(0)
+
+    assert len(observed) == 1
+    assert len(observed[0]) == 5 * 16_000 * 2
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_speaker_identity_management_is_primary_auth_and_worker_backed(
+    aiohttp_client: Any,
+    aiohttp_server: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    observed: list[tuple[str, str, object]] = []
+
+    async def worker(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == (
+            "Bearer speaker-specific-token-123456"
+        )
+        payload = await request.json() if request.can_read_body else None
+        observed.append((request.method, request.path, payload))
+        if request.path == "/status":
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "profiles": [],
+                    "enrollments": [],
+                    "settings": {
+                        "match_threshold": 0.55,
+                        "margin_threshold": 0.08,
+                    },
+                    "required_samples": 5,
+                    "raw_audio_retained": False,
+                }
+            )
+        if request.path == "/enrollments":
+            return web.json_response({"speaker_id": payload["speaker_id"]})
+        if request.path.endswith("/complete"):
+            return web.json_response(
+                {"speaker_id": "owner", "enabled": False, "chunks": 5}
+            )
+        if request.path == "/profiles/owner":
+            return web.json_response({"speaker_id": "owner", **(payload or {})})
+        if request.path == "/settings":
+            return web.json_response(payload)
+        return web.json_response({"deleted": True})
+
+    worker_app = web.Application()
+    worker_app.router.add_route("*", "/{tail:.*}", worker)
+    identity_server = await aiohttp_server(worker_app)
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            realtime_device_token="device-token-distinct",
+            speaker_identity_url=str(identity_server.make_url("/identify")),
+            speaker_identity_token="speaker-specific-token-123456",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    assert (await client.get("/v1/speaker-identity")).status == 401
+    assert (
+        await client.get(
+            "/v1/speaker-identity",
+            headers={"Authorization": "Bearer device-token-distinct"},
+        )
+    ).status == 401
+
+    status = await client.get("/v1/speaker-identity", headers=AUTH)
+    assert status.status == 200
+    assert (await status.json())["raw_audio_retained"] is False
+    enrollment = await client.post(
+        "/v1/speaker-identity/enrollments",
+        headers=AUTH,
+        json={
+            "speaker_id": "owner",
+            "display_name": "Aurelio",
+            "ha_person_id": "person.aurelio",
+            "ha_user_id": "user-id",
+            "consent": True,
+        },
+    )
+    assert enrollment.status == 200
+    assert (await enrollment.json())["speaker_id"] == "owner"
+    completed = await client.post(
+        "/v1/speaker-identity/enrollments/owner/complete", headers=AUTH
+    )
+    assert completed.status == 200
+    updated = await client.patch(
+        "/v1/speaker-identity/profiles/owner",
+        headers=AUTH,
+        json={"enabled": True},
+    )
+    assert (await updated.json())["enabled"] is True
+    settings = await client.patch(
+        "/v1/speaker-identity/settings",
+        headers=AUTH,
+        json={"match_threshold": 0.7, "margin_threshold": 0.12},
+    )
+    assert await settings.json() == {
+        "match_threshold": 0.7,
+        "margin_threshold": 0.12,
+    }
+    armed = await client.post(
+        "/v1/speaker-identity/tests",
+        headers=AUTH,
+        json={"expected_speaker_id": "owner"},
+    )
+    assert await armed.json() == {"armed": True, "expected_speaker_id": "owner"}
+    assert ("GET", "/status", None) in observed
+    assert any(
+        method == "POST" and path == "/enrollments" for method, path, _ in observed
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_report_back_is_route_scoped_and_uses_active_native_session(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+) -> None:
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            agent_announce_token="report-token",
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    report_auth = {"Authorization": "Bearer report-token"}
+
+    idle = await client.post(
+        "/v1/agent/announce",
+        headers=report_auth,
+        json={"text": "Terminé la investigación"},
+    )
+    assert idle.status == 503
+    assert (await client.get("/health", headers=report_auth)).status == 401
+
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    report = await client.post(
+        "/v1/agent/announce",
+        headers=report_auth,
+        json={"text": "Terminé la investigación"},
+    )
+    assert report.status == 200
+    assert await report.json() == {"accepted": True}
+    append = next(
+        params
+        for method, params in fake_rpc.calls
+        if method == "thread/realtime/appendSpeech"
+    )
+    assert append["text"] == "Terminé la investigación"
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_opt_in_device_wake_sample_can_be_explicitly_marked_false_by_voice(
+    aiohttp_client: Any,
+    fake_rpc: FakeRpc,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "voice-samples"
+    app = create_app(
+        BridgeConfig(
+            bearer_token="test-token",
+            realtime_device_token="device-token",
+            voice_sample_root=str(root),
+            voice_sample_consent=True,
+        ),
+        rpc=fake_rpc,
+        peer_factory=fake_rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device_auth = {"Authorization": "Bearer device-token"}
+    uploaded = await client.post(
+        "/v1/voice-lab/wake-sample",
+        headers={**device_auth, "X-Voice-Wake-Phrase": "okay nabu"},
+        data=b"\0\0" * 16_000,
+    )
+    assert uploaded.status == 200
+    assert await uploaded.json() == {"stored": True}
+
+    device = await client.ws_connect("/v1/realtime", headers=device_auth)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    thread_start = next(
+        params for method, params in fake_rpc.calls if method == "thread/start"
+    )
+    assert [tool["name"] for tool in thread_start["dynamicTools"]] == [
+        "end_conversation",
+        "mark_false_wake",
+    ]
+
+    await fake_rpc.broadcast(
+        {
+            "id": "false-wake-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "false-wake-call",
+                "tool": "mark_false_wake",
+                "arguments": {},
+            },
+        }
+    )
+    async with asyncio.timeout(1):
+        while not any(
+            request_id == "false-wake-request" for request_id, _ in fake_rpc.responses
+        ):
+            await asyncio.sleep(0)
+
+    response = next(
+        result
+        for request_id, result in fake_rpc.responses
+        if request_id == "false-wake-request"
+    )
+    assert response["success"] is True
+    assert json.loads(response["contentItems"][0]["text"])["status"] == "marked"
+    metadata_path = next((root / "inbox").glob("wake-*.json"))
+    assert (
+        json.loads(metadata_path.read_text(encoding="utf-8"))["detector_outcome"]
+        == "false-activation"
+    )
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_provider_barge_hushes_same_desktop_model_peer(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="bridge.service")
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    peer = fake_rpc.peers[0]
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert len(starts) == 1
+    assert starts[0]["model"] == DEFAULT_REALTIME_MODEL
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    first_output = b"\x01\x11" * 48
+    peer.audio.put_nowait(first_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == first_output
+
+    await device.send_json({"type": "provider_barge"})
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 1,
+    }
+    assert peer.sent_data_events == [
+        '{"type":"response.cancel"}',
+        '{"type":"output_audio_buffer.clear"}',
+    ]
+    assert len(fake_rpc.peers) == 1
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.cleared"}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "output_audio_buffer.cleared",
+    }
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "delta": "private replacement request",
+            },
+        }
+    )
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    second_output = b"\x02\x22" * 48
+    peer.audio.put_nowait(second_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 2,
+    }
+    assert (await device.receive(timeout=1)).data == second_output
+
+    peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.cleared"}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 2,
+    }
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "output_audio_buffer.cleared",
+    }
+
+    for milestone in (
+        "started",
+        "cancel_clear_sent",
+        "output_cleared",
+        "user_transcript_delta",
+        "next_response_started",
+        "first_output_pcm",
+    ):
+        assert f"source=device_control milestone={milestone}" in caplog.text
+    assert "sequence=2 source=provider_output_clear milestone=started" in caplog.text
+    assert (
+        "sequence=2 source=provider_output_clear milestone=output_cleared"
+        in caplog.text
+    )
+    assert "private replacement request" not in caplog.text
+
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert len(starts) == 1
+    assert len(fake_rpc.peers) == 1
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_barge_reuses_thread_replays_audio_once_and_fences_old_output(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    assert started["type"] == "started"
+    assert started["thread_id"] == "thread-1"
+
+    resampler = bridge_service.Pcm16Mono24KhzResampler(16_000)
+    before_barge = array("h", range(1, 257)).tobytes()
+    during_rollover = array("h", range(-400, -144)).tobytes()
+    converted_before = resampler.feed(before_barge)
+    converted_during = resampler.feed(during_rollover)
+    expected_replay = converted_before + converted_during
+
+    first_peer = fake_rpc.peers[0]
+    await device.send_bytes(before_barge)
+    async with asyncio.timeout(1):
+        while bytes(first_peer.fed) != converted_before:
+            await asyncio.sleep(0)
+
+    first_peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    first_output = b"\x01\x11" * 48
+    first_peer.audio.put_nowait(first_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == first_output
+
+    replacement_gate = asyncio.Event()
+    fake_rpc.realtime_start_gate = replacement_gate
+    await device.send_json({"type": "barge"})
+    async with asyncio.timeout(1):
+        while len(fake_rpc.peers) < 2:
+            await asyncio.sleep(0)
+    second_peer = fake_rpc.peers[1]
+
+    # These frames belong to the retired provider generation and must never
+    # cross the stable device socket, even if they were already queued.
+    first_peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    first_peer.audio.put_nowait(b"\x7f\x7f" * 48)
+    await device.send_bytes(during_rollover)
+    await device.send_json({"type": "barge"})
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    with pytest.raises(asyncio.TimeoutError):
+        await device.receive(timeout=0.02)
+
+    replacement_gate.set()
+    async with asyncio.timeout(1):
+        while bytes(second_peer.fed) != expected_replay:
+            await asyncio.sleep(0)
+    assert bytes(second_peer.fed) == expected_replay
+    assert first_peer.closed is True
+
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert [params["threadId"] for params in starts] == ["thread-1", "thread-1"]
+    assert [params["includeStartupContext"] for params in starts] == [False, True]
+    assert fake_rpc.thread_count == 1
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+    second_peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    second_output = b"\x02\x22" * 48
+    second_peer.audio.put_nowait(second_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 2,
+    }
+    assert (await device.receive(timeout=1)).data == second_output
+
+    # A second completed rollover keeps both the socket and output epoch alive.
+    await device.send_json({"type": "barge"})
+    async with asyncio.timeout(1):
+        while len(fake_rpc.peers) < 3:
+            await asyncio.sleep(0)
+    third_peer = fake_rpc.peers[2]
+    async with asyncio.timeout(1):
+        while bytes(third_peer.fed) != expected_replay:
+            await asyncio.sleep(0)
+    assert bytes(third_peer.fed) == expected_replay
+    assert second_peer.closed is True
+
+    third_peer.data.put_nowait(json.dumps({"type": "output_audio_buffer.started"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == (
+        "output_audio_buffer.started"
+    )
+    third_output = b"\x03\x33" * 48
+    third_peer.audio.put_nowait(third_output)
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 3,
+    }
+    assert (await device.receive(timeout=1)).data == third_output
+
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert [params["threadId"] for params in starts] == [
+        "thread-1",
+        "thread-1",
+        "thread-1",
+    ]
+    assert [params["includeStartupContext"] for params in starts] == [
+        False,
+        True,
+        True,
+    ]
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_barge_keeps_pcm_when_receive_and_replacement_complete_together(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    """A fast replacement must not skip the final concurrently received frame."""
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    real_wait = bridge_service.asyncio.wait
+    both_waiting = asyncio.Event()
+    both_returned = asyncio.Event()
+    force_once = True
+
+    async def force_simultaneous_completion(
+        tasks: set[asyncio.Task[Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[set[asyncio.Task[Any]], set[asyncio.Task[Any]]]:
+        nonlocal force_once
+        names = {task.get_name() for task in tasks}
+        is_rollover_pair = (
+            len(tasks) == 2
+            and "codex-native-v2-rollover-receiver" in names
+            and any(name.startswith("codex-native-v2-replace-") for name in names)
+        )
+        if force_once and is_rollover_pair:
+            force_once = False
+            both_waiting.set()
+            await asyncio.gather(*tasks)
+            both_returned.set()
+            return set(tasks), set()
+        return await real_wait(tasks, *args, **kwargs)
+
+    monkeypatch.setattr(bridge_service.asyncio, "wait", force_simultaneous_completion)
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    resampler = bridge_service.Pcm16Mono24KhzResampler(16_000)
+    before_barge = array("h", range(1_000, 1_256)).tobytes()
+    same_turn = array("h", range(-1_500, -1_244)).tobytes()
+    expected_replay = resampler.feed(before_barge) + resampler.feed(same_turn)
+    await device.send_bytes(before_barge)
+    async with asyncio.timeout(1):
+        while not fake_rpc.peers[0].fed:
+            await asyncio.sleep(0)
+
+    replacement_gate = asyncio.Event()
+    fake_rpc.realtime_start_gate = replacement_gate
+    await device.send_json({"type": "barge"})
+    await asyncio.wait_for(both_waiting.wait(), timeout=1)
+    await device.send_bytes(same_turn)
+    replacement_gate.set()
+    await asyncio.wait_for(both_returned.wait(), timeout=1)
+
+    async with asyncio.timeout(1):
+        while (
+            len(fake_rpc.peers) < 2 or bytes(fake_rpc.peers[1].fed) != expected_replay
+        ):
+            await asyncio.sleep(0)
+    assert bytes(fake_rpc.peers[1].fed) == expected_replay
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_ambiguous_barge_uses_fresh_thread_and_keeps_control_live(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        0.01,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    resampler = bridge_service.Pcm16Mono24KhzResampler(16_000)
+    before_barge = array("h", range(500, 756)).tobytes()
+    during_rollover = array("h", range(-900, -644)).tobytes()
+    converted_before = resampler.feed(before_barge)
+    converted_during = resampler.feed(during_rollover)
+    expected_replay = converted_before + converted_during
+    await device.send_bytes(before_barge)
+    async with asyncio.timeout(1):
+        while bytes(fake_rpc.peers[0].fed) != converted_before:
+            await asyncio.sleep(0)
+
+    old_stop_gate = asyncio.Event()
+    fake_rpc.realtime_stop_gates["thread-1"] = old_stop_gate
+    await device.send_json({"type": "barge"})
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    await device.send_bytes(during_rollover)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    async with asyncio.timeout(1):
+        while (
+            len(fake_rpc.peers) < 2 or bytes(fake_rpc.peers[1].fed) != expected_replay
+        ):
+            await asyncio.sleep(0)
+    second_peer = fake_rpc.peers[1]
+    assert bytes(second_peer.fed) == expected_replay
+    starts = [
+        params for method, params in fake_rpc.calls if method == "thread/realtime/start"
+    ]
+    assert [params["threadId"] for params in starts] == ["thread-1", "thread-2"]
+    assert [params["includeStartupContext"] for params in starts] == [False, False]
+    assert fake_rpc.realtime_active_threads == {"thread-1", "thread-2"}
+    assert fake_rpc.realtime_same_thread_overlaps == []
+
+    old_stop_gate.set()
+    state = bridge_app[bridge_service.STATE_KEY]
+    async with asyncio.timeout(1):
+        while (
+            _thread_call_counts(fake_rpc, "thread/delete")["thread-1"] != 1
+            or state._realtime_provider_cleanup_tasks
+        ):
+            await asyncio.sleep(0)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_stop_during_barge_rollover_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    stop_gate = asyncio.Event()
+    fake_rpc.realtime_stop_gates["thread-1"] = stop_gate
+    await device.send_json({"type": "barge"})
+    await asyncio.wait_for(fake_rpc.realtime_stop_started.wait(), timeout=1)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    await device.send_json({"type": "stop"})
+    stop_gate.set()
+    terminal = await device.receive(timeout=1)
+    assert terminal.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING}
+    await device.close()
+
+    async with asyncio.timeout(1):
+        while bridge_app[bridge_service.ACTIVE_WEBSOCKETS_KEY]:
+            await asyncio.sleep(0)
+    assert all(peer.closed for peer in fake_rpc.peers)
+    assert fake_rpc.realtime_active_threads == set()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_stop_during_fresh_thread_acquisition_disposes_late_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+) -> None:
+    class CancellationResistantThreadStartRpc(FakeRpc):
+        def __init__(self) -> None:
+            super().__init__()
+            self.replacement_start_gate = asyncio.Event()
+            self.replacement_start_started = asyncio.Event()
+            self.replacement_start_cancelled = asyncio.Event()
+
+        async def call(
+            self,
+            method: str,
+            params: Mapping[str, Any] | None = None,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            if method == "thread/start" and self.thread_count == 1:
+                self.replacement_start_started.set()
+                try:
+                    await self.replacement_start_gate.wait()
+                except asyncio.CancelledError:
+                    # Model an RPC transport that completes after its caller
+                    # has already transferred cleanup ownership.
+                    self.replacement_start_cancelled.set()
+                    await self.replacement_start_gate.wait()
+            return await super().call(method, params, timeout=timeout)
+
+    monkeypatch.setattr(
+        bridge_service,
+        "DIRECT_REALTIME_ROLLOVER_STOP_GRACE_SECONDS",
+        1.0,
+    )
+    rpc = CancellationResistantThreadStartRpc()
+    app = create_app(
+        BridgeConfig(bearer_token="test-token"),
+        rpc=rpc,
+        peer_factory=rpc.peer_factory,
+    )
+    client = await aiohttp_client(app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    assert (await device.receive_json(timeout=1))["type"] == "started"
+
+    rpc.realtime_stop_error = RuntimeError("ambiguous provider stop")
+    await device.send_json({"type": "barge"})
+    await asyncio.wait_for(rpc.replacement_start_started.wait(), timeout=1)
+    await device.send_json({"type": "stop"})
+
+    terminal = await device.receive(timeout=1)
+    assert terminal.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING}
+    await device.close()
+    assert rpc.replacement_start_cancelled.is_set()
+
+    rpc.replacement_start_gate.set()
+    state = app[bridge_service.STATE_KEY]
+    async with asyncio.timeout(1):
+        while state._realtime_provider_cleanup_tasks:
+            await asyncio.sleep(0)
+
+    assert rpc.thread_count == 2
+    assert _thread_call_counts(rpc, "thread/delete") == Counter(
+        {"thread-1": 1, "thread-2": 1}
+    )
+    assert _thread_call_counts(rpc, "thread/realtime/stop") == Counter({"thread-1": 1})
+    assert all(peer.closed for peer in rpc.peers)
+    assert rpc.realtime_active_threads == set()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_explicit_native_end_tool_stops_session(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+
+    await fake_rpc.broadcast(
+        {
+            "id": "provider-v2-end-request",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": started["thread_id"],
+                "callId": "provider-v2-end-call",
+                "tool": "end_conversation",
+                "arguments": {},
+            },
+        }
+    )
+    await asyncio.wait_for(fake_rpc.tool_result_received.wait(), timeout=1)
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    assert fake_rpc.responses == [
+        (
+            "provider-v2-end-request",
+            {
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": '{"status":"conversation_ended"}',
+                    }
+                ],
+                "success": True,
+            },
+        )
+    ]
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_explicit_native_spanish_end_transcript_stops_session(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bridge_app[bridge_service.STATE_KEY].config.realtime_log_transcripts = True
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-end", "role": "user"},
+            }
+        )
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "turn.created",
+        "role": "user",
+    }
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "¡Terminar llamada!",
+            },
+        }
+    )
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "end-reply"}})
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "response.created",
+    }
+    peer.audio.put_nowait(b"\x11\x01" * 480)
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.05)
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"id": "user-end", "role": "user"},
+            }
+        )
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "turn.done",
+    }
+
+    with caplog.at_level(logging.INFO, logger="bridge.service"):
+        await fake_rpc.broadcast(
+            {
+                "method": "thread/realtime/transcript/done",
+                "params": {
+                    "threadId": started["thread_id"],
+                    "role": "user",
+                    "text": "¡Terminar llamada!",
+                },
+            }
+        )
+        assert await device.receive_json(timeout=1) == {
+            "type": "stopped",
+            "reason": "end_conversation",
+        }
+    assert fake_rpc.responses == []
+    assert (
+        "Realtime native input transcript: fragments=1 fragment_chars=18 "
+        "final_chars=18" in caplog.text
+    )
+    assert (
+        "Realtime debug transcript: role=user text='¡Terminar llamada!'" in caplog.text
+    )
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_exact_delta_quiet_finalizes_without_turn_done(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS",
+        0.04,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-end-quiet", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Terminar",
+            },
+        }
+    )
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    assert fake_rpc.responses == []
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_repeated_end_deltas_rearm_quiet_finalizer(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS",
+        0.1,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-end-repeated", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Terminar",
+            },
+        }
+    )
+    peer.data.put_nowait(
+        json.dumps({"type": "response.created", "response": {"id": "end-reply"}})
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    retained = b"\x55\x05" * 480
+    peer.audio.put_nowait(retained)
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.02)
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {"id": "user-end-repeated", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.done"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": " terminar",
+            },
+        }
+    )
+
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_terminal_quiet_finalizer_cancels_on_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    monkeypatch.setattr(
+        bridge_service,
+        "REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS",
+        0.1,
+    )
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-music", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Terminar",
+            },
+        }
+    )
+    peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    retained = b"\x66\x06" * 480
+    peer.audio.put_nowait(retained)
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.02)
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": " la música",
+            },
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == retained
+    await asyncio.sleep(0.12)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_end_gate_handles_observed_rpc_only_order(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "¡Terminar llamada!",
+            },
+        }
+    )
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "assistant",
+                "delta": "De acuerdo.",
+            },
+        }
+    )
+    peer.audio.put_nowait(b"\x44\x04" * 480)
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "text": "¡Terminar llamada!",
+            },
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "stopped",
+        "reason": "end_conversation",
+    }
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_disambiguates_terminal_prefix_before_user_done(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.created",
+                "turn": {"id": "user-normal", "role": "user"},
+            }
+        )
+    )
+    assert (await device.receive_json(timeout=1))["event_type"] == "turn.created"
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "Stop",
+            },
+        }
+    )
+    peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    retained = b"\x22\x02" * 480
+    peer.audio.put_nowait(retained)
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.05)
+
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": " the kitchen timer",
+            },
+        }
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.started",
+        "output_epoch": 1,
+    }
+    assert (await device.receive(timeout=1)).data == retained
+
+    peer.data.put_nowait(
+        json.dumps(
+            {
+                "type": "turn.done",
+                "turn": {
+                    "id": "user-normal",
+                    "role": "user",
+                    "transcript": "Stop the kitchen timer",
+                },
+            }
+        )
+    )
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "turn.done",
+    }
+    with pytest.raises(TimeoutError):
+        await device.receive(timeout=0.05)
+
+    peer.data.put_nowait(json.dumps({"type": "response.done"}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "speaking.stopped",
+        "output_epoch": 1,
+    }
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.done"
+    await device.send_json({"type": "stop"})
+    await device.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_v2_native_ordinary_prefix_adds_no_output_gate(
+    aiohttp_client: Any,
+    bridge_app: web.Application,
+    fake_rpc: FakeRpc,
+) -> None:
+    client = await aiohttp_client(bridge_app)
+    device = await client.ws_connect("/v1/realtime", headers=AUTH)
+    await device.send_json(_realtime_v2_start(conversation_mode="native"))
+    started = await device.receive_json(timeout=1)
+    peer = fake_rpc.peers[-1]
+
+    peer.data.put_nowait(json.dumps({"type": "turn.created", "turn": {"role": "user"}}))
+    assert await device.receive_json(timeout=1) == {
+        "type": "control",
+        "event_type": "turn.created",
+        "role": "user",
+    }
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {
+                "threadId": started["thread_id"],
+                "role": "user",
+                "delta": "What",
+            },
+        }
+    )
+    peer.data.put_nowait(json.dumps({"type": "response.created"}))
+    assert (await device.receive_json(timeout=1))["event_type"] == "response.created"
+    pcm = b"\x33\x03" * 480
+    peer.audio.put_nowait(pcm)
+    assert (await device.receive_json(timeout=1))["event_type"] == "speaking.started"
+    assert (await device.receive(timeout=1)).data == pcm
+
+    await device.send_json({"type": "stop"})
+    await device.close()
 
 
 @pytest.mark.asyncio
@@ -7281,6 +10444,8 @@ async def test_realtime_v2_negotiates_binary_pcm_and_stateful_resampling(
         "local_flush": True,
         "remote_cancel": False,
         "same_session_interrupt_ack": True,
+        "server_owned_media": True,
+        "native_end_conversation": False,
     }
     assert (
         fake_rpc.peers[-1].input_buffer_limit_milliseconds
@@ -8458,6 +11623,7 @@ async def test_realtime_v2_executes_only_captured_home_assistant_tools(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {
@@ -8568,6 +11734,7 @@ async def test_pending_home_assistant_tool_does_not_block_provider_close(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {
@@ -8661,6 +11828,7 @@ async def test_realtime_home_assistant_tools_deduplicate_provider_call_ids(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {
@@ -8747,6 +11915,7 @@ async def test_realtime_home_assistant_tool_burst_is_bounded(
             "protocol_version": 1,
             "authority_id": "conversation-profile",
             "language": "es-MX",
+            "voice": "cove",
             "instructions": "Controla solo las entidades expuestas.",
             "tools": [
                 {

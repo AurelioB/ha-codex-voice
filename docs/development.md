@@ -14,24 +14,150 @@ Install the development dependencies once:
 uv sync --extra test --extra lint
 ```
 
-Run the smallest relevant component test while editing, then the full component
-suite:
+Run only the smallest relevant test while editing:
 
 ```bash
 uv run pytest tests/component/test_config_flow.py
-uv run pytest tests/component
 ```
 
 Bridge and standalone-script tests do not need the Home Assistant pytest
-plugin:
+plugin. Select the exact regression or test class during the edit/deploy loop;
+do not run the whole bridge suite after every change:
 
 ```bash
-uv run pytest -p no:homeassistant tests/bridge
+uv run pytest -p no:homeassistant \
+  tests/bridge/test_thirdreality_realtime_session.py::test_full_duplex_user_start_quarantines_tail_after_speaking_stop
 ```
 
-Before handing off a change, run Ruff as described in the repository
-`README.md`. Pytest remains the fastest loop because it avoids container
-startup and onboarding entirely.
+Use three validation tiers:
+
+1. **Edit loop:** one to five directly affected tests and Ruff only on changed
+   files.
+2. **Pre-deploy:** the affected test file or a narrow `-k` selection, followed
+   by the physical canary that exercises the reported behavior.
+3. **Release:** the complete component and bridge suites, full Ruff, hassfest,
+   and HACS validation.
+
+The complete 1,000-plus-test suite is a release gate, not an inner-loop gate.
+Do not delete behavior coverage merely to shorten the edit loop; select less of
+it until a release candidate exists. Pytest remains the fastest automated loop
+because it avoids container startup and onboarding entirely.
+
+## On-demand realtime session report
+
+The diagnostic reporter is a separate process and adds no work to the bridge,
+speaker capture callback, or media path. It reads existing rotated Docker and
+device syslog records only when invoked:
+
+```bash
+UV_CACHE_DIR=/tmp/codex-uv-cache uv run python \
+  scripts/report_realtime_session.py \
+  --live --adb-serial 192.168.8.42:5555 --since 4h --latest 3
+```
+
+Use `--json` for machine-readable output. For an offline report, supply
+`--bridge-log PATH --device-log PATH`. Exact transcript text appears only when
+the bridge's explicit testing switch `HA_CODEX_REALTIME_LOG_TRANSCRIPTS=true`
+was active; the reporter itself never enables logging or records audio.
+
+## Private voice lab
+
+The voice lab is a separate, dependency-free CLI for explicitly consented wake
+and speaker-enrollment recordings. It is not imported by the bridge or device,
+so installing it adds no media-path work. Initialize a private dataset outside
+the repository, or use the ignored `.voice-lab/` path for local experiments:
+
+```bash
+uv run python scripts/voice_lab.py --root .voice-lab init
+uv run python scripts/voice_lab.py --root .voice-lab add sample.wav \
+  --kind wake-positive --phrase "Okay Nabu" --outcome miss \
+  --speaker-id owner --provenance physical-test \
+  --session-id kitchen-20260813-a --consent
+uv run python scripts/voice_lab.py --root .voice-lab verify
+uv run python scripts/voice_lab.py --root .voice-lab list
+uv run python scripts/voice_lab.py --root .voice-lab export-wake \
+  --phrase "Okay Nabu" \
+  --output .voice-lab/artifacts/okay-nabu-training.json
+```
+
+Imports must be mono PCM16 WAV at 16 kHz. The CLI canonicalizes the file,
+deduplicates by PCM SHA-256, measures duration/peak/RMS, and keeps the dataset
+directory at mode `0700` with files at `0600`. Use `remove SAMPLE_ID` to delete
+an imported recording. Do not place real recordings, embeddings, or trained
+models in Git.
+
+`export-wake` includes matching hit/miss positives plus wake-negative and
+background samples. It deterministically splits by `session_id` (falling back
+to provenance), never by individual clip, so near-duplicate audio from one
+recording session cannot leak between train and validation. The output remains
+inside the private lab and is the handoff to a microWakeWord trainer. This
+repository intentionally does not disguise dataset preparation as model
+training: the referenced Voice PE project also uses the external community
+microWakeWord trainer. A trained JSON/TFLite pair must be calibrated and pass
+the physical acceptance matrix before setting `personalized_wake_config_path`.
+
+## Optional speaker identification
+
+Speaker identity is host-side and disabled unless the optional Compose override
+is selected. Download the exact TitaNet model into a private directory and
+verify its deployment lock:
+
+```bash
+install -d -m 700 .speaker-identity/models .speaker-identity/profiles
+curl -fL \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_large.onnx \
+  -o .speaker-identity/models/nemo_en_titanet_large.onnx
+printf '%s  %s\n' \
+  d51abcf31717ef28162f26acb9d44dd4127c3d44c9b8624f699f3425daca8e77 \
+  .speaker-identity/models/nemo_en_titanet_large.onnx | sha256sum --check
+```
+
+The recommended enrollment path is the admin-only Home Assistant **Codex
+Voice** panel. First build/start the worker and bridge:
+
+```bash
+docker build -f deploy/docker/SpeakerIdentity.Dockerfile \
+  -t ha-codex-speaker-identity:1.14.0 .
+```
+
+Set `HA_CODEX_SPEAKER_IDENTITY_TOKEN` to a distinct long random value and set
+`HA_CODEX_SPEAKER_IDENTITY_MODEL_HOST` and
+`HA_CODEX_SPEAKER_PROFILES_HOST` to those absolute paths. Start the bridge and
+worker together:
+
+```bash
+docker compose --env-file .codex-voice/compose.env \
+  -f compose.yaml -f compose.speaker-identity.yaml \
+  up --detach --build
+```
+
+Open **Codex Voice** in the Home Assistant sidebar as an administrator. Start
+an enrollment only after the named person explicitly consents. Optionally link
+the profile to an existing Home Assistant Person and user. The next five
+separate voice sessions each contribute at most one silence-stripped,
+normalized embedding from the bounded post-wake window. Raw audio is not
+written to the profile directory. Complete the enrollment after all five
+samples are accepted; the resulting profile remains inactive.
+
+Arm held-out tests from the same panel at different distances and with an
+unknown household member or visitor. Adjust match/separation thresholds toward
+`unknown` rather than a false match, then explicitly activate the profile. The
+panel also supports relinking, renaming, deactivation, deletion, and restarting
+enrollment. Person/user links do not inherit that user's permissions and must
+never be used as biometric authentication.
+
+For offline experiments only, the image still exposes the `enroll` CLI. Mount
+explicitly consented WAV recordings read-only and build a centroid from at
+least five usable three-second chunks spanning multiple sessions and distances.
+Do not mix those enrollment recordings into held-out validation.
+
+The worker binds only to host loopback. The bridge copies one bounded
+five-second post-wake window, never blocks PCM on inference, and appends only a
+confident session-level match as advisory context. Calibrate thresholds with
+held-out household and visitor speech before relying on personalization. This
+release does not attempt per-utterance diarization when speakers change during
+one open conversation. A match is not biometric authentication and must not
+authorize locks, alarms, purchases, or account changes.
 
 ## Inner loop: local Home Assistant
 

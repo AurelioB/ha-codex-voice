@@ -20,6 +20,7 @@ CONF_VOICE: Final = "voice"
 CONF_INSTRUCTIONS: Final = "instructions"
 CONF_REALTIME_AUTHORITY: Final = "realtime_authority"
 CONF_REALTIME_LANGUAGE: Final = "realtime_language"
+CONF_REALTIME_VOICE: Final = "realtime_voice"
 
 SUBENTRY_TYPE_CONVERSATION: Final = "conversation"
 SUBENTRY_TYPE_STT: Final = "stt"
@@ -36,6 +37,7 @@ LEGACY_CONVERSATION_SERVICE_TIER: Final = "standard"
 DEFAULT_VOICE: Final = "cove"
 DEFAULT_LLM_HASS_API: Final = ["assist"]
 DEFAULT_REALTIME_LANGUAGE: Final = "es-MX"
+DEFAULT_REALTIME_VOICE: Final = "cove"
 
 REALTIME_TOOL_PROTOCOL_VERSION: Final = 1
 REALTIME_TOOL_PATH: Final = "/v1/home-assistant/tools"
