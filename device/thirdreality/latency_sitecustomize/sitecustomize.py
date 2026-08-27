@@ -1033,7 +1033,10 @@ def _retry_direct_realtime_startup(
             break
         owner.startup_attempt += 1
         try:
-            replacement = _REALTIME_SUPPORT.RealtimeSession(_REALTIME_CONFIG)
+            replacement = _REALTIME_SUPPORT.RealtimeSession(
+                _REALTIME_CONFIG,
+                conversation_id=owner.session.conversation_id,
+            )
             owner.session = replacement
             owner.ready_seen = False
             owner.capture_open = False
@@ -1096,7 +1099,10 @@ def _retry_live_realtime_connection(
     while owner.reconnect_attempt < _LIVE_RECONNECT_MAX_ATTEMPTS:
         owner.reconnect_attempt += 1
         try:
-            replacement = _REALTIME_SUPPORT.RealtimeSession(_REALTIME_CONFIG)
+            replacement = _REALTIME_SUPPORT.RealtimeSession(
+                _REALTIME_CONFIG,
+                conversation_id=owner.session.conversation_id,
+            )
             owner.session = replacement
             owner.ready_seen = False
             owner.ready_confirmation_pending = False

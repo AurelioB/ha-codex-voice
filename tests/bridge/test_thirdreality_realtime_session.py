@@ -1000,6 +1000,8 @@ def _start_direct_session(
     sidecar = sidecars[0]
     start = connection.json_sent[0]
     assert start["protocol_version"] == 3
+    assert isinstance(start["conversation_id"], str)
+    assert start["conversation_id"] == session.conversation_id
     assert start["transport"] == {
         "type": "webrtc",
         "sdp": (

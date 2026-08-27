@@ -236,6 +236,12 @@ def test_realtime_start_message_hardcodes_native_conversation_mode(
     assert realtime_start_message(config)["conversation_mode"] == (
         NATIVE_CONVERSATION_MODE
     )
+    assert (
+        realtime_start_message(config, conversation_id="speaker-session")[
+            "conversation_id"
+        ]
+        == "speaker-session"
+    )
 
 
 def test_device_webrtc_start_carries_only_direct_offer_and_preferences(

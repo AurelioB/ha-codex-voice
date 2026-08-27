@@ -69,13 +69,21 @@ and releases use semantic versioning.
   logs, and host networking for the server-owned WebRTC peer.
 - Add the sole native `end_conversation` tool to server-owned PCM sessions and
   a strict normalized Spanish/English transcript fallback for exact phrases
-  such as “terminar” and “terminar llamada”. The model is instructed to invoke
-  the tool immediately without first promising verbally to end the session.
+  such as “terminar”, “hasta luego”, and “nos vemos”. Once accepted, microphone
+  PCM is discarded immediately; the model may finish one farewell of at most
+  three words, and a 2.5-second hard deadline guarantees socket closure. An
+  exact short assistant farewell also closes the session instead of leaving it
+  listening in the background.
 - Quarantine native assistant output while the user transcript can still be
   an exact terminal phrase. Ordinary speech releases immediately; an exact
-  Spanish or English end request now closes silently even when provider audio
-  arrives before the completed transcript, and user `turn.done` can no longer
-  truncate an active assistant response.
+  Spanish or English end request releases at most one brief farewell even when
+  provider audio arrives before the completed transcript, and user `turn.done`
+  can no longer truncate an active assistant response.
+- Preserve completed native user/assistant transcript context across strict
+  provider isolation and live speaker reconnects. The speaker retains one
+  random conversation identifier for its ownership window; the bridge keeps a
+  bounded 32-item/16,000-character in-memory history and restores it through
+  App Server v3 `initialItems` whenever a fresh thread is unavoidable.
 - Add explicit `direct_capture_gain_db` tuning for realtime microphone egress,
   defaulting to 0 dB and bounded to 0–18 dB. Gain uses saturating PCM16, leaves
   wake/Assist/local-barge audio unchanged, and is applied exactly once before

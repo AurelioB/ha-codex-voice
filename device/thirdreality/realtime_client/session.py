@@ -1932,6 +1932,7 @@ class RealtimeSession:
         self,
         config: RealtimeConfig,
         *,
+        conversation_id: str | None = None,
         clock: Callable[[], float] = time.monotonic,
         connection_factory: Callable[..., WebSocketConnection] = (
             WebSocketConnection.connect
@@ -1945,6 +1946,7 @@ class RealtimeSession:
     ) -> None:
         """Create an unstarted, single-use session."""
         self._config = config
+        self._conversation_id = conversation_id or os.urandom(16).hex()
         self._clock = clock
         self._connection_factory = connection_factory
         self._popen = popen
@@ -2047,6 +2049,11 @@ class RealtimeSession:
         """Return the current lifecycle state."""
         with self._state_lock:
             return self._state
+
+    @property
+    def conversation_id(self) -> str:
+        """Return the stable identifier retained across live reconnects."""
+        return self._conversation_id
 
     @property
     def ready(self) -> bool:
@@ -3112,7 +3119,12 @@ class RealtimeSession:
                 io_timeout_seconds=self._config.io_timeout_seconds,
                 max_message_bytes=self._config.max_message_bytes,
             )
-            connection.send_json(realtime_start_message(self._config))
+            connection.send_json(
+                realtime_start_message(
+                    self._config,
+                    conversation_id=self._conversation_id,
+                )
+            )
             last_semantic_activity = self._clock()
             handshake_deadline = min(
                 started_at + self._config.max_session_seconds,
@@ -3417,7 +3429,11 @@ class RealtimeSession:
                 max_message_bytes=self._config.max_message_bytes,
             )
             connection.send_json(
-                realtime_start_message(self._config, webrtc_sdp=offer_sdp)
+                realtime_start_message(
+                    self._config,
+                    webrtc_sdp=offer_sdp,
+                    conversation_id=self._conversation_id,
+                )
             )
             diagnostics.phase = "bridge_answer"
             answer_sdp = self._wait_for_direct_answer(

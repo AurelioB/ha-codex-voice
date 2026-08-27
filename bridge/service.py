@@ -162,9 +162,10 @@ DIRECT_END_CONVERSATION_TOOL = {
     "description": (
         "End this voice conversation immediately. Use only when the user explicitly "
         "asks to stop, end, close, or leave the conversation, or clearly says goodbye. "
-        "Spanish examples include: terminar, terminar llamada, terminar la llamada, "
-        "finalizar, colgar, and adios. Call this function with {} immediately; do not "
-        "first say that you are going to end the conversation."
+        "Spanish examples include: terminar, terminar llamada, finalizar, colgar, "
+        "adios, hasta luego, and nos vemos. First say one very short farewell in the "
+        "user's language (at most three words), then call this function with {} "
+        "immediately. Never merely promise that you will end the conversation."
     ),
     "inputSchema": {
         "type": "object",
@@ -182,9 +183,10 @@ DIRECT_REALTIME_BASE_INSTRUCTIONS = (
     "end_conversation only when the user explicitly asks to end, stop, close, or leave this "
     "conversation, or clearly says goodbye. Spanish requests such as 'terminar', "
     "'terminar llamada', 'terminar la llamada', 'finalizar', 'colgar', and 'adios' "
-    "mean to invoke end_conversation with {} immediately. Never say that you will "
-    "end the conversation; call the tool without further speech. Do not invoke it "
-    "merely because a response or topic is complete."
+    "mean to end the conversation. Say one farewell of at most three words in the "
+    "user's language, then invoke end_conversation with {} immediately. Never merely "
+    "promise that you will end the conversation or continue speaking afterward. Do "
+    "not invoke it merely because a response or topic is complete."
 )
 _DIRECT_END_CONVERSATION_TRANSCRIPTS = frozenset(
     {
@@ -205,6 +207,9 @@ _DIRECT_END_CONVERSATION_TRANSCRIPTS = frozenset(
         "finalizar llamada",
         "goodbye",
         "hang up",
+        "hasta luego",
+        "me voy",
+        "nos vemos",
         "stop",
         "stop the conversation",
         "termina",
@@ -213,6 +218,23 @@ _DIRECT_END_CONVERSATION_TRANSCRIPTS = frozenset(
         "terminar",
         "terminar la llamada",
         "terminar llamada",
+        "eso es todo",
+        "ya es todo",
+        "ya me voy",
+    }
+)
+_DIRECT_ASSISTANT_FAREWELL_TRANSCRIPTS = frozenset(
+    {
+        "adios",
+        "adios cuidate",
+        "adios cuidense",
+        "bye",
+        "goodbye",
+        "hasta luego",
+        "hasta luego cuidate",
+        "listo se acabo",
+        "nos vemos",
+        "take care",
     }
 )
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
@@ -237,6 +259,8 @@ REALTIME_NATIVE_TERMINAL_GATE_MAX_BYTES = (
 )
 REALTIME_NATIVE_TERMINAL_GATE_TTL_SECONDS = 1.25
 REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS = 0.7
+REALTIME_NATIVE_FAREWELL_DEADLINE_SECONDS = 2.5
+MAX_NATIVE_REALTIME_HISTORY_ITEMS = 32
 REALTIME_OUTPUT_SIGNAL_PEAK = 256
 REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS = 0.5
 REALTIME_MAX_PENDING_TOOL_CALLS = 16
@@ -611,6 +635,40 @@ class _ConversationEntry:
     tools_fingerprint: str
     last_used: float = field(default_factory=time.monotonic)
     turn_state: _ConversationTurnState = field(default_factory=_ConversationTurnState)
+
+
+@dataclass(slots=True)
+class _NativeRealtimeHistory:
+    """Bounded completed transcript restored after a provider/socket replacement."""
+
+    items: deque[dict[str, str]] = field(default_factory=deque)
+    character_count: int = 0
+    last_used: float = field(default_factory=time.monotonic)
+
+    def remember(self, role: object, text: object) -> None:
+        normalized_role = {
+            "input": "user",
+            "user": "user",
+            "assistant": "assistant",
+            "output": "assistant",
+        }.get(str(role).casefold())
+        if normalized_role is None or not isinstance(text, str):
+            return
+        normalized_text = text.strip()[:MAX_HISTORY_CONTEXT_CHARS]
+        if not normalized_text:
+            return
+        self.items.append({"role": normalized_role, "text": normalized_text})
+        self.character_count += len(normalized_text)
+        self.last_used = time.monotonic()
+        while self.items and (
+            len(self.items) > MAX_NATIVE_REALTIME_HISTORY_ITEMS
+            or self.character_count > MAX_HISTORY_CONTEXT_CHARS
+        ):
+            self.character_count -= len(self.items.popleft()["text"])
+
+    def initial_items(self) -> list[dict[str, str]] | None:
+        self.last_used = time.monotonic()
+        return [dict(item) for item in self.items] or None
 
 
 @dataclass(slots=True)
@@ -1002,6 +1060,9 @@ class BridgeState:
             config.assistant_location,
         )
         self._conversations: OrderedDict[str, _ConversationEntry] = OrderedDict()
+        self._native_realtime_histories: OrderedDict[str, _NativeRealtimeHistory] = (
+            OrderedDict()
+        )
         self._conversation_lock = asyncio.Lock()
         self._speech_state_lock = asyncio.Lock()
         self._speech_owner: object | None = None
@@ -1316,6 +1377,31 @@ class BridgeState:
                 "Codex must be signed in with managed ChatGPT OAuth; API-key auth is not accepted"
             )
 
+    def native_realtime_history(
+        self, conversation_id: object
+    ) -> _NativeRealtimeHistory:
+        """Return one in-memory history shared by bounded live reconnects."""
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return _NativeRealtimeHistory()
+        now = time.monotonic()
+        expired = [
+            key
+            for key, history in self._native_realtime_histories.items()
+            if now - history.last_used > CONVERSATION_TTL
+        ]
+        for key in expired:
+            self._native_realtime_histories.pop(key, None)
+        history = self._native_realtime_histories.get(conversation_id)
+        if history is None:
+            while len(self._native_realtime_histories) >= MAX_CONVERSATIONS:
+                self._native_realtime_histories.popitem(last=False)
+            history = _NativeRealtimeHistory()
+            self._native_realtime_histories[conversation_id] = history
+        else:
+            history.last_used = now
+            self._native_realtime_histories.move_to_end(conversation_id)
+        return history
+
     async def conversation_thread(
         self, payload: Mapping[str, Any]
     ) -> tuple[str, bool, bool, _ConversationTurnState]:
@@ -1440,6 +1526,7 @@ class BridgeState:
                 entry.turn_state.retired = True
                 await _dispose_thread(self.rpc, entry.thread_id)
             self._conversations.clear()
+            self._native_realtime_histories.clear()
         finally:
             try:
                 await self.agent_tools.close()
@@ -5253,6 +5340,13 @@ def _direct_provider_transcript_requests_end(event: Mapping[str, Any]) -> bool:
     return _direct_terminal_transcript_is_exact_sequence(params.get("text"))
 
 
+def _direct_assistant_transcript_is_farewell(value: object) -> bool:
+    """Recognize only a complete, short assistant farewell utterance."""
+    return _normalize_direct_terminal_transcript(value) in (
+        _DIRECT_ASSISTANT_FAREWELL_TRANSCRIPTS
+    )
+
+
 def _direct_terminal_transcript_is_exact_sequence(value: object) -> bool:
     """Match one or more complete allowlisted phrases at word boundaries."""
     normalized = _normalize_direct_terminal_transcript(value)
@@ -5646,6 +5740,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
     device_prompt = first.get("prompt")
     normalized_prompt = device_prompt if isinstance(device_prompt, str) else None
     active: _NativeV2Provider | None = None
+    conversation_history = state.native_realtime_history(first.get("conversation_id"))
     owned_thread_ids: set[str] = set()
     retired_tasks: set[asyncio.Task[None]] = set()
     startup_abandoned = asyncio.Event()
@@ -5716,6 +5811,11 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                 voice=normalized_voice,
                 include_startup_context=include_startup_context,
                 client_managed_handoffs=False,
+                initial_items=(
+                    conversation_history.initial_items()
+                    if created_thread and version == "v3"
+                    else None
+                ),
             )
             require_attached_device()
             return _NativeV2Provider(candidate_session, candidate_thread_id)
@@ -5881,6 +5981,7 @@ async def _serve_native_v2_realtime_session(  # noqa: C901
                 native_input=continuity,
                 announcements=announcements,
                 identity_probe=continuity.identity_probe,
+                conversation_history=conversation_history,
             )
 
     try:
@@ -6148,6 +6249,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     native_input: _NativeV2InputContinuity | None = None,
     announcements: asyncio.Queue[_AgentAnnouncementRequest] | None = None,
     identity_probe: SpeakerIdentityProbe | None = None,
+    conversation_history: _NativeRealtimeHistory | None = None,
 ) -> _NativeV2Barge | None:
     assistant_context = _assistant_context_for_snapshot(
         state.assistant_context,
@@ -6230,6 +6332,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     native_terminal_fragment_chars = 0
     native_terminal_quiet_generation = 0
     native_terminal_quiet_task: asyncio.Task[None] | None = None
+    native_terminal_closing = False
+    native_terminal_close_task: asyncio.Task[None] | None = None
+    native_terminal_stop_sent = False
     native_user_transcript_fragments = 0
     native_user_transcript_chars = 0
     event_trace = _RealtimeEventTrace()
@@ -6516,11 +6621,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             arm_native_terminal_quiet_finalizer()
 
     async def resolve_native_terminal_turn(value: object) -> bool:
-        """Return true after terminating an exact bilingual end utterance."""
+        """Return true after accepting an exact bilingual end utterance."""
         nonlocal native_terminal_turn_tracking
         nonlocal native_terminal_gate_pending, native_terminal_transcript
         nonlocal native_terminal_fragment_chars
-        nonlocal output_preroll_bytes
         if not uses_native_terminal_gate():
             return False
         cancel_native_terminal_quiet_finalizer()
@@ -6535,18 +6639,62 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         }
         if _direct_provider_transcript_requests_end(event):
             LOGGER.info("Direct realtime terminal intent: source=transcript")
-            async with output_state_lock:
-                output_preroll.clear()
-                output_preroll_bytes = 0
-            await end_output(after_tail=False)
-            await send({"type": "stopped", "reason": "end_conversation"})
-            stop.set()
+            await begin_native_terminal_close("transcript")
             return True
         native_terminal_turn_tracking = False
         native_terminal_transcript = ""
         native_terminal_fragment_chars = 0
         await release_native_terminal_gate()
         return False
+
+    async def finish_native_terminal_close() -> None:
+        """Stop the socket once, after the farewell tail or its hard deadline."""
+        nonlocal native_terminal_stop_sent
+        if native_terminal_stop_sent or stop.is_set():
+            return
+        native_terminal_stop_sent = True
+        await end_output(after_tail=True)
+        await send({"type": "stopped", "reason": "end_conversation"})
+        stop.set()
+
+    async def begin_native_terminal_close(source: str) -> None:
+        """Stop accepting input, permit one brief farewell, and guarantee closure."""
+        nonlocal native_terminal_closing, native_terminal_close_task
+        nonlocal native_terminal_fragment_chars, native_terminal_transcript
+        nonlocal native_terminal_turn_tracking
+        if native_terminal_closing or stop.is_set():
+            return
+        native_terminal_closing = True
+        native_terminal_turn_tracking = False
+        native_terminal_transcript = ""
+        native_terminal_fragment_chars = 0
+        session.discard_pending_input()
+        await release_native_terminal_gate()
+        LOGGER.info("Direct realtime closing: source=%s", source)
+
+        async def close_after_deadline() -> None:
+            await asyncio.sleep(REALTIME_NATIVE_FAREWELL_DEADLINE_SECONDS)
+            await finish_native_terminal_close()
+
+        task = asyncio.create_task(
+            close_after_deadline(),
+            name="codex-realtime-native-farewell-deadline",
+        )
+        native_terminal_close_task = task
+        output_aux_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            nonlocal native_terminal_close_task
+            output_aux_tasks.discard(completed)
+            if native_terminal_close_task is completed:
+                native_terminal_close_task = None
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None and tool_call_failures.empty():
+                tool_call_failures.put_nowait(error)
+
+        task.add_done_callback(finished)
 
     def arm_native_terminal_quiet_finalizer() -> None:
         """Finalize an exact terminal delta when provider completion is late."""
@@ -7804,6 +7952,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                 websocket, allow_binary=wire_protocol.uses_binary_audio
             )
             if isinstance(message, bytes):
+                if native_terminal_closing:
+                    # Once ending is accepted, the provider may finish only its
+                    # brief farewell. It must never keep listening in background.
+                    continue
                 if native_input is not None:
                     native_input.feed_live(message, session)
                 else:
@@ -8020,7 +8172,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         await _handle_direct_provider_tool_call(session, event)
         return False
 
-    async def events() -> None:
+    async def events() -> None:  # noqa: C901 - provider lifecycle dispatcher
         while not stop.is_set():
             event = await session.next_event()
             event_trace.app_event(event)
@@ -8032,12 +8184,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     if wire_protocol.requests_native_conversation:
                         if await handle_native_tool_call(event, params):
                             LOGGER.info("Direct realtime terminal intent: source=tool")
-                            await end_output(after_tail=False)
-                            await send(
-                                {"type": "stopped", "reason": "end_conversation"}
-                            )
-                            stop.set()
-                            return
+                            await begin_native_terminal_close("tool")
                     elif bridge_managed_realtime:
                         await reject_unowned_tool_call(event)
                     else:
@@ -8088,18 +8235,31 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     transcript = params.get("text")
                     log_native_debug_transcript(role, transcript)
                     observe_native_barge_transcript(role, done=True)
+                    if conversation_history is not None:
+                        conversation_history.remember(role, transcript)
                     if (
                         role in {"input", "user"}
                         and wire_protocol.requests_native_conversation
                     ):
                         complete_native_user_transcript(transcript)
-                        if await resolve_native_terminal_turn(transcript):
-                            return
+                        await resolve_native_terminal_turn(transcript)
                         continue
                     if role == "user" and bridge_managed_realtime:
                         continue
                     if role in {"assistant", "output"} and not bridge_managed_realtime:
                         await end_output(after_tail=True)
+                        if _direct_assistant_transcript_is_farewell(transcript):
+                            if not native_terminal_closing:
+                                LOGGER.info(
+                                    "Direct realtime terminal intent: "
+                                    "source=assistant_farewell"
+                                )
+                                await begin_native_terminal_close("assistant_farewell")
+                            await finish_native_terminal_close()
+                            return
+                        if native_terminal_closing:
+                            await finish_native_terminal_close()
+                            return
                     continue
                 await send(
                     {
@@ -8348,11 +8508,12 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         if control.transcript is not None and await resolve_native_terminal_turn(
             control.transcript
         ):
-            return "stop"
+            await send(control.wire_value())
+            return "handled"
         await send(control.wire_value())
         return "handled"
 
-    async def data_events() -> None:
+    async def data_events() -> None:  # noqa: C901 - provider control dispatcher
         nonlocal active_response_id, backend_output_generation
         nonlocal backend_render_context_acknowledged, input_speech_active
         nonlocal pending_managed_speech_generation
@@ -8452,6 +8613,9 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
                     after_tail=control.event_type != "output_audio_buffer.cleared"
                 )
                 await send(control.wire_value())
+                if native_terminal_closing:
+                    await finish_native_terminal_close()
+                    return
                 continue
             await send(control.wire_value())
 
@@ -8524,6 +8688,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             LOGGER.warning("Could not append advisory speaker identity context")
 
     tasks = {
+        asyncio.create_task(stop.wait(), name="codex-realtime-stop-waiter"),
         asyncio.create_task(receive(), name="codex-realtime-receiver"),
         asyncio.create_task(events(), name="codex-realtime-events"),
         asyncio.create_task(audio(), name="codex-realtime-audio"),

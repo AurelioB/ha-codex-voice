@@ -364,7 +364,10 @@ def normalize_wake_phrase(value: str) -> str:
 
 
 def realtime_start_message(
-    config: RealtimeConfig, *, webrtc_sdp: str | None = None
+    config: RealtimeConfig,
+    *,
+    webrtc_sdp: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """Build one strict native start object, omitting unset preferences."""
     if config.media_transport == DEVICE_WEBRTC_TRANSPORT:
@@ -391,6 +394,14 @@ def realtime_start_message(
         value["voice"] = config.voice
     if config.prompt is not None:
         value["prompt"] = config.prompt
+    if conversation_id is not None:
+        if (
+            not conversation_id
+            or len(conversation_id) > 128
+            or "\x00" in conversation_id
+        ):
+            raise ConfigError("conversation_id must be a bounded non-empty string")
+        value["conversation_id"] = conversation_id
     return value
 
 

@@ -1157,7 +1157,12 @@ def _fake_realtime_support(
         INVALID = object()
 
     class RealtimeSession:
-        def __init__(self, received_config: object) -> None:
+        def __init__(
+            self,
+            received_config: object,
+            *,
+            conversation_id: str | None = None,
+        ) -> None:
             assert received_config is config
             if constructor_error is not None:
                 raise constructor_error
@@ -1167,6 +1172,9 @@ def _fake_realtime_support(
             self.terminal = False
             self.terminal_reason = None
             self.state = _FakeSessionState.NEW
+            self.conversation_id = (
+                conversation_id or f"conversation-{len(sessions) + 1}"
+            )
             self.submit_result = SubmitResult.ACCEPTED
             self.started = 0
             self.stopped = 0
@@ -3180,6 +3188,7 @@ def test_failed_live_socket_reconnects_without_releasing_owner_or_replaying_cue(
         time.sleep(0.002)
 
     replacement = support.sessions[1]  # type: ignore[attr-defined]
+    assert replacement.conversation_id == first.conversation_id
     assert instance._codex_realtime_owner is owner
     assert owner.session is replacement
     assert owner.capture_open

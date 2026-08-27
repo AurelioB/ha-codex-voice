@@ -95,9 +95,17 @@ direct ownership window, so the wake tail cannot cancel signaling and playback
 echo cannot terminate the live session. Capture remains closed until cue EOF;
 EOF opens live capture and switches the LED to listening. The cue must finish
 within two seconds. Cue failure/timeout and any terminal race fail closed. The
-sole spoken terminal control is `end_conversation`; its terminal result tears
-down the socket and normal cleanup restores the detector and idle LED. No Home
-Assistant tool is present.
+bridge preserves a bounded sequence of completed role-bearing transcripts and
+restores it through App Server v3 `initialItems` if provider isolation or a live
+device reconnect requires a new thread. The speaker's random conversation ID
+is stable only for that wake ownership window.
+
+`end_conversation` and exact terminal phrases enter a deterministic closing
+state: further microphone PCM is discarded immediately, one farewell of at
+most three words may drain, and a 2.5-second hard deadline tears down the
+socket. An exact short assistant farewell is also terminal. Normal cleanup
+restores the detector and idle LED. Home Assistant exposed-entity tools remain
+available alongside this bridge-owned terminal control.
 
 During provider playback the microphone stays open. Qualified AEC-filtered
 near-end speech immediately kills and flushes local playback and sends one

@@ -86,6 +86,13 @@ startup-context/handoff overrides, and `initial_items`. The bridge selects
 those App Server policies. Optional `conversation_id`, `voice`, and `prompt`
 values are length-bounded before any thread is created.
 
+The reference speaker generates one unpredictable `conversation_id` for each
+wake-owned conversation and reuses it only for automatic live reconnects. The
+bridge uses that identifier to recover a bounded in-memory sequence of complete
+user/assistant transcripts. A fresh App Server v3 thread receives those items
+through server-owned `initialItems`; the device never sends transcript text or
+startup items over this wire. A new wake gets a new identifier.
+
 The reference ThirdReality client always sends `conversation_mode: "native"`;
 this is not a device configuration option. It omits `voice` and `prompt` unless
 they are explicitly configured. It accepts a safe 1–64 character ASCII voice
@@ -393,13 +400,15 @@ session exposes bridge-owned `end_conversation`, configured
 `get_current_time`, and `search_web`, the captured Home Assistant tools, and
 optional bridge-owned agent tools. Local clock/location context never crosses
 the device wire and `get_current_time` performs no network request.
-Spanish and English terminal
-instructions require the model to
-call it immediately without a spoken promise. An exact normalized terminal
-transcript such as `Terminar`, `Terminar llamada`, `goodbye`, or `hang up` is a
-narrow fallback. The bridge then sends
-`{"type":"stopped","reason":"end_conversation"}` and closes the owned
-session. Every undeclared provider tool request is rejected internally. The
+Spanish and English terminal instructions allow one farewell of at most three
+words followed immediately by the tool call. An exact normalized terminal
+transcript such as `Terminar`, `Hasta luego`, `Nos vemos`, or `hang up` is a
+narrow fallback. Acceptance immediately discards further microphone PCM. The
+bridge forwards at most that brief farewell, then sends
+`{"type":"stopped","reason":"end_conversation"}` on the assistant terminal
+boundary or after a 2.5-second hard deadline. An exact short assistant farewell
+is itself terminal, so it cannot leave a hidden listening session. Every
+undeclared provider tool request is rejected internally. The
 first Home Assistant Conversation subentry is the default authority; additional
 subentries remain non-authoritative unless selected explicitly. That subentry
 opens the separate
