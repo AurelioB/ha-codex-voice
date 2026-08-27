@@ -823,11 +823,11 @@ has a new remote context. Direct calls do the same.
 ## Bounded provider prewarming
 
 The Compose deployment keeps the bridge listener, Codex App Server process,
-OAuth state, and server media stack warm. The ThirdReality client additionally
-holds at most one authenticated strict-v2 session: five minutes after startup
-or a completed conversation, and ten seconds after a probable wake score. The
-slot occupies the account's single speech lane, while device capture remains
-closed until a real wake claims it and the ready cue reaches EOF.
+OAuth state, and server media stack warm without opening a provider voice
+session. The ThirdReality client may hold at most one authenticated strict-v2
+session for ten seconds after a probable wake score. Boot and completed
+conversations do not create an idle remote slot, because any such slot occupies
+the account's single speech lane even while device capture is closed.
 
 Always-on remote prewarming would also:
 
@@ -840,11 +840,12 @@ Always-on remote prewarming would also:
 
 The official [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
 provides usage and rate-limit observability, but no idle realtime-session cost
-or lifetime guarantee. The implemented policy is therefore single-slot,
-profile/configuration-bound, TTL-limited, and audio-empty before assignment. It
-uses the exact production session rather than caching only a local offer, which
-would not remove remote admission and negotiation. The dormant device-side
-worker/standby design is retained as historical evidence only.
+or lifetime guarantee. The implemented speculative policy is therefore
+single-slot, profile/configuration-bound, limited to the ten-second
+probable-wake window, and audio-empty before assignment. It uses the exact
+production session rather than caching only a local offer, which would not
+remove remote admission and negotiation. The dormant device-side worker/standby
+design is retained as historical evidence only.
 
 ## ThirdReality safe performance settings
 

@@ -1300,6 +1300,7 @@ def test_only_direct_webrtc_prewarms_after_guarded_overlay_activation(
 
     assert module._REALTIME_PATCH_ACTIVE
     assert support.prewarm_calls == expected_calls  # type: ignore[attr-defined]
+    assert support.scheduled_bridge_prewarm_calls == []  # type: ignore[attr-defined]
 
 
 def test_bridge_pcm_probable_wake_score_starts_nonblocking_prewarm(
@@ -1346,6 +1347,7 @@ def test_bridge_pcm_wake_claims_connecting_prewarm_without_second_start(
     assert instance._codex_realtime_owner.session is prewarmed
     assert prewarmed.started == 1
     instance.stop()
+    assert support.scheduled_bridge_prewarm_calls == []  # type: ignore[attr-defined]
 
 
 def test_guarded_direct_overlay_uses_50ms_system_volume_poll(

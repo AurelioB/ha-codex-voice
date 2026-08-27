@@ -1333,9 +1333,6 @@ def _detach_realtime_owner(
             except Exception:  # noqa: BLE001 - owner is already safely released
                 _LOGGER.warning("Failed to stop ThirdReality realtime ready cue")
         _nonblocking_led_fire("idle", to_idle=True)
-        if owner.ready_seen and _uses_bridge_pcm():
-            with suppress(Exception):
-                _REALTIME_SUPPORT.schedule_bridge_pcm_prewarm(_REALTIME_CONFIG)
 
 
 def _reconcile_realtime_owner(instance: Any) -> _RealtimeOwner | None:
@@ -2560,9 +2557,11 @@ if _observed_hashes == _expected_hashes:
                 if _uses_device_webrtc():
                     prewarm_ok = _REALTIME_SUPPORT.prewarm_device_webrtc()
                 elif _uses_bridge_pcm():
-                    prewarm_ok = _REALTIME_SUPPORT.schedule_bridge_pcm_prewarm(
-                        _REALTIME_CONFIG
-                    )
+                    # A bridge-PCM prewarm is a real subscription voice session.
+                    # Starting one at boot or after every conversation blocks the
+                    # user's other ChatGPT clients. Only the probable-wake hook
+                    # above may speculate, for its short 10-second claim window.
+                    prewarm_ok = True
                 else:
                     prewarm_ok = True
             except Exception as exc:  # noqa: BLE001 - optional support boundary

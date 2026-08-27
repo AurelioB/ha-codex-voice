@@ -162,13 +162,13 @@ and releases use semantic versioning.
   limiter, and moderate noise suppression. Wake detection and realtime capture
   now receive the same distance-adaptive samples. Use an 18 dB outbound stage
   only after wake so short commands are immediately usable at room distance.
-- Keep one bounded, audio-empty strict-v2 provider session warm on the
-  ThirdReality appliance: five minutes after startup or a completed
-  conversation, and ten seconds after a probable 0.50 wake-model score. A real
-  wake claims the already-negotiating or ready device WebSocket, Codex thread,
-  and server-owned WebRTC peer without repeating negotiation. Cache immutable
-  Pulse/AEC topology proof for the voice-process lifetime; retain per-response
-  sink-volume verification and the unchanged bounded cold/retry path.
+- Do not open a subscription realtime session merely because the speaker booted
+  or a conversation ended; that idle provider occupied ChatGPT's single voice
+  lane and blocked the official app. A probable 0.50 wake-model score may still
+  create one ten-second speculative slot, which a real wake claims without
+  repeating negotiation. Cache immutable Pulse/AEC topology proof for the
+  voice-process lifetime; retain per-response sink-volume verification and the
+  unchanged bounded cold/retry path.
 - Route the current controlled Okay Nabu deployment to full-duplex
   `bridge_pcm` with native AEC3, `direct_capture_gain_db: 18`, a fixed 100%
   playback anchor, and `realtime_only: true`; defer Home Assistant
