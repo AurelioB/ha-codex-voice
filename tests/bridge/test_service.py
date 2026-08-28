@@ -6595,6 +6595,19 @@ def test_direct_terminal_transcript_prefix_gate(
     )
 
 
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Claro, finalizo aquí.",
+        "De acuerdo, lo dejo aquí.",
+        "De acuerdo, terminamos aquí.",
+        "Listo, terminamos aquí.",
+    ],
+)
+def test_direct_assistant_farewell_recognizes_clear_live_cues(phrase: str) -> None:
+    assert bridge_service._direct_assistant_transcript_is_farewell(phrase)
+
+
 @pytest.mark.asyncio
 async def test_realtime_v3_exact_spanish_end_transcript_stops_active_epoch(
     aiohttp_client: Any,
@@ -7956,6 +7969,18 @@ async def test_realtime_v2_native_restores_completed_history_after_device_reconn
     async with asyncio.timeout(1):
         while history.initial_items() != expected:
             await asyncio.sleep(0)
+    await fake_rpc.broadcast(
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": first_started["thread_id"],
+                "role": "user",
+                "text": "Un turno ambiental todavía sin respuesta.",
+            },
+        }
+    )
+    await asyncio.sleep(0)
+    assert history.initial_items() == expected
 
     await first_device.send_json({"type": "stop"})
     await first_device.close()
@@ -8235,7 +8260,7 @@ async def test_realtime_v2_native_assistant_farewell_always_closes_session(
             "params": {
                 "threadId": started["thread_id"],
                 "role": "assistant",
-                "text": "¡Adiós! Cuídate.",
+                "text": "De acuerdo, terminamos aquí.",
             },
         }
     )
@@ -8244,6 +8269,9 @@ async def test_realtime_v2_native_assistant_farewell_always_closes_session(
         "type": "stopped",
         "reason": "end_conversation",
     }
+    await device.send_json({"type": "ping"})
+    assert await device.receive_json(timeout=1) == {"type": "pong"}
+    await device.send_json({"type": "stop_ack"})
     await device.close()
 
 

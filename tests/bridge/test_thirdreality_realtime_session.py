@@ -7469,7 +7469,9 @@ def test_explicit_boundary_cannot_overtake_a_dequeued_audio_send(
     assert session.state is SessionState.STOPPING
 
 
-def test_bridge_native_capture_gain_is_applied_once_with_pcm16_saturation() -> None:
+def test_bridge_native_capture_gain_preserves_headroom_without_losing_distance_boost() -> (
+    None
+):
     session = RealtimeSession(
         _duplex_config(
             capture_backend=NATIVE_AEC3_CAPTURE,
@@ -7489,14 +7491,19 @@ def test_bridge_native_capture_gain_is_applied_once_with_pcm16_saturation() -> N
     assert packet.data == source
     assert remaining == 0
     assert [value for value, _sent_at in connection.binary_sent] == [
-        struct.pack("<6h", 1_995, -1_995, 32_767, -32_768, 32_767, -32_768)
+        struct.pack("<6h", 915, -915, 18_310, -18_310, 29_999, -30_000)
     ]
     diagnostics = session._bridge_capture_diagnostics
     assert diagnostics.packets == 1
     assert diagnostics.suppressed_packets == 0
     assert diagnostics.source_max_peak == 32_768
-    assert diagnostics.provider_max_peak == 32_768
-    assert diagnostics.saturated_samples == 4
+    assert diagnostics.provider_max_peak == 30_000
+    assert diagnostics.saturated_samples == 0
+
+    quiet = struct.pack("<2h", 1_000, -1_000)
+    assert session_module._apply_capture_gain_pcm16(quiet, 6.0) == struct.pack(
+        "<2h", 1_995, -1_995
+    )
 
 
 @pytest.mark.parametrize(
@@ -8336,6 +8343,33 @@ def test_network_thread_startup_failure_is_terminal_before_ready(
         "ThirdReality realtime session failed: network_or_playback_os_error"
     ]
     assert "secret-token" not in caplog.text
+
+
+def test_remote_terminal_stop_is_acknowledged_before_socket_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeRealtimeConnection()
+    player = _LoopPlayer()
+    _install_fake_loop_io(monkeypatch, player)
+    session = RealtimeSession(
+        _config(),
+        connection_factory=lambda **_kwargs: connection,  # type: ignore[arg-type]
+    )
+
+    session.start()
+    connection.feed(Message("text", json.dumps(_started())))
+    assert _wait_for(lambda: session.ready)
+    connection.feed(
+        Message(
+            "text",
+            json.dumps({"type": "stopped", "reason": "end_conversation"}),
+        )
+    )
+
+    assert session.join(1.0)
+    assert session.state is SessionState.STOPPED
+    assert {"type": "stop_ack"} in connection.json_sent
+    assert connection.closed
 
 
 def test_interrupt_waits_for_bridge_ack_then_closes_fresh_session(

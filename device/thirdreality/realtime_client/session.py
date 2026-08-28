@@ -53,6 +53,7 @@ _LOCAL_BARGE_IN_SIGNAL_PEAK = 1_024
 _LOCAL_BARGE_IN_SIGNAL_RMS = 384
 _NATIVE_AEC3_LOCAL_BARGE_IN_POST_GAIN_PEAK = 256
 _NATIVE_AEC3_LOCAL_BARGE_IN_POST_GAIN_RMS = 96
+_BRIDGE_CAPTURE_PEAK_LIMIT = 30_000
 _LOCAL_BARGE_IN_FRAMES = 2
 _LOCAL_BARGE_IN_AMBIGUOUS_FRAMES = 4
 _LOCAL_BARGE_IN_REARM_QUIET_FRAMES = 8
@@ -3287,6 +3288,11 @@ class RealtimeSession:
                 if semantic:
                     last_semantic_activity = self._clock()
                 if action == "stop":
+                    # The bridge keeps the socket open briefly after its
+                    # terminal frame. Confirm receipt before this client sends
+                    # the WebSocket close frame so a successful end can never
+                    # be mistaken for a transport failure and auto-reconnected.
+                    connection.send_json({"type": "stop_ack"})
                     terminal_reason = "remote_stop"
                     return
                 if interrupt_sent and action == "interrupted":
@@ -5170,12 +5176,17 @@ def _scale_pcm16(value: bytes, gain: float) -> bytes:
 
 
 def _apply_capture_gain_pcm16(value: bytes, gain_db: float) -> bytes:
-    """Apply the configured bridge capture gain once with PCM16 saturation."""
+    """Apply up to the configured gain while preserving PCM headroom."""
     if len(value) % 2:
         raise ValueError("capture PCM must contain complete samples")
-    if not value or gain_db == 0.0:
+    if not value:
         return value
-    gain = 10 ** (gain_db / 20)
+    requested_gain = 1.0 if gain_db == 0.0 else 10 ** (gain_db / 20)
+    peak = max(abs(sample) for (sample,) in struct.iter_unpack("<h", value))
+    headroom_gain = _BRIDGE_CAPTURE_PEAK_LIMIT / peak if peak > 0 else requested_gain
+    gain = min(requested_gain, headroom_gain)
+    if gain == 1.0:
+        return value
     amplified = bytearray(len(value))
     for index, (sample,) in enumerate(struct.iter_unpack("<h", value)):
         scaled = int(sample * gain)

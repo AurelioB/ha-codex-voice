@@ -73,7 +73,9 @@ and releases use semantic versioning.
   PCM is discarded immediately; the model may finish one farewell of at most
   three words, and a 2.5-second hard deadline guarantees socket closure. An
   exact short assistant farewell also closes the session instead of leaving it
-  listening in the background.
+  listening in the background. The device acknowledges the terminal frame
+  before either endpoint closes, preventing a successful end from being
+  classified as a transport failure and automatically reconnected.
 - Quarantine native assistant output while the user transcript can still be
   an exact terminal phrase. Ordinary speech releases immediately; an exact
   Spanish or English end request releases at most one brief farewell even when
@@ -83,11 +85,14 @@ and releases use semantic versioning.
   provider isolation and live speaker reconnects. The speaker retains one
   random conversation identifier for its ownership window; the bridge keeps a
   bounded 32-item/16,000-character in-memory history and restores it through
-  App Server v3 `initialItems` whenever a fresh thread is unavoidable.
+  App Server v3 `initialItems` whenever a fresh thread is unavoidable. Restore
+  only through the last completed assistant turn, so an ambient or interrupted
+  trailing user transcript cannot become a fresh prompt after reconnect.
 - Add explicit `direct_capture_gain_db` tuning for realtime microphone egress,
-  defaulting to 0 dB and bounded to 0–18 dB. Gain uses saturating PCM16, leaves
-  wake/Assist/local-barge audio unchanged, and is applied exactly once before
-  bridge PCM or device-WebRTC provider egress.
+  defaulting to 0 dB and bounded to 0–18 dB. It is a maximum boost: a 30,000
+  PCM peak headroom limiter reduces the applied gain for already-loud frames
+  instead of hard-clipping them. Wake/Assist/local-barge audio remains
+  unchanged, and gain is applied exactly once before provider egress.
 - Add one content-free bridge-capture summary per realtime session with raw and
   provider peak/RMS maxima, suppressed packet count, and saturation count. This
   makes distance-gain tuning evidence-based without retaining microphone audio.

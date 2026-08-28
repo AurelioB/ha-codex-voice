@@ -90,8 +90,10 @@ The reference speaker generates one unpredictable `conversation_id` for each
 wake-owned conversation and reuses it only for automatic live reconnects. The
 bridge uses that identifier to recover a bounded in-memory sequence of complete
 user/assistant transcripts. A fresh App Server v3 thread receives those items
-through server-owned `initialItems`; the device never sends transcript text or
-startup items over this wire. A new wake gets a new identifier.
+through server-owned `initialItems`, ending at the latest completed assistant
+item so an unanswered ambient user item cannot trigger inference after a
+reconnect. The device never sends transcript text or startup items over this
+wire. A new wake gets a new identifier.
 
 The reference ThirdReality client always sends `conversation_mode: "native"`;
 this is not a device configuration option. It omits `voice` and `prompt` unless
@@ -336,7 +338,9 @@ WebSocket framing overhead is separate, and the minimum carries one fixed
 Full duplex is an explicit, fail-closed device option; protocol v2 itself does
 not provide AEC. The active ThirdReality deployment uses native AEC3 against
 the device's sample-aligned physical render reference and applies its bounded
-capture gain exactly once before WebSocket egress. Before opening the socket,
+capture gain exactly once before WebSocket egress. The configured dB value is a
+maximum boost; a 30,000-peak PCM16 headroom limiter reduces it on already-loud
+frames rather than hard-clipping them. Before opening the socket,
 the reference client also verifies the reviewed static PulseAudio topology,
 the configured allowlisted `aec_method`, exact raw hardware masters and AEC endpoint
 names, those endpoints as defaults, and every current-process native capture
@@ -388,6 +392,9 @@ The following client-to-bridge controls remain JSON:
   may enter its frontend rendering channel.
 - `ping`: request `{"type":"pong"}`.
 - `stop`: end the session normally.
+- `stop_ack`: exact acknowledgement of a bridge terminal `stopped` frame. It
+  has no other fields and is valid only while that terminal delivery is
+  pending.
 - `barge`: exact explicit-native, nonterminal provider rollover as defined
   above. No fields other than `type` are accepted.
 - `interrupt`: legacy compatibility exchange that requests cancellation of the
@@ -406,8 +413,10 @@ transcript such as `Terminar`, `Hasta luego`, `Nos vemos`, or `hang up` is a
 narrow fallback. Acceptance immediately discards further microphone PCM. The
 bridge forwards at most that brief farewell, then sends
 `{"type":"stopped","reason":"end_conversation"}` on the assistant terminal
-boundary or after a 2.5-second hard deadline. An exact short assistant farewell
-is itself terminal, so it cannot leave a hidden listening session. Every
+boundary or after a 2.5-second hard deadline. The device replies with exact
+`{"type":"stop_ack"}` before closing; the bridge waits at most 750 ms for that
+delivery proof. An exact short assistant farewell is itself terminal, so it
+cannot leave a hidden listening session. Every
 undeclared provider tool request is rejected internally. The
 first Home Assistant Conversation subentry is the default authority; additional
 subentries remain non-authoritative unless selected explicitly. That subentry

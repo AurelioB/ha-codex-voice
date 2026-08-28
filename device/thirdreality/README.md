@@ -295,15 +295,17 @@ entity, and each new direct session starts at that saved level.
 The preflight and exact preparation compare raw PulseAudio units rather than
 trusting rounded displayed percentages.
 
-`direct_capture_gain_db` is an additional outbound microphone gain from 0
-through 18 dB. The native APM profile already applies a 10 dB baseline plus
+`direct_capture_gain_db` is the maximum additional outbound microphone gain
+from 0 through 18 dB. The native APM profile already applies a 10 dB baseline plus
 adaptive digital gain whose noise cap prevents the output noise floor from
 rising above -50 dBFS. A limiter and moderate noise suppression run before wake
 detection, local barge-in, and realtime capture. Active bridge PCM uses 18 dB
 at the transport boundary so the first short command does not wait for adaptive
-gain to ramp; this outbound stage does not change wake-word audio. Saturating
-PCM16 bounds close speech, and the per-session `bridge_capture` syslog summary
-reports source/provider peak and RMS plus saturation without retaining audio.
+gain to ramp; this outbound stage does not change wake-word audio. A 30,000-peak
+PCM16 headroom limiter automatically reduces that boost on loud frames instead
+of clipping them, while quiet/distant speech still receives the configured
+maximum. The per-session `bridge_capture` syslog summary reports
+source/provider peak and RMS plus saturation without retaining audio.
 
 V3 owns at most one fixed-argv `paplay` child at a time. It accepts raw 24 kHz
 mono signed-16-bit PCM, requests 60 ms latency and 20 ms process time, and uses

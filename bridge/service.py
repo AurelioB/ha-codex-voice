@@ -179,7 +179,9 @@ DIRECT_REALTIME_BASE_INSTRUCTIONS = (
     "detail. Treat incoming speech as potentially noisy. If a request is incomplete, "
     "internally inconsistent, or you are not confident what the user wants, do not "
     "guess or silently supply missing words; ask one short clarification in the "
-    "user's language. Never inspect local files or use undeclared tools. Invoke "
+    "user's language. Treat obvious television, radio, or multi-speaker background "
+    "dialogue as ambient audio; do not answer it unless the user clearly addresses "
+    "you or asks about it. Never inspect local files or use undeclared tools. Invoke "
     "end_conversation only when the user explicitly asks to end, stop, close, or leave this "
     "conversation, or clearly says goodbye. Spanish requests such as 'terminar', "
     "'terminar llamada', 'terminar la llamada', 'finalizar', 'colgar', and 'adios' "
@@ -229,12 +231,19 @@ _DIRECT_ASSISTANT_FAREWELL_TRANSCRIPTS = frozenset(
         "adios cuidate",
         "adios cuidense",
         "bye",
+        "claro finalizo aqui",
+        "de acuerdo lo dejo aqui",
+        "de acuerdo terminamos aqui",
+        "finalizo aqui",
         "goodbye",
         "hasta luego",
         "hasta luego cuidate",
+        "listo terminamos aqui",
         "listo se acabo",
+        "lo dejo aqui",
         "nos vemos",
         "take care",
+        "terminamos aqui",
     }
 )
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
@@ -260,6 +269,7 @@ REALTIME_NATIVE_TERMINAL_GATE_MAX_BYTES = (
 REALTIME_NATIVE_TERMINAL_GATE_TTL_SECONDS = 1.25
 REALTIME_NATIVE_TERMINAL_TRANSCRIPT_QUIET_SECONDS = 0.7
 REALTIME_NATIVE_FAREWELL_DEADLINE_SECONDS = 2.5
+REALTIME_NATIVE_STOP_ACK_TIMEOUT_SECONDS = 0.75
 MAX_NATIVE_REALTIME_HISTORY_ITEMS = 32
 REALTIME_OUTPUT_SIGNAL_PEAK = 256
 REALTIME_REMOTE_CANCEL_CONFIRM_TIMEOUT_SECONDS = 0.5
@@ -667,8 +677,20 @@ class _NativeRealtimeHistory:
             self.character_count -= len(self.items.popleft()["text"])
 
     def initial_items(self) -> list[dict[str, str]] | None:
+        """Return completed exchanges, never a trailing unanswered user item."""
         self.last_used = time.monotonic()
-        return [dict(item) for item in self.items] or None
+        items = tuple(self.items)
+        last_assistant = next(
+            (
+                index
+                for index in range(len(items) - 1, -1, -1)
+                if items[index]["role"] == "assistant"
+            ),
+            None,
+        )
+        if last_assistant is None:
+            return None
+        return [dict(item) for item in items[: last_assistant + 1]]
 
 
 @dataclass(slots=True)
@@ -6335,6 +6357,7 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
     native_terminal_closing = False
     native_terminal_close_task: asyncio.Task[None] | None = None
     native_terminal_stop_sent = False
+    native_terminal_stop_ack = asyncio.Event()
     native_user_transcript_fragments = 0
     native_user_transcript_chars = 0
     event_trace = _RealtimeEventTrace()
@@ -6648,14 +6671,20 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
         return False
 
     async def finish_native_terminal_close() -> None:
-        """Stop the socket once, after the farewell tail or its hard deadline."""
+        """Stop once after the farewell and let the device confirm delivery."""
         nonlocal native_terminal_stop_sent
         if native_terminal_stop_sent or stop.is_set():
             return
         native_terminal_stop_sent = True
         await end_output(after_tail=True)
         await send({"type": "stopped", "reason": "end_conversation"})
-        stop.set()
+        try:
+            async with asyncio.timeout(REALTIME_NATIVE_STOP_ACK_TIMEOUT_SECONDS):
+                await native_terminal_stop_ack.wait()
+        except TimeoutError:
+            LOGGER.warning("Realtime device did not acknowledge terminal stop")
+        finally:
+            stop.set()
 
     async def begin_native_terminal_close(source: str) -> None:
         """Stop accepting input, permit one brief farewell, and guarantee closure."""
@@ -8111,6 +8140,10 @@ async def _run_realtime_socket(  # noqa: C901 - full-duplex protocol state machi
             elif message_type == "stop":
                 stop.set()
                 return
+            elif message_type == "stop_ack":
+                if set(message) != {"type"} or not native_terminal_stop_sent:
+                    raise ProtocolError("stop_ack requires one pending terminal stop")
+                native_terminal_stop_ack.set()
             elif message_type == "ping":
                 await send({"type": "pong"})
             else:
