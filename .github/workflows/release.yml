@@ -22,12 +22,41 @@ jobs:
         run: |
           mkdir -p release/thirdreality-realtime/latency_sitecustomize
           mkdir -p release/thirdreality-realtime/realtime_client
+          mkdir -p release/thirdreality-realtime/webrtc_sidecar
+          mkdir -p release/thirdreality-realtime/aec3_capture/cmake
+          mkdir -p release/thirdreality-realtime/aec3_capture/include
+          mkdir -p release/thirdreality-realtime/aec3_capture/src
+          mkdir -p release/thirdreality-realtime/deploy/init
           mkdir -p release/thirdreality-realtime/deploy/pulse
           install -m 0644 \
             device/thirdreality/latency_sitecustomize/sitecustomize.py \
             release/thirdreality-realtime/latency_sitecustomize/sitecustomize.py
           install -m 0644 device/thirdreality/realtime_client/*.py \
             release/thirdreality-realtime/realtime_client/
+          install -m 0644 device/thirdreality/webrtc_sidecar/*.py \
+            release/thirdreality-realtime/webrtc_sidecar/
+          install -m 0644 \
+            device/thirdreality/aec3_capture/CMakeLists.txt \
+            device/thirdreality/aec3_capture/README.md \
+            device/thirdreality/aec3_capture/THIRD_PARTY_NOTICES.md \
+            device/thirdreality/aec3_capture/__init__.py \
+            device/thirdreality/aec3_capture/recorder.py \
+            release/thirdreality-realtime/aec3_capture/
+          install -m 0755 device/thirdreality/aec3_capture/build_aarch64.py \
+            release/thirdreality-realtime/aec3_capture/build_aarch64.py
+          install -m 0644 device/thirdreality/aec3_capture/cmake/*.cmake \
+            release/thirdreality-realtime/aec3_capture/cmake/
+          install -m 0644 device/thirdreality/aec3_capture/include/*.h \
+            release/thirdreality-realtime/aec3_capture/include/
+          install -m 0644 device/thirdreality/aec3_capture/src/* \
+            release/thirdreality-realtime/aec3_capture/src/
+          install -m 0644 \
+            device/thirdreality/webrtc-runtime.in \
+            device/thirdreality/webrtc-runtime.lock.txt \
+            device/thirdreality/webrtc-runtime.md \
+            release/thirdreality-realtime/
+          install -m 0644 scripts/install_thirdreality_webrtc_runtime.py \
+            release/thirdreality-realtime/install_thirdreality_webrtc_runtime.py
           install -m 0644 \
             device/thirdreality/codex-realtime.example.json \
             release/thirdreality-realtime/codex-realtime.example.json
@@ -35,8 +64,12 @@ jobs:
             release/thirdreality-realtime/README.md
           install -m 0644 device/thirdreality/deploy/README.md \
             release/thirdreality-realtime/deploy/README.md
+          install -m 0755 device/thirdreality/deploy/prepare_mic_gain_boot.py \
+            release/thirdreality-realtime/deploy/prepare_mic_gain_boot.py
           install -m 0755 device/thirdreality/deploy/prepare_pulseaudio_aec.py \
             release/thirdreality-realtime/deploy/prepare_pulseaudio_aec.py
+          install -m 0755 device/thirdreality/deploy/init/S49codex-mic-gain \
+            release/thirdreality-realtime/deploy/init/S49codex-mic-gain
           install -m 0644 \
             device/thirdreality/deploy/pulse/codex-echo-cancel.pa \
             device/thirdreality/deploy/pulse/codex-echo-cancel-speex.pa \

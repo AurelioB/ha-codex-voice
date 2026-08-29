@@ -1,0 +1,4 @@
+# Direct requirements for the isolated ThirdReality Python 3.11/aarch64 runtime.
+# Regenerate webrtc-runtime.lock.txt with the command in webrtc-runtime.md.
+aiortc==1.15.0
+av==17.1.0

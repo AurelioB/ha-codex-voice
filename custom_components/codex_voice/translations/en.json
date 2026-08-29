@@ -63,6 +63,7 @@
             "prompt": "Instructions",
             "realtime_authority": "Provide Home Assistant tools to realtime voice",
             "realtime_language": "Realtime voice language",
+            "realtime_voice": "Realtime voice",
             "reasoning_effort": "Reasoning effort",
             "service_tier": "Service tier"
           },
@@ -71,6 +72,7 @@
             "prompt": "Instructions supplied before the conversation. Templates are supported.",
             "realtime_authority": "Exactly one conversation agent may provide tools to realtime voice. Tool access is limited to the Home Assistant APIs selected above.",
             "realtime_language": "Language and locale used for realtime tool context and responses.",
+            "realtime_voice": "Voice used for new realtime conversations. An active conversation keeps its current voice.",
             "reasoning_effort": "Choose low, medium, high, xhigh, max, or ultra; higher effort can improve difficult reasoning at the cost of latency.",
             "service_tier": "Priority targets lower latency and increases subscription usage compared with standard."
           }

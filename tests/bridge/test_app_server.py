@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from bridge import app_server as app_server_module
 from bridge.app_server import MAX_RETIRED_SERVER_RESPONSE_IDS, CodexAppServer
 from bridge.errors import AppServerExited, ProtocolError
 
@@ -55,6 +56,28 @@ async def test_approvals_fail_closed_and_dynamic_tools_round_trip() -> None:
         tool_result = await subscription.get(timeout=1)
         assert tool_result["method"] == "fake/toolResult"
         assert tool_result["params"]["success"] is True
+    finally:
+        subscription.close()
+        await rpc.close()
+
+
+@pytest.mark.asyncio
+async def test_current_time_request_returns_whole_unix_seconds_without_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app_server_module.time, "time", lambda: 1_786_442_400.875)
+    rpc = CodexAppServer((sys.executable, str(FAKE_SERVER)), request_timeout=2)
+    await rpc.start()
+    subscription = rpc.subscribe()
+    try:
+        await rpc.call("test/requestCurrentTime", {})
+
+        result = await subscription.get(timeout=1)
+        assert result == {
+            "method": "fake/currentTimeResult",
+            "params": {"currentTimeAt": 1_786_442_400},
+        }
+        assert subscription.queue.empty()
     finally:
         subscription.close()
         await rpc.close()

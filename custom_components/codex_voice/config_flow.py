@@ -45,6 +45,7 @@ from .const import (
     CONF_MODEL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     CONF_REASONING_EFFORT,
     CONF_SERVICE_TIER,
     CONF_VOICE,
@@ -55,6 +56,7 @@ from .const import (
     DEFAULT_CONVERSATION_SERVICE_TIER,
     DEFAULT_LLM_HASS_API,
     DEFAULT_REALTIME_LANGUAGE,
+    DEFAULT_REALTIME_VOICE,
     DEFAULT_STT_NAME,
     DEFAULT_TTS_NAME,
     DEFAULT_VOICE,
@@ -103,11 +105,11 @@ def _default_subentries() -> list[ConfigSubentryData]:
                 CONF_SERVICE_TIER: DEFAULT_CONVERSATION_SERVICE_TIER,
                 CONF_PROMPT: llm.DEFAULT_INSTRUCTIONS_PROMPT,
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
-                # Realtime control is a distinct, privileged execution path.
-                # Keep it disabled until the user explicitly enables one
-                # Conversation subentry in its options flow.
-                CONF_REALTIME_AUTHORITY: False,
+                # Home Assistant is the default smart-home authority for the
+                # independent realtime route. Additional agents remain opt-in.
+                CONF_REALTIME_AUTHORITY: True,
                 CONF_REALTIME_LANGUAGE: DEFAULT_REALTIME_LANGUAGE,
+                CONF_REALTIME_VOICE: DEFAULT_REALTIME_VOICE,
             },
         },
         {
@@ -147,7 +149,7 @@ class CodexVoiceConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Codex Voice config flow."""
 
     VERSION = 1
-    MINOR_VERSION = 2
+    MINOR_VERSION = 4
 
     @override
     async def async_step_user(
@@ -403,6 +405,9 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
                     vol.Required(CONF_REALTIME_LANGUAGE): SelectSelector(
                         SelectSelectorConfig(options=list(SUPPORTED_LANGUAGES))
                     ),
+                    vol.Required(CONF_REALTIME_VOICE): SelectSelector(
+                        SelectSelectorConfig(options=list(SUPPORTED_VOICES))
+                    ),
                 }
             )
         elif self._subentry_type == SUBENTRY_TYPE_STT:
@@ -434,6 +439,7 @@ class CodexVoiceSubentryFlow(ConfigSubentryFlow):
                 CONF_LLM_HASS_API: DEFAULT_LLM_HASS_API,
                 CONF_REALTIME_AUTHORITY: False,
                 CONF_REALTIME_LANGUAGE: DEFAULT_REALTIME_LANGUAGE,
+                CONF_REALTIME_VOICE: DEFAULT_REALTIME_VOICE,
             }
         if self._subentry_type == SUBENTRY_TYPE_STT:
             return {CONF_NAME: DEFAULT_STT_NAME}

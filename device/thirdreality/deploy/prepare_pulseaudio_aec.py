@@ -25,7 +25,7 @@ DEFAULT_AEC_METHOD = "webrtc"
 SUPPORTED_AEC_METHODS = (DEFAULT_AEC_METHOD, "speex", "adrian")
 DEFAULT_AEC_SINK_VOLUME_PERCENT = 25
 MIN_AEC_SINK_VOLUME_PERCENT = 1
-MAX_AEC_SINK_VOLUME_PERCENT = 60
+MAX_AEC_SINK_VOLUME_PERCENT = 100
 _PULSE_VOLUME_NORMAL = 65_536
 _AEC_BLOCK_TEMPLATE = """{begin_marker}
 # This block must remain after the raw module-alsa-source/sink definitions.

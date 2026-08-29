@@ -1,9 +1,16 @@
 # Codex Voice bridge
 
-This process exposes a small bearer-authenticated HTTP/WebSocket API to the
-Home Assistant custom component and owns a local `codex app-server` child. The
-child uses the machine's existing file-backed Codex/ChatGPT login through a
-private temporary Codex home; no OAuth token is copied into Home Assistant.
+This process exposes a small bearer-authenticated HTTP/WebSocket API and owns a
+local `codex app-server` child. In the active realtime architecture it is the
+media server for the ThirdReality speaker: strict-v2 PCM arrives over the LAN,
+and the bridge keeps one provider generation active behind the stable device
+WebSocket. A qualified interruption replaces that generation without making
+the speaker reconnect.
+Home Assistant exposed-entity tools are the default smart-home authority on the
+active Okay Nabu path; an external memory/deep-task agent is optional. The child
+uses the machine's existing file-backed
+Codex/ChatGPT login through a private temporary Codex home; no OAuth token is
+copied into Home Assistant or onto the speaker.
 
 ## Run
 
@@ -20,6 +27,12 @@ export HA_CODEX_BRIDGE_TOKEN="$(openssl rand -hex 32)"
 export HA_CODEX_REALTIME_DEVICE_TOKEN="$(openssl rand -hex 32)"
 .venv/bin/python -m bridge
 ```
+
+For the active always-running server, use the root `compose.yaml` and the
+ignored mode-0600 environment files described in
+[`server-offloaded-realtime-architecture.md`](../server-offloaded-realtime-architecture.md).
+Compose keeps the listener, App Server process, OAuth state, and media stack
+warm; it does not allocate a provider peer until an accepted wake.
 
 The default listener is `127.0.0.1:8787`. Override it with
 `HA_CODEX_BRIDGE_HOST` and `HA_CODEX_BRIDGE_PORT`. `CODEX_APP_SERVER_COMMAND`
@@ -61,7 +74,7 @@ All routes, including `GET /health`, accept
 legacy realtime v1 compatibility. When the optional, distinct
 `HA_CODEX_REALTIME_DEVICE_TOKEN` is set, it is accepted only for
 `GET /v1/realtime` and only after the first start message successfully
-negotiates strict v2. A device-token v1 or malformed negotiation is rejected
+negotiates strict v2 or v3. A device-token v1 or malformed negotiation is rejected
 before provider/thread startup, and the device token is rejected by every
 other route. This lets a speaker use content-private realtime audio without
 storing the Home Assistant/component credential. In particular, the device
@@ -96,36 +109,211 @@ requires the primary Home Assistant bridge token.
   bounded immutable generation of rendered instructions, locale, and selected
   LLM API tools; correlated tool calls/results remain on this socket. The
   route-scoped realtime-device token is never accepted here.
-- `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages or the strict
-  device-facing v2 binary PCM16 transport. V2 emits content-free lifecycle
-  controls, filters continuous WebRTC silence, gates output with monotonic
-  epochs, and supports negotiated same-session interruption. It does not expose
-  transcripts, provider payloads, tool calls, or tool results to the device.
-  The optional strict-v2 `conversation_mode` currently accepts only `native`;
-  an accepted value is echoed in `started`.
+- `POST /v1/agent/announce`: optional report-back with exact JSON
+  `{"text":"..."}`. A distinct `HA_CODEX_AGENT_ANNOUNCE_TOKEN` is valid only
+  on this route; the primary bridge token is also accepted for operator tests.
+  The message is appended for speech only while an idle native session is
+  active. It returns 503 rather than waking or reopening an idle speaker.
+- `GET /v1/realtime` WebSocket: legacy v1 JSON/base64 messages, strict v2
+  binary PCM16, or strict v3 device-owned WebRTC signaling. V3 relays a
+  validated SDP offer/answer and then carries JSON lifeline controls only;
+  audio and `oai-events` go directly between the device peer and provider.
+  V2 emits content-free lifecycle controls, filters continuous WebRTC silence,
+  gates output with socket-lifetime monotonic epochs, and supports exact native
+  `barge` rollover as well as the legacy negotiated interrupt exchange. It does
+  not expose transcripts, provider payloads, tool calls, or tool results to the
+  device.
+  The active strict-v2 route requires `conversation_mode: "native"`; an
+  accepted value is echoed in `started`. Native v2 declares bridge-owned
+  `end_conversation`, configured `get_current_time`, and `search_web`, the
+  immutable Home Assistant authority
+  snapshot captured at startup, and optional external-agent tools.
   A v2 `text` control is a bounded user message; its role must be omitted or
-  exactly `user`. See the
-  [v2 wire contract](../protocol/realtime-wire-v2.md).
+  exactly `user`. See the [active v2
+  contract](../protocol/realtime-wire-v2.md) and dormant [v3 direct-media
+  contract](../protocol/realtime-wire-v3.md).
 
 Authenticated health includes a content-free `home_assistant_tools` object:
 registration/open-transport readiness, locale, tool count, pending calls,
-exclusive process-lifetime outcome counters, and the duration of the most
+local-context availability, exclusive process-lifetime outcome counters, and
+the duration of the most
 recent completed attempt. It never includes authority IDs, tool names,
 schemas, arguments, results, prompts, or conversation content.
 
-Device-facing v2 is the transport used by the pinned ThirdReality v1.1.7
-in-process client. “Okay Computer” enters this direct mode; “Okay Nabu” remains
-on Home Assistant's official Assist flow. The device sends 16 kHz mono PCM16
-and receives 24 kHz mono PCM16. It remains an untrusted audio/control endpoint:
-it cannot declare tools or send tool results. The current reference client
-always sends `conversation_mode: "native"` and requires that value in the
-`started` acknowledgement. For that session, the bridge does not capture the
-Home Assistant broker snapshot. It creates exactly one tool-free native App
-Server WebRTC voice thread and relays its speech directly; no completed
-transcript, executor thread, or `thread/realtime/appendSpeech` operation is in
-the audio path. With qualified device AEC, this is the full-duplex/barge-in
-route. The bridge applies a 2,250 ms input-track limit only to v2 live
-sessions; finite STT keeps its existing whole-utterance input capacity.
+### Active server-offloaded ThirdReality route
+
+Okay Nabu uses strict v2 `bridge_pcm`, explicit native mode, and full duplex.
+The speaker continuously sends 16 kHz mono PCM16; the bridge resamples and
+paces it into the active provider WebRTC peer, then returns 24 kHz mono PCM16
+inside monotonic speaking epochs. The device WebSocket remains open across
+responses and interruptions. The active provider-control policy sends exact
+`{"type":"provider_barge"}` after a qualified local cut. The bridge mirrors the
+desktop WebRTC hush pair (`response.cancel`, then
+`output_audio_buffer.clear`) while keeping that peer and its input stream live.
+The bridge explicitly requests `gpt-live-1-codex`; the model is overridable by
+`HA_CODEX_REALTIME_MODEL` for a controlled rollback or canary.
+
+For a temporary debugging installation, set
+`HA_CODEX_REALTIME_LOG_TRANSCRIPTS=true`. Native realtime then writes bounded
+final user and assistant transcript text to the rotated Docker log. It defaults
+to false because these records contain conversation content; disable it and
+rotate/remove the test logs before ordinary household use.
+
+The bridge does not wait for a provider VAD boundary. If same-peer provider
+control is unavailable, `barge_in_mode: "rollover"` retains the conservative
+generation-replacement path: strict stop and a matching
+`thread/realtime/closed` notification within the 100 ms reuse grace before
+reusing the existing thread with startup context. An error, timeout, or
+otherwise ambiguous close starts the replacement on a fresh isolated thread so
+late output from the retired generation cannot cross the fence.
+
+The bridge sends `started` only after the App Server thread, SDP exchange,
+WebRTC transport, and provider session are ready. That is the device's
+cue-gated capture boundary. Native v2 has no completed-transcript executor or
+`appendSpeech` render handoff. It exposes bridge-owned `end_conversation`, Home
+Assistant tools from the generation snapshot captured before `thread/start`,
+and—only when configured—`get_current_time`, `ask_agent`, and `recall_memory`.
+Trusted local context includes a provider-start timestamp; the clock tool
+returns a fresh value for exact date/time requests without web access. A live
+Home Assistant authority overrides the deployment fallback with its immutable
+location name, coordinates, and timezone snapshot for that session. Calls
+execute asynchronously so PCM forwarding continues. The narrow bilingual
+terminal-phrase fallback still emits terminal `stopped`; undeclared and
+device-declared tools fail closed.
+
+### Default public-web search
+
+When managed Codex OAuth is configured, the bridge advertises `search_web` and
+uses the same subscription-backed `alpha/search` endpoint as the pinned Codex
+App Server. It reads the managed OAuth snapshot for each request so App Server
+token refreshes remain authoritative; credentials and raw provider payloads are
+never returned to the realtime model. This is an experimental Codex endpoint,
+so it is version-pinned and not treated as a stable public API.
+
+The normal Compose stack also starts a digest-pinned SearXNG service whose
+published port is restricted to `127.0.0.1`. It is an automatic fallback when
+subscription search is unavailable and is the primary backend only when no
+managed OAuth file is configured. Each call accepts one bounded query and
+returns at most six bounded public HTTP or HTTPS results with title, URL,
+excerpt, and optional publication date. It does not expose a general browser,
+arbitrary fetch endpoint, host network tool, or OpenAI API key.
+
+Search is independent of PCM forwarding and Home Assistant authority. Results
+are explicitly untrusted and may contain inaccurate or adversarial text; the
+model is instructed to compare sources and never treat web content as
+authorization or smart-home state. Set a different local SearXNG endpoint with
+`HA_CODEX_WEB_SEARCH_URL`. With managed OAuth present, omitting that variable
+disables only the local fallback, not subscription search.
+
+An optional agent may report a completed background task to the currently
+active session through `/v1/agent/announce`. This path has a separate bearer,
+accepts at most 600 characters, refuses busy/idle sessions, and never receives
+Home Assistant or Codex credentials. It deliberately does not create a new
+speaker connection after the user has ended a conversation.
+
+### Private wake-sample collection
+
+Wake-sample collection is disabled by default and the normal Compose service
+has no writable recording mount. To opt in for a controlled training session,
+create an owner-only directory, set `HA_CODEX_VOICE_SAMPLE_ROOT_HOST` to its
+absolute path, and add the explicit override:
+
+```bash
+install -d -m 700 /absolute/private/voice-samples
+docker compose -f compose.yaml -f compose.voice-lab.yaml \
+  --env-file .codex-voice/compose.env up -d --build bridge
+```
+
+Also set `voice_sample_collection_enabled: true` in the root-owned speaker
+configuration. The speaker retains at most three seconds of AEC-cleaned idle
+PCM in memory, detaches that ring at an accepted wake, and queues it to a lazy
+background uploader. The microphone callback never performs HTTP or file I/O.
+The bridge writes mode-`0600` WAV/JSON pairs beneath the mode-`0700` inbox and
+initially labels each capture `unreviewed-wake`. When the user explicitly says
+the wake was accidental, the native-only `mark_false_wake` tool changes only a
+recent unreviewed record to `wake-negative`/`false-activation`. It never infers
+labels automatically. Remove the override and speaker flag to restore the
+zero-allocation default.
+
+### Optional local speaker identification
+
+Speaker identification is disabled by default. Enabling
+`compose.speaker-identity.yaml` starts a separate non-root worker with pinned
+`sherpa-onnx`/NumPy dependencies and an exact hash-verified TitaNet model. The
+ordinary bridge image remains unchanged. Configure a distinct token and
+owner-only model/profile paths:
+
+```bash
+export HA_CODEX_SPEAKER_IDENTITY_TOKEN="replace-with-a-distinct-random-token"
+export HA_CODEX_SPEAKER_IDENTITY_MODEL_HOST="/absolute/private/nemo_en_titanet_large.onnx"
+export HA_CODEX_SPEAKER_PROFILES_HOST="/absolute/private/speaker-profiles"
+docker compose --env-file .codex-voice/compose.env \
+  -f compose.yaml -f compose.speaker-identity.yaml \
+  up -d --build
+```
+
+The Home Assistant integration exposes the worker through an admin-only panel
+and primary-token management API. It supports explicit-consent enrollment,
+held-out validation, activation, deletion, threshold tuning, and optional
+links to live Home Assistant Person and user records. The bridge captures at
+most one five-second post-wake PCM window and submits it asynchronously over
+loopback. The worker strips silence and requires both a calibrated cosine
+threshold and separation margin. A confident match is appended later as
+advisory developer context; `unknown`, timeout, worker failure, or an absent
+profile changes nothing. Identity never delays readiness, capture,
+interruption, or the first response and never authorizes a sensitive Home
+Assistant action. Enrollment and threshold evaluation are documented in
+[`docs/development.md`](../docs/development.md#optional-speaker-identification).
+
+The Compose service keeps the bridge, App Server, OAuth state, media stack, and
+listener warm. It still creates the provider thread and peer at wake; a
+connected standby session is deliberately deferred until measurement proves
+remote negotiation is the dominant remaining delay.
+
+### Dormant device-owned v3 route
+
+The following route is retained for rollback and research; it is not used by
+the active Okay Nabu deployment. Device-facing v3 was the direct-media
+transport used by the earlier ThirdReality
+v1.1.7 client. The aarch64 Buildroot Linux speaker creates an `aiortc` offer
+with audio and `oai-events`; the bridge starts one native App Server realtime
+session with only `end_conversation` and returns the provider SDP answer.
+The operator may select documented WebRTC v1 or v3 at the bridge, with v3 as
+the supported default; the device cannot override it. The
+device must acknowledge its applied answer, connected peer, and open data
+channel before the bridge sends `started`. The bridge never constructs a v3
+media peer or accepts binary audio on that socket. It owns OAuth, App Server
+start/stop, SDP relay, unexpected-tool rejection, sanitized remote lifecycle,
+and bounded cleanup of every thread created by the outer session only.
+
+The initial peer is implicit epoch 1. Its strict
+`start`/`answer`/`transport_ready`/`started` objects remain unchanged. Trusted
+AEC barge-in extends the same WebSocket with consecutive epoch-tagged
+`rollover`, `rollover_answer`, `rollover_transport_ready`, and
+`rollover_started` controls. Since the exact initial acknowledgement has no
+capability field, deploy the rollover-capable bridge before the new device. The
+new bridge remains compatible with the old device; the old bridge rejects a
+rollover message. Protocol and epoch values require exact JSON integers;
+booleans and floating-point values are rejected.
+
+“Okay Computer” entered this historical native route while “Okay Nabu”
+remained on Home Assistant's official Assist flow. The bridge did not capture a Home
+Assistant broker snapshot, wait for a transcript, create an executor, or call
+`thread/realtime/appendSpeech` for v3. Device/provider RTP and data-channel
+traffic bypass the bridge, and the route-scoped device bearer cannot access
+the Home Assistant broker.
+
+The v3 signaling, cleanup, rejection, and no-bridge-media boundaries have local
+automated coverage. This documentation does not claim that the new v3 path has
+completed the physical ThirdReality acceptance matrix.
+
+### Active v2 and compatibility details
+
+Device-facing v2 is now the active `bridge_pcm` route. It sends 16 kHz
+mono PCM16 to the bridge and receives 24 kHz mono PCM16. The bridge applies its
+2,250 ms input-track limit to these v2 live sessions; finite STT keeps its
+existing whole-utterance input capacity. Active native/realtime-only startup
+discards pre-ready PCM and never falls through to Assist.
 
 Strict-v2 clients that omit `conversation_mode` retain compatibility with the
 previous automatic policy. When exactly one Conversation subentry is opted in,
@@ -165,35 +353,48 @@ service shutdown tombstone and interrupt an active executor before its event
 subscription closes; transport and two-thread deletion then continue in
 tracked, cancellation-shielded cleanup.
 
-The reference device keeps at most 64 KiB (2.048 s) of startup/fallback input,
-drains a post-handshake backlog at no more than 2× capture rate, and keeps at
-most 48 KiB (about 1.024 s) queued for playback. Provider output also crosses a
-bounded bridge queue. A bound violation is terminal or triggers the documented
-pre-ready Home Assistant fallback; audio is never silently discarded to make
-latency metrics look better. Catch-up prevents a permanent handshake-sized
-offset once v2 becomes ready, but it cannot make the cold App Server/WebRTC
-handshake or provider response generation disappear.
+The active device keeps capture closed until the ready cue reaches EOF, so no
+v2 startup backlog or pre-ready Assist copy exists. Its 64 KiB input queue and
+48 KiB (about 1.024 s) playback queue bound live scheduling pressure only.
+Realtime-only failure clears both queues and returns idle. Catch-up cannot make
+cold App Server/WebRTC setup or provider response generation disappear.
 
-The device mode is turn-taking by default. Opt-in full duplex is a device-side
-contract: the pinned client must verify the reviewed static PulseAudio
+Historically, dormant v3 bounded its sequenced-packet IPC and bypassed bridge
+media queues; older optional v2 split deployments retained bounded pre-ready
+Assist replay. Neither behavior describes the active route.
+
+### Dormant v3 safety details
+
+V3 `device_webrtc` requires full duplex as a device-side contract: the pinned
+client must verify the reviewed static PulseAudio
 `module-echo-cancel` topology with the exact configured allowlisted AEC engine,
 exact source/sink and capture-process routing, and a configured 1–60% sink
 ceiling (25% by default) before
 it opens this route. WebRTC is the default when no method is supplied; there is
 no automatic fallback. The stock ThirdReality v1.1.7 module rejects WebRTC and
 Speex, so its qualified configuration must explicitly select Adrian. The client
-rechecks the ceiling before every response and pins `paplay` to the AEC sink
-with a fixed configured stream volume that cannot exceed the sink ceiling. The
+checks the ceiling and sets and verifies the dedicated AEC sink at the exact
+configured raw playback value once per direct session, before requesting its
+SDP offer or connecting to the bridge. Direct `paplay` targets that sink with
+raw stream volume 65536, non-blocking 20 ms writes, and reviewed 60 ms/20 ms
+latency/process arguments; no sink-input is mutated and no `pactl` subprocess
+runs from the live response or interruption path. Active v2 uses the same
+qualified fixed sink anchor and raw 65536 (100%-relative) stream, with one
+non-amplifying software attenuator for user volume; it does not apply the old
+second linear stream-volume reduction. The
 guarded device installer writes the matching raw sink value in the static
 PulseAudio startup block. The stock voice process later reapplies the persistent
 Home Assistant media-player preference, which must match the configured
 ceiling; runtime restore state alone is not treated as reboot evidence.
 
+### Active and compatibility v2 interruption
+
 V2 advertises `remote_cancel: false` because clients may never infer remote
 cancellation from a local flush. It separately advertises
-`same_session_interrupt_ack: true`. The current ThirdReality client sends
-`User-Agent: ha-codex-voice-thirdreality/2`; that header retains compatibility
-with the managed interrupt policy but does not select it. On a legacy
+`same_session_interrupt_ack: true` for the legacy `interrupt` exchange. The v2
+ThirdReality client sends `User-Agent: ha-codex-voice-thirdreality/2`; that
+header retains compatibility with the managed interrupt policy but does not
+select it. On a legacy
 broker-managed interrupt, the bridge invalidates the executor/output generation
 and asks the frontend provider to cancel only when an identified assistant
 render is active; it never cancels an idle or pending frontend. Before Home
@@ -203,17 +404,64 @@ newest request when its transcript arrives.
 It then returns `fresh_session_required: false`, `remote_cancelled: false`, and
 `continuation_safe: true`; the local generation gate makes continuation safe
 without claiming remote cancellation. A legacy client gets the established
-fresh-session fallback and socket teardown. On the current native path,
-same-socket continuation still requires a sanitized `response.cancelled` event
-correlated to the active provider response.
+fresh-session fallback and socket teardown.
 
-Audio uses Codex app-server's experimental WebRTC v3 path by default. The peer
-creates a real paced outbound audio track and `oai-events` data channel before
-the SDP offer; app-server supplies the remote SDP answer and transcript
-notifications. Codex 0.147.0 or newer is required for the managed frontend's
+The active explicit-native client instead sends exact nonterminal
+`provider_barge` after its local AEC-qualified cut. Capture and the device
+WebSocket stay live while the bridge sends `response.cancel` and
+`output_audio_buffer.clear` over the same provider peer. The bridge never waits
+for provider VAD. Exact `barge` remains the conservative peer-replacement
+fallback.
+
+### Dormant v3 rollover details
+
+V3 barge-in does not use a bridge or provider interrupt acknowledgement. The
+device immediately kills local `paplay`, retires the old sidecar, and sends no
+later capture to that peer. It retains the outer vendor owner/session/player,
+bridge WebSocket, and ready latch while a prewarmed child negotiates the next
+peer epoch. A bounded recent AEC pre-roll plus queued/live speech is sent once
+and in order to the replacement peer. Queue/age/timeout, sidecar, or invalid
+epoch failure ends the outer session closed; stop, mute, disconnect, and
+normal-wake preemption still end it. A device `stop` is normal termination
+during old-session closure and every answer/readiness phase, not a rollover
+protocol failure.
+
+The bridge stops the retired App Server realtime session and waits for the
+matching `thread/realtime/closed` notification. The stop RPC alone only
+enqueues close. A confirmed notification permits same-thread replacement with
+`includeStartupContext: true` and `context_retained: true`. Timeout, error, or
+an absent close starts an isolated thread and reports `context_retained: false`
+so a delayed old close cannot terminate the replacement. Retained context does
+not prove audible-history correctness; interrupted unheard assistant output may
+remain, and recent pre-roll may overlap audio already sent to the retired peer.
+
+Frameless v3 exposes no public cancel/truncate control or provider interruption
+acknowledgement. A synthetic same-peer canary was rejected when old RTP
+continued beyond the five-second media-fence deadline, so the former
+`response.interrupt`/`interrupt.fenced` experiment is not the production path.
+Fresh-peer rollover is a safe subscription-backed approximation, not exact
+ChatGPT same-session interruption, and adds measurable negotiation latency.
+The reference installation passed a physical v3 double-interruption canary at
+its qualified 60% setting in two exact-artifact runs: four local cuts were
+208–211 ms and four rollovers were 1.29–1.57 s. Each run recycled its same two
+worker PIDs without a cold replacement and retained context twice. That
+evidence is installation-specific; each deployment must still pass its own
+physical acceptance matrix. See the normative
+[v3 interruption contract](../protocol/realtime-wire-v3.md#barge-in-and-interruption).
+
+### Server-owned media adapters
+
+Bridge-owned v1/v2/STT/TTS audio adapters use Codex App Server's experimental
+WebRTC v3 path. Their peer creates a real paced outbound audio track and
+`oai-events` data channel before the SDP offer. Device protocol v3 instead
+relays the device's offer and never creates that bridge peer. App Server
+supplies the remote SDP answer and lifecycle notifications. Codex 0.147.0 or
+newer is required for the managed frontend's
 delegation acknowledgement control. This is the subscription-compatible path.
-Raw Realtime v2 WebSockets require API-key authentication and are intentionally
-not used.
+The public Realtime v2 WebRTC/client-event dialect is unsupported on this
+subscription-backed direct route; raw Realtime v2 WebSockets require API-key
+authentication and are intentionally not used. That restriction is unrelated
+to this project's active wire-v2 `bridge_pcm` LAN transport.
 
 This App Server realtime surface is experimental and not the documented OpenAI
 Realtime API. Native selection removes the bridge-created transcript/executor/
@@ -221,6 +469,10 @@ render sequence, but a new direct wake still pays for cold Codex thread
 creation, App Server/WebRTC negotiation, service admission, network latency,
 and provider response generation. The bridge does not claim parity with an
 already-open ChatGPT voice session.
+
+Current App Server documentation exposes WebRTC start/stop for realtime v1 and
+v3, not v2. The direct device route remains on tagged Frameless v3; a live v1
+subscription canary failed before startup and is not an operational fallback.
 
 The subscription realtime voice is conversational, not a verbatim
 text-to-speech API. `/v1/synthesize` sends a tightly constrained text turn but

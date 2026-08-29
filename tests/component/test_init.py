@@ -20,6 +20,7 @@ from custom_components.codex_voice.const import (
     CONF_BRIDGE_URL,
     CONF_REALTIME_AUTHORITY,
     CONF_REALTIME_LANGUAGE,
+    CONF_REALTIME_VOICE,
     DOMAIN,
 )
 
@@ -64,8 +65,13 @@ async def test_setup_owns_handoff_release_tasks_until_unload() -> None:
         patch(
             "custom_components.codex_voice.async_start_realtime_tool_broker"
         ) as start_broker,
+        patch(
+            "custom_components.codex_voice.async_setup_identity_management",
+            new_callable=AsyncMock,
+        ) as setup_identity_management,
     ):
         assert await async_setup_entry(cast("Any", hass), cast("Any", entry))
+        setup_identity_management.assert_awaited_once_with(hass)
         start_broker.assert_not_called()
         assert len(startup_callbacks) == 1
         startup_callbacks[0](hass)
@@ -155,10 +161,10 @@ async def test_realtime_tool_snapshot_starts_immediately_after_boot(
     cancel()
 
 
-async def test_migrate_requires_explicit_authority_opt_in_and_adds_language(
+async def test_migrate_selects_first_authority_and_adds_language(
     hass: HomeAssistant,
 ) -> None:
-    """Legacy profiles do not silently gain a Home Assistant control surface."""
+    """Legacy profiles gain one deterministic Home Assistant authority."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         version=1,
@@ -195,8 +201,9 @@ async def test_migrate_requires_explicit_authority_opt_in_and_adds_language(
         if item.subentry_type == "conversation"
     ]
     assert [item.data[CONF_REALTIME_AUTHORITY] for item in conversations] == [
-        False,
+        True,
         False,
     ]
     assert all(item.data[CONF_REALTIME_LANGUAGE] == "es-MX" for item in conversations)
-    assert entry.minor_version == 2
+    assert all(item.data[CONF_REALTIME_VOICE] == "cove" for item in conversations)
+    assert entry.minor_version == 4

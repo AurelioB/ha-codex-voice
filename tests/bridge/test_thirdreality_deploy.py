@@ -101,12 +101,18 @@ def test_aec_blocks_cover_every_supported_method_and_volume() -> None:
             )
             assert render_remove(installed) == (_PINNED_DEFAULT_PA, True)
 
-    assert len(blocks) == len(SUPPORTED_AEC_METHODS) * 60
+    assert len(blocks) == len(SUPPORTED_AEC_METHODS) * 100
 
 
 @pytest.mark.parametrize(
     ("volume_percent", "expected_raw"),
-    [(1, 655), (25, 16_384), (60, 39_321)],
+    [
+        (1, 655),
+        (25, 16_384),
+        (60, 39_321),
+        (80, 52_428),
+        (100, 65_536),
+    ],
 )
 def test_aec_sink_startup_volume_uses_exact_pulse_raw_floor(
     volume_percent: int,
@@ -150,7 +156,7 @@ def test_aec_method_allowlist_keeps_webrtc_as_default() -> None:
     assert SUPPORTED_AEC_METHODS == ("webrtc", "speex", "adrian")
     assert DEFAULT_AEC_SINK_VOLUME_PERCENT == 25
     assert MIN_AEC_SINK_VOLUME_PERCENT == 1
-    assert MAX_AEC_SINK_VOLUME_PERCENT == 60
+    assert MAX_AEC_SINK_VOLUME_PERCENT == 100
     assert aec_block() == AEC_BLOCK
     assert aec_block("speex") == SPEEX_AEC_BLOCK
     assert aec_block("adrian") == ADRIAN_AEC_BLOCK
@@ -161,23 +167,23 @@ def test_aec_method_allowlist_keeps_webrtc_as_default() -> None:
         render_install(_PINNED_DEFAULT_PA, "unknown")
 
 
-@pytest.mark.parametrize("volume_percent", [0, 61, -1, True, False, 25.0, "25", None])
+@pytest.mark.parametrize("volume_percent", [0, 101, -1, True, False, 25.0, "25", None])
 def test_aec_sink_volume_api_rejects_invalid_bounds_and_types(
     volume_percent: Any,
 ) -> None:
     with pytest.raises(
         DeploymentError,
-        match=r"must be an integer from 1 through 60",
+        match=r"must be an integer from 1 through 100",
     ):
         aec_block(DEFAULT_AEC_METHOD, volume_percent)
     with pytest.raises(
         DeploymentError,
-        match=r"must be an integer from 1 through 60",
+        match=r"must be an integer from 1 through 100",
     ):
         render_install(_PINNED_DEFAULT_PA, DEFAULT_AEC_METHOD, volume_percent)
 
 
-@pytest.mark.parametrize("value", ["0", "61", "-1", "true", "25.0", "1_0"])
+@pytest.mark.parametrize("value", ["0", "101", "-1", "true", "25.0", "1_0"])
 def test_aec_sink_volume_cli_rejects_invalid_bounds_and_types(
     value: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,7 +198,7 @@ def test_aec_sink_volume_cli_rejects_invalid_bounds_and_types(
         prepare_pulseaudio_aec.main()
 
 
-@pytest.mark.parametrize("volume_percent", [1, 25, 60])
+@pytest.mark.parametrize("volume_percent", [1, 25, 60, 80, 100])
 def test_aec_sink_volume_cli_accepts_and_propagates_supported_values(
     volume_percent: int,
     monkeypatch: pytest.MonkeyPatch,

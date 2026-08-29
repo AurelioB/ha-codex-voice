@@ -18,13 +18,14 @@ _HANDSHAKE_TIMEOUT_SECONDS = 45.0
 _OUTPUT_TIMEOUT_SECONDS = 90.0
 
 
-async def run_smoke(
+async def run_smoke(  # noqa: C901 - one bounded wire-protocol smoke state machine
     url: str,
     token: str,
     text: str,
     *,
     input_wav: Path | None = None,
     output_wav: Path | None = None,
+    expect_end: bool = False,
 ) -> dict[str, Any]:
     """Send one text or paced-audio turn and validate epoch-gated output."""
     input_pcm: bytes | None = None
@@ -47,6 +48,7 @@ async def run_smoke(
     audio = bytearray()
     active_epoch: int | None = None
     completed_epoch: int | None = None
+    terminal_reason: str | None = None
     controls = 0
 
     async with AsyncExitStack() as stack:
@@ -83,6 +85,8 @@ async def run_smoke(
             "local_flush": True,
             "remote_cancel": False,
             "same_session_interrupt_ack": True,
+            "server_owned_media": True,
+            "native_end_conversation": True,
         }:
             raise RuntimeError("realtime v2 returned incompatible capabilities")
 
@@ -98,7 +102,9 @@ async def run_smoke(
         output_deadline = asyncio.get_running_loop().time() + _OUTPUT_TIMEOUT_SECONDS
         try:
             async with asyncio.timeout_at(output_deadline):
-                while completed_epoch is None:
+                while terminal_reason is None and (
+                    expect_end or completed_epoch is None
+                ):
                     message = await websocket.receive()
                     if message.type is WSMsgType.BINARY:
                         if active_epoch is None:
@@ -119,6 +125,13 @@ async def run_smoke(
                     event = json.loads(message.data)
                     if event.get("type") == "error":
                         raise RuntimeError("realtime v2 bridge returned an error")
+                    if event.get("type") == "stopped":
+                        terminal_reason = event.get("reason")
+                        if not expect_end or terminal_reason != "end_conversation":
+                            raise RuntimeError(
+                                "realtime v2 stopped for an unexpected reason"
+                            )
+                        continue
                     if event.get("type") != "control":
                         continue
                     controls += 1
@@ -145,9 +158,23 @@ async def run_smoke(
         except TimeoutError:
             raise TimeoutError("realtime v2 output timed out") from None
 
-        await websocket.send_json({"type": "stop"})
+        if terminal_reason is None:
+            await websocket.send_json({"type": "stop"})
 
-    if not audio_bytes or first_audio_at is None or handshake_at is None:
+    if handshake_at is None:
+        raise RuntimeError("realtime v2 completed without a handshake")
+    if expect_end:
+        if audio_bytes or active_epoch is not None:
+            raise RuntimeError("end_conversation produced unexpected audible PCM")
+        return {
+            "protocol_version": started.get("protocol_version"),
+            "conversation_mode": started.get("conversation_mode"),
+            "terminal_reason": terminal_reason,
+            "audio_bytes": audio_bytes,
+            "handshake_seconds": round(handshake_at - started_at, 3),
+            "total_seconds": round(time.monotonic() - started_at, 3),
+        }
+    if not audio_bytes or first_audio_at is None:
         raise RuntimeError("realtime v2 completed without audible PCM")
     if output_wav is not None:
         with output_wav.open("xb") as output, wave.open(output, "wb") as wav:
@@ -179,6 +206,11 @@ def main() -> None:
     )
     parser.add_argument("--output-wav", type=Path)
     parser.add_argument("--input-wav", type=Path)
+    parser.add_argument(
+        "--expect-end",
+        action="store_true",
+        help="require a silent end_conversation terminal instead of spoken output",
+    )
     args = parser.parse_args()
     token = os.environ.get("HA_CODEX_REALTIME_DEVICE_TOKEN") or os.environ.get(
         "HA_CODEX_BRIDGE_TOKEN"
@@ -196,6 +228,7 @@ def main() -> None:
                     args.text,
                     input_wav=args.input_wav,
                     output_wav=args.output_wav,
+                    expect_end=args.expect_end,
                 )
             ),
             indent=2,

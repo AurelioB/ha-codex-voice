@@ -1,0 +1,49 @@
+#!/bin/sh
+# HA Codex Voice managed early microphone-gain hook.
+# PulseAudio must open hw:0,2 only after this mixer write has completed.
+
+SOUND_CONF=/data/conf/sound.json
+DEFAULT_MIC_GAIN=30
+
+read_mic_gain() {
+    if [ -f "$SOUND_CONF" ] && [ ! -L "$SOUND_CONF" ]; then
+        value=$(/usr/bin/jq -er '
+            if type == "object" and has("mic_gain") then .mic_gain else empty end
+            | select(type == "number")
+            | select(. >= 0 and . <= 100)
+            | select(. == floor)
+            | if . == 0 then 0 else floor end
+        ' "$SOUND_CONF" 2>/dev/null) || value=
+        case "$value" in
+            ''|*[!0-9]*) ;;
+            *)
+                printf '%s\n' "$value"
+                return 0
+                ;;
+        esac
+    fi
+
+    /usr/bin/logger -t codex-mic-gain \
+        "invalid or absent sound.json gain; using 30%" 2>/dev/null || :
+    printf '%s\n' "codex-mic-gain: invalid or absent sound.json gain; using 30%" >&2
+    printf '%s\n' "$DEFAULT_MIC_GAIN"
+}
+
+case "${1:-}" in
+    start)
+        MIC_GAIN=$(read_mic_gain)
+        if ! /usr/bin/amixer -c 0 cset numid=7 "${MIC_GAIN}%" >/dev/null 2>&1; then
+            printf '%s\n' "codex-mic-gain: failed to apply PDM gain before PulseAudio" >&2
+            exit 1
+        fi
+        /usr/bin/logger -t codex-mic-gain \
+            "Applied pre-PulseAudio microphone gain: ${MIC_GAIN}%" 2>/dev/null || :
+        printf 'Applied pre-PulseAudio microphone gain: %s%%\n' "$MIC_GAIN"
+        ;;
+    stop)
+        ;;
+    *)
+        printf 'Usage: %s {start|stop}\n' "$0" >&2
+        exit 1
+        ;;
+esac

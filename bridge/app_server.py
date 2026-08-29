@@ -8,6 +8,7 @@ import itertools
 import json
 import logging
 import os
+import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -32,6 +33,7 @@ _OTHER_CLOSED_METHODS = {
     "account/chatgptAuthTokens/refresh",
     "attestation/generate",
 }
+_CURRENT_TIME_METHOD = "currentTime/read"
 
 
 class RpcSubscription:
@@ -394,6 +396,16 @@ class CodexAppServer:
         method = message["method"]
         request_id = message["id"]
         self._retired_server_response_ids.pop(request_id, None)
+        if method == _CURRENT_TIME_METHOD:
+            # Codex realtime asks its client for an external clock before it
+            # answers time-sensitive voice requests.  The desktop client
+            # supplies whole Unix seconds; answer locally without exposing the
+            # request to subscribers or granting a general-purpose tool.
+            await self.respond_result(
+                request_id,
+                {"currentTimeAt": int(time.time())},
+            )
+            return
         if method in _MODERN_APPROVAL_METHODS:
             await self.respond_result(request_id, {"decision": "decline"})
             return

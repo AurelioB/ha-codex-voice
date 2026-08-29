@@ -101,12 +101,23 @@ def main() -> None:
                     },
                 }
             )
+        elif method == "test/requestCurrentTime":
+            send({"id": request_id, "result": {}})
+            send(
+                {
+                    "id": "current-time-1",
+                    "method": "currentTime/read",
+                    "params": {"threadId": "thread-1"},
+                }
+            )
         elif method == "test/largeResponse":
             send({"id": request_id, "result": {"payload": "x" * 100_000}})
         elif request_id == "approval-1" and "result" in message:
             send({"method": "fake/approvalResult", "params": message["result"]})
         elif request_id == "rpc-tool-1" and "result" in message:
             send({"method": "fake/toolResult", "params": message["result"]})
+        elif request_id == "current-time-1" and "result" in message:
+            send({"method": "fake/currentTimeResult", "params": message["result"]})
         elif request_id is not None:
             send({"id": request_id, "result": {}})
 

@@ -103,6 +103,59 @@ async def test_health_and_authentication(
         await invalid_client.async_health()
 
 
+async def test_speaker_identity_management_uses_primary_bridge_api(
+    aiohttp_client: Any,
+    socket_enabled: None,
+) -> None:
+    """Identity status and profile links use authenticated bounded JSON calls."""
+    observed: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    async def identity(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == "Bearer primary-token"
+        payload = await request.json() if request.can_read_body else None
+        observed.append((request.method, request.path, payload))
+        if request.method == "GET":
+            return web.json_response({"status": "ok", "profiles": []})
+        return web.json_response({"speaker_id": "owner", **(payload or {})})
+
+    app = web.Application()
+    app.router.add_route("*", "/v1/speaker-identity{tail:.*}", identity)
+    test_client = await aiohttp_client(app)
+    client = BridgeClient(
+        test_client.session, str(test_client.make_url("")), "primary-token"
+    )
+
+    assert await client.async_speaker_identity_status() == {
+        "status": "ok",
+        "profiles": [],
+    }
+    assert await client.async_update_speaker_profile(
+        "owner",
+        {
+            "ha_person_id": "person.aurelio",
+            "ha_user_id": "user-1",
+            "enabled": True,
+        },
+    ) == {
+        "speaker_id": "owner",
+        "ha_person_id": "person.aurelio",
+        "ha_user_id": "user-1",
+        "enabled": True,
+    }
+    assert observed == [
+        ("GET", "/v1/speaker-identity", None),
+        (
+            "PATCH",
+            "/v1/speaker-identity/profiles/owner",
+            {
+                "ha_person_id": "person.aurelio",
+                "ha_user_id": "user-1",
+                "enabled": True,
+            },
+        ),
+    ]
+
+
 async def test_conversation_stream_and_tool_result(
     aiohttp_client: Any,
     socket_enabled: None,
