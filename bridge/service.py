@@ -246,6 +246,16 @@ _DIRECT_ASSISTANT_FAREWELL_TRANSCRIPTS = frozenset(
         "terminamos aqui",
     }
 )
+_DIRECT_ASSISTANT_FAREWELL_SUFFIXES = frozenset(
+    {
+        "aqui lo dejamos",
+        "finalizo aqui",
+        "lo dejamos aqui",
+        "lo dejo aqui",
+        "se acabo",
+        "terminamos aqui",
+    }
+)
 REALTIME_BINARY_FRAME_MAX_BYTES = 64 * 1024
 REALTIME_NATIVE_ROLLOVER_PREROLL_MILLISECONDS = 320
 REALTIME_NATIVE_ROLLOVER_PREROLL_MAX_BYTES = (
@@ -5363,9 +5373,13 @@ def _direct_provider_transcript_requests_end(event: Mapping[str, Any]) -> bool:
 
 
 def _direct_assistant_transcript_is_farewell(value: object) -> bool:
-    """Recognize only a complete, short assistant farewell utterance."""
-    return _normalize_direct_terminal_transcript(value) in (
-        _DIRECT_ASSISTANT_FAREWELL_TRANSCRIPTS
+    """Recognize a complete, short assistant farewell utterance."""
+    normalized = _normalize_direct_terminal_transcript(value)
+    if normalized in _DIRECT_ASSISTANT_FAREWELL_TRANSCRIPTS:
+        return True
+    return any(
+        normalized == suffix or normalized.endswith(f" {suffix}")
+        for suffix in _DIRECT_ASSISTANT_FAREWELL_SUFFIXES
     )
 
 

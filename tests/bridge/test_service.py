@@ -6602,6 +6602,7 @@ def test_direct_terminal_transcript_prefix_gate(
         "De acuerdo, lo dejo aquí.",
         "De acuerdo, terminamos aquí.",
         "Listo, terminamos aquí.",
+        "Va, entendido. Aquí lo dejamos.",
     ],
 )
 def test_direct_assistant_farewell_recognizes_clear_live_cues(phrase: str) -> None:

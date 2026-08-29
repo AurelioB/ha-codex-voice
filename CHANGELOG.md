@@ -170,10 +170,12 @@ and releases use semantic versioning.
 - Do not open a subscription realtime session merely because the speaker booted
   or a conversation ended; that idle provider occupied ChatGPT's single voice
   lane and blocked the official app. A probable 0.50 wake-model score may still
-  create one ten-second speculative slot, which a real wake claims without
-  repeating negotiation. Cache immutable Pulse/AEC topology proof for the
-  voice-process lifetime; retain per-response sink-volume verification and the
-  unchanged bounded cold/retry path.
+  create one ten-second speculative slot on its rising edge, which a real wake
+  claims without repeating negotiation. The score must fall below threshold
+  before another slot can open, preventing a completed call's stale score from
+  reopening the subscription voice lane. Cache immutable Pulse/AEC topology
+  proof for the voice-process lifetime; retain per-response sink-volume
+  verification and the unchanged bounded cold/retry path.
 - Route the current controlled Okay Nabu deployment to full-duplex
   `bridge_pcm` with native AEC3, `direct_capture_gain_db: 18`, a fixed 100%
   playback anchor, and `realtime_only: true`; defer Home Assistant

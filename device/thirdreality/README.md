@@ -162,10 +162,12 @@ absolute 12-second owner deadline; each session retains its own configured
 10-second signaling-handshake bound inside the remaining owner budget. Process
 startup and completed conversations never open a remote provider session, so
 an idle speaker cannot occupy ChatGPT's voice lane. Before final detector
-acceptance, an Okay Nabu model score of 0.50 creates or refreshes one ten-second
-speculative slot. The accepted wake atomically claims that same WebSocket,
-thread, and server WebRTC peer, while an expired or failed slot uses the
-ordinary bounded cold attempts. No unclaimed slot receives microphone PCM.
+acceptance, an Okay Nabu model score of 0.50 creates one ten-second
+speculative slot on its rising edge. The accepted wake consumes that score
+excursion and the detector must fall below threshold before another slot can
+open. It atomically claims that same WebSocket, thread, and server WebRTC peer,
+while an expired or failed slot uses the ordinary bounded cold attempts. No
+unclaimed slot receives microphone PCM.
 Dormant v3 process prewarm still proves only that its isolated `Popen` child is
 alive; it does not validate an SDP offer.
 

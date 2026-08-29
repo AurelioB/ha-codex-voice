@@ -253,6 +253,7 @@ _REALTIME_LOCK_ATTRIBUTE = "_codex_realtime_lock"
 _REALTIME_STOP_REQUESTED_ATTRIBUTE = "_codex_realtime_stop_requested"
 _REALTIME_SOUND_SIGNATURE_ATTRIBUTE = "_codex_realtime_sound_signature"
 _REALTIME_ANCHOR_DIRTY_ATTRIBUTE = "_codex_realtime_anchor_dirty"
+_REALTIME_PREWAKE_LATCH_ATTRIBUTE = "_codex_realtime_prewake_latched"
 # The pinned recorder emits 2,048-byte PCM16 frames every 64 ms. Retain six
 # idle frames only for the bridge-PCM path; device WebRTC deliberately drops
 # all pre-cue PCM and opens live capture after its audible ready boundary.
@@ -711,7 +712,7 @@ def _discard_realtime_preroll(instance: Any) -> None:
 
 
 def _maybe_prewarm_probable_realtime_wake(instance: Any) -> None:
-    """Start server media on the first strong pre-activation model score."""
+    """Start server media once on a rising pre-activation model score."""
     if not _uses_bridge_pcm() or not _uses_deterministic_realtime_media():
         return
     wake_words = getattr(instance.state, "wake_words", None)
@@ -729,9 +730,18 @@ def _maybe_prewarm_probable_realtime_wake(instance: Any) -> None:
             isinstance(latest, bool)
             or not isinstance(latest, (int, float))
             or not math.isfinite(float(latest))
-            or float(latest) < _BRIDGE_PCM_PREWAKE_PROBABILITY
         ):
             return
+        if float(latest) < _BRIDGE_PCM_PREWAKE_PROBABILITY:
+            setattr(instance, _REALTIME_PREWAKE_LATCH_ATTRIBUTE, False)
+            return
+        if bool(getattr(instance, _REALTIME_PREWAKE_LATCH_ATTRIBUTE, False)):
+            return
+        # A score can remain high in the detector's short history after a
+        # completed call. Latch before starting network work and re-arm only
+        # after the score falls below threshold, so one wake episode can never
+        # open a second provider session during terminal cleanup.
+        setattr(instance, _REALTIME_PREWAKE_LATCH_ATTRIBUTE, True)
         try:
             started = _REALTIME_SUPPORT.prewarm_bridge_pcm(_REALTIME_CONFIG)
         except Exception:  # noqa: BLE001 - speculation must never affect wake audio
@@ -905,6 +915,10 @@ def _start_realtime_wakeup(
         if instance._pipeline_active:  # noqa: SLF001
             _LOGGER.debug("Ignoring wake word - pipeline already active")
             return
+
+        # The accepted wake consumes the current probability excursion even
+        # when the speculative hook did not observe its rising edge.
+        setattr(instance, _REALTIME_PREWAKE_LATCH_ATTRIBUTE, True)
 
         # A direct WebRTC wake is only permission to establish a session. The
         # triggering audio and every frame recorded while signaling are stale

@@ -79,15 +79,15 @@ transcript gate, executor, `appendSpeech` render, or device `aiortc` import.
 Qualified interruption replaces the provider peer on the server while the
 device session stays open.
 
-Native mode does not make cold startup free. The active client now keeps one
-bounded, audio-empty provider session warm for five minutes after voice-process
-startup and after a completed conversation. A probable Okay Nabu score at 0.50
-also creates or refreshes a ten-second speculative slot before final wake
-acceptance. A matching wake atomically claims the same device WebSocket, Codex
-thread, and server-owned WebRTC peer; no second negotiation is started. An
-expired, failed, or incompatible slot is stopped and the existing three-attempt
-cold path remains available. Capture remains closed and no microphone PCM is
-queued while the slot is unclaimed. Report wake to exact
+Native mode does not make cold startup free. The active client does not keep a
+provider session open after boot or a completed conversation. A probable Okay
+Nabu score at 0.50 creates a ten-second speculative slot on its rising edge
+before final wake acceptance. A matching wake consumes that score excursion and
+atomically claims the same device WebSocket, Codex thread, and server-owned
+WebRTC peer; the detector must fall below threshold before another slot can
+open. An expired, failed, or incompatible slot is stopped and the existing
+three-attempt cold path remains available. Capture remains closed and no
+microphone PCM is queued while the slot is unclaimed. Report wake to exact
 `started`, `started` to cue EOF/capture-open, capture-open to speech endpoint,
 endpoint to first PCM, and first PCM to audible playback separately. The
 experimental App Server surface provides no

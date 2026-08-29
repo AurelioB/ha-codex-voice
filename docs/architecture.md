@@ -356,14 +356,15 @@ The bundled component omits the private request, so STT and TTS always use
 separate remote contexts. Diagnostic tickets remain bearer secrets and are
 excluded from logs and diagnostics.
 
-The active ThirdReality strict-v2 route keeps at most one audio-empty provider
-session warm. Voice-process startup and completed conversations arm a
-five-minute slot; a 0.50 probable wake score creates or refreshes a ten-second
-slot before final detector acceptance. The real wake claims that exact device
-WebSocket, thread, and server-owned WebRTC peer. Expiry or failure stops it and
-falls back to bounded cold startup. This deliberately occupies the single
-subscription speech lane, but never admits microphone PCM before assignment.
-The recommended Wyoming providers do not use this policy. The dormant direct
+The active ThirdReality strict-v2 route keeps no provider session open after
+boot or a completed conversation. A 0.50 probable wake score creates one
+ten-second slot on its rising edge before final detector acceptance. The real
+wake consumes that score excursion and claims that exact device WebSocket,
+thread, and server-owned WebRTC peer; the detector must fall below threshold
+before another slot can open. Expiry or failure stops it and falls back to
+bounded cold startup. This briefly occupies the single subscription speech
+lane, but never admits microphone PCM before assignment. The recommended
+Wyoming providers do not use this policy. The dormant direct
 device route prewarms exactly one reusable local isolated `aiortc` worker. Idle
 process prewarm means only that its `Popen` is alive; it does not request,
 drain, or validate an SDP offer. The worker creates its first peer offer only

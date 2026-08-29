@@ -1324,6 +1324,47 @@ def test_bridge_pcm_probable_wake_score_starts_nonblocking_prewarm(
     instance.handle_audio(_pcm_frame(2))
     assert support.bridge_prewarm_calls == [support.load_config()]  # type: ignore[attr-defined]
 
+    # A sustained or stale score belongs to the same wake episode.
+    instance.handle_audio(_pcm_frame(3))
+    assert support.bridge_prewarm_calls == [support.load_config()]  # type: ignore[attr-defined]
+
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY - 0.01]
+    instance.handle_audio(_pcm_frame(4))
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY]
+    instance.handle_audio(_pcm_frame(5))
+    assert support.bridge_prewarm_calls == [
+        support.load_config(),
+        support.load_config(),
+    ]  # type: ignore[attr-defined]
+
+
+def test_accepted_wake_consumes_score_until_detector_rearms(
+    load_overlay: Any,
+) -> None:
+    support = _fake_realtime_support(
+        media_transport="bridge_pcm",
+        full_duplex=True,
+        wake_phrase="okay nabu",
+        realtime_only=True,
+    )
+    protocol, module, _tr_satellite = load_overlay(_REALTIME_HASHES, support)
+    instance = protocol()
+    detector = instance.state.wake_words["okay_nabu"]
+
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY]
+    _wake(instance, "okay nabu")
+    owner = instance._codex_realtime_owner
+    module._detach_realtime_owner(instance, owner, unduck=owner.ducked)
+
+    instance.handle_audio(_pcm_frame(1))
+    assert support.bridge_prewarm_calls == []  # type: ignore[attr-defined]
+
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY - 0.01]
+    instance.handle_audio(_pcm_frame(2))
+    detector._probabilities[:] = [module._BRIDGE_PCM_PREWAKE_PROBABILITY]
+    instance.handle_audio(_pcm_frame(3))
+    assert support.bridge_prewarm_calls == [support.load_config()]  # type: ignore[attr-defined]
+
 
 def test_bridge_pcm_wake_claims_connecting_prewarm_without_second_start(
     load_overlay: Any,
